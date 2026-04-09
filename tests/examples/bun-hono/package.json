@@ -1,0 +1,6 @@
+{
+  "name": "bun-hono",
+  "module": "server.ts",
+  "type": "module",
+  "dependencies": { "hono": "4.6.14" }
+}

@@ -1,0 +1,1650 @@
+// Package container is the high-level runtime.
+// Accepts a git repo URL, local path, OCI image ref, or Dockerfile —
+// builds a rootfs + ext4 disk, generates a kernel cmdline, and boots a VM.
+package container
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gocracker/gocracker/internal/buildserver"
+	"github.com/gocracker/gocracker/internal/dockerfile"
+	"github.com/gocracker/gocracker/internal/guest"
+	"github.com/gocracker/gocracker/internal/hostguard"
+	"github.com/gocracker/gocracker/internal/hostnet"
+	gclog "github.com/gocracker/gocracker/internal/log"
+	"github.com/gocracker/gocracker/internal/oci"
+	"github.com/gocracker/gocracker/internal/repo"
+	"github.com/gocracker/gocracker/internal/runtimecfg"
+	"github.com/gocracker/gocracker/internal/worker"
+	"github.com/gocracker/gocracker/pkg/vmm"
+)
+
+// RunOptions describes how to run a container as a microVM.
+type RunOptions struct {
+	// Source — exactly one must be set:
+	Image      string // OCI ref e.g. "ubuntu:22.04"
+	Dockerfile string // explicit path to a Dockerfile
+	Context    string // build context dir (used with Dockerfile)
+	RepoURL    string // git remote URL or local path — Dockerfile auto-detected
+	RepoRef    string // branch/tag/commit (default: repo default branch)
+	RepoSubdir string // subdir inside repo containing the Dockerfile
+
+	// VM
+	MemMB       uint64
+	Arch        string
+	CPUs        int
+	KernelPath  string
+	TapName     string
+	NetworkMode string
+	X86Boot     vmm.X86BootMode
+
+	// Container overrides
+	Cmd           []string
+	Entrypoint    []string
+	Env           []string
+	Hosts         []string
+	WorkDir       string
+	PID1Mode      string
+	Mounts        []Mount
+	KernelModules []guest.KernelModule
+	ConsoleOut    io.Writer
+	ConsoleIn     io.Reader
+
+	// Disk image size in MiB (default 2048)
+	DiskSizeMB int
+
+	// Working dir for build artifacts (auto-generated if empty)
+	WorkDir2 string
+
+	// Build args (Dockerfile ARG values)
+	BuildArgs map[string]string
+
+	// VM identifier (auto-generated if empty)
+	ID string
+
+	// CacheDir enables persistent reuse of OCI and VM artifacts across runs.
+	CacheDir string
+
+	// Metadata is persisted into the VM config and surfaced by serve.
+	Metadata map[string]string
+
+	// JailerMode controls whether privileged boot happens through jailed workers.
+	JailerMode string
+
+	// Snapshot dir: if set, attempt fast restore before building
+	SnapshotDir string
+
+	// StaticIP / gateway for the guest network (optional)
+	StaticIP string
+	Gateway  string
+
+	// Optional internal exec access over virtio-vsock.
+	ExecEnabled bool
+	// InteractiveExec boots the guest into an idle supervisor so the CLI can
+	// attach a PTY over the exec agent instead of running the image process as PID 1.
+	InteractiveExec bool
+
+	// Additional create-time block devices exposed after the root disk.
+	Drives []vmm.DriveConfig
+
+	// Optional memory management devices.
+	Balloon       *vmm.BalloonConfig
+	MemoryHotplug *vmm.MemoryHotplugConfig
+
+	// Explicit worker/jailer launch configuration used by serve/supervisors.
+	JailerBinary string
+	VMMBinary    string
+	ChrootBase   string
+	UID          int
+	GID          int
+}
+
+// RunResult is returned after a VM is started.
+type RunResult struct {
+	VM           vmm.Handle
+	DiskPath     string
+	ID           string
+	Config       oci.ImageConfig
+	TapName      string
+	GuestIP      string
+	Gateway      string
+	WorkerSocket string
+	cleanup      func()
+}
+
+const (
+	runtimeDiskRetention    = time.Minute
+	runArtifactCacheVersion = 2
+)
+
+func (r *RunResult) Close() {
+	if r == nil || r.cleanup == nil {
+		return
+	}
+	r.cleanup()
+}
+
+const (
+	NetworkModeNone = ""
+	NetworkModeAuto = "auto"
+	JailerModeOn    = "on"
+	JailerModeOff   = "off"
+)
+
+func defaultCacheDir() string {
+	return filepath.Join(os.TempDir(), "gocracker", "cache")
+}
+
+func resolvedCacheDir(cacheDir string) string {
+	base := strings.TrimSpace(cacheDir)
+	if base != "" {
+		return base
+	}
+	return defaultCacheDir()
+}
+
+type MountBackend string
+
+const (
+	MountBackendMaterialized MountBackend = ""
+	MountBackendVirtioFS     MountBackend = "virtiofs"
+)
+
+// Mount describes a host path materialized into the guest filesystem
+// before the ext4 image is built, or exported live via a shared filesystem backend.
+type Mount struct {
+	Source   string       `json:"source"`
+	Target   string       `json:"target"`
+	ReadOnly bool         `json:"read_only"`
+	Populate bool         `json:"populate"`
+	Backend  MountBackend `json:"backend"`
+}
+
+// Run builds (if needed) and starts a microVM.
+func Run(opts RunOptions) (*RunResult, error) {
+	if opts.Arch == "" {
+		opts.Arch = runtime.GOARCH
+	}
+	if opts.Arch != runtime.GOARCH {
+		return nil, fmt.Errorf("arch %q is not compatible with host arch %q (same-arch only)", opts.Arch, runtime.GOARCH)
+	}
+	if jailerEnabled(opts.JailerMode) {
+		return runViaWorker(opts)
+	}
+	return runLocal(opts)
+}
+
+func jailerEnabled(mode string) bool {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "", JailerModeOn:
+		return true
+	case JailerModeOff:
+		return false
+	default:
+		return true
+	}
+}
+
+func runLocal(opts RunOptions) (*RunResult, error) {
+	if opts.MemMB == 0 {
+		opts.MemMB = 256
+	}
+	if opts.Arch == "" {
+		opts.Arch = runtime.GOARCH
+	}
+	if opts.DiskSizeMB == 0 {
+		opts.DiskSizeMB = 2048
+	}
+	if opts.ID == "" {
+		opts.ID = fmt.Sprintf("gc-%d", time.Now().UnixNano()%100000)
+	}
+	if err := hostguard.CheckHostDevices(hostguard.DeviceRequirements{
+		NeedKVM: true,
+		NeedTun: opts.TapName != "" || opts.NetworkMode == NetworkModeAuto,
+	}); err != nil {
+		return nil, fmt.Errorf("host device preflight: %w", err)
+	}
+	workDir, err := resolveRunWorkDir(opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return nil, fmt.Errorf("create workdir %s: %w", workDir, err)
+	}
+
+	var autoNet *hostnet.AutoNetwork
+	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto {
+		return nil, fmt.Errorf("invalid network mode %q", opts.NetworkMode)
+	}
+	if opts.NetworkMode == NetworkModeAuto {
+		if opts.SnapshotDir != "" {
+			return nil, fmt.Errorf("--net auto is not supported with snapshot restore yet")
+		}
+		var err error
+		autoNet, err = hostnet.NewAuto(opts.ID, opts.TapName)
+		if err != nil {
+			return nil, fmt.Errorf("auto network: %w", err)
+		}
+		opts.TapName = autoNet.TapName()
+		opts.StaticIP = autoNet.GuestCIDR()
+		opts.Gateway = autoNet.GatewayIP()
+	}
+
+	// ---- Fast path: snapshot restore ----
+	if opts.SnapshotDir != "" {
+		if len(opts.Drives) > 0 {
+			return nil, fmt.Errorf("snapshot restore is not supported with additional block devices yet")
+		}
+		if _, err := os.Stat(opts.SnapshotDir + "/snapshot.json"); err == nil {
+			gclog.Container.Info("restoring from snapshot", "dir", opts.SnapshotDir)
+			t0 := time.Now()
+			vm, err := vmm.RestoreFromSnapshotWithOptions(opts.SnapshotDir, vmm.RestoreOptions{
+				ConsoleIn:       opts.ConsoleIn,
+				ConsoleOut:      opts.ConsoleOut,
+				OverrideVCPUs:   opts.CPUs,
+				OverrideX86Boot: opts.X86Boot,
+			})
+			if err == nil {
+				if err := vm.Start(); err != nil {
+					return nil, err
+				}
+				gclog.Container.Info("restored", "duration", time.Since(t0).Round(time.Millisecond))
+				return &RunResult{VM: vm, ID: opts.ID}, nil
+			}
+			gclog.Container.Warn("snapshot restore failed, building fresh", "error", err)
+		}
+	}
+
+	// ---- Resolve repo source (if given) ----
+	if opts.RepoURL != "" {
+		resolved, err := resolveRepo(opts, workDir)
+		if err != nil {
+			return nil, err
+		}
+		defer resolved.cleanup()
+		opts.Dockerfile = resolved.dockerfile
+		opts.Context = resolved.context
+	}
+
+	// ---- Build rootfs (cached on disk) ----
+	rootfsDir := filepath.Join(workDir, "rootfs")
+	diskPath := filepath.Join(workDir, "disk.ext4")
+	initrdPath := filepath.Join(workDir, "initrd.img")
+	configPath := filepath.Join(workDir, "image-config.json")
+	specPath := filepath.Join(workDir, "runtime-spec.json")
+	defer func() { _ = os.RemoveAll(rootfsDir) }()
+
+	var imgConfig oci.ImageConfig
+	var guestSpec runtimecfg.GuestSpec
+	sharedFS := resolveSharedFSMounts(opts.Mounts)
+	kernelModules := append([]guest.KernelModule{}, opts.KernelModules...)
+	kernelModules = appendVirtioFSKernelModule(kernelModules, sharedFS)
+
+	rebuildDisk := hasMaterializedMounts(opts.Mounts)
+	if !rebuildDisk {
+		cached, usable, reason, err := inspectCachedRunArtifacts(diskPath, configPath)
+		if err != nil {
+			return nil, fmt.Errorf("inspect artifact cache: %w", err)
+		}
+		if usable {
+			imgConfig = cached
+		} else {
+			rebuildDisk = true
+			if reason != "" {
+				gclog.Container.Warn("invalidating cached artifacts", "path", workDir, "reason", reason)
+			}
+			if err := removeCachedRunArtifacts(diskPath, initrdPath, configPath); err != nil {
+				return nil, fmt.Errorf("reset cached artifacts %s: %w", workDir, err)
+			}
+		}
+	}
+
+	if rebuildDisk {
+		gclog.Container.Info("artifact cache miss", "path", workDir)
+		if err := os.RemoveAll(rootfsDir); err != nil {
+			return nil, fmt.Errorf("reset rootfs %s: %w", rootfsDir, err)
+		}
+		if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+			return nil, fmt.Errorf("create rootfs %s: %w", rootfsDir, err)
+		}
+
+		var err error
+		imgConfig, err = buildRootfs(rootfsDir, opts)
+		if err != nil {
+			return nil, err
+		}
+		guestSpec = buildGuestSpec(imgConfig, opts, sharedFS)
+		if err := writeRuntimeSpecToRootfs(rootfsDir, guestSpec); err != nil {
+			return nil, fmt.Errorf("write runtime spec: %w", err)
+		}
+
+		if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
+			return nil, fmt.Errorf("ext4: %w", err)
+		}
+		if err := writeImageConfig(configPath, imgConfig); err != nil {
+			return nil, fmt.Errorf("write image config: %w", err)
+		}
+		if err := writeGuestSpecCache(specPath, guestSpec); err != nil {
+			return nil, fmt.Errorf("write runtime spec cache: %w", err)
+		}
+	} else {
+		gclog.Container.Info("artifact cache hit", "path", workDir)
+		gclog.Container.Info("reusing cached disk", "path", diskPath)
+	}
+	if !guestSpec.HasStructuredFields() {
+		guestSpec = buildGuestSpec(imgConfig, opts, sharedFS)
+	}
+
+	// ---- Build initrd ----
+	reuseInitrd, initrdReason, err := shouldReuseCachedInitrd(initrdPath, specPath, guestSpec)
+	if err != nil {
+		return nil, fmt.Errorf("inspect cached initrd: %w", err)
+	}
+	if reuseInitrd && !rebuildDisk {
+		gclog.Container.Info("reusing cached initrd", "path", initrdPath)
+	} else {
+		if !rebuildDisk && initrdReason != "" {
+			gclog.Container.Warn("invalidating cached initrd", "path", initrdPath, "reason", initrdReason)
+		}
+		if err := guest.BuildInitrdWithOptions(initrdPath, guest.InitrdOptions{
+			KernelModules: kernelModules,
+			RuntimeSpec:   &guestSpec,
+		}); err != nil {
+			return nil, fmt.Errorf("initrd: %w", err)
+		}
+		if err := writeGuestSpecCache(specPath, guestSpec); err != nil {
+			return nil, fmt.Errorf("write runtime spec cache: %w", err)
+		}
+	}
+
+	// ---- Assemble kernel cmdline ----
+	cmdline := buildCmdlineWithPlan(opts, sharedFS, len(kernelModules) > 0)
+
+	bootDiskPath, cleanupRuntimeDisk, err := prepareBootDisk(workDir, diskPath, opts.ID)
+	if err != nil {
+		return nil, fmt.Errorf("prepare boot disk: %w", err)
+	}
+	if err := writeRuntimeSpecToDiskImage(bootDiskPath, guestSpec); err != nil {
+		cleanupRuntimeDisk()
+		return nil, fmt.Errorf("write runtime spec to boot disk: %w", err)
+	}
+
+	// ---- Boot ----
+	gclog.Container.Info("booting", "id", opts.ID)
+	t0 := time.Now()
+
+	vm, err := vmm.New(vmm.Config{
+		ID:         opts.ID,
+		MemMB:      opts.MemMB,
+		Arch:       opts.Arch,
+		VCPUs:      opts.CPUs,
+		X86Boot:    opts.X86Boot,
+		KernelPath: opts.KernelPath,
+		InitrdPath: initrdPath,
+		Cmdline:    cmdline,
+		DiskImage:  bootDiskPath,
+		Drives:     runtimeDrives(bootDiskPath, opts),
+		TapName:    opts.TapName,
+		Metadata:   cloneStringMap(opts.Metadata),
+		SharedFS:   sharedFS.Exports,
+		Vsock:      buildVsockConfig(opts),
+		Exec:       buildExecConfig(opts),
+		Balloon:    cloneBalloonConfig(opts.Balloon),
+		MemoryHotplug: cloneMemoryHotplugConfig(opts.MemoryHotplug),
+		ConsoleOut: opts.ConsoleOut,
+		ConsoleIn:  opts.ConsoleIn,
+	})
+	if err != nil {
+		if autoNet != nil {
+			autoNet.Close()
+		}
+		return nil, fmt.Errorf("create vm: %w", err)
+	}
+	if autoNet != nil {
+		if err := autoNet.Activate(); err != nil {
+			vm.Stop()
+			autoNet.Close()
+			return nil, fmt.Errorf("activate auto network: %w", err)
+		}
+	}
+	if err := vm.Start(); err != nil {
+		if autoNet != nil {
+			autoNet.Close()
+		}
+		return nil, fmt.Errorf("start vm: %w", err)
+	}
+
+	var cleanupOnce sync.Once
+	cleanupFn := cleanupRuntimeDisk
+	if autoNet != nil {
+		cleanupFn = func() {
+			cleanupOnce.Do(func() {
+				autoNet.Close()
+				cleanupRuntimeDisk()
+			})
+		}
+		go func() {
+			for {
+				state := vm.State()
+				if state != vmm.StateRunning && state != vmm.StateCreated && state != vmm.StatePaused {
+					cleanupFn()
+					return
+				}
+				time.Sleep(250 * time.Millisecond)
+			}
+		}()
+	}
+
+	gclog.Container.Info("started", "id", opts.ID, "duration", time.Since(t0).Round(time.Millisecond))
+	return &RunResult{
+		VM:       vm,
+		DiskPath: bootDiskPath,
+		ID:       opts.ID,
+		Config:   imgConfig,
+		TapName:  opts.TapName,
+		GuestIP:  trimCIDR(opts.StaticIP),
+		Gateway:  opts.Gateway,
+		cleanup:  cleanupFn,
+	}, nil
+}
+
+func trimCIDR(value string) string {
+	if value == "" {
+		return ""
+	}
+	if idx := strings.IndexByte(value, '/'); idx >= 0 {
+		return value[:idx]
+	}
+	return value
+}
+
+func buildVsockConfig(opts RunOptions) *vmm.VsockConfig {
+	if !opts.ExecEnabled && !guestAgentRequired(opts.Balloon, opts.MemoryHotplug) {
+		return nil
+	}
+	return &vmm.VsockConfig{
+		Enabled:  true,
+		GuestCID: 0,
+	}
+}
+
+func workerSocket(handle vmm.Handle) string {
+	workerHandle, ok := handle.(vmm.WorkerBacked)
+	if !ok {
+		return ""
+	}
+	return workerHandle.WorkerMetadata().SocketPath
+}
+
+func runViaWorker(opts RunOptions) (*RunResult, error) {
+	if opts.MemMB == 0 {
+		opts.MemMB = 256
+	}
+	if opts.Arch == "" {
+		opts.Arch = runtime.GOARCH
+	}
+	if opts.DiskSizeMB == 0 {
+		opts.DiskSizeMB = 2048
+	}
+	if opts.ID == "" {
+		opts.ID = fmt.Sprintf("gc-%d", time.Now().UnixNano()%100000)
+	}
+	if err := hostguard.CheckHostDevices(hostguard.DeviceRequirements{
+		NeedKVM: true,
+		NeedTun: opts.TapName != "" || opts.NetworkMode == NetworkModeAuto,
+	}); err != nil {
+		return nil, fmt.Errorf("host device preflight: %w", err)
+	}
+	workDir, err := resolveRunWorkDir(opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return nil, fmt.Errorf("create workdir %s: %w", workDir, err)
+	}
+
+	var autoNet *hostnet.AutoNetwork
+	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto {
+		return nil, fmt.Errorf("invalid network mode %q", opts.NetworkMode)
+	}
+	if opts.NetworkMode == NetworkModeAuto {
+		if opts.SnapshotDir != "" {
+			return nil, fmt.Errorf("--net auto is not supported with snapshot restore yet")
+		}
+		var err error
+		autoNet, err = hostnet.NewAuto(opts.ID, opts.TapName)
+		if err != nil {
+			return nil, fmt.Errorf("auto network: %w", err)
+		}
+		opts.TapName = autoNet.TapName()
+		opts.StaticIP = autoNet.GuestCIDR()
+		opts.Gateway = autoNet.GatewayIP()
+	}
+
+	if opts.SnapshotDir != "" {
+		if len(opts.Drives) > 0 {
+			return nil, fmt.Errorf("snapshot restore is not supported with additional block devices yet")
+		}
+		if _, err := os.Stat(filepath.Join(opts.SnapshotDir, "snapshot.json")); err == nil {
+			gclog.Container.Info("restoring from snapshot via worker", "dir", opts.SnapshotDir)
+			handle, cleanup, err := worker.LaunchRestoredVMM(opts.SnapshotDir, vmm.RestoreOptions{
+				OverrideTap:     opts.TapName,
+				OverrideVCPUs:   opts.CPUs,
+				OverrideX86Boot: opts.X86Boot,
+				ConsoleIn:       opts.ConsoleIn,
+				ConsoleOut:      opts.ConsoleOut,
+			}, worker.VMMOptions{
+				JailerBinary: opts.JailerBinary,
+				VMMBinary:    opts.VMMBinary,
+				UID:          firstNonNegative(opts.UID, os.Getuid()),
+				GID:          firstNonNegative(opts.GID, os.Getgid()),
+				ChrootBase:   opts.ChrootBase,
+			})
+			if err == nil {
+				return &RunResult{
+					VM:           handle,
+					ID:           handle.ID(),
+					TapName:      opts.TapName,
+					GuestIP:      trimCIDR(opts.StaticIP),
+					Gateway:      opts.Gateway,
+					WorkerSocket: workerSocket(handle),
+					cleanup: func() {
+						if autoNet != nil {
+							autoNet.Close()
+						}
+						if cleanup != nil {
+							cleanup()
+						}
+					},
+				}, nil
+			}
+			gclog.Container.Warn("snapshot restore via worker failed, building fresh", "error", err)
+		}
+	}
+
+	if opts.RepoURL != "" {
+		resolved, err := resolveRepo(opts, workDir)
+		if err != nil {
+			return nil, err
+		}
+		defer resolved.cleanup()
+		opts.Dockerfile = resolved.dockerfile
+		opts.Context = resolved.context
+	}
+
+	rootfsDir := filepath.Join(workDir, "rootfs")
+	diskPath := filepath.Join(workDir, "disk.ext4")
+	initrdPath := filepath.Join(workDir, "initrd.img")
+	configPath := filepath.Join(workDir, "image-config.json")
+	specPath := filepath.Join(workDir, "runtime-spec.json")
+	defer func() { _ = os.RemoveAll(rootfsDir) }()
+
+	var imgConfig oci.ImageConfig
+	var guestSpec runtimecfg.GuestSpec
+	sharedFS := resolveSharedFSMounts(opts.Mounts)
+	kernelModules := append([]guest.KernelModule{}, opts.KernelModules...)
+	kernelModules = appendVirtioFSKernelModule(kernelModules, sharedFS)
+
+	rebuildDisk := hasMaterializedMounts(opts.Mounts)
+	if !rebuildDisk {
+		cached, usable, reason, err := inspectCachedRunArtifacts(diskPath, configPath)
+		if err != nil {
+			return nil, fmt.Errorf("inspect artifact cache: %w", err)
+		}
+		if usable {
+			imgConfig = cached
+		} else {
+			rebuildDisk = true
+			if reason != "" {
+				gclog.Container.Warn("invalidating cached artifacts", "path", workDir, "reason", reason)
+			}
+			if err := removeCachedRunArtifacts(diskPath, initrdPath, configPath); err != nil {
+				return nil, fmt.Errorf("reset cached artifacts %s: %w", workDir, err)
+			}
+		}
+	}
+	if rebuildDisk {
+		gclog.Container.Info("artifact cache miss", "path", workDir)
+		if err := os.RemoveAll(rootfsDir); err != nil {
+			return nil, fmt.Errorf("reset rootfs %s: %w", rootfsDir, err)
+		}
+		if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+			return nil, fmt.Errorf("create rootfs %s: %w", rootfsDir, err)
+		}
+		var err error
+		imgConfig, err = buildRootfs(rootfsDir, opts)
+		if err != nil {
+			return nil, err
+		}
+		guestSpec = buildGuestSpec(imgConfig, opts, sharedFS)
+		if err := writeRuntimeSpecToRootfs(rootfsDir, guestSpec); err != nil {
+			return nil, fmt.Errorf("write runtime spec: %w", err)
+		}
+		if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
+			return nil, fmt.Errorf("ext4: %w", err)
+		}
+		if err := writeImageConfig(configPath, imgConfig); err != nil {
+			return nil, fmt.Errorf("write image config: %w", err)
+		}
+		if err := writeGuestSpecCache(specPath, guestSpec); err != nil {
+			return nil, fmt.Errorf("write runtime spec cache: %w", err)
+		}
+	} else {
+		gclog.Container.Info("artifact cache hit", "path", workDir)
+		gclog.Container.Info("reusing cached disk", "path", diskPath)
+	}
+	if !guestSpec.HasStructuredFields() {
+		guestSpec = buildGuestSpec(imgConfig, opts, sharedFS)
+	}
+	reuseInitrd, initrdReason, err := shouldReuseCachedInitrd(initrdPath, specPath, guestSpec)
+	if err != nil {
+		return nil, fmt.Errorf("inspect cached initrd: %w", err)
+	}
+	if reuseInitrd && !rebuildDisk {
+		gclog.Container.Info("reusing cached initrd", "path", initrdPath)
+	} else {
+		if !rebuildDisk && initrdReason != "" {
+			gclog.Container.Warn("invalidating cached initrd", "path", initrdPath, "reason", initrdReason)
+		}
+		if err := guest.BuildInitrdWithOptions(initrdPath, guest.InitrdOptions{
+			KernelModules: kernelModules,
+			RuntimeSpec:   &guestSpec,
+		}); err != nil {
+			return nil, fmt.Errorf("initrd: %w", err)
+		}
+		if err := writeGuestSpecCache(specPath, guestSpec); err != nil {
+			return nil, fmt.Errorf("write runtime spec cache: %w", err)
+		}
+	}
+	cmdline := buildCmdlineWithPlan(opts, sharedFS, len(kernelModules) > 0)
+
+	bootDiskPath, cleanupRuntimeDisk, err := prepareBootDisk(workDir, diskPath, opts.ID)
+	if err != nil {
+		return nil, fmt.Errorf("prepare boot disk: %w", err)
+	}
+	if err := writeRuntimeSpecToDiskImage(bootDiskPath, guestSpec); err != nil {
+		cleanupRuntimeDisk()
+		return nil, fmt.Errorf("write runtime spec to boot disk: %w", err)
+	}
+
+	handle, cleanup, err := worker.LaunchVMM(vmm.Config{
+		ID:         opts.ID,
+		MemMB:      opts.MemMB,
+		Arch:       opts.Arch,
+		VCPUs:      opts.CPUs,
+		X86Boot:    opts.X86Boot,
+		KernelPath: opts.KernelPath,
+		InitrdPath: initrdPath,
+		Cmdline:    cmdline,
+		DiskImage:  bootDiskPath,
+		Drives:     runtimeDrives(bootDiskPath, opts),
+		TapName:    opts.TapName,
+		Metadata:   cloneStringMap(opts.Metadata),
+		SharedFS:   sharedFS.Exports,
+		Vsock:      buildVsockConfig(opts),
+		Exec:       buildExecConfig(opts),
+		Balloon:    cloneBalloonConfig(opts.Balloon),
+		MemoryHotplug: cloneMemoryHotplugConfig(opts.MemoryHotplug),
+		ConsoleOut: opts.ConsoleOut,
+		ConsoleIn:  opts.ConsoleIn,
+	}, worker.VMMOptions{
+		JailerBinary: opts.JailerBinary,
+		VMMBinary:    opts.VMMBinary,
+		UID:          firstNonNegative(opts.UID, os.Getuid()),
+		GID:          firstNonNegative(opts.GID, os.Getgid()),
+		ChrootBase:   opts.ChrootBase,
+	})
+	if err != nil {
+		if autoNet != nil {
+			autoNet.Close()
+		}
+		return nil, fmt.Errorf("launch vm worker: %w", err)
+	}
+	if autoNet != nil {
+		if err := autoNet.Activate(); err != nil {
+			handle.Stop()
+			autoNet.Close()
+			if cleanup != nil {
+				cleanup()
+			}
+			return nil, fmt.Errorf("activate auto network: %w", err)
+		}
+	}
+	var cleanupOnce sync.Once
+	cleanupFn := cleanupRuntimeDisk
+	if autoNet != nil || cleanup != nil {
+		cleanupFn = func() {
+			cleanupOnce.Do(func() {
+				if autoNet != nil {
+					autoNet.Close()
+				}
+				if cleanup != nil {
+					cleanup()
+				}
+				cleanupRuntimeDisk()
+			})
+		}
+		go func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			_ = handle.WaitStopped(ctx)
+			cleanupFn()
+		}()
+	}
+	return &RunResult{
+		VM:           handle,
+		DiskPath:     bootDiskPath,
+		ID:           opts.ID,
+		Config:       imgConfig,
+		TapName:      opts.TapName,
+		GuestIP:      trimCIDR(opts.StaticIP),
+		Gateway:      opts.Gateway,
+		WorkerSocket: workerSocket(handle),
+		cleanup:      cleanupFn,
+	}, nil
+}
+
+// BuildOptions describes a build-only operation (no boot).
+type BuildOptions struct {
+	Image        string
+	Dockerfile   string
+	Context      string
+	RepoURL      string
+	RepoRef      string
+	RepoSubdir   string
+	DiskSizeMB   int
+	BuildArgs    map[string]string
+	OutputPath   string
+	WorkDir      string
+	CacheDir     string
+	JailerMode   string
+	JailerBinary string
+	WorkerBinary string
+	ChrootBase   string
+	UID          int
+	GID          int
+}
+
+// BuildResult is returned after a build completes.
+type BuildResult struct {
+	RootfsDir string
+	DiskPath  string
+	Config    oci.ImageConfig
+}
+
+// Build creates a rootfs and disk image without booting a VM.
+func Build(opts BuildOptions) (*BuildResult, error) {
+	if jailerEnabled(opts.JailerMode) {
+		return buildViaWorker(opts)
+	}
+	return buildLocal(opts)
+}
+
+func buildLocal(opts BuildOptions) (*BuildResult, error) {
+	if opts.DiskSizeMB == 0 {
+		opts.DiskSizeMB = 2048
+	}
+	if err := hostguard.CheckHostDevices(hostguard.DeviceRequirements{}); err != nil {
+		return nil, fmt.Errorf("host device preflight: %w", err)
+	}
+	id := fmt.Sprintf("build-%d", time.Now().UnixNano()%100000)
+	workDir := opts.WorkDir
+	if workDir == "" {
+		workDir = buildWorkDirForCache(opts, id)
+	}
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return nil, fmt.Errorf("create workdir %s: %w", workDir, err)
+	}
+
+	rootfsDir := filepath.Join(workDir, "rootfs")
+	diskPath := opts.OutputPath
+	if diskPath == "" {
+		diskPath = filepath.Join(workDir, "disk.ext4")
+	}
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0755); err != nil {
+		return nil, fmt.Errorf("create output dir %s: %w", filepath.Dir(diskPath), err)
+	}
+	if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+		return nil, fmt.Errorf("create rootfs %s: %w", rootfsDir, err)
+	}
+
+	runOpts := RunOptions{
+		Image:      opts.Image,
+		Dockerfile: opts.Dockerfile,
+		Context:    opts.Context,
+		RepoURL:    opts.RepoURL,
+		RepoRef:    opts.RepoRef,
+		RepoSubdir: opts.RepoSubdir,
+		BuildArgs:  opts.BuildArgs,
+		ID:         id,
+		CacheDir:   opts.CacheDir,
+	}
+	if runOpts.RepoURL != "" {
+		resolved, err := resolveRepo(runOpts, workDir)
+		if err != nil {
+			return nil, err
+		}
+		defer resolved.cleanup()
+		runOpts.Dockerfile = resolved.dockerfile
+		runOpts.Context = resolved.context
+	}
+
+	imgConfig, err := buildRootfs(rootfsDir, runOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
+		return nil, fmt.Errorf("ext4: %w", err)
+	}
+
+	return &BuildResult{RootfsDir: rootfsDir, DiskPath: diskPath, Config: imgConfig}, nil
+}
+
+func buildViaWorker(opts BuildOptions) (*BuildResult, error) {
+	if opts.DiskSizeMB == 0 {
+		opts.DiskSizeMB = 2048
+	}
+	if err := hostguard.CheckHostDevices(hostguard.DeviceRequirements{}); err != nil {
+		return nil, fmt.Errorf("host device preflight: %w", err)
+	}
+	id := fmt.Sprintf("build-%d", time.Now().UnixNano()%100000)
+	workDir := opts.WorkDir
+	if workDir == "" {
+		workDir = buildWorkDirForCache(opts, id)
+	}
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return nil, fmt.Errorf("create workdir %s: %w", workDir, err)
+	}
+
+	rootfsDir := filepath.Join(workDir, "rootfs")
+	diskPath := opts.OutputPath
+	if diskPath == "" {
+		diskPath = filepath.Join(workDir, "disk.ext4")
+	}
+	if err := os.MkdirAll(filepath.Dir(diskPath), 0755); err != nil {
+		return nil, fmt.Errorf("create output dir %s: %w", filepath.Dir(diskPath), err)
+	}
+	if err := os.RemoveAll(rootfsDir); err != nil {
+		return nil, fmt.Errorf("reset rootfs %s: %w", rootfsDir, err)
+	}
+	if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+		return nil, fmt.Errorf("create rootfs %s: %w", rootfsDir, err)
+	}
+
+	runOpts := RunOptions{
+		Image:        opts.Image,
+		Dockerfile:   opts.Dockerfile,
+		Context:      opts.Context,
+		RepoURL:      opts.RepoURL,
+		RepoRef:      opts.RepoRef,
+		RepoSubdir:   opts.RepoSubdir,
+		BuildArgs:    opts.BuildArgs,
+		ID:           id,
+		CacheDir:     opts.CacheDir,
+		JailerMode:   opts.JailerMode,
+		JailerBinary: opts.JailerBinary,
+		VMMBinary:    opts.WorkerBinary,
+		ChrootBase:   opts.ChrootBase,
+		UID:          opts.UID,
+		GID:          opts.GID,
+	}
+	if runOpts.RepoURL != "" {
+		resolved, err := resolveRepo(runOpts, workDir)
+		if err != nil {
+			return nil, err
+		}
+		defer resolved.cleanup()
+		runOpts.Dockerfile = resolved.dockerfile
+		runOpts.Context = resolved.context
+	}
+
+	imgConfig, err := buildRootfsViaWorker(rootfsDir, runOpts)
+	if err != nil {
+		return nil, err
+	}
+	if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
+		return nil, fmt.Errorf("ext4: %w", err)
+	}
+	return &BuildResult{RootfsDir: rootfsDir, DiskPath: diskPath, Config: imgConfig}, nil
+}
+
+func buildWorkDirForCache(opts BuildOptions, fallbackID string) string {
+	opts.CacheDir = resolvedCacheDir(opts.CacheDir)
+	key, err := stableHashKey(map[string]any{
+		"image":       opts.Image,
+		"dockerfile":  opts.Dockerfile,
+		"context":     opts.Context,
+		"repo_url":    opts.RepoURL,
+		"repo_ref":    opts.RepoRef,
+		"repo_subdir": opts.RepoSubdir,
+		"build_args":  normalizedStringMap(opts.BuildArgs),
+		"disk_size":   opts.DiskSizeMB,
+	})
+	if err != nil {
+		return filepath.Join(os.TempDir(), "gocracker-"+fallbackID)
+	}
+	return filepath.Join(opts.CacheDir, "build-artifacts", key)
+}
+
+// ---- Repo resolution ----
+
+type resolvedRepo struct {
+	dockerfile string
+	context    string
+	cleanup    func()
+}
+
+func resolveRepo(opts RunOptions, workDir string) (*resolvedRepo, error) {
+	result, err := repo.Resolve(repo.Source{
+		URL:    opts.RepoURL,
+		Ref:    opts.RepoRef,
+		Subdir: opts.RepoSubdir,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("repo: %w", err)
+	}
+	result.Summary()
+
+	if result.DockerfilePath == "" {
+		result.Cleanup()
+		return nil, fmt.Errorf("no Dockerfile found in %s", result.ContextDir)
+	}
+
+	return &resolvedRepo{
+		dockerfile: result.DockerfilePath,
+		context:    result.ContextDir,
+		cleanup:    result.Cleanup,
+	}, nil
+}
+
+// ---- Image/Dockerfile builders ----
+
+func buildFromImage(rootfsDir string, opts RunOptions) (oci.ImageConfig, error) {
+	pulled, err := oci.Pull(oci.PullOptions{
+		Ref:      opts.Image,
+		Arch:     opts.Arch,
+		CacheDir: imageCacheDir(opts.CacheDir),
+	})
+	if err != nil {
+		return oci.ImageConfig{}, err
+	}
+	return pulled.Config, pulled.ExtractToDir(rootfsDir)
+}
+
+func buildFromDockerfile(rootfsDir string, opts RunOptions) (oci.ImageConfig, error) {
+	result, err := dockerfile.Build(dockerfile.BuildOptions{
+		DockerfilePath: opts.Dockerfile,
+		ContextDir:     opts.Context,
+		BuildArgs:      opts.BuildArgs,
+		OutputDir:      rootfsDir,
+		Tag:            opts.ID,
+		CacheDir:       resolvedCacheDir(opts.CacheDir),
+	})
+	if err != nil {
+		return oci.ImageConfig{}, err
+	}
+	return result.Config, nil
+}
+
+func buildRootfs(rootfsDir string, opts RunOptions) (oci.ImageConfig, error) {
+	var (
+		imgConfig oci.ImageConfig
+		err       error
+	)
+	switch {
+	case opts.Image != "":
+		imgConfig, err = buildFromImage(rootfsDir, opts)
+	case opts.Dockerfile != "":
+		imgConfig, err = buildFromDockerfile(rootfsDir, opts)
+	default:
+		return oci.ImageConfig{}, fmt.Errorf("specify --image, --dockerfile, or --repo")
+	}
+	if err != nil {
+		return oci.ImageConfig{}, err
+	}
+	if err := applyMounts(rootfsDir, opts.Mounts); err != nil {
+		return oci.ImageConfig{}, fmt.Errorf("apply mounts: %w", err)
+	}
+	return imgConfig, nil
+}
+
+func buildRootfsViaWorker(rootfsDir string, opts RunOptions) (oci.ImageConfig, error) {
+	cacheDir := resolvedCacheDir(opts.CacheDir)
+	resp, err := worker.BuildRootfs(buildserver.BuildRequest{
+		Image:      opts.Image,
+		Dockerfile: opts.Dockerfile,
+		Context:    opts.Context,
+		BuildArgs:  opts.BuildArgs,
+		OutputDir:  rootfsDir,
+		CacheDir:   cacheDir,
+	}, worker.BuildOptions{
+		JailerBinary: opts.JailerBinary,
+		WorkerBinary: opts.VMMBinary,
+		UID:          firstNonNegative(opts.UID, os.Getuid()),
+		GID:          firstNonNegative(opts.GID, os.Getgid()),
+		ChrootBase:   opts.ChrootBase,
+	})
+	if err != nil {
+		return oci.ImageConfig{}, err
+	}
+	if err := applyMounts(rootfsDir, opts.Mounts); err != nil {
+		return oci.ImageConfig{}, fmt.Errorf("apply mounts: %w", err)
+	}
+	return resp, nil
+}
+
+func writeImageConfig(path string, cfg oci.ImageConfig) error {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+func writeRuntimeSpecToRootfs(rootfsDir string, spec runtimecfg.GuestSpec) error {
+	if !spec.HasStructuredFields() {
+		return nil
+	}
+	data, err := spec.MarshalJSONBytes()
+	if err != nil {
+		return err
+	}
+	hostPath := filepath.Join(rootfsDir, strings.TrimPrefix(runtimecfg.GuestSpecPath, "/"))
+	if err := os.MkdirAll(filepath.Dir(hostPath), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(hostPath, data, 0644)
+}
+
+func readImageConfig(path string) (oci.ImageConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return oci.ImageConfig{}, err
+	}
+	var cfg oci.ImageConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return oci.ImageConfig{}, err
+	}
+	return cfg, nil
+}
+
+func writeGuestSpecCache(path string, spec runtimecfg.GuestSpec) error {
+	payload := struct {
+		Version    int                  `json:"version"`
+		InitDigest string               `json:"init_digest,omitempty"`
+		Spec       runtimecfg.GuestSpec `json:"spec"`
+	}{
+		Version:    1,
+		InitDigest: guest.EmbeddedInitDigest(),
+		Spec:       spec,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+func shouldReuseCachedInitrd(initrdPath, specPath string, spec runtimecfg.GuestSpec) (bool, string, error) {
+	if _, err := os.Stat(initrdPath); err != nil {
+		if os.IsNotExist(err) {
+			return false, "initrd missing", nil
+		}
+		return false, "", err
+	}
+	match, reason, err := cachedGuestSpecMatches(specPath, spec)
+	if err != nil {
+		return false, "", err
+	}
+	if !match {
+		if err := os.Remove(initrdPath); err != nil && !os.IsNotExist(err) {
+			return false, "", err
+		}
+	}
+	return match, reason, nil
+}
+
+func cachedGuestSpecMatches(path string, spec runtimecfg.GuestSpec) (bool, string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, "runtime spec missing", nil
+		}
+		return false, "", err
+	}
+	var payload struct {
+		Version    int                  `json:"version"`
+		InitDigest string               `json:"init_digest,omitempty"`
+		Spec       runtimecfg.GuestSpec `json:"spec"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return false, fmt.Sprintf("runtime spec unreadable: %v", err), nil
+	}
+	cached := payload.Spec
+	if payload.InitDigest == "" {
+		if err := json.Unmarshal(data, &cached); err != nil {
+			return false, fmt.Sprintf("runtime spec unreadable: %v", err), nil
+		}
+		return false, "guest init version missing", nil
+	}
+	if payload.InitDigest != guest.EmbeddedInitDigest() {
+		return false, "guest init version changed", nil
+	}
+	cachedData, err := cached.MarshalJSONBytes()
+	if err != nil {
+		return false, "", err
+	}
+	currentData, err := spec.MarshalJSONBytes()
+	if err != nil {
+		return false, "", err
+	}
+	if !bytes.Equal(cachedData, currentData) {
+		return false, "runtime spec changed", nil
+	}
+	return true, "", nil
+}
+
+func inspectCachedRunArtifacts(diskPath, configPath string) (oci.ImageConfig, bool, string, error) {
+	if _, err := os.Stat(diskPath); err != nil {
+		if os.IsNotExist(err) {
+			return oci.ImageConfig{}, false, "disk image missing", nil
+		}
+		return oci.ImageConfig{}, false, "", err
+	}
+	cfg, err := readImageConfig(configPath)
+	if err == nil {
+		return cfg, true, "", nil
+	}
+	if os.IsNotExist(err) {
+		return oci.ImageConfig{}, false, "image config missing", nil
+	}
+	return oci.ImageConfig{}, false, fmt.Sprintf("image config unreadable: %v", err), nil
+}
+
+func prepareBootDisk(workDir, templateDiskPath, id string) (string, func(), error) {
+	runtimeDir := filepath.Join(workDir, "runs", sanitizeRuntimePathComponent(id))
+	if err := os.RemoveAll(runtimeDir); err != nil {
+		return "", nil, err
+	}
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+		return "", nil, err
+	}
+	runtimeDiskPath := filepath.Join(runtimeDir, filepath.Base(templateDiskPath))
+	if err := copyDiskImage(templateDiskPath, runtimeDiskPath); err != nil {
+		return "", nil, err
+	}
+	return runtimeDiskPath, delayedRemoveAll(runtimeDir, runtimeDiskRetention), nil
+}
+
+func writeRuntimeSpecToDiskImage(diskPath string, spec runtimecfg.GuestSpec) error {
+	if !spec.HasStructuredFields() {
+		return nil
+	}
+	data, err := spec.MarshalJSONBytes()
+	if err != nil {
+		return err
+	}
+	tempFile, err := os.CreateTemp("", "gocracker-runtime-spec-*.json")
+	if err != nil {
+		return err
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+	if _, err := tempFile.Write(data); err != nil {
+		tempFile.Close()
+		return err
+	}
+	if err := tempFile.Close(); err != nil {
+		return err
+	}
+	if err := runDebugFSCommand(diskPath, "rm "+runtimecfg.GuestSpecPath); err != nil && !strings.Contains(err.Error(), "File not found by ext2_lookup") {
+		return err
+	}
+	return runDebugFSCommand(diskPath, fmt.Sprintf("write %s %s", tempPath, runtimecfg.GuestSpecPath))
+}
+
+func runDebugFSCommand(diskPath, command string) error {
+	cmd := exec.Command("debugfs", "-w", "-R", command, diskPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("debugfs %q on %s: %w: %s", command, diskPath, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func sanitizeRuntimePathComponent(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "vm"
+	}
+	sanitized := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '-', r == '_', r == '.':
+			return r
+		default:
+			return '_'
+		}
+	}, value)
+	if sanitized == "" {
+		return "vm"
+	}
+	return sanitized
+}
+
+func copyDiskImage(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+func delayedRemoveAll(path string, delay time.Duration) func() {
+	if strings.TrimSpace(path) == "" {
+		return func() {}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if delay <= 0 {
+				_ = os.RemoveAll(path)
+				return
+			}
+			delaySeconds := int(delay / time.Second)
+			if delay%time.Second != 0 {
+				delaySeconds++
+			}
+			script := fmt.Sprintf("sleep %d; rm -rf -- %s", delaySeconds, shellQuote(path))
+			cmd := exec.Command("sh", "-c", script)
+			cmd.Stdout = io.Discard
+			cmd.Stderr = io.Discard
+			if err := cmd.Start(); err != nil {
+				go func() {
+					time.Sleep(delay)
+					_ = os.RemoveAll(path)
+				}()
+				return
+			}
+			_ = cmd.Process.Release()
+		})
+	}
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+func removeCachedRunArtifacts(paths ...string) error {
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// ---- Cmdline builder ----
+
+func buildCmdline(imgConfig oci.ImageConfig, opts RunOptions) string {
+	sharedFS := resolveSharedFSMounts(opts.Mounts)
+	kernelModules := appendVirtioFSKernelModule(append([]guest.KernelModule{}, opts.KernelModules...), sharedFS)
+	return buildCmdlineWithPlan(opts, sharedFS, len(kernelModules) > 0)
+}
+
+func buildCmdlineWithPlan(opts RunOptions, sharedFS sharedFSPlan, allowKernelModules bool) string {
+	parts := append(runtimecfg.DefaultKernelArgsForRuntime(true, allowKernelModules),
+		"rw",
+		"root=/dev/vda",
+		"rootfstype=ext4",
+	)
+
+	// Network
+	if opts.StaticIP != "" {
+		parts = append(parts, "gc.ip="+opts.StaticIP)
+		if opts.Gateway != "" {
+			parts = append(parts, "gc.gw="+opts.Gateway)
+		}
+	} else if opts.TapName != "" {
+		parts = append(parts, "gc.wait_network=1")
+	}
+	if hasMaterializedMounts(opts.Mounts) {
+		parts = append(parts, "gc.fs_sync=1")
+	}
+
+	// Working dir
+	return strings.Join(parts, " ")
+}
+
+func buildGuestSpec(imgConfig oci.ImageConfig, opts RunOptions, sharedFS sharedFSPlan) runtimecfg.GuestSpec {
+	entrypoint := effectiveSlice(opts.Entrypoint, imgConfig.Entrypoint)
+	cmd := effectiveSlice(opts.Cmd, imgConfig.Cmd)
+	workDir := opts.WorkDir
+	if workDir == "" {
+		workDir = imgConfig.WorkingDir
+	}
+	pid1Mode := opts.PID1Mode
+	if pid1Mode == "" && (opts.ConsoleIn != nil || opts.InteractiveExec) {
+		// Interactive console sessions need a supervised PID 1 so the guest
+		// process gets a controlling TTY and exits cleanly when the shell ends.
+		pid1Mode = runtimecfg.PID1ModeSupervised
+	}
+
+	env := append([]string{}, imgConfig.Env...)
+	env = append(env, opts.Env...)
+
+	process := runtimecfg.ResolveProcess(entrypoint, cmd)
+	if opts.InteractiveExec {
+		process = runtimecfg.Process{}
+	}
+
+	return runtimecfg.GuestSpec{
+		Process:  process,
+		Env:      env,
+		Hosts:    append([]string{}, opts.Hosts...),
+		SharedFS: append([]runtimecfg.SharedFSMount{}, sharedFS.Mounts...),
+		WorkDir:  workDir,
+		User:     imgConfig.User,
+		PID1Mode: pid1Mode,
+		Exec: runtimecfg.ExecConfig{
+			Enabled:   opts.ExecEnabled || guestAgentRequired(opts.Balloon, opts.MemoryHotplug),
+			VsockPort: runtimecfg.DefaultExecVsockPort,
+		},
+	}
+}
+
+func resolveRunWorkDir(opts RunOptions) (string, error) {
+	if opts.WorkDir2 != "" {
+		return opts.WorkDir2, nil
+	}
+	opts.CacheDir = resolvedCacheDir(opts.CacheDir)
+	key, err := runArtifactCacheKey(opts)
+	if err != nil {
+		return "", fmt.Errorf("compute run cache key: %w", err)
+	}
+	return filepath.Join(opts.CacheDir, "artifacts", key), nil
+}
+
+func imageCacheDir(cacheDir string) string {
+	base := resolvedCacheDir(cacheDir)
+	return filepath.Join(base, "layers")
+}
+
+func runArtifactCacheKey(opts RunOptions) (string, error) {
+	payload := map[string]any{
+		"artifact_cache_version": runArtifactCacheVersion,
+		"image":                  opts.Image,
+		"arch":                   opts.Arch,
+		"dockerfile":             opts.Dockerfile,
+		"context":                opts.Context,
+		"repo_url":               opts.RepoURL,
+		"repo_ref":               opts.RepoRef,
+		"repo_subdir":            opts.RepoSubdir,
+		"build_args":             normalizedStringMap(opts.BuildArgs),
+		"disk_size_mb":           opts.DiskSizeMB,
+		"cmd":                    opts.Cmd,
+		"entrypoint":             opts.Entrypoint,
+		"env":                    opts.Env,
+		"hosts":                  opts.Hosts,
+		"workdir":                opts.WorkDir,
+		"pid1_mode":              opts.PID1Mode,
+		"mounts":                 opts.Mounts,
+		"kernelModules":          opts.KernelModules,
+		"metadata":               normalizedStringMap(opts.Metadata),
+		"exec_enabled":           opts.ExecEnabled,
+		"interactive_exec":       opts.InteractiveExec,
+		"drives":                 opts.Drives,
+		"balloon":                opts.Balloon,
+		"memory_hotplug":         opts.MemoryHotplug,
+	}
+	return stableHashKey(payload)
+}
+
+func cloneBalloonConfig(cfg *vmm.BalloonConfig) *vmm.BalloonConfig {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	if len(cfg.SnapshotPages) > 0 {
+		cloned.SnapshotPages = append([]uint32(nil), cfg.SnapshotPages...)
+	}
+	return &cloned
+}
+
+func cloneMemoryHotplugConfig(cfg *vmm.MemoryHotplugConfig) *vmm.MemoryHotplugConfig {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	return &cloned
+}
+
+func buildExecConfig(opts RunOptions) *vmm.ExecConfig {
+	if !opts.ExecEnabled && !guestAgentRequired(opts.Balloon, opts.MemoryHotplug) {
+		return nil
+	}
+	return &vmm.ExecConfig{
+		Enabled:   true,
+		VsockPort: runtimecfg.DefaultExecVsockPort,
+	}
+}
+
+func guestAgentRequired(balloon *vmm.BalloonConfig, hotplug *vmm.MemoryHotplugConfig) bool {
+	return balloonNeedsGuestAgent(balloon) || hotplugNeedsGuestAgent(hotplug)
+}
+
+func balloonNeedsGuestAgent(cfg *vmm.BalloonConfig) bool {
+	return cfg != nil && (cfg.StatsPollingIntervalS > 0 || cfg.Auto == vmm.BalloonAutoConservative)
+}
+
+func hotplugNeedsGuestAgent(cfg *vmm.MemoryHotplugConfig) bool {
+	return cfg != nil
+}
+
+func runtimeDrives(rootDisk string, opts RunOptions) []vmm.DriveConfig {
+	if len(opts.Drives) == 0 {
+		return nil
+	}
+	drives := []vmm.DriveConfig{{
+		ID:       "root",
+		Path:     rootDisk,
+		Root:     true,
+		ReadOnly: false,
+	}}
+	for _, drive := range opts.Drives {
+		drives = append(drives, vmm.DriveConfig{
+			ID:          drive.ID,
+			Path:        drive.Path,
+			Root:        false,
+			ReadOnly:    drive.ReadOnly,
+			RateLimiter: cloneVMLimiter(drive.RateLimiter),
+		})
+	}
+	return drives
+}
+
+func cloneVMLimiter(cfg *vmm.RateLimiterConfig) *vmm.RateLimiterConfig {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	return &cloned
+}
+
+func stableHashKey(payload any) (string, error) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func normalizedStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for _, key := range sortedKeys(src) {
+		dst[key] = src[key]
+	}
+	return dst
+}
+
+func sortedKeys(src map[string]string) []string {
+	keys := make([]string, 0, len(src))
+	for key := range src {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+func effectiveSlice(override, fallback []string) []string {
+	if len(override) > 0 {
+		return append([]string{}, override...)
+	}
+	return append([]string{}, fallback...)
+}
+
+type sharedFSPlan struct {
+	Exports []vmm.SharedFSConfig
+	Mounts  []runtimecfg.SharedFSMount
+}
+
+func hasMaterializedMounts(mounts []Mount) bool {
+	for _, mount := range mounts {
+		if mount.Backend != MountBackendVirtioFS {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveSharedFSMounts(mounts []Mount) sharedFSPlan {
+	if len(mounts) == 0 {
+		return sharedFSPlan{}
+	}
+	plan := sharedFSPlan{}
+	seen := map[string]string{}
+	for _, mount := range mounts {
+		if mount.Backend != MountBackendVirtioFS {
+			continue
+		}
+		source := filepath.Clean(mount.Source)
+		tag, ok := seen[source]
+		if !ok {
+			tag = fmt.Sprintf("gocracker-fs-%d", len(seen))
+			seen[source] = tag
+			plan.Exports = append(plan.Exports, vmm.SharedFSConfig{
+				Source: source,
+				Tag:    tag,
+			})
+		}
+		plan.Mounts = append(plan.Mounts, runtimecfg.SharedFSMount{
+			Tag:      tag,
+			Target:   mount.Target,
+			ReadOnly: mount.ReadOnly,
+		})
+	}
+	return plan
+}
+
+func appendVirtioFSKernelModule(kernelModules []guest.KernelModule, sharedFS sharedFSPlan) []guest.KernelModule {
+	if len(sharedFS.Exports) == 0 || hasKernelModule(kernelModules, "virtiofs") {
+		return kernelModules
+	}
+	hostPath := hostVirtioFSModulePath()
+	if hostPath == "" {
+		return kernelModules
+	}
+	return append(kernelModules, guest.KernelModule{
+		Name:     "virtiofs",
+		HostPath: hostPath,
+	})
+}
+
+func hasKernelModule(modules []guest.KernelModule, name string) bool {
+	for _, module := range modules {
+		if module.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func hostVirtioFSModulePath() string {
+	release, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return ""
+	}
+	base := strings.TrimSpace(string(release))
+	if base == "" {
+		return ""
+	}
+	matches, err := filepath.Glob(filepath.Join("/lib/modules", base, "kernel", "fs", "fuse", "virtiofs.ko*"))
+	if err != nil || len(matches) == 0 {
+		return ""
+	}
+	return matches[0]
+}
+
+func firstNonNegative(values ...int) int {
+	for _, v := range values {
+		if v >= 0 {
+			return v
+		}
+	}
+	return 0
+}

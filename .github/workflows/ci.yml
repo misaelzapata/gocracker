@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Unit and package tests
+        run: go test ./...
+
+  privileged-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check privileged prerequisites
+        id: prereq
+        run: |
+          if [[ -e /dev/kvm && -e /dev/net/tun ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Privileged integration subset
+        if: steps.prereq.outputs.run == 'true'
+        run: |
+          sudo -n env GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
+            go test -tags integration ./tests/integration \
+            -run 'TestAPIServeRunExec|TestCLIComposeServeExec|TestCLIRunInteractiveExec|TestCLIComposeExecInteractive|TestVirtioBalloon(LocalStatsAndExec|WorkerReclaimsRSS)' \
+            -count=1 -v
+      - name: Skip note
+        if: steps.prereq.outputs.run != 'true'
+        run: echo "Skipping privileged integration subset because /dev/kvm or /dev/net/tun is unavailable on this runner."

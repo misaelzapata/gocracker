@@ -1,0 +1,20 @@
+# Expanded test set: popular GitHub projects with self-contained root Dockerfiles
+# discovered 2026-04-07 via automated search agents.
+jesseduffield-lazygit
+go-acme-lego
+restic-rest-server
+muety-wakapi
+projectdiscovery-nuclei
+dexidp-dex
+schollz-croc
+gitleaks-gitleaks
+wader-fq
+nsqio-nsq
+sigstore-rekor
+treeverse-lakefs
+go-gost-gost
+gping-rs
+sonic-rs
+git-cliff-rs
+oha-rs
+dufs-rs
