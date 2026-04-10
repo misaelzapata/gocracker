@@ -120,3 +120,13 @@ gocracker creates a virtual network so services can reach each other by name
 
 No Docker daemon is required. gocracker pulls OCI layers, builds with its own
 builder, and boots the result as a real Linux VM via KVM.
+
+## Real-World Validation (328 Projects)
+
+Beyond the included examples, gocracker has been validated against 328 open-source
+projects from GitHub, each booted from its own Dockerfile as a microVM. The full
+manifest is at [`tests/external-repos/manifest.tsv`](../tests/external-repos/manifest.tsv).
+
+Highlights: Traefik, Caddy, Envoy, Prometheus, Grafana, PostgreSQL, Redis,
+MinIO, Gitea, MLflow, Ollama, Meilisearch, RabbitMQ, NATS, and more across
+Go, Python, Node.js, PHP, Rust, Ruby, Java, Elixir, C, and C++.

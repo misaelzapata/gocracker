@@ -252,6 +252,28 @@ Common flags (run):
   --jailer      Privilege model: on or off (default: on)
 ```
 
+## Tested with 328 Real-World Projects
+
+gocracker has been validated against 328 open-source projects across 16 languages,
+booting each from its own Dockerfile as a microVM:
+
+| Category | Projects |
+|----------|----------|
+| Infrastructure | Traefik, Caddy, Envoy, HAProxy, NGINX, CoreDNS |
+| Databases | PostgreSQL, Redis, Valkey, CockroachDB, DragonflyDB, Memcached |
+| Search | Meilisearch, Qdrant, Typesense, Quickwit |
+| Monitoring | Prometheus, Grafana, Loki, Tempo, Telegraf, VictoriaMetrics |
+| ML/AI | MLflow, BentoML, Gradio, Streamlit, Ollama |
+| CI/CD | Woodpecker, Drone, Kestra, Dagster, Prefect |
+| Messaging | RabbitMQ, NATS, EMQX, Mosquitto |
+| Storage | MinIO, SeaweedFS, Distribution (registry) |
+| Forges | Gitea, Gogs |
+| Languages | Go (123), Node.js (62), Python (50), PHP (24), Rust (21), Ruby (12), Java (12), Elixir (6), C (6), C++ (4), and more |
+
+Full manifest: [`tests/external-repos/manifest.tsv`](tests/external-repos/manifest.tsv) (328 entries)
+
+See [docs/EXAMPLES.md](docs/EXAMPLES.md) for included example applications.
+
 ## Requirements
 
 - Linux kernel 5.10+ with KVM (`/dev/kvm` accessible)
