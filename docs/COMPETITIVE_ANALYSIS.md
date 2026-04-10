@@ -56,7 +56,7 @@ of them in one self-contained binary:
 5. **Native Docker Compose** -- each service is a real VM, not a container
 6. **Firecracker-compatible REST API** -- drop-in for existing FC tooling
 7. **Snapshot/restore + live migration** -- full VM state capture and transfer
-8. **ARM64 + x86-64** -- irqfd, GICv2/v3, tested on real AWS Graviton hardware
+8. **ARM64 + x86-64** -- irqfd, GICv2/v3, tested on AWS a1.metal bare metal (Graviton 1)
 9. **328 real-world projects validated** -- not just hello-world demos
 
 The closest historical project was **Ignite** (Weaveworks), which ran OCI images
