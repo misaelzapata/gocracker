@@ -220,8 +220,19 @@ gocracker builds on Firecracker's proven security model and adds the developer e
 
 ## Documentation
 
-- [ARM64 Porting Guide](docs/ARM64_PORTING_GUIDE.md)
-- [VFIO GPU Passthrough Plan](docs/VFIO_GPU_PASSTHROUGH_PLAN.md)
+- [Getting Started](docs/GETTING_STARTED.md) -- build, install, first VM in 60 seconds
+- [Networking](docs/NETWORKING.md) -- auto NAT, compose bridges, manual TAP
+- [Architecture](docs/ARCHITECTURE.md) -- boot flow, device model, security layers
+- [Docker Compose](docs/COMPOSE.md) -- multi-service stacks, healthchecks, ports
+- [API Reference](docs/API.md) -- Firecracker-compatible + extended endpoints
+- [CLI Reference](docs/CLI_REFERENCE.md) -- every command and flag
+- [Snapshots and Migration](docs/SNAPSHOTS.md) -- save, restore, live migrate
+- [Examples](docs/EXAMPLES.md) -- 16 example apps across 10 languages
+- [Validated Projects](docs/VALIDATED_PROJECTS.md) -- 328 real-world repos tested
+- [Troubleshooting](docs/TROUBLESHOOTING.md) -- common issues and fixes
+- [How gocracker Fits In](docs/COMPETITIVE_ANALYSIS.md) -- comparison with Firecracker, Kata, etc.
+- [Security Policy](SECURITY.md) -- isolation model, vulnerability reporting
+- [VFIO GPU Passthrough Plan](docs/VFIO_GPU_PASSTHROUGH_PLAN.md) -- future GPU support
 
 ## CLI Reference
 
