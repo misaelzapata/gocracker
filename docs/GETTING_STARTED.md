@@ -7,7 +7,7 @@ No Docker daemon required. Inspired by Firecracker.
 
 - **Linux** (x86_64 or aarch64). No macOS or Windows support.
 - **KVM** enabled in your kernel.
-- **Go 1.22+** to build from source.
+- **Go 1.22+** only if building from source (pre-built binaries available).
 - **ip** (iproute2) and **iptables** (or iptables-nft) for networking.
 - Root privileges (or appropriate `/dev/kvm` permissions).
 
@@ -31,21 +31,45 @@ Verify your user can access it:
 [ -r /dev/kvm ] && [ -w /dev/kvm ] && echo "KVM OK" || echo "no access"
 ```
 
-## 2. Build gocracker
+## 2. Install gocracker
+
+### Option A: Download pre-built binaries (fastest)
+
+Download the latest release from GitHub:
 
 ```bash
-git clone https://github.com/gocracker/gocracker.git
+# x86-64
+curl -L -o gocracker https://github.com/misaelzapata/gocracker/releases/latest/download/gocracker-linux-amd64
+chmod +x gocracker
+
+# ARM64
+curl -L -o gocracker https://github.com/misaelzapata/gocracker/releases/latest/download/gocracker-linux-arm64
+chmod +x gocracker
+```
+
+### Option B: Build from source
+
+```bash
+git clone https://github.com/misaelzapata/gocracker.git
 cd gocracker
 make build
 ```
 
-This runs `go mod tidy`, compiles the guest init binary (`go generate`), and
-produces a static `gocracker` binary in the repo root. The build uses
-`CGO_ENABLED=0` so the result is fully static.
+This produces a fully static `gocracker` binary (CGO_ENABLED=0).
 
 ## 3. Get a Guest Kernel
 
-Build a minimal guest kernel from source:
+Pre-built guest kernels are included in the repository (gzip-compressed):
+
+```bash
+# x86-64
+gunzip -k artifacts/kernels/gocracker-guest-standard-vmlinux.gz
+
+# ARM64
+gunzip -k artifacts/kernels/gocracker-guest-standard-arm64-Image.gz
+```
+
+Or build a minimal guest kernel from source:
 
 ```bash
 make kernel-guest
