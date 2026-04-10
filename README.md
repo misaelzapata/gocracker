@@ -5,12 +5,39 @@ One binary. One command. Real VM isolation.
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen)]()
+[![Linux](https://img.shields.io/badge/Linux-KVM-FCC624?logo=linux&logoColor=black)](https://www.kernel.org)
+[![x86-64](https://img.shields.io/badge/x86--64-supported-green)]()
+[![ARM64](https://img.shields.io/badge/ARM64-supported-green)]()
+[![OCI](https://img.shields.io/badge/OCI-compatible-purple?logo=open-containers-initiative)](https://opencontainers.org)
+[![Firecracker Inspired](https://img.shields.io/badge/Inspired_by-Firecracker-FF9900?logo=amazon-aws)](https://firecracker-microvm.github.io)
+[![Projects Tested](https://img.shields.io/badge/Tested_with-328_projects-blue)]()
 
 ## What is gocracker?
 
-gocracker is a micro-VMM written in pure Go that runs OCI containers as KVM microVMs. Inspired by Firecracker's security model, it pulls OCI images, builds Dockerfiles, clones git repos, and orchestrates Docker Compose stacks -- where each service is a real Linux VM. No Docker daemon, no containerd, no runc. Just KVM.
+I fell in love with [Firecracker](https://firecracker-microvm.github.io) --
+the idea of booting a real Linux VM in milliseconds with minimal overhead is
+brilliant. But every time I wanted to just run a container image as a microVM,
+I had to: pull the image manually, extract the rootfs, build an ext4 disk,
+generate an initrd, write a JSON config, set up a TAP interface, configure
+iptables... and only then call the Firecracker API. I kept thinking: why can't
+I just type one command?
 
-Think `docker run`, but each container is a real Linux VM.
+So I built gocracker. It is a micro-VMM written in pure Go that does everything
+Firecracker does at the KVM level -- virtio devices, jailer, seccomp -- but adds
+the developer experience on top: pull any OCI image, build any Dockerfile, clone
+any git repo, orchestrate Docker Compose stacks. Each service becomes a real
+Linux VM.
+
+```
+gocracker run --image ubuntu:22.04 --kernel ./kernel --wait
+```
+
+No Docker daemon. No containerd. No runc. Just KVM.
+
+This started as a hobby project to understand KVM and Go systems programming.
+It grew into something that boots 328 real-world projects, runs Flask + PostgreSQL
+compose stacks on ARM64 bare metal, and supports snapshots, live migration, and a
+Firecracker-compatible REST API. All in a single static binary.
 
 ## Quick Start
 
