@@ -1,0 +1,108 @@
+# Historical PASS entries that no longer form a reproducible regression gate
+# because the upstream input is currently non-hermetic, release-shaped, or drift-prone.
+#
+# Categories of breakage (last verified 2026-04-07 against 17 sampled cases):
+#   - Dockerfile expects a pre-built binary in the build context (release tarball
+#     workflow): minio, prometheus-node-exporter, prom-prometheus, hashicorp-http-echo,
+#     chartmuseum
+#   - No Dockerfile in repo at the manifest path: caddy
+#   - Upstream Makefile/build broken with current toolchain or missing scripts:
+#     mailhog (Go too old for `cmp` package), grafana-loki (`make: no rule for loki`),
+#     influxdata-telegraf (postgres C build), influxdata-influxdb (network fetch in step 17),
+#     ollama (OCI layer apply network error)
+#   - Dockerfile uses `ARG BASE` with no default, requires --build-arg: opa
+#   - Build is too heavy to gate on (>10 min, mostly bind-pulls): grafana-grafana
+minio-minio
+caddyserver-caddy
+mailhog-mailhog
+prometheus-node-exporter
+prom-prometheus
+grafana-grafana
+grafana-loki
+hashicorp-http-echo
+chartmuseum-chartmuseum
+influxdata-telegraf
+influxdata-influxdb
+open-policy-agent-opa
+ollama-ollama
+# Verified 2026-04-07 second sweep:
+qdrant-qdrant
+meilisearch-meilisearch
+coredns-coredns
+gotenberg-gotenberg
+woodpecker-ci-woodpecker
+openfaas-faas
+etcd-io-etcd
+cockroachdb-cockroach
+seaweedfs-seaweedfs
+apache-apisix
+rabbitmq-server
+redis-redis
+valkey-valkey
+memcached-memcached
+haproxy-haproxy
+eclipse-mosquitto
+nats-server
+emqx-emqx
+dragonflydb-dragonfly
+milvus-milvus
+quickwit-quickwit
+# Second pass (Python ML / build-helper issues):
+mlflow-mlflow
+bentoml-bentoml
+dagster-dagster
+gradio-gradio
+streamlit-streamlit
+locust-locust
+celery-celery
+uvicorn-gunicorn-fastapi
+plotly-dash
+wger
+semaphore
+jupyterhub-jupyterhub
+jupyter-docker-stacks
+livebook
+metabase
+directus
+strapi
+n8n
+hoppscotch
+pocketbase
+nextcloud-server
+wallabag
+# Third pass (expanded set, 2026-04-07):
+# Upstream Dockerfiles pinned to `golang:1-alpine` which resolves to 1.24
+# but go.mod requires 1.25 — unfixable from our side until upstream bumps.
+projectdiscovery-nuclei
+schollz-croc
+# Fourth pass (expanded2 sweep, 2026-04-07): upstream Dockerfile/build issues
+navidrome
+fabio
+kong-kic
+lnx
+wasmcloud
+librechat
+chat-ui
+superset
+redash
+papercups
+whoogle
+znc
+pyload
+sickchill
+zammad
+microblog
+djangooscar
+# Fifth pass (expanded3, 2026-04-07): docmost moved Dockerfile out of repo root;
+# zoekt and dnsx have build helper failures upstream.
+docmost
+zoekt
+dnsx
+# Sixth pass (final-2 sweep, 2026-04-08): drift upstream / Dockerfile bugs
+# we cannot patch from our side.
+djangox
+fastapi-realworld
+fiber-go-template
+node-express-realworld
+phoenix-todo-list
+symfony-docker

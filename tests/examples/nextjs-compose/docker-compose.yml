@@ -1,0 +1,31 @@
+# nextjs-compose: Next.js 14 standalone build talking to a Postgres service.
+#
+# Run with:
+#   gocracker compose --file tests/examples/nextjs-compose/docker-compose.yml \
+#                     --kernel artifacts/kernels/gocracker-guest-standard-vmlinux \
+#                     --wait
+# Probe:
+#   curl -fsS http://127.0.0.1:13000/api/health
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nextjs
+      POSTGRES_USER: nextjs
+      POSTGRES_PASSWORD: nextjs
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nextjs -d nextjs"]
+      interval: 1s
+      timeout: 3s
+      retries: 20
+
+  web:
+    build:
+      context: ./web
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://nextjs:nextjs@db:5432/nextjs
+    ports:
+      - "13000:3000"
