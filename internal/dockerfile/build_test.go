@@ -19,6 +19,20 @@ import (
 	"github.com/gocracker/gocracker/internal/oci"
 )
 
+// skipIfNoMountNS skips tests that need mount namespace creation (unshare).
+// GitHub Actions runners and other restricted environments block this syscall.
+func skipIfNoMountNS(t *testing.T) {
+	t.Helper()
+	if os.Getuid() == 0 {
+		return // root can always unshare
+	}
+	// Try creating a mount namespace — if this fails, RUN tests will also fail.
+	err := syscall.Unshare(syscall.CLONE_NEWNS)
+	if err != nil {
+		t.Skipf("mount namespace not available (unshare: %v); skipping RUN test", err)
+	}
+}
+
 func TestBuild_COPYDirectoryHonorsDockerignore(t *testing.T) {
 	ctxDir := t.TempDir()
 	writeContextFile(t, ctxDir, "Dockerfile", "FROM scratch\nWORKDIR /app\nCOPY . .\n")
@@ -395,6 +409,7 @@ func TestBuild_RUNWorksRootlessWithoutExternalTools(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("exercise rootless RUN as an unprivileged user")
 	}
+	skipIfNoMountNS(t)
 
 	ctxDir := t.TempDir()
 	writeContextFile(t, ctxDir, "Dockerfile", "FROM scratch\nCOPY tool /bin/tool\nENV FOO=bar\nRUN [\"/bin/tool\", \"/out.txt\"]\n")
@@ -452,6 +467,7 @@ func TestBuild_ARGWithoutDefaultIsDefinedEmptyForFROMExpansion(t *testing.T) {
 }
 
 func TestBuild_ARGWithoutDefaultIsNotExportedToRUNWhenUnset(t *testing.T) {
+	skipIfNoMountNS(t)
 	ctxDir := t.TempDir()
 	writeContextFile(t, ctxDir, "Dockerfile", "FROM scratch\nARG JEMALLOC_SYS_WITH_LG_PAGE\nCOPY tool /bin/tool\nRUN [\"/bin/tool\", \"/out.txt\"]\n")
 	buildStaticTestTool(t, ctxDir, "tool", `package main
@@ -479,6 +495,7 @@ func main() {
 }
 
 func TestBuild_RUNSeesARGValues(t *testing.T) {
+	skipIfNoMountNS(t)
 	ctxDir := t.TempDir()
 	writeContextFile(t, ctxDir, "Dockerfile", "FROM scratch\nARG S6_ARCH=x86_64\nCOPY tool /bin/tool\nRUN [\"/bin/tool\", \"/out.txt\"]\n")
 	buildStaticTestTool(t, ctxDir, "tool", `package main
@@ -503,6 +520,7 @@ func main() {
 }
 
 func TestBuild_RUNHasDevPts(t *testing.T) {
+	skipIfNoMountNS(t)
 	ctxDir := t.TempDir()
 	writeContextFile(t, ctxDir, "Dockerfile", "FROM scratch\nCOPY tool /bin/tool\nRUN [\"/bin/tool\", \"/out.txt\"]\n")
 	buildStaticTestTool(t, ctxDir, "tool", `package main

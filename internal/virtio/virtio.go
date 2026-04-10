@@ -140,39 +140,47 @@ func (q *Queue) Reset() {
 }
 
 // IterAvail calls fn for each new descriptor chain in the available ring.
-// fn receives the head descriptor index; call WalkChain to traverse it.
-// IMPORTANT: fn runs with q.mu held — use pushUsedLocked(), not PushUsed().
+// fn receives the head descriptor index; call PushUsed to return the chain.
 func (q *Queue) IterAvail(fn func(head uint16)) error {
 	q.mu.Lock()
-	defer q.mu.Unlock()
-
 	avail, err := q.readAvail()
 	if err != nil {
+		q.mu.Unlock()
 		return err
 	}
+	
+	// Collect available heads
+	var heads []uint16
 	for q.LastAvail != avail.Idx {
-		head := avail.Ring[q.LastAvail%uint16(q.Size)]
+		heads = append(heads, avail.Ring[q.LastAvail%uint16(q.Size)])
 		q.LastAvail++
+	}
+	q.mu.Unlock()
+
+	// Process without holding the queue lock
+	for _, head := range heads {
 		fn(head)
 	}
 	return nil
 }
 
 // ConsumeAvail consumes at most one available descriptor chain.
-// fn runs with q.mu held, so callers can safely use WalkChain and PushUsedLocked.
+// fn executes without q.mu held, so callers must use PushUsed instead of PushUsedLocked.
 func (q *Queue) ConsumeAvail(fn func(head uint16)) (bool, error) {
 	q.mu.Lock()
-	defer q.mu.Unlock()
-
 	avail, err := q.readAvail()
 	if err != nil {
+		q.mu.Unlock()
 		return false, err
 	}
 	if q.LastAvail == avail.Idx {
+		q.mu.Unlock()
 		return false, nil
 	}
 	head := avail.Ring[q.LastAvail%uint16(q.Size)]
 	q.LastAvail++
+	q.mu.Unlock()
+	
 	fn(head)
 	return true, nil
 }

@@ -125,7 +125,7 @@ func (d *Device) processTX(q *virtio.Queue) bool {
 		chain, err := q.WalkChain(head)
 		if err != nil {
 			gclog.VMM.Warn("virtio-vsock invalid TX descriptor chain", "head", head, "error", err)
-			_ = q.PushUsedLocked(uint32(head), 0)
+			_ = q.PushUsed(uint32(head), 0)
 			return
 		}
 		if len(chain) == 0 {
@@ -133,13 +133,13 @@ func (d *Device) processTX(q *virtio.Queue) bool {
 		}
 		// Read header
 		if chain[0].Len < hdrSize {
-			_ = q.PushUsedLocked(uint32(head), 0)
+			_ = q.PushUsed(uint32(head), 0)
 			return
 		}
 		hdrBuf := make([]byte, hdrSize)
 		if err := q.GuestRead(chain[0].Addr, hdrBuf); err != nil {
 			gclog.VMM.Warn("virtio-vsock TX header read failed", "head", head, "error", err)
-			_ = q.PushUsedLocked(uint32(head), 0)
+			_ = q.PushUsed(uint32(head), 0)
 			return
 		}
 		var hdr pktHdr
@@ -157,7 +157,7 @@ func (d *Device) processTX(q *virtio.Queue) bool {
 		case opCreditUpdate, opCreditRequest:
 			// flow control — acknowledge
 		}
-		_ = q.PushUsedLocked(uint32(head), 0)
+		_ = q.PushUsed(uint32(head), 0)
 	}); err != nil {
 		gclog.VMM.Warn("virtio-vsock TX queue iteration failed", "error", err)
 	}
@@ -274,7 +274,7 @@ func (d *Device) sendPkt(srcCID, dstCID uint64, srcPort, dstPort uint32, op uint
 		chain, walkErr := rxQ.WalkChain(head)
 		if walkErr != nil {
 			gclog.VMM.Warn("virtio-vsock invalid RX descriptor chain", "head", head, "error", walkErr)
-			_ = rxQ.PushUsedLocked(uint32(head), 0)
+			_ = rxQ.PushUsed(uint32(head), 0)
 			return
 		}
 		written := uint32(0)
@@ -297,7 +297,7 @@ func (d *Device) sendPkt(srcCID, dstCID uint64, srcPort, dstPort uint32, op uint
 				break
 			}
 		}
-		_ = rxQ.PushUsedLocked(uint32(head), written)
+		_ = rxQ.PushUsed(uint32(head), written)
 	})
 	if err != nil {
 		gclog.VMM.Warn("virtio-vsock RX queue consume failed", "error", err)

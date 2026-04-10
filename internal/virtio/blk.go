@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	gclog "github.com/gocracker/gocracker/internal/log"
 	"golang.org/x/sys/unix"
@@ -19,10 +20,10 @@ const (
 
 // virtio-blk request types
 const (
-	BlkTIn    = 0 // read
-	BlkTOut   = 1 // write
-	BlkTFlush = 4
-	BlkTGetID = 8
+	BlkTIn      = 0 // read
+	BlkTOut     = 1 // write
+	BlkTFlush   = 4
+	BlkTGetID   = 8
 	BlkTDiscard = 11
 )
 
@@ -34,8 +35,8 @@ const (
 )
 
 const (
-	blkSectorSize = 512
-	blkIDBytes    = 20
+	blkSectorSize          = 512
+	blkIDBytes             = 20
 	blkDiscardSegmentBytes = 16
 )
 
@@ -137,13 +138,13 @@ func (d *BlockDevice) HandleQueue(idx uint32, q *Queue) {
 		chain, err := q.WalkChain(head)
 		if err != nil {
 			gclog.VMM.Warn("virtio-blk invalid descriptor chain", "head", head, "error", err)
-			_ = q.PushUsedLocked(uint32(head), 0)
+			_ = q.PushUsed(uint32(head), 0)
 			return
 		}
 		req, err := d.parseRequest(q, chain)
 		if err != nil {
 			gclog.VMM.Warn("virtio-blk parse request failed", "head", head, "chain_len", len(chain), "error", err)
-			_ = q.PushUsedLocked(uint32(head), 0)
+			_ = q.PushUsed(uint32(head), 0)
 			return
 		}
 		status := byte(BlkSOK)
@@ -156,17 +157,21 @@ func (d *BlockDevice) HandleQueue(idx uint32, q *Queue) {
 			}
 			sector := req.sector
 			for _, desc := range req.dataDescs {
-				buf := make([]byte, desc.Len)
+				// sync.Pool allocation removal
+				buf := GetBlkBuffer(desc.Len)
 				n, err := d.file.ReadAt(buf, int64(sector)*blkSectorSize)
 				if err != nil || n != len(buf) {
+					PutBlkBuffer(buf)
 					status = BlkSIOErr
 					break
 				}
 				if err := q.GuestWrite(desc.Addr, buf); err != nil {
+					PutBlkBuffer(buf)
 					gclog.VMM.Warn("virtio-blk guest write failed", "head", head, "error", err)
 					status = BlkSIOErr
 					break
 				}
+				PutBlkBuffer(buf)
 				writtenToMem += desc.Len
 				sector += uint64(desc.Len) / blkSectorSize
 			}
@@ -181,17 +186,20 @@ func (d *BlockDevice) HandleQueue(idx uint32, q *Queue) {
 			}
 			sector := req.sector
 			for _, desc := range req.dataDescs {
-				buf := make([]byte, desc.Len)
+				buf := GetBlkBuffer(desc.Len)
 				if err := q.GuestRead(desc.Addr, buf); err != nil {
+					PutBlkBuffer(buf)
 					gclog.VMM.Warn("virtio-blk guest read failed", "head", head, "error", err)
 					status = BlkSIOErr
 					break
 				}
 				n, err := d.file.WriteAt(buf, int64(sector)*blkSectorSize)
 				if err != nil || n != len(buf) {
+					PutBlkBuffer(buf)
 					status = BlkSIOErr
 					break
 				}
+				PutBlkBuffer(buf)
 				d.dirty.Mark(sector*blkSectorSize, uint64(len(buf)))
 				sector += uint64(desc.Len) / blkSectorSize
 			}
@@ -254,10 +262,10 @@ func (d *BlockDevice) HandleQueue(idx uint32, q *Queue) {
 		// Write status byte into last descriptor
 		if err := q.GuestWrite(req.statusDesc.Addr, []byte{status}); err != nil {
 			gclog.VMM.Warn("virtio-blk status write failed", "head", head, "error", err)
-			_ = q.PushUsedLocked(uint32(head), writtenToMem)
+			_ = q.PushUsed(uint32(head), writtenToMem)
 			return
 		}
-		_ = q.PushUsedLocked(uint32(head), writtenToMem+1)
+		_ = q.PushUsed(uint32(head), writtenToMem+1)
 	}); err != nil {
 		gclog.VMM.Warn("virtio-blk queue iteration failed", "error", err)
 	}
@@ -467,4 +475,45 @@ func (d *BlockDevice) ReadAt(p []byte, off int64) (int, error) {
 // String returns a description of the block device.
 func (d *BlockDevice) String() string {
 	return fmt.Sprintf("virtio-blk sectors=%d ro=%v", d.sectors, d.readOnly)
+}
+
+// Basic variable-size buffer pool for blk operations
+var blkPools = map[uint32]*sync.Pool{
+	512:  {New: func() any { return make([]byte, 512) }},
+	1024: {New: func() any { return make([]byte, 1024) }},
+	4096: {New: func() any { return make([]byte, 4096) }},
+	8192: {New: func() any { return make([]byte, 8192) }},
+}
+
+func getPoolSize(l uint32) uint32 {
+	if l <= 512 {
+		return 512
+	}
+	if l <= 1024 {
+		return 1024
+	}
+	if l <= 4096 {
+		return 4096
+	}
+	if l <= 8192 {
+		return 8192
+	}
+	return l
+}
+
+func GetBlkBuffer(l uint32) []byte {
+	size := getPoolSize(l)
+	pool, ok := blkPools[size]
+	if !ok {
+		return make([]byte, l)
+	}
+	buf := pool.Get().([]byte)
+	return buf[:l]
+}
+
+func PutBlkBuffer(b []byte) {
+	c := uint32(cap(b))
+	if pool, ok := blkPools[c]; ok {
+		pool.Put(b[:cap(b)])
+	}
 }

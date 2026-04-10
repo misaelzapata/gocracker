@@ -8,18 +8,18 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Unit and package tests
-        run: go test ./...
+        run: go test $(go list ./... | grep -v /tests/integration)
 
   privileged-integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Check privileged prerequisites
@@ -30,13 +30,19 @@ jobs:
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
+      - name: Decompress guest kernel
+        if: steps.prereq.outputs.run == 'true'
+        run: gunzip -k artifacts/kernels/gocracker-guest-standard-vmlinux.gz || true
+      - name: Build gocracker binary
+        if: steps.prereq.outputs.run == 'true'
+        run: make build
       - name: Privileged integration subset
         if: steps.prereq.outputs.run == 'true'
         run: |
           sudo -n env GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
             go test -tags integration ./tests/integration \
             -run 'TestAPIServeRunExec|TestCLIComposeServeExec|TestCLIRunInteractiveExec|TestCLIComposeExecInteractive|TestVirtioBalloon(LocalStatsAndExec|WorkerReclaimsRSS)' \
-            -count=1 -v
+            -count=1 -v -timeout 300s
       - name: Skip note
         if: steps.prereq.outputs.run != 'true'
         run: echo "Skipping privileged integration subset because /dev/kvm or /dev/net/tun is unavailable on this runner."

@@ -40,7 +40,7 @@ func (d *RNGDevice) HandleQueue(idx uint32, q *Queue) {
 		chain, err := q.WalkChain(head)
 		if err != nil {
 			gclog.VMM.Warn("virtio-rng invalid descriptor chain", "head", head, "error", err)
-			_ = q.PushUsedLocked(uint32(head), 0)
+			_ = q.PushUsed(uint32(head), 0)
 			return
 		}
 		total := uint32(0)
@@ -69,7 +69,7 @@ func (d *RNGDevice) HandleQueue(idx uint32, q *Queue) {
 			}
 			written += desc.Len
 		}
-		_ = q.PushUsedLocked(uint32(head), written)
+		_ = q.PushUsed(uint32(head), written)
 	}); err != nil {
 		gclog.VMM.Warn("virtio-rng queue iteration failed", "error", err)
 	}
