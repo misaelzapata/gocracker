@@ -125,8 +125,11 @@ sudo ./gocracker run \
   --cmd 'python3 app.py'
 ```
 
-gocracker builds the image (using a built-in OCI builder -- no Docker daemon),
-creates an ext4 disk, and boots the result as a VM.
+The `--context` flag sets the build context directory (where `COPY` and `ADD`
+instructions look for files). It works exactly like the path argument in
+`docker build -f Dockerfile <context>`. gocracker builds the image using a
+built-in OCI builder (no Docker daemon), creates an ext4 disk, and boots the
+result as a VM.
 
 ## 7. From a Git Repo
 
