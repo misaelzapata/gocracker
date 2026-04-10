@@ -44,6 +44,26 @@ implement everything ourselves, which is both the fun part and the risky part.
 | Stars | We just got here | 33.6k | 7.7k | 5.5k | 18.1k |
 | Production use | No | AWS Lambda, Fly.io | Telcos, cloud providers | Azure, Kata | GKE Sandbox |
 
+## What gocracker Brings to the Table
+
+None of these features are unique on their own -- what is unusual is having all
+of them in one self-contained binary:
+
+1. **Pure Go, single binary, direct KVM** -- no QEMU, no Firecracker, no external VMM dependency
+2. **Native OCI image pulling** -- not via containerd shim or CRI
+3. **Native Dockerfile builds** -- not delegated to Docker or Buildah
+4. **Native git repo builds** -- clone, detect Dockerfile, build, boot
+5. **Native Docker Compose** -- each service is a real VM, not a container
+6. **Firecracker-compatible REST API** -- drop-in for existing FC tooling
+7. **Snapshot/restore + live migration** -- full VM state capture and transfer
+8. **ARM64 + x86-64** -- irqfd, GICv2/v3, tested on real AWS Graviton hardware
+9. **328 real-world projects validated** -- not just hello-world demos
+
+The closest historical project was **Ignite** (Weaveworks), which ran OCI images
+as Firecracker VMs but required Firecracker + containerd as dependencies. It was
+archived in December 2023. gocracker fills that gap with zero external
+dependencies.
+
 ## What We Learned From Each
 
 ### Firecracker
