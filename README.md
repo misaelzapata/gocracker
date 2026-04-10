@@ -10,7 +10,9 @@ One binary. One command. Real VM isolation.
 [![ARM64](https://img.shields.io/badge/ARM64-supported-green)]()
 [![OCI](https://img.shields.io/badge/OCI-compatible-purple?logo=open-containers-initiative)](https://opencontainers.org)
 [![Firecracker Inspired](https://img.shields.io/badge/Inspired_by-Firecracker-FF9900?logo=amazon-aws)](https://firecracker-microvm.github.io)
-[![Projects Tested](https://img.shields.io/badge/Tested_with-328_projects-blue)]()
+[![Coverage](https://img.shields.io/badge/Coverage-48%25-yellow)]()
+[![Tests](https://img.shields.io/badge/Tests-228+-green)]()
+[![Projects Tested](https://img.shields.io/badge/Validated-328_real--world_projects-blue)]()
 
 ## What is gocracker?
 
