@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -15,25 +16,33 @@ import (
 
 func TestBuildCmdline_Defaults(t *testing.T) {
 	cmdline := buildCmdline(oci.ImageConfig{}, RunOptions{})
-	required := []string{
-		"console=ttyS0",
-		"reboot=k",
-		"panic=1",
-		"nomodule",
-		"i8042.noaux",
-		"i8042.nomux",
-		"i8042.dumbkbd",
-		"swiotlb=noforce",
-		"rw",
-		"root=/dev/vda",
-		"rootfstype=ext4",
+	required := []string{"rw", "root=/dev/vda", "rootfstype=ext4"}
+	if runtime.GOOS == "darwin" {
+		required = append(required,
+			"console=hvc0",
+			"panic=-1",
+			"gc.shutdown=poweroff",
+			"gc.wait_network=1",
+			"nomodule",
+		)
+	} else {
+		required = append(required,
+			"console=ttyS0",
+			"reboot=k",
+			"panic=1",
+			"nomodule",
+			"i8042.noaux",
+			"i8042.nomux",
+			"i8042.dumbkbd",
+			"swiotlb=noforce",
+		)
 	}
 	for _, want := range required {
 		if !strings.Contains(cmdline, want) {
 			t.Fatalf("cmdline missing %q:\n%s", want, cmdline)
 		}
 	}
-	if strings.Contains(cmdline, runtimecfg.SerialDisable8250) {
+	if runtime.GOOS != "darwin" && strings.Contains(cmdline, runtimecfg.SerialDisable8250) {
 		t.Fatalf("serial console cmdline should not disable 8250:\n%s", cmdline)
 	}
 }

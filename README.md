@@ -164,7 +164,7 @@ historical baseline, expanded sets, and discovered framework boilerplates).
 
 ## External Sweep Policy
 
-- The checked-in sweep manifest is curated to exactly `200` pinned entries: `150` Dockerfile and `50` Compose.
+- The checked-in sweep manifest currently carries `328` pinned entries: `278` Dockerfile and `50` Compose.
 - Every row carries `disk_mb`. The harness defaults to `4096 MiB`, and larger stacks can override that per entry.
 - The external-repo harness now treats per-case VM caches and cloned repo worktrees as disposable by default: it uses a per-case VM cache directory and deletes both that cache and the cloned checkout after each case, so ext4 disks, initrds, rootfs trees, and repo worktrees do not accumulate across the sweep. Set `EXT_REPO_KEEP_VM_CACHE=1` or `EXT_REPO_KEEP_REPO_CACHE=1` only when intentionally debugging one case.
 - Setup-heavy or release-shaped repos do not belong in the main sweep. They should move to the excluded list instead of being treated as product regressions.
@@ -303,6 +303,16 @@ go test ./...
 GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
   go test -tags integration ./tests/integration/
 
+# Darwin feature e2e (requires signed Apple Silicon host, kernel, and prebuilt signed binaries)
+DARWIN_SIGN_IDENTITY='Developer ID Application: <Team> (<TEAMID>)' \
+  make build-darwin-e2e
+GOCRACKER_E2E=1 \
+  go test -tags e2e ./tests/e2e/darwin/...
+
+# Optional when the signed binaries live outside the repo root
+GOCRACKER_E2E=1 GOCRACKER_E2E_BIN_DIR=/path/to/signed/bin \
+  go test -tags e2e ./tests/e2e/darwin/...
+
 # Host sanity check before privileged runs
 ./tools/check-host-devices.sh
 ```
@@ -318,9 +328,9 @@ Latest recorded sweep snapshot: `/home/misael/Desktop/projects/gocracker/.tmp/ex
 - `PASS`: `73`
 - `FAIL`: `27`
 
-The checked-in external manifest is now curated to exactly `200` pinned entries (`150` Dockerfile, `50` Compose) and every row carries `disk_mb`. The last completed full rerun below still predates that curation step, so it remains the latest *completed* sweep snapshot, not the final result for the new 200-entry manifest.
+The checked-in external manifest now carries `328` pinned entries (`278` Dockerfile, `50` Compose) and every row carries `disk_mb`. The last completed full rerun below still predates the current checked-in manifest shape, so it remains the latest *completed* sweep snapshot, not the final result for the present 328-entry inventory.
 
-The current regression-validation workflow is now split into reproducible gates: keep `tests/external-repos/historical-pass.ids` as the baseline, move non-hermetic entries into `tests/external-repos/historical-unstable.ids`, validate interactive shell behavior with `tests/external-repos/historical-tty.ids` and `tests/external-repos/compose-tty.ids`, and only run the fixed-50 after those gates are green.
+The current regression-validation workflow is now split into reproducible gates: keep `tests/external-repos/historical-pass.ids` as the baseline, move non-hermetic entries into `tests/external-repos/historical-unstable.ids`, validate interactive shell behavior with `tests/external-repos/historical-tty.tsv` and `tests/external-repos/compose-tty.tsv`, and only run the fixed-50 after those gates are green.
 
 The previous targeted rerun workspace was intentionally cleaned after the host `/dev` repair and temporary-disk cleanup. The next rerun should start from that clean host state, with the current blockers now narrowed to product/runtime issues rather than broken `/dev`, `sudo`, or KVM/TUN preflight.
 

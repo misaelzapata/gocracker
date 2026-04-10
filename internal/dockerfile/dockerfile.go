@@ -60,6 +60,15 @@ type BuildOptions struct {
 	ContextDir string
 	// BuildArgs overrides ARG values
 	BuildArgs map[string]string
+	// BuildSecrets, BuildSSH, Target, Platform, and NoCache mirror the
+	// public build API. The current in-process executor does not yet
+	// implement all of them, but they are carried through so the Darwin
+	// BuildKit backend can adopt the same surface.
+	BuildSecrets []string
+	BuildSSH     []string
+	Target       string
+	Platform     string
+	NoCache      bool
 	// OutputDir is where the final rootfs is written
 	OutputDir string
 	// Tag is the image name (informational)
@@ -111,16 +120,16 @@ func Build(opts BuildOptions) (*BuildResult, error) {
 	}
 
 	builder := &builder{
-		opts:         opts,
-		outputRootfs: opts.OutputDir,
-		stagesRoot:   stagesRoot,
-		env:          map[string]string{},
-		args:         defaultBuildArgs(),
-		argExport:    map[string]bool{},
-		pullCache:    map[string]pulledImage{},
-		remoteRootfs: map[string]string{},
-		stageByName:  map[string]*buildStage{},
-		runCacheRoot: runCacheRoot,
+		opts:              opts,
+		outputRootfs:      opts.OutputDir,
+		stagesRoot:        stagesRoot,
+		env:               map[string]string{},
+		args:              defaultBuildArgs(),
+		argExport:         map[string]bool{},
+		pullCache:         map[string]pulledImage{},
+		remoteRootfs:      map[string]string{},
+		stageByName:       map[string]*buildStage{},
+		runCacheRoot:      runCacheRoot,
 		currentStageIndex: -1,
 		nextStageIndex:    0,
 	}
@@ -587,27 +596,27 @@ var pullOCIImage = func(opts oci.PullOptions) (pulledImage, error) {
 }
 
 type builder struct {
-	opts             BuildOptions
-	outputRootfs     string
-	stagesRoot       string
-	rootfs           string
-	config           oci.ImageConfig
-	env              map[string]string
-	envOrder         []string
-	args             map[string]string
-	argExport        map[string]bool
-	user             string
-	workdir          string
-	shell            []string
-	pullCache        map[string]pulledImage
-	remoteRootfs     map[string]string
-	stages           []*buildStage
-	stageByName      map[string]*buildStage
-	currentStageName string
+	opts              BuildOptions
+	outputRootfs      string
+	stagesRoot        string
+	rootfs            string
+	config            oci.ImageConfig
+	env               map[string]string
+	envOrder          []string
+	args              map[string]string
+	argExport         map[string]bool
+	user              string
+	workdir           string
+	shell             []string
+	pullCache         map[string]pulledImage
+	remoteRootfs      map[string]string
+	stages            []*buildStage
+	stageByName       map[string]*buildStage
+	currentStageName  string
 	currentStageIndex int
 	nextStageIndex    int
-	contextFilter    *contextFilter
-	runCacheRoot     string
+	contextFilter     *contextFilter
+	runCacheRoot      string
 }
 
 func (b *builder) execute(instrs []Instruction) error {
@@ -1564,10 +1573,11 @@ func validateBuildPlatform(platform string) error {
 	if len(parts) < 2 {
 		return fmt.Errorf("expected platform in the form OS/ARCH[/VARIANT]")
 	}
-	hostOS := runtime.GOOS
+	// Accept both the host OS and "linux" since the guest always runs Linux.
 	hostArch := runtime.GOARCH
-	if parts[0] != hostOS || parts[1] != hostArch {
-		return fmt.Errorf("host platform is %s/%s", hostOS, hostArch)
+	validOS := parts[0] == runtime.GOOS || parts[0] == "linux"
+	if !validOS || parts[1] != hostArch {
+		return fmt.Errorf("target platform must be linux/%s (got %s)", hostArch, platform)
 	}
 	return nil
 }
@@ -1665,16 +1675,18 @@ func defaultShell() []string {
 }
 
 func defaultBuildArgs() map[string]string {
-	osName := runtime.GOOS
+	buildOS := runtime.GOOS
 	arch := runtime.GOARCH
-	platform := osName + "/" + arch
+	// The target is always Linux because the VM runs a Linux guest kernel,
+	// regardless of the host OS. The build platform reflects the host.
+	targetOS := "linux"
 	return map[string]string{
-		"BUILDOS":        osName,
+		"BUILDOS":        buildOS,
 		"BUILDARCH":      arch,
-		"BUILDPLATFORM":  platform,
-		"TARGETOS":       osName,
+		"BUILDPLATFORM":  buildOS + "/" + arch,
+		"TARGETOS":       targetOS,
 		"TARGETARCH":     arch,
-		"TARGETPLATFORM": platform,
+		"TARGETPLATFORM": targetOS + "/" + arch,
 		"TARGETVARIANT":  "",
 		"BUILDVARIANT":   "",
 	}

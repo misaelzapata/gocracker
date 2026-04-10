@@ -5,6 +5,7 @@ package uart
 
 import (
 	"io"
+	"os"
 	"sync"
 )
 
@@ -93,6 +94,21 @@ type UART struct {
 
 	// IRQ callback: called when interrupt state changes
 	irqFn func(asserted bool)
+
+	nextAttachID uint64
+	attachments  map[uint64]*consoleAttachment
+}
+
+type consoleAttachment struct {
+	uart *UART
+	id   uint64
+
+	guestRead  *os.File
+	guestWrite *os.File
+	hostRead   *os.File
+	hostWrite  *os.File
+
+	closeOnce sync.Once
 }
 
 // New creates a UART with the given I/O streams and IRQ callback.
@@ -116,6 +132,41 @@ func New(out io.Writer, in io.Reader, irqFn func(bool)) *UART {
 		go u.rxPump()
 	}
 	return u
+}
+
+// AttachConsole opens a live bidirectional console attachment.
+func (u *UART) AttachConsole() (io.ReadWriteCloser, error) {
+	guestRead, hostWrite, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	hostRead, guestWrite, err := os.Pipe()
+	if err != nil {
+		_ = guestRead.Close()
+		_ = hostWrite.Close()
+		return nil, err
+	}
+
+	attachment := &consoleAttachment{
+		uart:       u,
+		guestRead:  guestRead,
+		guestWrite: guestWrite,
+		hostRead:   hostRead,
+		hostWrite:  hostWrite,
+	}
+
+	u.mu.Lock()
+	u.nextAttachID++
+	attachment.id = u.nextAttachID
+	if u.attachments == nil {
+		u.attachments = map[uint64]*consoleAttachment{}
+	}
+	u.attachments[attachment.id] = attachment
+	u.mu.Unlock()
+
+	go attachment.pumpInput()
+
+	return attachment, nil
 }
 
 // Read handles a guest read from port (base + offset).
@@ -198,6 +249,7 @@ func (u *UART) Write(offset, val uint8) {
 		if u.out != nil {
 			u.out.Write([]byte{val}) //nolint:errcheck
 		}
+		u.writeAttachmentsLocked(val)
 		// Buffer for API retrieval
 		u.outBuf = append(u.outBuf, val)
 		if len(u.outBuf) > u.outBufMax {
@@ -283,21 +335,6 @@ func (u *UART) InjectBytes(bytes []byte) {
 	}
 }
 
-// UARTState captures all UART register state for snapshot/restore.
-type UARTState struct {
-	IER   uint8  `json:"ier"`
-	IIR   uint8  `json:"iir"`
-	LCR   uint8  `json:"lcr"`
-	MCR   uint8  `json:"mcr"`
-	LSR   uint8  `json:"lsr"`
-	MSR   uint8  `json:"msr"`
-	SCR   uint8  `json:"scr"`
-	DLL   uint8  `json:"dll"`
-	DLH   uint8  `json:"dlh"`
-	RxBuf []byte `json:"rx_buf,omitempty"`
-	OutBuf []byte `json:"out_buf,omitempty"`
-}
-
 // State returns a snapshot of the UART state.
 func (u *UART) State() UARTState {
 	u.mu.Lock()
@@ -309,7 +346,7 @@ func (u *UART) State() UARTState {
 	return UARTState{
 		IER: u.ier, IIR: u.iir, LCR: u.lcr, MCR: u.mcr,
 		LSR: u.lsr, MSR: u.msr, SCR: u.scr, DLL: u.dll, DLH: u.dlh,
-		RxBuf: rxCopy,
+		RxBuf:  rxCopy,
 		OutBuf: outCopy,
 	}
 }
@@ -340,6 +377,34 @@ func (u *UART) OutputBytes() []byte {
 	out := make([]byte, len(u.outBuf))
 	copy(out, u.outBuf)
 	return out
+}
+
+func (u *UART) writeAttachmentsLocked(b byte) {
+	if len(u.attachments) == 0 {
+		return
+	}
+	var stale []uint64
+	for id, attachment := range u.attachments {
+		if _, err := attachment.guestWrite.Write([]byte{b}); err != nil {
+			stale = append(stale, id)
+		}
+	}
+	for _, id := range stale {
+		if attachment := u.attachments[id]; attachment != nil {
+			delete(u.attachments, id)
+			go attachment.closeOwned()
+		}
+	}
+}
+
+func (u *UART) detachConsole(id uint64) {
+	u.mu.Lock()
+	attachment := u.attachments[id]
+	delete(u.attachments, id)
+	u.mu.Unlock()
+	if attachment != nil {
+		attachment.closeOwned()
+	}
 }
 
 // Ports returns the I/O port range for this UART [base, base+8).
@@ -389,6 +454,56 @@ func (u *UART) updateMSRLocked() {
 		msr |= 0x80 // DCD
 	}
 	u.msr = msr
+}
+
+func (a *consoleAttachment) Read(p []byte) (int, error) {
+	return a.hostRead.Read(p)
+}
+
+func (a *consoleAttachment) Write(p []byte) (int, error) {
+	return a.hostWrite.Write(p)
+}
+
+func (a *consoleAttachment) Close() error {
+	if a == nil || a.uart == nil {
+		return nil
+	}
+	a.uart.detachConsole(a.id)
+	return nil
+}
+
+func (a *consoleAttachment) closeOwned() {
+	if a == nil {
+		return
+	}
+	a.closeOnce.Do(func() {
+		if a.hostRead != nil {
+			_ = a.hostRead.Close()
+		}
+		if a.hostWrite != nil {
+			_ = a.hostWrite.Close()
+		}
+		if a.guestRead != nil {
+			_ = a.guestRead.Close()
+		}
+		if a.guestWrite != nil {
+			_ = a.guestWrite.Close()
+		}
+	})
+}
+
+func (a *consoleAttachment) pumpInput() {
+	buf := make([]byte, 4096)
+	for {
+		n, err := a.guestRead.Read(buf)
+		if n > 0 {
+			a.uart.InjectBytes(buf[:n])
+		}
+		if err != nil {
+			a.uart.detachConsole(a.id)
+			return
+		}
+	}
 }
 
 // rxPump reads from the input reader and injects bytes into the RX buffer.

@@ -63,6 +63,38 @@ func DefaultKernelCmdline(withSerialConsole bool) string {
 	return strings.Join(DefaultKernelArgs(withSerialConsole), " ")
 }
 
+// DarwinKernelArgs returns kernel args suitable for Virtualization.framework.
+// Uses virtio-console (hvc0) instead of UART (ttyS0) and enables PCI.
+func DarwinKernelArgs(withSerialConsole bool) []string {
+	return DarwinKernelArgsForRuntime(withSerialConsole, false)
+}
+
+// darwinBaseArgs is a minimal set of kernel args for Virtualization.framework.
+// Unlike the Firecracker path, vz VMs don't need i8042 or swiotlb workarounds.
+var darwinBaseArgs = []string{
+	"panic=-1",
+	"gc.shutdown=poweroff",
+	"gc.wait_network=1",
+}
+
+// DarwinKernelArgsForRuntime returns vz-compatible kernel args.
+func DarwinKernelArgsForRuntime(withSerialConsole, allowKernelModules bool) []string {
+	args := make([]string, len(darwinBaseArgs))
+	copy(args, darwinBaseArgs)
+	if !allowKernelModules {
+		args = append(args, "nomodule")
+	}
+	if withSerialConsole {
+		return append([]string{"console=hvc0"}, args...)
+	}
+	return args
+}
+
+// DarwinKernelCmdline returns the default kernel cmdline for macOS VMs.
+func DarwinKernelCmdline(withSerialConsole bool) string {
+	return strings.Join(DarwinKernelArgs(withSerialConsole), " ")
+}
+
 type Process struct {
 	Exec string   `json:"exec"`
 	Args []string `json:"args,omitempty"`

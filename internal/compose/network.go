@@ -13,23 +13,11 @@ import (
 
 const composeSubnetPoolCIDR = stacknet.SubnetPoolCIDR
 
-type networkManager struct {
-	*stacknet.Manager
-}
-
 type portMapping = stacknet.PortMapping
 
 type plannedNetwork struct {
 	subnet  *net.IPNet
 	gateway net.IP
-}
-
-func newNetworkManager(project string, subnet *net.IPNet, gateway net.IP) (*networkManager, error) {
-	manager, err := stacknet.New(project, subnet, gateway)
-	if err != nil {
-		return nil, err
-	}
-	return &networkManager{Manager: manager}, nil
 }
 
 func newPlannedNetwork(subnet *net.IPNet, gateway net.IP) *plannedNetwork {
@@ -59,43 +47,15 @@ func (n *plannedNetwork) AddPortForwards(string, string, interface{}) error {
 	return nil
 }
 
+func (n *plannedNetwork) NetworkID() string {
+	return ""
+}
+
+func (n *plannedNetwork) NetworkAttachmentMode() string {
+	return ""
+}
+
 func (n *plannedNetwork) Close() {}
-
-func (n *networkManager) AddPortForwards(serviceName, serviceIP string, ports interface{}) error {
-	mappings, err := parsePortMappings(ports)
-	if err != nil {
-		return fmt.Errorf("parse port mappings for %s: %w", serviceName, err)
-	}
-	return n.Manager.AddPortForwardMappings(serviceName, serviceIP, mappings)
-}
-
-func cleanupStackNetwork(project string) {
-	stacknet.Cleanup(project)
-}
-
-func parsePortMappings(value interface{}) ([]portMapping, error) {
-	return parsePortSpecs(value)
-}
-
-func selectStackSubnet(project string) (*net.IPNet, error) {
-	return stacknet.SelectStackSubnet(project)
-}
-
-func selectAvailableSubnet(project string, occupied []*net.IPNet) (*net.IPNet, error) {
-	return stacknet.SelectAvailableSubnet(project, occupied)
-}
-
-func firstHostIP(network *net.IPNet) (net.IP, error) {
-	return stacknet.FirstHostIP(network)
-}
-
-func normalizeIPv4Net(network *net.IPNet) *net.IPNet {
-	return stacknet.NormalizeIPv4Net(network)
-}
-
-func cidrOverlap(a, b *net.IPNet) bool {
-	return stacknet.CIDROverlap(a, b)
-}
 
 func hashProject(project string) uint32 {
 	h := fnv.New32a()

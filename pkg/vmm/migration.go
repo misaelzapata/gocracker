@@ -1,3 +1,5 @@
+//go:build linux
+
 package vmm
 
 import (
@@ -12,32 +14,6 @@ import (
 	"github.com/gocracker/gocracker/internal/uart"
 	"github.com/gocracker/gocracker/internal/virtio"
 )
-
-const (
-	migrationMemFile    = "mem.bin"
-	migrationPatchMeta  = "patches.json"
-	migrationPatchData  = "patches.bin"
-	migrationKernelPath = "artifacts/kernel"
-	migrationInitrdPath = "artifacts/initrd"
-	migrationDiskPath   = "artifacts/disk.ext4"
-)
-
-type DirtyPatchEntry struct {
-	Offset     uint64 `json:"offset"`
-	Length     uint64 `json:"length"`
-	DataOffset uint64 `json:"data_offset"`
-}
-
-type DirtyFilePatch struct {
-	Path     string            `json:"path"`
-	PageSize uint64            `json:"page_size"`
-	Entries  []DirtyPatchEntry `json:"entries,omitempty"`
-}
-
-type MigrationPatchSet struct {
-	Version int              `json:"version"`
-	Patches []DirtyFilePatch `json:"patches,omitempty"`
-}
 
 // CreateMigrationBundle snapshots a running VM into dir and rewrites referenced
 // host-side assets so the bundle can be moved to another process or host.

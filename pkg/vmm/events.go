@@ -2,6 +2,7 @@ package vmm
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -155,4 +156,8 @@ type WorkerBacked interface {
 
 type VsockDialer interface {
 	DialVsock(port uint32) (net.Conn, error)
+}
+
+type ConsoleDialer interface {
+	AttachConsole() (io.ReadWriteCloser, error)
 }

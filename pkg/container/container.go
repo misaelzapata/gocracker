@@ -20,8 +20,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gocracker/gocracker/internal/buildbackend"
 	"github.com/gocracker/gocracker/internal/buildserver"
-	"github.com/gocracker/gocracker/internal/dockerfile"
+	"github.com/gocracker/gocracker/internal/ext4write"
 	"github.com/gocracker/gocracker/internal/guest"
 	"github.com/gocracker/gocracker/internal/hostguard"
 	"github.com/gocracker/gocracker/internal/hostnet"
@@ -50,6 +51,7 @@ type RunOptions struct {
 	KernelPath  string
 	TapName     string
 	NetworkMode string
+	Network     *vmm.NetworkConfig
 	X86Boot     vmm.X86BootMode
 
 	// Container overrides
@@ -72,6 +74,12 @@ type RunOptions struct {
 
 	// Build args (Dockerfile ARG values)
 	BuildArgs map[string]string
+	// BuildKit-style build inputs.
+	BuildSecrets []string
+	BuildSSH     []string
+	Target       string
+	Platform     string
+	NoCache      bool
 
 	// VM identifier (auto-generated if empty)
 	ID string
@@ -191,11 +199,11 @@ func Run(opts RunOptions) (*RunResult, error) {
 func jailerEnabled(mode string) bool {
 	switch strings.TrimSpace(strings.ToLower(mode)) {
 	case "", JailerModeOn:
-		return true
+		return runtime.GOOS == "linux"
 	case JailerModeOff:
 		return false
 	default:
-		return true
+		return runtime.GOOS == "linux"
 	}
 }
 
@@ -235,13 +243,10 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 			return nil, fmt.Errorf("--net auto is not supported with snapshot restore yet")
 		}
 		var err error
-		autoNet, err = hostnet.NewAuto(opts.ID, opts.TapName)
+		autoNet, err = setupAutoNetwork(&opts)
 		if err != nil {
-			return nil, fmt.Errorf("auto network: %w", err)
+			return nil, err
 		}
-		opts.TapName = autoNet.TapName()
-		opts.StaticIP = autoNet.GuestCIDR()
-		opts.Gateway = autoNet.GatewayIP()
 	}
 
 	// ---- Fast path: snapshot restore ----
@@ -388,25 +393,26 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	t0 := time.Now()
 
 	vm, err := vmm.New(vmm.Config{
-		ID:         opts.ID,
-		MemMB:      opts.MemMB,
-		Arch:       opts.Arch,
-		VCPUs:      opts.CPUs,
-		X86Boot:    opts.X86Boot,
-		KernelPath: opts.KernelPath,
-		InitrdPath: initrdPath,
-		Cmdline:    cmdline,
-		DiskImage:  bootDiskPath,
-		Drives:     runtimeDrives(bootDiskPath, opts),
-		TapName:    opts.TapName,
-		Metadata:   cloneStringMap(opts.Metadata),
-		SharedFS:   sharedFS.Exports,
-		Vsock:      buildVsockConfig(opts),
-		Exec:       buildExecConfig(opts),
-		Balloon:    cloneBalloonConfig(opts.Balloon),
+		ID:            opts.ID,
+		MemMB:         opts.MemMB,
+		Arch:          opts.Arch,
+		VCPUs:         opts.CPUs,
+		X86Boot:       opts.X86Boot,
+		KernelPath:    opts.KernelPath,
+		InitrdPath:    initrdPath,
+		Cmdline:       cmdline,
+		DiskImage:     bootDiskPath,
+		Drives:        runtimeDrives(bootDiskPath, opts),
+		TapName:       opts.TapName,
+		Network:       cloneNetworkConfig(opts.Network),
+		Metadata:      cloneStringMap(opts.Metadata),
+		SharedFS:      sharedFS.Exports,
+		Vsock:         buildVsockConfig(opts),
+		Exec:          buildExecConfig(opts),
+		Balloon:       cloneBalloonConfig(opts.Balloon),
 		MemoryHotplug: cloneMemoryHotplugConfig(opts.MemoryHotplug),
-		ConsoleOut: opts.ConsoleOut,
-		ConsoleIn:  opts.ConsoleIn,
+		ConsoleOut:    opts.ConsoleOut,
+		ConsoleIn:     opts.ConsoleIn,
 	})
 	if err != nil {
 		if autoNet != nil {
@@ -526,13 +532,10 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 			return nil, fmt.Errorf("--net auto is not supported with snapshot restore yet")
 		}
 		var err error
-		autoNet, err = hostnet.NewAuto(opts.ID, opts.TapName)
+		autoNet, err = setupAutoNetwork(&opts)
 		if err != nil {
-			return nil, fmt.Errorf("auto network: %w", err)
+			return nil, err
 		}
-		opts.TapName = autoNet.TapName()
-		opts.StaticIP = autoNet.GuestCIDR()
-		opts.Gateway = autoNet.GatewayIP()
 	}
 
 	if opts.SnapshotDir != "" {
@@ -682,25 +685,26 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 	}
 
 	handle, cleanup, err := worker.LaunchVMM(vmm.Config{
-		ID:         opts.ID,
-		MemMB:      opts.MemMB,
-		Arch:       opts.Arch,
-		VCPUs:      opts.CPUs,
-		X86Boot:    opts.X86Boot,
-		KernelPath: opts.KernelPath,
-		InitrdPath: initrdPath,
-		Cmdline:    cmdline,
-		DiskImage:  bootDiskPath,
-		Drives:     runtimeDrives(bootDiskPath, opts),
-		TapName:    opts.TapName,
-		Metadata:   cloneStringMap(opts.Metadata),
-		SharedFS:   sharedFS.Exports,
-		Vsock:      buildVsockConfig(opts),
-		Exec:       buildExecConfig(opts),
-		Balloon:    cloneBalloonConfig(opts.Balloon),
+		ID:            opts.ID,
+		MemMB:         opts.MemMB,
+		Arch:          opts.Arch,
+		VCPUs:         opts.CPUs,
+		X86Boot:       opts.X86Boot,
+		KernelPath:    opts.KernelPath,
+		InitrdPath:    initrdPath,
+		Cmdline:       cmdline,
+		DiskImage:     bootDiskPath,
+		Drives:        runtimeDrives(bootDiskPath, opts),
+		TapName:       opts.TapName,
+		Network:       cloneNetworkConfig(opts.Network),
+		Metadata:      cloneStringMap(opts.Metadata),
+		SharedFS:      sharedFS.Exports,
+		Vsock:         buildVsockConfig(opts),
+		Exec:          buildExecConfig(opts),
+		Balloon:       cloneBalloonConfig(opts.Balloon),
 		MemoryHotplug: cloneMemoryHotplugConfig(opts.MemoryHotplug),
-		ConsoleOut: opts.ConsoleOut,
-		ConsoleIn:  opts.ConsoleIn,
+		ConsoleOut:    opts.ConsoleOut,
+		ConsoleIn:     opts.ConsoleIn,
 	}, worker.VMMOptions{
 		JailerBinary: opts.JailerBinary,
 		VMMBinary:    opts.VMMBinary,
@@ -768,6 +772,11 @@ type BuildOptions struct {
 	RepoSubdir   string
 	DiskSizeMB   int
 	BuildArgs    map[string]string
+	BuildSecrets []string
+	BuildSSH     []string
+	Target       string
+	Platform     string
+	NoCache      bool
 	OutputPath   string
 	WorkDir      string
 	CacheDir     string
@@ -785,6 +794,8 @@ type BuildResult struct {
 	DiskPath  string
 	Config    oci.ImageConfig
 }
+
+var buildRootfsBackendFactory = selectedLocalBuildBackend
 
 // Build creates a rootfs and disk image without booting a VM.
 func Build(opts BuildOptions) (*BuildResult, error) {
@@ -823,15 +834,20 @@ func buildLocal(opts BuildOptions) (*BuildResult, error) {
 	}
 
 	runOpts := RunOptions{
-		Image:      opts.Image,
-		Dockerfile: opts.Dockerfile,
-		Context:    opts.Context,
-		RepoURL:    opts.RepoURL,
-		RepoRef:    opts.RepoRef,
-		RepoSubdir: opts.RepoSubdir,
-		BuildArgs:  opts.BuildArgs,
-		ID:         id,
-		CacheDir:   opts.CacheDir,
+		Image:        opts.Image,
+		Dockerfile:   opts.Dockerfile,
+		Context:      opts.Context,
+		RepoURL:      opts.RepoURL,
+		RepoRef:      opts.RepoRef,
+		RepoSubdir:   opts.RepoSubdir,
+		BuildArgs:    opts.BuildArgs,
+		BuildSecrets: append([]string(nil), opts.BuildSecrets...),
+		BuildSSH:     append([]string(nil), opts.BuildSSH...),
+		Target:       opts.Target,
+		Platform:     opts.Platform,
+		NoCache:      opts.NoCache,
+		ID:           id,
+		CacheDir:     opts.CacheDir,
 	}
 	if runOpts.RepoURL != "" {
 		resolved, err := resolveRepo(runOpts, workDir)
@@ -894,6 +910,11 @@ func buildViaWorker(opts BuildOptions) (*BuildResult, error) {
 		RepoRef:      opts.RepoRef,
 		RepoSubdir:   opts.RepoSubdir,
 		BuildArgs:    opts.BuildArgs,
+		BuildSecrets: append([]string(nil), opts.BuildSecrets...),
+		BuildSSH:     append([]string(nil), opts.BuildSSH...),
+		Target:       opts.Target,
+		Platform:     opts.Platform,
+		NoCache:      opts.NoCache,
 		ID:           id,
 		CacheDir:     opts.CacheDir,
 		JailerMode:   opts.JailerMode,
@@ -926,14 +947,19 @@ func buildViaWorker(opts BuildOptions) (*BuildResult, error) {
 func buildWorkDirForCache(opts BuildOptions, fallbackID string) string {
 	opts.CacheDir = resolvedCacheDir(opts.CacheDir)
 	key, err := stableHashKey(map[string]any{
-		"image":       opts.Image,
-		"dockerfile":  opts.Dockerfile,
-		"context":     opts.Context,
-		"repo_url":    opts.RepoURL,
-		"repo_ref":    opts.RepoRef,
-		"repo_subdir": opts.RepoSubdir,
-		"build_args":  normalizedStringMap(opts.BuildArgs),
-		"disk_size":   opts.DiskSizeMB,
+		"image":        opts.Image,
+		"dockerfile":   opts.Dockerfile,
+		"context":      opts.Context,
+		"repo_url":     opts.RepoURL,
+		"repo_ref":     opts.RepoRef,
+		"repo_subdir":  opts.RepoSubdir,
+		"build_args":   normalizedStringMap(opts.BuildArgs),
+		"build_secret": append([]string(nil), opts.BuildSecrets...),
+		"build_ssh":    append([]string(nil), opts.BuildSSH...),
+		"target":       opts.Target,
+		"platform":     opts.Platform,
+		"no_cache":     opts.NoCache,
+		"disk_size":    opts.DiskSizeMB,
 	})
 	if err != nil {
 		return filepath.Join(os.TempDir(), "gocracker-"+fallbackID)
@@ -986,52 +1012,43 @@ func buildFromImage(rootfsDir string, opts RunOptions) (oci.ImageConfig, error) 
 	return pulled.Config, pulled.ExtractToDir(rootfsDir)
 }
 
-func buildFromDockerfile(rootfsDir string, opts RunOptions) (oci.ImageConfig, error) {
-	result, err := dockerfile.Build(dockerfile.BuildOptions{
-		DockerfilePath: opts.Dockerfile,
-		ContextDir:     opts.Context,
-		BuildArgs:      opts.BuildArgs,
-		OutputDir:      rootfsDir,
-		Tag:            opts.ID,
-		CacheDir:       resolvedCacheDir(opts.CacheDir),
-	})
-	if err != nil {
-		return oci.ImageConfig{}, err
-	}
-	return result.Config, nil
-}
-
 func buildRootfs(rootfsDir string, opts RunOptions) (oci.ImageConfig, error) {
-	var (
-		imgConfig oci.ImageConfig
-		err       error
-	)
-	switch {
-	case opts.Image != "":
-		imgConfig, err = buildFromImage(rootfsDir, opts)
-	case opts.Dockerfile != "":
-		imgConfig, err = buildFromDockerfile(rootfsDir, opts)
-	default:
-		return oci.ImageConfig{}, fmt.Errorf("specify --image, --dockerfile, or --repo")
-	}
+	result, err := buildRootfsBackendFactory().BuildRootfs(context.Background(), buildbackend.Request{
+		Image:        opts.Image,
+		Dockerfile:   opts.Dockerfile,
+		Context:      opts.Context,
+		BuildArgs:    opts.BuildArgs,
+		BuildSecrets: append([]string(nil), opts.BuildSecrets...),
+		BuildSSH:     append([]string(nil), opts.BuildSSH...),
+		Target:       opts.Target,
+		Platform:     opts.Platform,
+		NoCache:      opts.NoCache,
+		OutputDir:    rootfsDir,
+		CacheDir:     resolvedCacheDir(opts.CacheDir),
+	})
 	if err != nil {
 		return oci.ImageConfig{}, err
 	}
 	if err := applyMounts(rootfsDir, opts.Mounts); err != nil {
 		return oci.ImageConfig{}, fmt.Errorf("apply mounts: %w", err)
 	}
-	return imgConfig, nil
+	return result.Config, nil
 }
 
 func buildRootfsViaWorker(rootfsDir string, opts RunOptions) (oci.ImageConfig, error) {
 	cacheDir := resolvedCacheDir(opts.CacheDir)
 	resp, err := worker.BuildRootfs(buildserver.BuildRequest{
-		Image:      opts.Image,
-		Dockerfile: opts.Dockerfile,
-		Context:    opts.Context,
-		BuildArgs:  opts.BuildArgs,
-		OutputDir:  rootfsDir,
-		CacheDir:   cacheDir,
+		Image:        opts.Image,
+		Dockerfile:   opts.Dockerfile,
+		Context:      opts.Context,
+		BuildArgs:    opts.BuildArgs,
+		BuildSecrets: append([]string(nil), opts.BuildSecrets...),
+		BuildSSH:     append([]string(nil), opts.BuildSSH...),
+		Target:       opts.Target,
+		Platform:     opts.Platform,
+		NoCache:      opts.NoCache,
+		OutputDir:    rootfsDir,
+		CacheDir:     cacheDir,
 	}, worker.BuildOptions{
 		JailerBinary: opts.JailerBinary,
 		WorkerBinary: opts.VMMBinary,
@@ -1199,32 +1216,8 @@ func writeRuntimeSpecToDiskImage(diskPath string, spec runtimecfg.GuestSpec) err
 	if err != nil {
 		return err
 	}
-	tempFile, err := os.CreateTemp("", "gocracker-runtime-spec-*.json")
-	if err != nil {
-		return err
-	}
-	tempPath := tempFile.Name()
-	defer os.Remove(tempPath)
-	if _, err := tempFile.Write(data); err != nil {
-		tempFile.Close()
-		return err
-	}
-	if err := tempFile.Close(); err != nil {
-		return err
-	}
-	if err := runDebugFSCommand(diskPath, "rm "+runtimecfg.GuestSpecPath); err != nil && !strings.Contains(err.Error(), "File not found by ext2_lookup") {
-		return err
-	}
-	return runDebugFSCommand(diskPath, fmt.Sprintf("write %s %s", tempPath, runtimecfg.GuestSpecPath))
-}
-
-func runDebugFSCommand(diskPath, command string) error {
-	cmd := exec.Command("debugfs", "-w", "-R", command, diskPath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("debugfs %q on %s: %w: %s", command, diskPath, err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	_ = ext4write.RemoveFile(diskPath, runtimecfg.GuestSpecPath)
+	return ext4write.WriteFile(diskPath, runtimecfg.GuestSpecPath, data)
 }
 
 func sanitizeRuntimePathComponent(value string) string {
@@ -1333,7 +1326,7 @@ func buildCmdline(imgConfig oci.ImageConfig, opts RunOptions) string {
 }
 
 func buildCmdlineWithPlan(opts RunOptions, sharedFS sharedFSPlan, allowKernelModules bool) string {
-	parts := append(runtimecfg.DefaultKernelArgsForRuntime(true, allowKernelModules),
+	parts := append(platformKernelArgs(true, allowKernelModules),
 		"rw",
 		"root=/dev/vda",
 		"rootfstype=ext4",
@@ -1421,6 +1414,11 @@ func runArtifactCacheKey(opts RunOptions) (string, error) {
 		"repo_ref":               opts.RepoRef,
 		"repo_subdir":            opts.RepoSubdir,
 		"build_args":             normalizedStringMap(opts.BuildArgs),
+		"build_secret":           append([]string(nil), opts.BuildSecrets...),
+		"build_ssh":              append([]string(nil), opts.BuildSSH...),
+		"target":                 opts.Target,
+		"platform":               opts.Platform,
+		"no_cache":               opts.NoCache,
 		"disk_size_mb":           opts.DiskSizeMB,
 		"cmd":                    opts.Cmd,
 		"entrypoint":             opts.Entrypoint,
@@ -1436,6 +1434,7 @@ func runArtifactCacheKey(opts RunOptions) (string, error) {
 		"drives":                 opts.Drives,
 		"balloon":                opts.Balloon,
 		"memory_hotplug":         opts.MemoryHotplug,
+		"network":                opts.Network,
 	}
 	return stableHashKey(payload)
 }
@@ -1452,6 +1451,14 @@ func cloneBalloonConfig(cfg *vmm.BalloonConfig) *vmm.BalloonConfig {
 }
 
 func cloneMemoryHotplugConfig(cfg *vmm.MemoryHotplugConfig) *vmm.MemoryHotplugConfig {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	return &cloned
+}
+
+func cloneNetworkConfig(cfg *vmm.NetworkConfig) *vmm.NetworkConfig {
 	if cfg == nil {
 		return nil
 	}

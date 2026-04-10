@@ -7,9 +7,19 @@ import (
 	"testing"
 )
 
+func testShortTempDir(t *testing.T, prefix string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", prefix)
+	if err != nil {
+		t.Fatalf("mkdir temp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func TestApplyMounts_SkipsSpecialFilesInDirectoryMounts(t *testing.T) {
 	rootfsDir := t.TempDir()
-	sourceDir := t.TempDir()
+	sourceDir := testShortTempDir(t, "gocracker-container-")
 
 	regularPath := filepath.Join(sourceDir, "regular.txt")
 	if err := os.WriteFile(regularPath, []byte("ok"), 0644); err != nil {

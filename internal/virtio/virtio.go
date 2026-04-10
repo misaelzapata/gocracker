@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package virtio implements the virtio 1.1 MMIO transport and virtqueue ring.
 // Devices (net, blk) embed Transport and override DeviceFeatures / HandleQueue.
 package virtio
@@ -689,16 +691,6 @@ func (t *Transport) String() string {
 	return fmt.Sprintf("virtio-mmio@%#x irq=%d", t.basePA, t.irqLine)
 }
 
-// QueueState captures virtqueue state for snapshot/restore.
-type QueueState struct {
-	Size       uint32 `json:"size"`
-	Ready      bool   `json:"ready"`
-	LastAvail  uint16 `json:"last_avail"`
-	DescAddr   uint64 `json:"desc_addr"`
-	DriverAddr uint64 `json:"driver_addr"`
-	DeviceAddr uint64 `json:"device_addr"`
-}
-
 // State returns a snapshot of the queue state.
 func (q *Queue) State() QueueState {
 	q.mu.Lock()
@@ -719,17 +711,6 @@ func (q *Queue) RestoreState(s QueueState) {
 	q.DescAddr = s.DescAddr
 	q.DriverAddr = s.DriverAddr
 	q.DeviceAddr = s.DeviceAddr
-}
-
-// TransportState captures transport state for snapshot/restore.
-type TransportState struct {
-	Status         uint32       `json:"status"`
-	DrvFeatures    uint64       `json:"drv_features"`
-	DevFeaturesSel uint32       `json:"dev_features_sel"`
-	DrvFeaturesSel uint32       `json:"drv_features_sel"`
-	QueueSel       uint32       `json:"queue_sel"`
-	InterruptStat  uint32       `json:"interrupt_stat"`
-	Queues         []QueueState `json:"queues"`
 }
 
 // State returns a snapshot of the transport state.

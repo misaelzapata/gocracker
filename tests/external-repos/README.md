@@ -1,6 +1,6 @@
 # External Repo Sweep
 
-Este folder deja un harness reproducible para validar repos externos con `gocracker`. El flujo recomendado actual ya no es “barrer todo de una vez”, sino correr casos de a uno con `run_one.sh`, supervisando cleanup y espacio libre entre corridas.
+Este folder deja un harness reproducible para validar repos externos con `gocracker`. El entrypoint canonico ahora es `go run ./cmd/gocracker-sweep`, y los scripts `run_one.sh`, `run_historical_pass.sh`, `run_historical_tty.sh`, `run_compose_tty.sh` y `run_fixed_50.sh` son wrappers versionados arriba de ese runner.
 
 Los scripts viven en el repo, pero los logs, clones cacheados y reportes se escriben fuera del worktree:
 
@@ -13,7 +13,7 @@ Los scripts viven en el repo, pero los logs, clones cacheados y reportes se escr
 
 - clona o reutiliza cada repo de la muestra
 - resuelve una ruta Dockerfile o Compose declarada en el manifiesto
-- arranca el caso con `gocracker repo` o `gocracker compose`
+- arranca el caso con `gocracker repo`, `gocracker run --dockerfile` o `gocracker compose`, segun la fila del manifiesto
 - guarda un log por repo
 - escribe un `results.tsv` maquina-legible
 - escribe un `summary.md` humano-legible
@@ -36,6 +36,12 @@ El exit code del runner es `0` solo si no hay `FAIL`.
 - `timeout`
 - red saliente para `git clone` y pulls de imagen base
 
+Para el gate Darwin firmado, el runner cambia a Apple Silicon + binarios ya firmados con `entitlements.plist`. En ese caso:
+
+- correr `make build-darwin-e2e` antes del sweep
+- usar `GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-arm64-Image`
+- si los binarios firmados viven fuera del repo root, exportar `GC_BIN`, `GC_VMM_BIN` y `GC_JAILER_BIN`
+
 ## Uso
 
 Flujo recomendado, un repo por vez:
@@ -52,26 +58,30 @@ Baseline historico:
 ```bash
 tests/external-repos/historical-pass.ids
 tests/external-repos/historical-unstable.ids
-tests/external-repos/historical-tty.ids
-tests/external-repos/compose-tty.ids
+tests/external-repos/historical-tty.tsv
+tests/external-repos/compose-tty.tsv
 ```
 
 - `historical-pass.ids` es la lista base de casos que antes dieron `PASS`
 - `historical-unstable.ids` separa casos historicos que hoy ya no son un gate reproducible por drift upstream o Dockerfiles release-shaped
-- `historical-tty.ids` es el subconjunto dockerfile/service que valida guest + PTY real
-- `compose-tty.ids` fija pares `repo-id + service` para validar guest + PTY via `compose exec`
+- `historical-tty.tsv` fija `id + command + expect` para validar guest + PTY real
+- `compose-tty.tsv` fija `repo-id + service + command + expect` para validar guest + PTY via exec interactivo
 - `ollama-ollama` hoy vive en `historical-unstable.ids` porque el caso ya supero regresiones reales del extractor/builder, pero su stage CUDA sigue siendo demasiado pesado para el gate manual estable
 
-Corrida completa o barridos amplios:
+Barrido amplio o shardeado:
 
 ```bash
-cd /home/misael/Desktop/projects/gocracker
-./tools/build-guest-kernel.sh
-sudo -v
-GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux tests/external-repos/run_all.sh
+GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
+  EXT_REPO_SHARD_INDEX=0 \
+  EXT_REPO_SHARD_TOTAL=4 \
+  go run ./cmd/gocracker-sweep \
+    --manifest tests/external-repos/manifest.tsv \
+    --ids-file tests/external-repos/historical-pass.ids \
+    --exclude-ids-file tests/external-repos/historical-unstable.ids
 ```
 
-Ese camino queda como secundario mientras se cierran regresiones; para validacion real de regresion usamos el flujo manual caso-por-caso.
+Ese camino queda para CI y corridas supervisadas; para validar una regresion puntual sigue siendo mejor el flujo manual caso-por-caso.
+Los wrappers `run_historical_pass.sh` y `run_fixed_50.sh` ya restan `historical-unstable.ids` automaticamente para que el gate bloqueante no vuelva a meter casos marcados como inestables.
 
 Gates reproducibles recomendados antes del `fixed-50`:
 
@@ -142,11 +152,13 @@ EXT_REPO_LIMIT=10
 EXT_REPO_REFRESH=1
 EXT_REPO_BOOT_TIMEOUT=45
 EXT_REPO_SERVICE_WINDOW=10
-EXT_REPO_MIN_FREE_GB=12
+EXT_REPO_SUDO=1
+EXT_REPO_SHARD_INDEX=0
+EXT_REPO_SHARD_TOTAL=4
 ```
 
 `EXT_REPO_REFRESH=1` fuerza reclone limpio del cache local.
-`EXT_REPO_MIN_FREE_GB` evita arrancar un caso nuevo si el host ya no tiene espacio libre suficiente en el filesystem del repo o en `/tmp`.
+`EXT_REPO_SUDO=1` hace que el runner prefije `sudo -n` a los comandos `gocracker` cuando el host Linux lo necesita.
 
 ## Manifiesto
 
@@ -156,7 +168,7 @@ La muestra vive en:
 tests/external-repos/manifest.tsv
 ```
 
-El manifiesto tiene exactamente 200 entradas y cada fila declara:
+El manifiesto checked-in hoy tiene 328 entradas versionadas y cada fila declara:
 
 - id estable del caso
 - tipo: `dockerfile` o `compose`

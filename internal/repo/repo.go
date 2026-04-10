@@ -235,6 +235,15 @@ func locateFiles(r *CloneResult, exactOnly bool) {
 }
 
 func locateFilesExact(r *CloneResult) {
+	entries, err := os.ReadDir(r.ContextDir)
+	if err != nil {
+		return
+	}
+	entrySet := make(map[string]os.DirEntry, len(entries))
+	for _, entry := range entries {
+		entrySet[entry.Name()] = entry
+	}
+
 	// Dockerfile candidates in priority order
 	for _, name := range []string{
 		"Dockerfile",
@@ -242,9 +251,8 @@ func locateFilesExact(r *CloneResult) {
 		"Dockerfile.prod",
 		"Dockerfile.production",
 	} {
-		p := filepath.Join(r.ContextDir, name)
-		if _, err := os.Stat(p); err == nil {
-			r.DockerfilePath = p
+		if entry, ok := entrySet[name]; ok && !entry.IsDir() {
+			r.DockerfilePath = filepath.Join(r.ContextDir, entry.Name())
 			break
 		}
 	}
@@ -256,9 +264,8 @@ func locateFilesExact(r *CloneResult) {
 		"compose.yml",
 		"compose.yaml",
 	} {
-		p := filepath.Join(r.ContextDir, name)
-		if _, err := os.Stat(p); err == nil {
-			r.ComposePath = p
+		if entry, ok := entrySet[name]; ok && !entry.IsDir() {
+			r.ComposePath = filepath.Join(r.ContextDir, entry.Name())
 			break
 		}
 	}

@@ -158,6 +158,9 @@ type RunRequest struct {
 	Image      string `json:"image,omitempty"`
 	Dockerfile string `json:"dockerfile,omitempty"`
 	Context    string `json:"context,omitempty"`
+	RepoURL    string `json:"repo_url,omitempty"`
+	RepoRef    string `json:"repo_ref,omitempty"`
+	RepoSubdir string `json:"repo_subdir,omitempty"`
 
 	// VM
 	VcpuCount  int    `json:"vcpu_count,omitempty"`
@@ -168,21 +171,27 @@ type RunRequest struct {
 	X86Boot    string `json:"x86_boot,omitempty"`
 
 	// Container
-	Cmd        []string          `json:"cmd,omitempty"`
-	Entrypoint []string          `json:"entrypoint,omitempty"`
-	Env        []string          `json:"env,omitempty"`
-	Hosts      []string          `json:"hosts,omitempty"`
-	WorkDir    string            `json:"workdir,omitempty"`
-	PID1Mode   string            `json:"pid1_mode,omitempty"`
-	BuildArgs  map[string]string `json:"build_args,omitempty"`
-	DiskSizeMB int               `json:"disk_size_mb,omitempty"`
-	Mounts     []container.Mount `json:"mounts,omitempty"`
-	Drives     []Drive           `json:"drives,omitempty"`
+	Cmd          []string          `json:"cmd,omitempty"`
+	Entrypoint   []string          `json:"entrypoint,omitempty"`
+	Env          []string          `json:"env,omitempty"`
+	Hosts        []string          `json:"hosts,omitempty"`
+	WorkDir      string            `json:"workdir,omitempty"`
+	PID1Mode     string            `json:"pid1_mode,omitempty"`
+	BuildArgs    map[string]string `json:"build_args,omitempty"`
+	BuildSecrets []string          `json:"build_secrets,omitempty"`
+	BuildSSH     []string          `json:"build_ssh,omitempty"`
+	Target       string            `json:"target,omitempty"`
+	Platform     string            `json:"platform,omitempty"`
+	NoCache      bool              `json:"no_cache,omitempty"`
+	DiskSizeMB   int               `json:"disk_size_mb,omitempty"`
+	Mounts       []container.Mount `json:"mounts,omitempty"`
+	Drives       []Drive           `json:"drives,omitempty"`
 
 	// Snapshot to restore from (optional)
 	SnapshotDir   string                   `json:"snapshot_dir,omitempty"`
 	StaticIP      string                   `json:"static_ip,omitempty"`
 	Gateway       string                   `json:"gateway,omitempty"`
+	Network       *vmm.NetworkConfig       `json:"network,omitempty"`
 	CacheDir      string                   `json:"cache_dir,omitempty"`
 	Metadata      map[string]string        `json:"metadata,omitempty"`
 	ExecEnabled   bool                     `json:"exec_enabled,omitempty"`
@@ -194,6 +203,12 @@ type RunResponse struct {
 	ID      string `json:"id"`
 	State   string `json:"state"`
 	Message string `json:"message,omitempty"`
+}
+
+type BuildResponse struct {
+	Status    string `json:"status,omitempty"`
+	RootfsDir string `json:"rootfs_dir,omitempty"`
+	DiskPath  string `json:"disk_path,omitempty"`
 }
 
 type SnapshotRequest struct {
@@ -354,6 +369,7 @@ func NewWithOptions(opts Options) *Server {
 	// GET  /vms/{id}/events       — polling event log (?since=RFC3339)
 	// GET  /vms/{id}/events/stream — SSE event stream
 	// GET  /vms/{id}/logs         — UART console output
+	// GET  /vms/{id}/console/stream — upgraded live UART stream
 	r.Get("/vms", s.handleListVMs)
 	r.Get("/vms/{id}", s.handleGetVM)
 	r.Post("/vms/{id}/stop", s.handleStopVM)
@@ -362,6 +378,7 @@ func NewWithOptions(opts Options) *Server {
 	r.Get("/vms/{id}/events", s.handleVMEvents)
 	r.Get("/vms/{id}/events/stream", s.handleVMEventsStream)
 	r.Get("/vms/{id}/logs", s.handleVMLogs)
+	r.Get("/vms/{id}/console/stream", s.handleVMConsoleStream)
 	r.Post("/vms/{id}/exec", s.handleVMExec)
 	r.Post("/vms/{id}/exec/stream", s.handleVMExecStream)
 	r.Get("/vms/{id}/vsock/connect", s.handleVMVsockConnect)
@@ -908,21 +925,33 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, 400, err.Error())
 		return
 	}
-	if req.KernelPath == "" {
+	sourceCount := 0
+	if strings.TrimSpace(req.Image) != "" {
+		sourceCount++
+	}
+	if strings.TrimSpace(req.Dockerfile) != "" {
+		sourceCount++
+	}
+	if strings.TrimSpace(req.RepoURL) != "" {
+		sourceCount++
+	}
+	if req.KernelPath == "" && strings.TrimSpace(req.SnapshotDir) == "" {
 		apiErr(w, 400, "kernel_path is required")
 		return
 	}
-	if req.Image == "" && req.Dockerfile == "" {
-		apiErr(w, 400, "exactly one of image or dockerfile is required")
+	if sourceCount == 0 && strings.TrimSpace(req.SnapshotDir) == "" {
+		apiErr(w, 400, "specify image, dockerfile, repo_url, or snapshot_dir")
 		return
 	}
-	if req.Image != "" && req.Dockerfile != "" {
-		apiErr(w, 400, "specify image or dockerfile, not both")
+	if sourceCount > 1 {
+		apiErr(w, 400, "specify only one of image, dockerfile, or repo_url")
 		return
 	}
-	if err := s.validateKernelPathForServer(req.KernelPath); err != nil {
-		apiErr(w, http.StatusBadRequest, err.Error())
-		return
+	if req.KernelPath != "" {
+		if err := s.validateKernelPathForServer(req.KernelPath); err != nil {
+			apiErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	if req.Dockerfile != "" {
 		if err := s.validateWorkPathForServer(req.Dockerfile, "dockerfile"); err != nil {
@@ -934,6 +963,12 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			contextPath = filepath.Dir(req.Dockerfile)
 		}
 		if err := s.validateWorkPathForServer(contextPath, "context"); err != nil {
+			apiErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if repoURLNeedsPathValidation(req.RepoURL) {
+		if err := s.validateWorkPathForServer(req.RepoURL, "repo_url"); err != nil {
 			apiErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -995,6 +1030,9 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		Image:         req.Image,
 		Dockerfile:    req.Dockerfile,
 		Context:       req.Context,
+		RepoURL:       req.RepoURL,
+		RepoRef:       req.RepoRef,
+		RepoSubdir:    req.RepoSubdir,
 		CPUs:          req.VcpuCount,
 		MemMB:         req.MemMB,
 		Arch:          req.Arch,
@@ -1008,16 +1046,25 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		WorkDir:       req.WorkDir,
 		PID1Mode:      req.PID1Mode,
 		BuildArgs:     buildArgs,
+		BuildSecrets:  append([]string(nil), req.BuildSecrets...),
+		BuildSSH:      append([]string(nil), req.BuildSSH...),
+		Target:        req.Target,
+		Platform:      req.Platform,
+		NoCache:       req.NoCache,
 		DiskSizeMB:    req.DiskSizeMB,
 		Mounts:        append([]container.Mount(nil), req.Mounts...),
 		JailerMode:    s.jailerMode,
 		SnapshotDir:   req.SnapshotDir,
 		StaticIP:      req.StaticIP,
 		Gateway:       req.Gateway,
+		Network:       cloneNetworkConfig(req.Network),
 		CacheDir:      req.CacheDir,
 		Metadata:      cloneMetadata(req.Metadata),
 		ExecEnabled:   req.ExecEnabled,
 		MemoryHotplug: cloneMemoryHotplug(req.MemoryHotplug),
+	}
+	if req.Network == nil && runtime.GOOS == "darwin" && strings.TrimSpace(req.TapName) == "" && strings.TrimSpace(req.StaticIP) == "" && strings.TrimSpace(req.Gateway) == "" {
+		opts.Network = cloneNetworkConfig(req.Network)
 	}
 	if req.Balloon != nil {
 		opts.Balloon = &vmm.BalloonConfig{
@@ -1068,20 +1115,41 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		opts.CacheDir = s.cacheDir
 	}
 
-	// Run asynchronously so the HTTP response returns immediately
-	go func() {
-		opts.JailerBinary = s.jailerBinary
-		opts.VMMBinary = s.vmmBinary
-		opts.ChrootBase = s.chrootBaseDir
-		opts.UID = s.uid
-		opts.GID = s.gid
-		result, err := s.runFn(opts)
+	s.registerVMEntry(id, newPendingVMEntry(id, opts))
+
+	// Run asynchronously so the HTTP response returns immediately.
+	go func(runOpts container.RunOptions) {
+		runOpts.JailerBinary = s.jailerBinary
+		runOpts.VMMBinary = s.vmmBinary
+		runOpts.ChrootBase = s.chrootBaseDir
+		runOpts.UID = s.uid
+		runOpts.GID = s.gid
+		if runtime.GOOS == "darwin" && isComposeVMMetadata(runOpts.Metadata) {
+			stackName := strings.TrimSpace(runOpts.Metadata["stack_name"])
+			manager, _, err := s.ensureComposeStackNetwork(
+				stackName,
+				firstNonEmpty(runOpts.StaticIP, runOpts.Metadata["guest_ip"]),
+				firstNonEmpty(runOpts.Gateway, runOpts.Metadata["gateway"]),
+			)
+			if err != nil {
+				gclog.API.Error("compose network prepare failed", "stack", stackName, "error", err)
+				s.markPendingVMStartFailed(id, err)
+				return
+			}
+			runOpts.Network = &vmm.NetworkConfig{
+				Mode:      vmm.NetworkAttachmentStack,
+				NetworkID: manager.NetworkID(),
+			}
+		}
+
+		result, err := s.runFn(runOpts)
 		if err != nil {
 			gclog.API.Error("run failed", "error", err)
+			s.releaseComposeStackResources(id, runOpts.Metadata)
 			s.markPendingVMStartFailed(id, err)
 			return
 		}
-		if err := s.attachComposeStackResources(id, opts, result); err != nil {
+		if err := s.attachComposeStackResources(id, runOpts, result); err != nil {
 			gclog.API.Error("compose network attach failed", "id", id, "error", err)
 			result.VM.Stop()
 			stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1099,15 +1167,24 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			"disk_path": result.DiskPath,
 		})
 		s.registerVMEntry(result.ID, entry)
-	}()
-
-	s.registerVMEntry(id, newPendingVMEntry(id, opts))
+	}(opts)
 
 	json.NewEncoder(w).Encode(RunResponse{
 		ID:      id,
 		State:   "starting",
 		Message: "VM is booting",
 	})
+}
+
+func repoURLNeedsPathValidation(raw string) bool {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return false
+	}
+	if strings.Contains(value, "://") || strings.HasPrefix(value, "git@") {
+		return false
+	}
+	return true
 }
 
 // POST /build — build rootfs+disk only, don't boot
@@ -1140,29 +1217,36 @@ func (s *Server) handleBuild(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	go func() {
-		result, err := s.buildFn(container.BuildOptions{
-			Image:        req.Image,
-			Dockerfile:   req.Dockerfile,
-			Context:      req.Context,
-			DiskSizeMB:   req.DiskSizeMB,
-			BuildArgs:    req.BuildArgs,
-			CacheDir:     firstNonEmpty(req.CacheDir, s.cacheDir),
-			JailerMode:   s.jailerMode,
-			JailerBinary: s.jailerBinary,
-			WorkerBinary: s.vmmBinary,
-			ChrootBase:   s.chrootBaseDir,
-			UID:          s.uid,
-			GID:          s.gid,
-		})
-		if err != nil {
-			gclog.API.Error("build failed", "error", err)
-			return
-		}
-		gclog.API.Info("build complete", "disk", result.DiskPath)
-	}()
-
-	json.NewEncoder(w).Encode(map[string]string{"status": "building"})
+	result, err := s.buildFn(container.BuildOptions{
+		Image:        req.Image,
+		Dockerfile:   req.Dockerfile,
+		Context:      req.Context,
+		DiskSizeMB:   req.DiskSizeMB,
+		BuildArgs:    req.BuildArgs,
+		BuildSecrets: append([]string(nil), req.BuildSecrets...),
+		BuildSSH:     append([]string(nil), req.BuildSSH...),
+		Target:       req.Target,
+		Platform:     req.Platform,
+		NoCache:      req.NoCache,
+		CacheDir:     firstNonEmpty(req.CacheDir, s.cacheDir),
+		JailerMode:   s.jailerMode,
+		JailerBinary: s.jailerBinary,
+		WorkerBinary: s.vmmBinary,
+		ChrootBase:   s.chrootBaseDir,
+		UID:          s.uid,
+		GID:          s.gid,
+	})
+	if err != nil {
+		gclog.API.Error("build failed", "error", err)
+		apiErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	gclog.API.Info("build complete", "disk", result.DiskPath)
+	_ = json.NewEncoder(w).Encode(BuildResponse{
+		Status:    "built",
+		RootfsDir: result.RootfsDir,
+		DiskPath:  result.DiskPath,
+	})
 }
 
 func firstNonEmpty(values ...string) string {
@@ -1246,39 +1330,33 @@ func (s *Server) attachComposeStackResources(id string, opts container.RunOption
 	if !isComposeVMMetadata(opts.Metadata) {
 		return nil
 	}
+	releaseOnErr := func(err error) error {
+		s.releaseComposeStackResources(id, opts.Metadata)
+		return err
+	}
 	stackName := strings.TrimSpace(opts.Metadata["stack_name"])
 	serviceName := strings.TrimSpace(opts.Metadata["service_name"])
 	if stackName == "" {
 		return nil
 	}
-	manager, created, err := s.ensureComposeStackNetwork(stackName, firstNonEmpty(opts.StaticIP, opts.Metadata["guest_ip"]), firstNonEmpty(opts.Gateway, opts.Metadata["gateway"]))
+	manager, _, err := s.ensureComposeStackNetwork(stackName, firstNonEmpty(opts.StaticIP, opts.Metadata["guest_ip"]), firstNonEmpty(opts.Gateway, opts.Metadata["gateway"]))
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(result.TapName) == "" {
-		return fmt.Errorf("compose service %s missing tap name", serviceName)
-	}
 	if strings.TrimSpace(result.GuestIP) == "" {
-		return fmt.Errorf("compose service %s missing guest IP", serviceName)
+		return releaseOnErr(fmt.Errorf("compose service %s missing guest IP", serviceName))
 	}
-	if err := manager.AttachTap(result.TapName); err != nil {
-		if created {
-			s.releaseComposeStackResources(id, opts.Metadata)
+	if tapName := strings.TrimSpace(result.TapName); tapName != "" {
+		if err := manager.AttachTap(tapName); err != nil {
+			return releaseOnErr(err)
 		}
-		return err
 	}
 	mappings, err := decodeComposePortMappings(opts.Metadata)
 	if err != nil {
-		if created {
-			s.releaseComposeStackResources(id, opts.Metadata)
-		}
-		return err
+		return releaseOnErr(err)
 	}
 	if err := manager.AddPortForwardMappings(serviceName, result.GuestIP, mappings); err != nil {
-		if created {
-			s.releaseComposeStackResources(id, opts.Metadata)
-		}
-		return err
+		return releaseOnErr(err)
 	}
 	s.mu.Lock()
 	stack := s.composeStacks[stackName]
@@ -1396,6 +1474,7 @@ func newPendingVMEntry(id string, opts container.RunOptions) *vmEntry {
 		Arch:          opts.Arch,
 		KernelPath:    opts.KernelPath,
 		TapName:       opts.TapName,
+		Network:       cloneNetworkConfig(opts.Network),
 		Metadata:      cloneMetadata(opts.Metadata),
 		Balloon:       cloneBalloonConfig(opts.Balloon),
 		MemoryHotplug: cloneMemoryHotplug(opts.MemoryHotplug),
@@ -1504,12 +1583,14 @@ func (s *Server) handleGetVM(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	s.mu.RLock()
 	v, ok := s.vms[id]
-	s.mu.RUnlock()
 	if !ok {
+		s.mu.RUnlock()
 		apiErr(w, 404, "VM not found")
 		return
 	}
-	json.NewEncoder(w).Encode(s.buildVMInfo(v))
+	info := s.buildVMInfo(v)
+	s.mu.RUnlock()
+	json.NewEncoder(w).Encode(info)
 }
 
 func (s *Server) buildVMInfo(entry *vmEntry) VMInfo {
@@ -1639,6 +1720,14 @@ func cloneBalloonConfig(cfg *vmm.BalloonConfig) *vmm.BalloonConfig {
 }
 
 func cloneMemoryHotplug(cfg *vmm.MemoryHotplugConfig) *vmm.MemoryHotplugConfig {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	return &cloned
+}
+
+func cloneNetworkConfig(cfg *vmm.NetworkConfig) *vmm.NetworkConfig {
 	if cfg == nil {
 		return nil
 	}

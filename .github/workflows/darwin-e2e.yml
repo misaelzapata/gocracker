@@ -1,0 +1,114 @@
+name: darwin-e2e
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  darwin-feature-e2e:
+    runs-on: [self-hosted, macOS, ARM64, gocracker-darwin]
+    env:
+      DARWIN_SIGN_IDENTITY: ${{ secrets.DARWIN_SIGN_IDENTITY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Require Darwin signing identity
+        run: |
+          test -n "$DARWIN_SIGN_IDENTITY"
+          security find-identity -v -p codesigning
+      - name: Build signed Darwin binaries
+        run: make build-darwin-e2e
+      - name: Darwin preflight
+        run: |
+          test -f ./artifacts/kernels/gocracker-guest-standard-arm64-Image
+          codesign -d --entitlements :- ./gocracker 2>&1 | tee /tmp/gocracker-entitlements.txt
+          grep -q 'com.apple.security.virtualization' /tmp/gocracker-entitlements.txt
+          grep -q 'com.apple.vm.networking' /tmp/gocracker-entitlements.txt
+          ./gocracker version
+      - name: Darwin e2e suite
+        env:
+          GOCRACKER_E2E: "1"
+        run: |
+          go test -tags e2e ./tests/e2e/darwin/... -count=1 -v
+
+  darwin-repos-dockerfile:
+    runs-on: [self-hosted, macOS, ARM64, gocracker-darwin]
+    env:
+      DARWIN_SIGN_IDENTITY: ${{ secrets.DARWIN_SIGN_IDENTITY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard_index: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Require Darwin signing identity
+        run: test -n "$DARWIN_SIGN_IDENTITY"
+      - name: Build signed Darwin binaries
+        run: make build-darwin-e2e
+      - name: Stable dockerfile repo gate
+        env:
+          GOCRACKER_KERNEL: ./artifacts/kernels/gocracker-guest-standard-arm64-Image
+          EXT_REPO_SHARD_INDEX: ${{ matrix.shard_index }}
+          EXT_REPO_SHARD_TOTAL: "4"
+        run: |
+          go run ./cmd/gocracker-sweep \
+            --manifest tests/external-repos/manifest.tsv \
+            --ids-file tests/external-repos/historical-pass.ids \
+            --exclude-ids-file tests/external-repos/historical-unstable.ids \
+            --kind dockerfile
+
+  darwin-repos-compose:
+    runs-on: [self-hosted, macOS, ARM64, gocracker-darwin]
+    env:
+      DARWIN_SIGN_IDENTITY: ${{ secrets.DARWIN_SIGN_IDENTITY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard_index: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Require Darwin signing identity
+        run: test -n "$DARWIN_SIGN_IDENTITY"
+      - name: Build signed Darwin binaries
+        run: make build-darwin-e2e
+      - name: Stable compose repo gate
+        env:
+          GOCRACKER_KERNEL: ./artifacts/kernels/gocracker-guest-standard-arm64-Image
+          EXT_REPO_SHARD_INDEX: ${{ matrix.shard_index }}
+          EXT_REPO_SHARD_TOTAL: "2"
+        run: |
+          go run ./cmd/gocracker-sweep \
+            --manifest tests/external-repos/manifest.tsv \
+            --ids-file tests/external-repos/curated-50.ids \
+            --exclude-ids-file tests/external-repos/historical-unstable.ids \
+            --kind compose
+
+  darwin-repos-tty:
+    runs-on: [self-hosted, macOS, ARM64, gocracker-darwin]
+    env:
+      DARWIN_SIGN_IDENTITY: ${{ secrets.DARWIN_SIGN_IDENTITY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Require Darwin signing identity
+        run: test -n "$DARWIN_SIGN_IDENTITY"
+      - name: Build signed Darwin binaries
+        run: make build-darwin-e2e
+      - name: Historical TTY gate
+        env:
+          GOCRACKER_KERNEL: ./artifacts/kernels/gocracker-guest-standard-arm64-Image
+        run: tests/external-repos/run_historical_tty.sh
+      - name: Compose TTY gate
+        env:
+          GOCRACKER_KERNEL: ./artifacts/kernels/gocracker-guest-standard-arm64-Image
+        run: tests/external-repos/run_compose_tty.sh

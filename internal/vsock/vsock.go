@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package vsock implements a virtio-vsock device and a host-side
 // connection multiplexer. It lets the host communicate with processes
 // inside the guest over lightweight streams, similar to Firecracker's vsock.

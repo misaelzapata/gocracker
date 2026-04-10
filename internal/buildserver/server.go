@@ -11,17 +11,22 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/gocracker/gocracker/internal/dockerfile"
+	"github.com/gocracker/gocracker/internal/buildbackend"
 	"github.com/gocracker/gocracker/internal/oci"
 )
 
 type BuildRequest struct {
-	Image      string            `json:"image,omitempty"`
-	Dockerfile string            `json:"dockerfile,omitempty"`
-	Context    string            `json:"context,omitempty"`
-	BuildArgs  map[string]string `json:"build_args,omitempty"`
-	OutputDir  string            `json:"output_dir"`
-	CacheDir   string            `json:"cache_dir,omitempty"`
+	Image        string            `json:"image,omitempty"`
+	Dockerfile   string            `json:"dockerfile,omitempty"`
+	Context      string            `json:"context,omitempty"`
+	BuildArgs    map[string]string `json:"build_args,omitempty"`
+	BuildSecrets []string          `json:"build_secrets,omitempty"`
+	BuildSSH     []string          `json:"build_ssh,omitempty"`
+	Target       string            `json:"target,omitempty"`
+	Platform     string            `json:"platform,omitempty"`
+	NoCache      bool              `json:"no_cache,omitempty"`
+	OutputDir    string            `json:"output_dir"`
+	CacheDir     string            `json:"cache_dir,omitempty"`
 }
 
 type BuildResponse struct {
@@ -36,6 +41,8 @@ type apiError struct {
 type Server struct {
 	router http.Handler
 }
+
+var buildBackendFactory = selectedBackend
 
 func New() *Server {
 	mux := http.NewServeMux()
@@ -88,52 +95,30 @@ func (s *Server) handleBuild(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		cfg oci.ImageConfig
-		err error
+		result *buildbackend.Result
+		err    error
 	)
-	switch {
-	case req.Image != "":
-		cfg, err = buildFromImage(req.OutputDir, req.Image, req.CacheDir)
-	case req.Dockerfile != "":
-		cfg, err = buildFromDockerfile(req.OutputDir, req)
-	}
+	result, err = buildBackendFactory().BuildRootfs(r.Context(), buildbackend.Request{
+		Image:        req.Image,
+		Dockerfile:   req.Dockerfile,
+		Context:      req.Context,
+		BuildArgs:    req.BuildArgs,
+		BuildSecrets: append([]string(nil), req.BuildSecrets...),
+		BuildSSH:     append([]string(nil), req.BuildSSH...),
+		Target:       req.Target,
+		Platform:     req.Platform,
+		NoCache:      req.NoCache,
+		OutputDir:    req.OutputDir,
+		CacheDir:     req.CacheDir,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	_ = json.NewEncoder(w).Encode(BuildResponse{
-		RootfsDir: req.OutputDir,
-		Config:    cfg,
+		RootfsDir: result.RootfsDir,
+		Config:    result.Config,
 	})
-}
-
-func buildFromImage(outputDir, ref, cacheDir string) (oci.ImageConfig, error) {
-	base := cacheDir
-	if base == "" {
-		base = filepath.Join(os.TempDir(), "gocracker", "cache")
-	}
-	pulled, err := oci.Pull(oci.PullOptions{
-		Ref:      ref,
-		CacheDir: filepath.Join(base, "layers"),
-	})
-	if err != nil {
-		return oci.ImageConfig{}, err
-	}
-	return pulled.Config, pulled.ExtractToDir(outputDir)
-}
-
-func buildFromDockerfile(outputDir string, req BuildRequest) (oci.ImageConfig, error) {
-	result, err := dockerfile.Build(dockerfile.BuildOptions{
-		DockerfilePath: req.Dockerfile,
-		ContextDir:     req.Context,
-		BuildArgs:      req.BuildArgs,
-		OutputDir:      outputDir,
-		CacheDir:       req.CacheDir,
-	})
-	if err != nil {
-		return oci.ImageConfig{}, err
-	}
-	return result.Config, nil
 }
 
 func writeError(w http.ResponseWriter, code int, err error) {

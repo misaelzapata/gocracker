@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -392,6 +393,9 @@ func TestBuild_ADDFromRemoteImageUsesCachedExtraction(t *testing.T) {
 }
 
 func TestBuild_RUNWorksRootlessWithoutExternalTools(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("rootless RUN without compatibility tools is Linux-only")
+	}
 	if os.Getuid() == 0 {
 		t.Skip("exercise rootless RUN as an unprivileged user")
 	}
@@ -427,7 +431,7 @@ func main() {
 
 func TestBuild_ARGQuotedDefaultAndPlatformExpansion(t *testing.T) {
 	ctxDir := t.TempDir()
-	writeContextFile(t, ctxDir, "Dockerfile", "ARG ARCH=\"amd64\"\nFROM --platform=linux/$ARCH scratch\n")
+	writeContextFile(t, ctxDir, "Dockerfile", fmt.Sprintf("ARG ARCH=%q\nFROM --platform=linux/$ARCH scratch\n", runtime.GOARCH))
 
 	result := buildFromContext(t, ctxDir)
 	if result.RootfsDir == "" {
@@ -452,6 +456,9 @@ func TestBuild_ARGWithoutDefaultIsDefinedEmptyForFROMExpansion(t *testing.T) {
 }
 
 func TestBuild_ARGWithoutDefaultIsNotExportedToRUNWhenUnset(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("rootless RUN without compatibility tools is Linux-only")
+	}
 	ctxDir := t.TempDir()
 	writeContextFile(t, ctxDir, "Dockerfile", "FROM scratch\nARG JEMALLOC_SYS_WITH_LG_PAGE\nCOPY tool /bin/tool\nRUN [\"/bin/tool\", \"/out.txt\"]\n")
 	buildStaticTestTool(t, ctxDir, "tool", `package main
@@ -479,6 +486,9 @@ func main() {
 }
 
 func TestBuild_RUNSeesARGValues(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("rootless RUN without compatibility tools is Linux-only")
+	}
 	ctxDir := t.TempDir()
 	writeContextFile(t, ctxDir, "Dockerfile", "FROM scratch\nARG S6_ARCH=x86_64\nCOPY tool /bin/tool\nRUN [\"/bin/tool\", \"/out.txt\"]\n")
 	buildStaticTestTool(t, ctxDir, "tool", `package main
@@ -503,6 +513,9 @@ func main() {
 }
 
 func TestBuild_RUNHasDevPts(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("rootless RUN without compatibility tools is Linux-only")
+	}
 	ctxDir := t.TempDir()
 	writeContextFile(t, ctxDir, "Dockerfile", "FROM scratch\nCOPY tool /bin/tool\nRUN [\"/bin/tool\", \"/out.txt\"]\n")
 	buildStaticTestTool(t, ctxDir, "tool", `package main
@@ -585,12 +598,17 @@ func TestBuild_FromPlatformBuildPlatformAndTargetArch(t *testing.T) {
 
 func TestBuild_SkipsUnusedForeignPlatformStage(t *testing.T) {
 	ctxDir := t.TempDir()
+	hostArch := runtime.GOARCH
+	foreignArch := "amd64"
+	if hostArch == "amd64" {
+		foreignArch = "arm64"
+	}
 	writeContextFile(t, ctxDir, "Dockerfile", strings.Join([]string{
-		"FROM --platform=linux/arm64 scratch AS arm64",
-		"FROM --platform=linux/amd64 scratch AS amd64",
+		fmt.Sprintf("FROM --platform=linux/%s scratch AS %s", foreignArch, foreignArch),
+		fmt.Sprintf("FROM --platform=linux/%s scratch AS %s", hostArch, hostArch),
 		"COPY artifact /artifact",
-		"FROM amd64",
-		"COPY --from=amd64 /artifact /artifact",
+		fmt.Sprintf("FROM %s", hostArch),
+		fmt.Sprintf("COPY --from=%s /artifact /artifact", hostArch),
 	}, "\n"))
 	writeContextFile(t, ctxDir, "artifact", "payload")
 

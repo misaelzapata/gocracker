@@ -43,6 +43,8 @@ type RunOptions struct {
 type stackNetwork interface {
 	GatewayIP() string
 	GuestCIDR(ip string) string
+	NetworkID() string
+	NetworkAttachmentMode() string
 	AttachTap(tapName string) error
 	AddPortForwards(serviceName, serviceIP string, ports interface{}) error
 	Close()
@@ -486,7 +488,8 @@ func (s *Stack) startService(name string, svc Service, ip, tapName string, hosts
 		Arch:        opts.Arch,
 		CPUs:        serviceCPUCount(svc),
 		KernelPath:  opts.KernelPath,
-		TapName:     tapName,
+		TapName:     composeTapName(tapName),
+		NetworkMode: composeNetworkMode(),
 		X86Boot:     opts.X86Boot,
 		DiskSizeMB:  opts.DefaultDisk,
 		Cmd:         toStringSlice(svc.Command),
@@ -501,6 +504,12 @@ func (s *Stack) startService(name string, svc Service, ip, tapName string, hosts
 		JailerMode:  opts.JailerMode,
 		CacheDir:    opts.CacheDir,
 		ExecEnabled: true,
+	}
+	if mode := strings.TrimSpace(s.network.NetworkAttachmentMode()); mode != "" {
+		runOpts.Network = &vmm.NetworkConfig{
+			Mode:      vmm.NetworkAttachmentMode(mode),
+			NetworkID: strings.TrimSpace(s.network.NetworkID()),
+		}
 	}
 	if supervised {
 		runOpts.PID1Mode = runtimecfg.PID1ModeSupervised
@@ -532,7 +541,7 @@ func (s *Stack) startService(name string, svc Service, ip, tapName string, hosts
 	if err != nil {
 		return nil, fmt.Errorf("compose up: service %s: %w", name, err)
 	}
-	if err := s.network.AttachTap(tapName); err != nil {
+	if err := s.network.AttachTap(result.TapName); err != nil {
 		result.Close()
 		return nil, fmt.Errorf("service %s tap attach: %w", name, err)
 	}
@@ -548,7 +557,7 @@ func (s *Stack) startService(name string, svc Service, ip, tapName string, hosts
 		VMID:    result.ID,
 		State:   result.VM.State().String(),
 		IP:      result.GuestIP,
-		TapName: tapName,
+		TapName: result.TapName,
 		volumes: volumes,
 	}, nil
 }
@@ -579,6 +588,7 @@ func (s *Stack) startServiceViaAPI(name string, svc Service, runOpts container.R
 		SnapshotDir: runOpts.SnapshotDir,
 		StaticIP:    runOpts.StaticIP,
 		Gateway:     runOpts.Gateway,
+		Network:     cloneNetworkConfig(runOpts.Network),
 		CacheDir:    runOpts.CacheDir,
 		Metadata:    cloneStringMap(runOpts.Metadata),
 		ExecEnabled: true,
@@ -977,10 +987,7 @@ func assignServiceIPs(order []string, services map[string]Service, primary strin
 		return nil, fmt.Errorf("missing compose subnet")
 	}
 	serviceIPs := make(map[string]string, len(order))
-	reserved := map[string]string{}
-	if gateway != nil {
-		reserved[gateway.String()] = "gateway"
-	}
+	reserved := reserveStackIPs(subnet, gateway)
 
 	for _, name := range order {
 		ip := explicitServiceIPv4(services[name], primary)
@@ -1025,6 +1032,14 @@ func assignServiceIPs(order []string, services map[string]Service, primary strin
 		}
 	}
 	return serviceIPs, nil
+}
+
+func cloneNetworkConfig(cfg *vmm.NetworkConfig) *vmm.NetworkConfig {
+	if cfg == nil {
+		return nil
+	}
+	cloned := *cfg
+	return &cloned
 }
 
 func explicitServiceIPv4(svc Service, primary string) string {

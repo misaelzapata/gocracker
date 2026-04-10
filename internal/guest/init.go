@@ -30,7 +30,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var kmsg *os.File
+var (
+	kmsg           *os.File
+	globalCmdline  map[string]string
+)
 
 func initKmsg() {
 	os.MkdirAll("/dev", 0755)
@@ -50,6 +53,18 @@ func dupTo(oldfd, newfd int) error {
 		return nil
 	}
 	return unix.Dup3(oldfd, newfd, 0)
+}
+
+// shutdownVM performs a clean VM shutdown. On vz (macOS), the cmdline
+// contains gc.shutdown=poweroff which triggers POWER_OFF instead of RESTART,
+// ensuring the VM stops rather than rebooting in a loop.
+func shutdownVM() {
+	syscall.Sync()
+	if globalCmdline["gc.shutdown"] == "poweroff" {
+		syscall.Reboot(syscall.LINUX_REBOOT_CMD_POWER_OFF)
+	} else {
+		syscall.Reboot(syscall.LINUX_REBOOT_CMD_RESTART)
+	}
 }
 
 func requireGuestInitContext() {
@@ -79,10 +94,12 @@ func main() {
 	applyGuestSysctls()
 	setupConsole()
 	klogf("init start")
+	os.Setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	syscall.Sethostname([]byte("gocracker"))
 	loadKernelModules()
 
 	cmdline := readCmdline()
+	globalCmdline = cmdline
 	spec, err := resolveGuestSpec(cmdline)
 	if err != nil {
 		klogf("decode runtime config error: %v", err)
@@ -93,15 +110,13 @@ func main() {
 	if rootfs == "" {
 		klogf("root disk handoff failed")
 		persistExitCode(1)
-		syscall.Sync()
-		syscall.Reboot(syscall.LINUX_REBOOT_CMD_RESTART)
+		shutdownVM()
 	}
 	if err := switchRoot(rootfs); err != nil {
 		klogf("switch_root to %q failed: %v", rootfs, err)
 		fmt.Fprintf(os.Stderr, "[init] switch_root %s: %v\n", rootfs, err)
 		persistExitCode(1)
-		syscall.Sync()
-		syscall.Reboot(syscall.LINUX_REBOOT_CMD_RESTART)
+		shutdownVM()
 	}
 	if refreshedSpec, refreshErr := resolveGuestSpec(cmdline); refreshErr != nil {
 		klogf("runtime config refresh after switch_root failed: %v", refreshErr)
@@ -152,11 +167,7 @@ func main() {
 	if effectivePID1Mode(spec) == runtimecfg.PID1ModeSupervised {
 		code := runForeground(proc.Exec, proc.Args, buildEnv(spec.Env), spec.WorkDir, spec.User)
 		persistExitCode(code)
-		syscall.Sync()
-		if err := syscall.Reboot(syscall.LINUX_REBOOT_CMD_RESTART); err != nil {
-			klogf("supervised reboot failed after exit code %d: %v", code, err)
-			fmt.Fprintf(os.Stderr, "[init] supervised reboot after exit %d: %v\n", code, err)
-		}
+		shutdownVM()
 		return
 	}
 
@@ -164,10 +175,7 @@ func main() {
 		klogf("exec handoff failed for %q: %v", proc.Exec, err)
 		fmt.Fprintf(os.Stderr, "[init] exec handoff %s: %v\n", proc.Exec, err)
 		persistExitCode(127)
-		syscall.Sync()
-		// Firecracker expects guests to request reboot and uses reboot=k to turn
-		// that into a clean VM shutdown through the legacy reset path.
-		syscall.Reboot(syscall.LINUX_REBOOT_CMD_RESTART)
+		shutdownVM()
 	}
 }
 
@@ -826,8 +834,9 @@ func configureNetwork(c map[string]string) {
 
 	iface := c["gc.iface"]
 	if iface == "" {
-		iface = "eth0"
+		iface = detectFirstNIC()
 	}
+	klogf("network config start iface=%q ip=%q gw=%q", iface, c["gc.ip"], c["gc.gw"])
 	klogf("network config start iface=%q ip=%q gw=%q", iface, c["gc.ip"], c["gc.gw"])
 	bringUpLoopback()
 
@@ -839,6 +848,14 @@ func configureNetwork(c map[string]string) {
 	if err := netlink.LinkSetUp(link); err != nil {
 		networkErrorf("bring up %s: %v", iface, err)
 		return
+	}
+	// Wait for carrier (the vz NAT backend needs a moment after boot)
+	for i := 0; i < 50; i++ {
+		updated, err := netlink.LinkByName(iface)
+		if err == nil && updated.Attrs().OperState == netlink.OperUp {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	if ip := c["gc.ip"]; ip != "" {
@@ -871,13 +888,19 @@ func configureNetwork(c map[string]string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	for _, dhcp := range []string{"dhclient", "udhcpc"} {
-		if p, err := exec.LookPath(dhcp); err == nil {
-			if err := exec.CommandContext(ctx, p, "-i", iface).Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "[init] DHCP %s: %v\n", dhcp, err)
-			}
-			break
+	for _, dhcp := range []string{"udhcpc", "dhclient"} {
+		p, err := exec.LookPath(dhcp)
+		if err != nil {
+			continue
 		}
+		args := []string{"-i", iface}
+		if dhcp == "udhcpc" {
+			args = append(args, "-n", "-q")
+		}
+		if err := exec.CommandContext(ctx, p, args...).Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "[init] DHCP %s: %v\n", dhcp, err)
+		}
+		break
 	}
 	klogf("network config finished iface=%q", iface)
 }
@@ -890,6 +913,23 @@ func networkRequested(c map[string]string) bool {
 		return true
 	}
 	return c["gc.iface"] != ""
+}
+
+// detectFirstNIC finds the first non-loopback network interface.
+// On KVM (virtio-mmio) it's typically eth0; on vz (virtio-pci) it may be
+// enp0s1 or similar. Falls back to eth0 if nothing found.
+func detectFirstNIC() string {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return "eth0"
+	}
+	for _, link := range links {
+		name := link.Attrs().Name
+		if name != "lo" && name != "" {
+			return name
+		}
+	}
+	return "eth0"
 }
 
 func bringUpLoopback() {

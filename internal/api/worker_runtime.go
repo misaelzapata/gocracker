@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -32,6 +33,9 @@ type persistedWorkerRecord struct {
 }
 
 func (s *Server) workerLaunchEnabled() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
 	return strings.TrimSpace(strings.ToLower(s.jailerMode)) != container.JailerModeOff
 }
 
@@ -313,7 +317,7 @@ func (s *Server) removePersistedWorkerRecord(id string) {
 }
 
 func (s *Server) loadPersistedWorkers() {
-	if s.stateDir == "" || !s.workerLaunchEnabled() {
+	if s.stateDir == "" || (!s.workerLaunchEnabled() && s.reattachVMMFn == nil) {
 		return
 	}
 	dir := s.workerRegistryDir()

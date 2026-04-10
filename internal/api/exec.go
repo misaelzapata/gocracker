@@ -111,6 +111,54 @@ func (s *Server) handleVMExecStream(w http.ResponseWriter, r *http.Request) {
 	go proxyExecStream(clientConn, agentConn)
 }
 
+func (s *Server) handleVMConsoleStream(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	entry, ok := s.lookupVMEntry(id)
+	if !ok {
+		apiErr(w, http.StatusNotFound, "VM not found")
+		return
+	}
+	if entry.isPending() {
+		apiErr(w, http.StatusConflict, "VM is still starting")
+		return
+	}
+	dialer, ok := entry.handle.(vmm.ConsoleDialer)
+	if !ok {
+		apiErr(w, http.StatusConflict, "live console is not available for this VM")
+		return
+	}
+	consoleConn, err := dialer.AttachConsole()
+	if err != nil {
+		apiErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		_ = consoleConn.Close()
+		apiErr(w, http.StatusInternalServerError, "http hijacking is not supported")
+		return
+	}
+	clientConn, rw, err := hj.Hijack()
+	if err != nil {
+		_ = consoleConn.Close()
+		apiErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if _, err := rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: console\r\n\r\n"); err != nil {
+		_ = clientConn.Close()
+		_ = consoleConn.Close()
+		return
+	}
+	if err := rw.Flush(); err != nil {
+		_ = clientConn.Close()
+		_ = consoleConn.Close()
+		return
+	}
+
+	go proxyReadWriteCloser(clientConn, consoleConn)
+}
+
 func (s *Server) lookupVMEntry(id string) (*vmEntry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -182,6 +230,24 @@ func proxyExecStream(clientConn, agentConn net.Conn) {
 	}()
 	go func() {
 		_, _ = io.Copy(clientConn, agentConn)
+		closeWriter(clientConn)
+		done <- struct{}{}
+	}()
+	<-done
+}
+
+func proxyReadWriteCloser(clientConn net.Conn, backend io.ReadWriteCloser) {
+	defer clientConn.Close()
+	defer backend.Close()
+
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(backend, clientConn)
+		_ = backend.Close()
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(clientConn, backend)
 		closeWriter(clientConn)
 		done <- struct{}{}
 	}()

@@ -3,10 +3,31 @@ package compose
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	internalapi "github.com/gocracker/gocracker/internal/api"
 )
+
+func listRemoteStackVMs(ctx context.Context, client *internalapi.Client, stackName string) ([]internalapi.VMInfo, error) {
+	vms, err := client.ListVMs(ctx, map[string]string{
+		"orchestrator": "compose",
+		"stack":        stackName,
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(vms, func(i, j int) bool {
+		left := strings.TrimSpace(vms[i].Metadata["service_name"])
+		right := strings.TrimSpace(vms[j].Metadata["service_name"])
+		if left == right {
+			return vms[i].ID < vms[j].ID
+		}
+		return left < right
+	})
+	return vms, nil
+}
 
 func DownRemote(serverURL, composePath string) error {
 	client := internalapi.NewClient(serverURL)
@@ -15,10 +36,7 @@ func DownRemote(serverURL, composePath string) error {
 
 	stackName := StackNameForComposePath(composePath)
 
-	vms, err := client.ListVMs(ctx, map[string]string{
-		"orchestrator": "compose",
-		"stack":        stackName,
-	})
+	vms, err := listRemoteStackVMs(ctx, client, stackName)
 	if err != nil {
 		return err
 	}

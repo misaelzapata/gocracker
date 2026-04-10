@@ -44,6 +44,20 @@ func newFakeHandle(id string) *fakeHandle {
 	}
 }
 
+func testUnixSocketPath(t *testing.T, name string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if runtime.GOOS == "darwin" {
+		shortDir, err := os.MkdirTemp("/tmp", "gocracker-api-")
+		if err != nil {
+			t.Fatalf("mkdir temp: %v", err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
+		dir = shortDir
+	}
+	return filepath.Join(dir, name)
+}
+
 func (f *fakeHandle) Start() error                               { return nil }
 func (f *fakeHandle) Stop()                                      { f.state = vmm.StateStopped }
 func (f *fakeHandle) TakeSnapshot(string) (*vmm.Snapshot, error) { return &vmm.Snapshot{ID: f.id}, nil }
@@ -55,6 +69,14 @@ func (f *fakeHandle) VMConfig() vmm.Config                       { return f.cfg 
 func (f *fakeHandle) DeviceList() []vmm.DeviceInfo               { return nil }
 func (f *fakeHandle) ConsoleOutput() []byte                      { return []byte("logs") }
 func (f *fakeHandle) WaitStopped(ctx context.Context) error      { <-ctx.Done(); return ctx.Err() }
+func (f *fakeHandle) AttachConsole() (io.ReadWriteCloser, error) {
+	serverConn, clientConn := net.Pipe()
+	go func() {
+		_, _ = io.WriteString(serverConn, "console-ok")
+		_ = serverConn.Close()
+	}()
+	return clientConn, nil
+}
 func (f *fakeHandle) UpdateNetRateLimiter(cfg *vmm.RateLimiterConfig) error {
 	f.netRL = cfg
 	return nil
@@ -738,7 +760,7 @@ func TestHandleRun_MissingImage(t *testing.T) {
 	}
 	var apiErr APIError
 	json.NewDecoder(rec.Body).Decode(&apiErr)
-	if apiErr.FaultMessage != "exactly one of image or dockerfile is required" {
+	if apiErr.FaultMessage != "specify image, dockerfile, repo_url, or snapshot_dir" {
 		t.Errorf("fault = %q", apiErr.FaultMessage)
 	}
 }
@@ -756,7 +778,7 @@ func TestHandleRun_BothImageAndDockerfile(t *testing.T) {
 	}
 	var apiErr APIError
 	json.NewDecoder(rec.Body).Decode(&apiErr)
-	if apiErr.FaultMessage != "specify image or dockerfile, not both" {
+	if apiErr.FaultMessage != "specify only one of image, dockerfile, or repo_url" {
 		t.Errorf("fault = %q", apiErr.FaultMessage)
 	}
 }
@@ -1043,7 +1065,7 @@ func TestPrebootRootStartsWorkerBackedAndRejectsReconfigure(t *testing.T) {
 
 func TestNewWithOptionsReattachesPersistedRootWorker(t *testing.T) {
 	stateDir := t.TempDir()
-	socketPath := filepath.Join(t.TempDir(), "worker.sock")
+	socketPath := testUnixSocketPath(t, "worker.sock")
 	ln, err := net.Listen("unix", socketPath)
 	if err != nil {
 		t.Fatalf("listen unix: %v", err)
@@ -1115,6 +1137,9 @@ func TestNewWithOptionsReattachesPersistedRootWorker(t *testing.T) {
 }
 
 func TestMigrationLoadUsesRestoreWorkerHook(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("migration restore worker hooks are Linux-only")
+	}
 	srv := NewWithOptions(Options{
 		JailerMode: container.JailerModeOn,
 		RestoreVMMFn: func(snapshotDir string, opts vmm.RestoreOptions) (vmm.Handle, func(), error) {
@@ -1232,7 +1257,7 @@ func TestHandleRunPassesCacheMetadataAndExec(t *testing.T) {
 		"image":"alpine:latest",
 		"kernel_path":"/vmlinux",
 		"cache_dir":"",
-		"metadata":{"orchestrator":"compose","stack_name":"todo-stack"},
+		"metadata":{"stack_name":"todo-stack","custom":"value"},
 		"exec_enabled":true,
 		"static_ip":"198.18.0.10/24",
 		"gateway":"198.18.0.1"
@@ -1255,8 +1280,94 @@ func TestHandleRunPassesCacheMetadataAndExec(t *testing.T) {
 		if got := opts.Metadata["stack_name"]; got != "todo-stack" {
 			t.Fatalf("metadata stack_name = %q, want todo-stack", got)
 		}
+		if got := opts.Metadata["custom"]; got != "value" {
+			t.Fatalf("metadata custom = %q, want value", got)
+		}
 		if got := opts.StaticIP; got != "198.18.0.10/24" {
 			t.Fatalf("StaticIP = %q, want 198.18.0.10/24", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runFn was not invoked")
+	}
+}
+
+func TestHandleRunAllowsSnapshotOnly(t *testing.T) {
+	runOptsCh := make(chan container.RunOptions, 1)
+	srv := NewWithOptions(Options{
+		RunFn: func(opts container.RunOptions) (*container.RunResult, error) {
+			runOptsCh <- opts
+			return &container.RunResult{
+				ID: opts.ID,
+				VM: newFakeHandle(opts.ID),
+			}, nil
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewBufferString(`{"snapshot_dir":"/tmp/snapshot"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	select {
+	case opts := <-runOptsCh:
+		if got := opts.SnapshotDir; got != "/tmp/snapshot" {
+			t.Fatalf("SnapshotDir = %q, want /tmp/snapshot", got)
+		}
+		if opts.Image != "" || opts.Dockerfile != "" || opts.RepoURL != "" {
+			t.Fatalf("unexpected source fields in %+v", opts)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runFn was not invoked")
+	}
+}
+
+func TestHandleRunPassesBuildInputs(t *testing.T) {
+	runOptsCh := make(chan container.RunOptions, 1)
+	srv := NewWithOptions(Options{
+		RunFn: func(opts container.RunOptions) (*container.RunResult, error) {
+			runOptsCh <- opts
+			return &container.RunResult{
+				ID: opts.ID,
+				VM: newFakeHandle(opts.ID),
+			}, nil
+		},
+	})
+
+	body := `{
+		"repo_url":".",
+		"kernel_path":"/vmlinux",
+		"build_args":{"FOO":"bar"},
+		"build_secrets":["npmrc=/tmp/npmrc"],
+		"build_ssh":["default"],
+		"target":"release",
+		"platform":"linux/arm64",
+		"no_cache":true
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	select {
+	case opts := <-runOptsCh:
+		if got := opts.RepoURL; got != "." {
+			t.Fatalf("RepoURL = %q, want .", got)
+		}
+		if got := opts.BuildArgs["FOO"]; got != "bar" {
+			t.Fatalf("BuildArgs[FOO] = %q, want bar", got)
+		}
+		if len(opts.BuildSecrets) != 1 || opts.BuildSecrets[0] != "npmrc=/tmp/npmrc" {
+			t.Fatalf("BuildSecrets = %#v", opts.BuildSecrets)
+		}
+		if len(opts.BuildSSH) != 1 || opts.BuildSSH[0] != "default" {
+			t.Fatalf("BuildSSH = %#v", opts.BuildSSH)
+		}
+		if opts.Target != "release" || opts.Platform != "linux/arm64" || !opts.NoCache {
+			t.Fatalf("build inputs = %+v", opts)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("runFn was not invoked")
@@ -1371,6 +1482,31 @@ func TestClientExecVMStream(t *testing.T) {
 	}
 }
 
+func TestClientConsoleVMStream(t *testing.T) {
+	srv := New()
+	srv.registerVMEntry("vm-console", srv.newVMEntry(newFakeHandle("vm-console"), nil))
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := NewClient(ts.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := client.ConsoleVMStream(ctx, "vm-console")
+	if err != nil {
+		t.Fatalf("ConsoleVMStream(): %v", err)
+	}
+	defer conn.Close()
+
+	data, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("ReadAll(): %v", err)
+	}
+	if string(data) != "console-ok" {
+		t.Fatalf("stream payload = %q, want %q", string(data), "console-ok")
+	}
+}
+
 func TestHandleBuildPassesSupervisorWorkerConfig(t *testing.T) {
 	buildOptsCh := make(chan container.BuildOptions, 1)
 	srv := NewWithOptions(Options{
@@ -1409,7 +1545,54 @@ func TestHandleBuildPassesSupervisorWorkerConfig(t *testing.T) {
 	}
 }
 
+func TestHandleBuildPassesBuildInputs(t *testing.T) {
+	buildOptsCh := make(chan container.BuildOptions, 1)
+	srv := NewWithOptions(Options{
+		BuildFn: func(opts container.BuildOptions) (*container.BuildResult, error) {
+			buildOptsCh <- opts
+			return &container.BuildResult{DiskPath: "/tmp/disk.ext4"}, nil
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/build", bytes.NewBufferString(`{
+		"dockerfile":"/tmp/Dockerfile",
+		"context":"/tmp",
+		"build_args":{"FOO":"bar"},
+		"build_secrets":["npmrc=/tmp/npmrc"],
+		"build_ssh":["default"],
+		"target":"release",
+		"platform":"linux/arm64",
+		"no_cache":true
+	}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	select {
+	case opts := <-buildOptsCh:
+		if got := opts.BuildArgs["FOO"]; got != "bar" {
+			t.Fatalf("BuildArgs[FOO] = %q, want bar", got)
+		}
+		if len(opts.BuildSecrets) != 1 || opts.BuildSecrets[0] != "npmrc=/tmp/npmrc" {
+			t.Fatalf("BuildSecrets = %#v", opts.BuildSecrets)
+		}
+		if len(opts.BuildSSH) != 1 || opts.BuildSSH[0] != "default" {
+			t.Fatalf("BuildSSH = %#v", opts.BuildSSH)
+		}
+		if opts.Target != "release" || opts.Platform != "linux/arm64" || !opts.NoCache {
+			t.Fatalf("build inputs = %+v", opts)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("buildFn was not invoked")
+	}
+}
+
 func TestMigrationFinalizeUsesRestoreWorkerHook(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("migration finalize worker hooks are Linux-only")
+	}
 	srv := NewWithOptions(Options{
 		JailerMode: container.JailerModeOn,
 		RestoreVMMFn: func(snapshotDir string, opts vmm.RestoreOptions) (vmm.Handle, func(), error) {

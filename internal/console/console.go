@@ -124,6 +124,13 @@ func (s *Session) ConsoleOut() io.Writer {
 	return s.slave
 }
 
+func (s *Session) Peer() io.ReadWriteCloser {
+	if s == nil {
+		return nil
+	}
+	return s.slave
+}
+
 func (s *Session) Detached() <-chan struct{} {
 	if s == nil {
 		return nil

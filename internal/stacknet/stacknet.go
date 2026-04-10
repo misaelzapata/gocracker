@@ -1,3 +1,5 @@
+//go:build linux
+
 package stacknet
 
 import (
@@ -162,6 +164,10 @@ func NormalizeIPv4Net(network *net.IPNet) *net.IPNet {
 func CIDROverlap(a, b *net.IPNet) bool {
 	return cidrOverlap(a, b)
 }
+
+func (n *Manager) NetworkID() string { return "" }
+
+func (n *Manager) NetworkAttachmentMode() string { return "" }
 
 func (n *Manager) GatewayIP() string {
 	if n == nil || n.gateway == nil {

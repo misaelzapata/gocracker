@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -377,6 +378,9 @@ func TestAssignIPs(t *testing.T) {
 }
 
 func TestSelectAvailableSubnet(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("subnet selection requires Linux network namespaces")
+	}
 	_, occupiedA, err := net.ParseCIDR("198.18.0.0/24")
 	if err != nil {
 		t.Fatalf("ParseCIDR: %v", err)
@@ -786,8 +790,12 @@ func TestPlanStackNetwork_UsesComposeSubnetAndExplicitIPv4(t *testing.T) {
 	if got := plan.serviceIPs["dns"]; got != "172.16.238.100" {
 		t.Fatalf("dns IP = %q, want 172.16.238.100", got)
 	}
-	if got := plan.serviceIPs["app"]; got != "172.16.238.2" {
-		t.Fatalf("app IP = %q, want 172.16.238.2", got)
+	wantAppIP := "172.16.238.2"
+	if runtime.GOOS == "darwin" {
+		wantAppIP = "172.16.238.3"
+	}
+	if got := plan.serviceIPs["app"]; got != wantAppIP {
+		t.Fatalf("app IP = %q, want %q", got, wantAppIP)
 	}
 }
 
@@ -1031,6 +1039,14 @@ func (f *fakeStackNetwork) GatewayIP() string {
 
 func (f *fakeStackNetwork) GuestCIDR(ip string) string {
 	return ip
+}
+
+func (f *fakeStackNetwork) NetworkID() string {
+	return ""
+}
+
+func (f *fakeStackNetwork) NetworkAttachmentMode() string {
+	return ""
 }
 
 func (f *fakeStackNetwork) AttachTap(tapName string) error {

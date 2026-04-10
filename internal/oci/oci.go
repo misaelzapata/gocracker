@@ -215,6 +215,46 @@ func imageConfigFromV1(cfgFile *v1.ConfigFile) ImageConfig {
 	}
 }
 
+// ImageConfigFromJSON decodes an OCI config JSON payload into the subset used by gocracker.
+func ImageConfigFromJSON(data []byte) (ImageConfig, error) {
+	var cfgFile v1.ConfigFile
+	if err := json.Unmarshal(data, &cfgFile); err != nil {
+		return ImageConfig{}, fmt.Errorf("decode image config: %w", err)
+	}
+	return imageConfigFromV1(&cfgFile), nil
+}
+
+// LoadLayoutImage opens a local OCI layout and returns its first image.
+func LoadLayoutImage(dir string) (*PulledImage, error) {
+	lp, err := layout.FromPath(dir)
+	if err != nil {
+		return nil, fmt.Errorf("open oci layout %s: %w", dir, err)
+	}
+	index, err := lp.ImageIndex()
+	if err != nil {
+		return nil, fmt.Errorf("read oci index %s: %w", dir, err)
+	}
+	manifest, err := index.IndexManifest()
+	if err != nil {
+		return nil, fmt.Errorf("read oci manifest %s: %w", dir, err)
+	}
+	if len(manifest.Manifests) == 0 {
+		return nil, fmt.Errorf("oci layout %s is empty", dir)
+	}
+	img, err := index.Image(manifest.Manifests[0].Digest)
+	if err != nil {
+		return nil, fmt.Errorf("open oci image %s: %w", dir, err)
+	}
+	cfgFile, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("read oci config %s: %w", dir, err)
+	}
+	return &PulledImage{
+		Config: imageConfigFromV1(cfgFile),
+		img:    img,
+	}, nil
+}
+
 func loadCachedImage(opts PullOptions, ref name.Reference) (v1.Image, error) {
 	cachePath := cacheEntryPath(opts, ref)
 	if cachePath == "" {
@@ -1027,8 +1067,8 @@ func writeRootfsTar(root string, w io.Writer) error {
 			// suid binaries lose their setuid-on-exec attribute during the
 			// rootfs → tar → ext4 pipeline.
 			hdr.Mode = int64(stat.Mode & 0o7777)
-			hdr.AccessTime = time.Unix(stat.Atim.Sec, stat.Atim.Nsec)
-			hdr.ChangeTime = time.Unix(stat.Ctim.Sec, stat.Ctim.Nsec)
+			hdr.AccessTime = statAccessTime(stat)
+			hdr.ChangeTime = statChangeTime(stat)
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err

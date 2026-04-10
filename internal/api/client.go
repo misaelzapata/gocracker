@@ -21,11 +21,26 @@ type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	authToken  string
+	unixSocket string
 }
 
 func NewClient(baseURL string) *Client {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if socketPath, ok := parseUnixSocketURL(baseURL); ok {
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		}
+		return &Client{
+			baseURL:    "http://unix",
+			httpClient: &http.Client{Transport: transport},
+			authToken:  strings.TrimSpace(os.Getenv("GOCRACKER_API_TOKEN")),
+			unixSocket: socketPath,
+		}
+	}
 	return &Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
+		baseURL:    baseURL,
 		httpClient: http.DefaultClient,
 		authToken:  strings.TrimSpace(os.Getenv("GOCRACKER_API_TOKEN")),
 	}
@@ -35,6 +50,14 @@ func (c *Client) Run(ctx context.Context, req RunRequest) (RunResponse, error) {
 	var resp RunResponse
 	if err := c.doJSON(ctx, http.MethodPost, "/run", req, &resp); err != nil {
 		return RunResponse{}, err
+	}
+	return resp, nil
+}
+
+func (c *Client) Build(ctx context.Context, req RunRequest) (BuildResponse, error) {
+	var resp BuildResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/build", req, &resp); err != nil {
+		return BuildResponse{}, err
 	}
 	return resp, nil
 }
@@ -145,41 +168,26 @@ func (c *Client) Logs(ctx context.Context, id string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
+func (c *Client) ConsoleVMStream(ctx context.Context, id string) (net.Conn, error) {
+	rawConn, host, basePath, err := c.dialUpgradeConn(ctx, "console")
+	if err != nil {
+		return nil, err
+	}
+	upgradePath := path.Join(basePath, "/vms/", id, "/console/stream")
+	return upgradeHTTPConn(rawConn, http.MethodGet, host, upgradePath, nil, "console", c.authToken)
+}
+
 func (c *Client) DialVsock(ctx context.Context, id string, port uint32) (net.Conn, error) {
-	baseURL, err := url.Parse(c.baseURL)
+	rawConn, host, basePath, err := c.dialUpgradeConn(ctx, "vsock")
 	if err != nil {
 		return nil, err
 	}
-	if baseURL.Scheme != "http" {
-		return nil, fmt.Errorf("vsock upgrade only supports http endpoints")
-	}
-	address := baseURL.Host
-	if !strings.Contains(address, ":") {
-		address += ":80"
-	}
-	var d net.Dialer
-	rawConn, err := d.DialContext(ctx, "tcp", address)
-	if err != nil {
-		return nil, err
-	}
-	upgradePath := path.Join(baseURL.Path, "/vms/", id, "/vsock/connect")
-	return upgradeHTTPConn(rawConn, http.MethodGet, baseURL.Host, upgradePath+"?port="+fmt.Sprintf("%d", port), nil, "vsock", c.authToken)
+	upgradePath := path.Join(basePath, "/vms/", id, "/vsock/connect")
+	return upgradeHTTPConn(rawConn, http.MethodGet, host, upgradePath+"?port="+fmt.Sprintf("%d", port), nil, "vsock", c.authToken)
 }
 
 func (c *Client) ExecVMStream(ctx context.Context, id string, req ExecRequest) (net.Conn, error) {
-	baseURL, err := url.Parse(c.baseURL)
-	if err != nil {
-		return nil, err
-	}
-	if baseURL.Scheme != "http" {
-		return nil, fmt.Errorf("exec stream upgrade only supports http endpoints")
-	}
-	address := baseURL.Host
-	if !strings.Contains(address, ":") {
-		address += ":80"
-	}
-	var d net.Dialer
-	rawConn, err := d.DialContext(ctx, "tcp", address)
+	rawConn, host, basePath, err := c.dialUpgradeConn(ctx, "exec")
 	if err != nil {
 		return nil, err
 	}
@@ -188,8 +196,8 @@ func (c *Client) ExecVMStream(ctx context.Context, id string, req ExecRequest) (
 		_ = rawConn.Close()
 		return nil, err
 	}
-	upgradePath := path.Join(baseURL.Path, "/vms/", id, "/exec/stream")
-	return upgradeHTTPConn(rawConn, http.MethodPost, baseURL.Host, upgradePath, body.Bytes(), "exec", c.authToken)
+	upgradePath := path.Join(basePath, "/vms/", id, "/exec/stream")
+	return upgradeHTTPConn(rawConn, http.MethodPost, host, upgradePath, body.Bytes(), "exec", c.authToken)
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, body any, out any) error {
@@ -229,6 +237,50 @@ func decodeClientError(resp *http.Response) error {
 		return fmt.Errorf("%s", apiErr.FaultMessage)
 	}
 	return fmt.Errorf("api returned %s", resp.Status)
+}
+
+func parseUnixSocketURL(raw string) (string, bool) {
+	if !strings.HasPrefix(raw, "unix://") {
+		return "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	socketPath := strings.TrimSpace(u.Path)
+	if socketPath == "" {
+		return "", false
+	}
+	return socketPath, true
+}
+
+func (c *Client) dialUpgradeConn(ctx context.Context, upgrade string) (net.Conn, string, string, error) {
+	if c.unixSocket != "" {
+		var d net.Dialer
+		rawConn, err := d.DialContext(ctx, "unix", c.unixSocket)
+		if err != nil {
+			return nil, "", "", err
+		}
+		return rawConn, "unix", "", nil
+	}
+
+	baseURL, err := url.Parse(c.baseURL)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if baseURL.Scheme != "http" {
+		return nil, "", "", fmt.Errorf("%s upgrade only supports http endpoints", upgrade)
+	}
+	address := baseURL.Host
+	if !strings.Contains(address, ":") {
+		address += ":80"
+	}
+	var d net.Dialer
+	rawConn, err := d.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return rawConn, baseURL.Host, baseURL.Path, nil
 }
 
 func upgradeHTTPConn(rawConn net.Conn, method, host, requestPath string, body []byte, upgrade string, authToken string) (net.Conn, error) {
