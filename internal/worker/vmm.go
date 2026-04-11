@@ -32,7 +32,6 @@ type subprocessLogBuffer struct {
 func (b *subprocessLogBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	os.Stdout.Write(p) // FOR DEBUGGING
 	return b.buf.Write(p)
 }
 

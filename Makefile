@@ -12,10 +12,14 @@ all: build
 generate:
 	go generate ./internal/guest/
 
-## Download dependencies, generate, and build the binary
+## Download dependencies, generate, and build all binaries
 build: tidy generate
 	CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
 	  go build -trimpath -ldflags="-s -w" -o $(BIN) $(CMD)
+	CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
+	  go build -trimpath -ldflags="-s -w" -o gocracker-vmm ./cmd/gocracker-vmm
+	CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
+	  go build -trimpath -ldflags="-s -w" -o gocracker-jailer ./cmd/gocracker-jailer
 
 build-amd64:
 	$(MAKE) build TARGET_GOARCH=amd64
