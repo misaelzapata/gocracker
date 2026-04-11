@@ -79,6 +79,14 @@ type interactiveMode struct {
 	enabled bool
 }
 
+var (
+	terminalGetFdInfo   = mobyterm.GetFdInfo
+	terminalSetRaw      = mobyterm.SetRawTerminal
+	terminalRestore     = mobyterm.RestoreTerminal
+	terminalOutput      io.Writer = os.Stdout
+	terminalInputReader          = os.Stdin
+)
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Print(usage)
@@ -462,23 +470,21 @@ func cmdComposeExec(args []string) {
 }
 
 func runInteractiveConn(conn net.Conn) error {
+	return runInteractiveConnWithIO(conn, terminalInputReader, terminalOutput)
+}
+
+func runInteractiveConnWithIO(conn net.Conn, stdin *os.File, stdout io.Writer) error {
 	defer conn.Close()
-	stdinFD, stdinTTY := mobyterm.GetFdInfo(os.Stdin)
-	if stdinTTY {
-		oldState, err := mobyterm.SetRawTerminal(stdinFD)
-		if err == nil {
-			defer mobyterm.RestoreTerminal(stdinFD, oldState)
-		}
-	}
+	defer prepareInteractiveTerminal(stdin, stdout)()
 	copyInputDone := make(chan error, 1)
 	go func() {
-		_, err := io.Copy(conn, os.Stdin)
+		_, err := io.Copy(conn, stdin)
 		closeNetWriter(conn)
 		copyInputDone <- err
 	}()
 	copyOutputDone := make(chan error, 1)
 	go func() {
-		_, err := io.Copy(os.Stdout, conn)
+		_, err := io.Copy(stdout, conn)
 		copyOutputDone <- err
 	}()
 
@@ -490,6 +496,28 @@ func runInteractiveConn(conn net.Conn) error {
 		return normalizeCopyError(<-copyOutputDone)
 	case outputErr := <-copyOutputDone:
 		return normalizeCopyError(outputErr)
+	}
+}
+
+func prepareInteractiveTerminal(stdin *os.File, stdout io.Writer) func() {
+	if stdin == nil {
+		return func() {}
+	}
+	stdinFD, stdinTTY := terminalGetFdInfo(stdin)
+	if !stdinTTY {
+		return func() {}
+	}
+	oldState, err := terminalSetRaw(stdinFD)
+	if err != nil {
+		return func() {}
+	}
+	return func() {
+		_ = terminalRestore(stdinFD, oldState)
+		if stdout != nil {
+			// Reset cursor visibility and print carriage return + newline
+			// so the shell prompt reappears cleanly after raw mode.
+			fmt.Fprint(stdout, "\033[?25h\r\n")
+		}
 	}
 }
 
@@ -847,10 +875,16 @@ func mustBalloonAutoMode(raw string) vmm.BalloonAutoMode {
 }
 
 func printResult(r *container.RunResult) {
+	state := r.VM.State()
+	// Worker-backed VMs report "created" before the first state poll;
+	// the VM is actually running inside the worker at this point.
+	if state == vmm.StateCreated && r.WorkerSocket != "" {
+		state = vmm.StateRunning
+	}
 	if r.Duration > 0 {
-		fmt.Printf("\n✓ VM %s is %s (%s)\n", r.ID, r.VM.State(), r.Duration)
+		fmt.Printf("\n✓ VM %s is %s (%s)\n", r.ID, state, r.Duration)
 	} else {
-		fmt.Printf("\n✓ VM %s is %s\n", r.ID, r.VM.State())
+		fmt.Printf("\n✓ VM %s is %s\n", r.ID, state)
 	}
 	if r.DiskPath != "" {
 		fmt.Printf("  disk:   %s\n", r.DiskPath)
@@ -990,11 +1024,13 @@ func stopVMAndWait(vm vmm.Handle, timeout time.Duration) {
 		return
 	}
 	if vm.State() != vmm.StateStopped {
+		fmt.Printf("  Stopping VM %s...\n", vm.ID())
 		vm.Stop()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	_ = vm.WaitStopped(ctx)
+	fmt.Printf("  VM stopped after %s\n", vm.Uptime().Round(time.Second))
 }
 
 func interactiveTerminalSize() (int, int) {

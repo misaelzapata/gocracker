@@ -494,6 +494,7 @@ func workerSocket(handle vmm.Handle) string {
 }
 
 func runViaWorker(opts RunOptions) (*RunResult, error) {
+	t0 := time.Now()
 	if opts.MemMB == 0 {
 		opts.MemMB = 256
 	}
@@ -757,6 +758,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		GuestIP:      trimCIDR(opts.StaticIP),
 		Gateway:      opts.Gateway,
 		WorkerSocket: workerSocket(handle),
+		Duration:     time.Since(t0).Round(time.Millisecond),
 		cleanup:      cleanupFn,
 	}, nil
 }
