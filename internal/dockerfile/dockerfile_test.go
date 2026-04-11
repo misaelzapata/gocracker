@@ -3287,3 +3287,173 @@ func TestApplyArgDefaults_NoValueKey(t *testing.T) {
 		t.Fatalf("EMPTY_KEY = %q, want empty", args["EMPTY_KEY"])
 	}
 }
+
+// --- Additional coverage: Build early exits ---
+
+func TestBuild_NonexistentDockerfile(t *testing.T) {
+	_, err := Build(BuildOptions{
+		DockerfilePath: "/nonexistent/path/Dockerfile",
+		ContextDir:     t.TempDir(),
+		OutputDir:      t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("Build() with nonexistent Dockerfile should fail")
+	}
+}
+
+func TestBuild_EmptyContextDir(t *testing.T) {
+	ctxDir := t.TempDir()
+	dfPath := filepath.Join(ctxDir, "Dockerfile")
+	if err := os.WriteFile(dfPath, []byte("FROM scratch\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Build(BuildOptions{
+		DockerfilePath: dfPath,
+		ContextDir:     ctxDir,
+		OutputDir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+}
+
+func TestBuild_DefaultDockerfilePath(t *testing.T) {
+	ctxDir := t.TempDir()
+	dfPath := filepath.Join(ctxDir, "Dockerfile")
+	if err := os.WriteFile(dfPath, []byte("FROM scratch\nWORKDIR /app\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Build(BuildOptions{
+		ContextDir: ctxDir,
+		OutputDir:  t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if result.Config.WorkingDir != "/app" {
+		t.Fatalf("WorkingDir = %q, want /app", result.Config.WorkingDir)
+	}
+}
+
+func TestBuild_FromScratchSingleStage(t *testing.T) {
+	ctxDir := t.TempDir()
+	dfPath := filepath.Join(ctxDir, "Dockerfile")
+	content := `FROM scratch
+WORKDIR /data
+ENV MY_VAR=hello
+EXPOSE 8080
+CMD ["echo", "hello"]
+`
+	if err := os.WriteFile(dfPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Build(BuildOptions{
+		DockerfilePath: dfPath,
+		ContextDir:     ctxDir,
+		OutputDir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	cfg := result.Config
+	if cfg.WorkingDir != "/data" {
+		t.Fatalf("WorkingDir = %q, want /data", cfg.WorkingDir)
+	}
+	foundEnv := false
+	for _, e := range cfg.Env {
+		if e == "MY_VAR=hello" {
+			foundEnv = true
+		}
+	}
+	if !foundEnv {
+		t.Fatalf("expected MY_VAR=hello in env, got %v", cfg.Env)
+	}
+	if len(cfg.Cmd) == 0 || cfg.Cmd[0] != "echo" {
+		t.Fatalf("Cmd = %v, want [echo hello]", cfg.Cmd)
+	}
+}
+
+func TestBuild_WithBuildArgs(t *testing.T) {
+	ctxDir := t.TempDir()
+	dfPath := filepath.Join(ctxDir, "Dockerfile")
+	content := `FROM scratch
+ARG VERSION=1.0
+ENV APP_VERSION=$VERSION
+`
+	if err := os.WriteFile(dfPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Build(BuildOptions{
+		DockerfilePath: dfPath,
+		ContextDir:     ctxDir,
+		OutputDir:      t.TempDir(),
+		BuildArgs:      map[string]string{"VERSION": "2.0"},
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	foundEnv := false
+	for _, e := range result.Config.Env {
+		if e == "APP_VERSION=2.0" {
+			foundEnv = true
+		}
+	}
+	if !foundEnv {
+		t.Fatalf("expected APP_VERSION=2.0 in env, got %v", result.Config.Env)
+	}
+}
+
+func TestBuild_EntrypointAndCmd(t *testing.T) {
+	ctxDir := t.TempDir()
+	dfPath := filepath.Join(ctxDir, "Dockerfile")
+	content := `FROM scratch
+ENTRYPOINT ["/bin/sh", "-c"]
+CMD ["echo hello"]
+`
+	if err := os.WriteFile(dfPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Build(BuildOptions{
+		DockerfilePath: dfPath,
+		ContextDir:     ctxDir,
+		OutputDir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	cfg := result.Config
+	if len(cfg.Entrypoint) != 2 || cfg.Entrypoint[0] != "/bin/sh" {
+		t.Fatalf("Entrypoint = %v, want [/bin/sh -c]", cfg.Entrypoint)
+	}
+	if len(cfg.Cmd) != 1 || cfg.Cmd[0] != "echo hello" {
+		t.Fatalf("Cmd = %v, want [echo hello]", cfg.Cmd)
+	}
+}
+
+func TestBuild_UserInstruction(t *testing.T) {
+	ctxDir := t.TempDir()
+	dfPath := filepath.Join(ctxDir, "Dockerfile")
+	content := `FROM scratch
+USER nobody
+`
+	if err := os.WriteFile(dfPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Build(BuildOptions{
+		DockerfilePath: dfPath,
+		ContextDir:     ctxDir,
+		OutputDir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if result.Config.User != "nobody" {
+		t.Fatalf("User = %q, want nobody", result.Config.User)
+	}
+}

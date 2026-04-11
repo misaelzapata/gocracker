@@ -2385,6 +2385,461 @@ func TestBuildDirtyFilePatch_SingleDirtyPage(t *testing.T) {
 	}
 }
 
+// --- Non-KVM coverage tests: VM lifecycle methods on manually constructed VMs ---
+
+func TestStart_WrongState_Running(t *testing.T) {
+	vm := &VM{state: StateRunning}
+	err := vm.Start()
+	if err == nil || err.Error() != "cannot start VM in state running" {
+		t.Fatalf("Start() on running VM: error = %v, want state error", err)
+	}
+}
+
+func TestStart_WrongState_Stopped(t *testing.T) {
+	vm := &VM{state: StateStopped}
+	err := vm.Start()
+	if err == nil || err.Error() != "cannot start VM in state stopped" {
+		t.Fatalf("Start() on stopped VM: error = %v, want state error", err)
+	}
+}
+
+func TestStart_CreatedState_NoVCPUs(t *testing.T) {
+	vm := &VM{
+		state:       StateCreated,
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
+		events:      NewEventLog(),
+		pausedVCPUs: make(map[int]struct{}),
+	}
+	err := vm.Start()
+	if err != nil {
+		t.Fatalf("Start() on created VM with no vCPUs: error = %v", err)
+	}
+	if vm.state != StateRunning {
+		t.Fatalf("state = %s, want running", vm.state)
+	}
+}
+
+func TestPause_WrongState_Created(t *testing.T) {
+	vm := &VM{state: StateCreated}
+	err := vm.Pause()
+	if err == nil {
+		t.Fatal("Pause() on created VM should fail")
+	}
+}
+
+func TestPause_WrongState_Stopped(t *testing.T) {
+	vm := &VM{state: StateStopped}
+	err := vm.Pause()
+	if err == nil {
+		t.Fatal("Pause() on stopped VM should fail")
+	}
+}
+
+func TestPause_AlreadyPaused(t *testing.T) {
+	vm := &VM{state: StatePaused}
+	err := vm.Pause()
+	if err != nil {
+		t.Fatalf("Pause() on already paused VM: error = %v, want nil", err)
+	}
+}
+
+func TestResume_WrongState_Created(t *testing.T) {
+	vm := &VM{state: StateCreated}
+	err := vm.Resume()
+	if err == nil {
+		t.Fatal("Resume() on created VM should fail")
+	}
+}
+
+func TestResume_WrongState_Running(t *testing.T) {
+	vm := &VM{state: StateRunning}
+	err := vm.Resume()
+	if err == nil {
+		t.Fatal("Resume() on running VM should fail")
+	}
+}
+
+func TestResume_WrongState_Stopped(t *testing.T) {
+	vm := &VM{state: StateStopped}
+	err := vm.Resume()
+	if err == nil {
+		t.Fatal("Resume() on stopped VM should fail")
+	}
+}
+
+func TestResume_PausedState(t *testing.T) {
+	vm := &VM{
+		state:       StatePaused,
+		events:      NewEventLog(),
+		pausedVCPUs: make(map[int]struct{}),
+	}
+	err := vm.Resume()
+	if err != nil {
+		t.Fatalf("Resume() on paused VM: error = %v", err)
+	}
+	if vm.state != StateRunning {
+		t.Fatalf("state = %s, want running", vm.state)
+	}
+}
+
+func TestTakeSnapshotWithOptions_WrongState_Created(t *testing.T) {
+	vm := &VM{state: StateCreated}
+	_, err := vm.TakeSnapshotWithOptions(t.TempDir(), SnapshotOptions{})
+	if err == nil {
+		t.Fatal("TakeSnapshotWithOptions() on created VM should fail")
+	}
+}
+
+func TestTakeSnapshotWithOptions_WrongState_Stopped(t *testing.T) {
+	vm := &VM{state: StateStopped}
+	_, err := vm.TakeSnapshotWithOptions(t.TempDir(), SnapshotOptions{})
+	if err == nil {
+		t.Fatal("TakeSnapshotWithOptions() on stopped VM should fail")
+	}
+}
+
+func TestGetMemoryHotplug_NilState(t *testing.T) {
+	vm := &VM{memoryHotplug: nil}
+	_, err := vm.GetMemoryHotplug()
+	if err == nil {
+		t.Fatal("GetMemoryHotplug() without config should fail")
+	}
+	if err.Error() != "memory hotplug is not configured" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestGetMemoryHotplug_WithState_NoExecAgent(t *testing.T) {
+	vm := &VM{
+		memoryHotplug: &memoryHotplugState{
+			cfg:            MemoryHotplugConfig{TotalSizeMiB: 1024, SlotSizeMiB: 256, BlockSizeMiB: 128},
+			totalBytes:     1024 << 20,
+			slotBytes:      256 << 20,
+			blockBytes:     128 << 20,
+			requestedBytes: 256 << 20,
+			pluggedBytes:   256 << 20,
+		},
+		cfg:   Config{},
+		state: StateRunning,
+	}
+	status, err := vm.GetMemoryHotplug()
+	if err != nil {
+		t.Fatalf("GetMemoryHotplug() error = %v", err)
+	}
+	if status.TotalSizeMiB != 1024 {
+		t.Fatalf("TotalSizeMiB = %d, want 1024", status.TotalSizeMiB)
+	}
+	if status.RequestedSizeMiB != 256 {
+		t.Fatalf("RequestedSizeMiB = %d, want 256", status.RequestedSizeMiB)
+	}
+}
+
+func TestUpdateMemoryHotplug_NilState(t *testing.T) {
+	vm := &VM{memoryHotplug: nil}
+	err := vm.UpdateMemoryHotplug(MemoryHotplugSizeUpdate{RequestedSizeMiB: 256})
+	if err == nil {
+		t.Fatal("UpdateMemoryHotplug() without config should fail")
+	}
+}
+
+func TestUpdateMemoryHotplug_NoExecAgent(t *testing.T) {
+	vm := &VM{
+		memoryHotplug: &memoryHotplugState{
+			totalBytes: 1024 << 20,
+			blockBytes: 128 << 20,
+		},
+		cfg: Config{}, // no Exec
+	}
+	err := vm.UpdateMemoryHotplug(MemoryHotplugSizeUpdate{RequestedSizeMiB: 256})
+	if err == nil {
+		t.Fatal("UpdateMemoryHotplug() without exec agent should fail")
+	}
+	if err.Error() != "memory hotplug requires the guest exec agent to be enabled" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestUpdateMemoryHotplug_ExceedsTotal(t *testing.T) {
+	vm := &VM{
+		memoryHotplug: &memoryHotplugState{
+			totalBytes: 1024 << 20,
+			blockBytes: 128 << 20,
+		},
+		cfg: Config{Exec: &ExecConfig{Enabled: true}},
+	}
+	err := vm.UpdateMemoryHotplug(MemoryHotplugSizeUpdate{RequestedSizeMiB: 2048})
+	if err == nil {
+		t.Fatal("UpdateMemoryHotplug() exceeding total should fail")
+	}
+}
+
+func TestDeviceList_NilBackend(t *testing.T) {
+	vm := &VM{archBackend: nil}
+	if devices := vm.DeviceList(); devices != nil {
+		t.Fatalf("DeviceList() on nil backend = %v, want nil", devices)
+	}
+}
+
+func TestConsoleOutput_NilBackend(t *testing.T) {
+	vm := &VM{archBackend: nil}
+	if output := vm.ConsoleOutput(); output != nil {
+		t.Fatalf("ConsoleOutput() on nil backend = %v, want nil", output)
+	}
+}
+
+func TestUptime_ZeroStartTime(t *testing.T) {
+	vm := &VM{}
+	if d := vm.Uptime(); d != 0 {
+		t.Fatalf("Uptime() on unstarted VM = %v, want 0", d)
+	}
+}
+
+func TestUptime_NonZero(t *testing.T) {
+	vm := &VM{startTime: time.Now().Add(-5 * time.Second)}
+	d := vm.Uptime()
+	if d < 4*time.Second || d > 10*time.Second {
+		t.Fatalf("Uptime() = %v, want ~5s", d)
+	}
+}
+
+func TestKickVCPUs_NoTIDs(t *testing.T) {
+	vm := &VM{vcpuTIDs: make(map[int]int)}
+	// Should not panic
+	vm.kickVCPUs()
+}
+
+func TestCleanup_EmptyVM(t *testing.T) {
+	vm := &VM{}
+	// Should not panic on nil fields
+	vm.cleanup()
+}
+
+func TestCleanup_Idempotent(t *testing.T) {
+	vm := &VM{}
+	vm.cleanup()
+	vm.cleanup() // should not panic on double call
+}
+
+func TestACPIMMIODevices_NoTransports(t *testing.T) {
+	vm := &VM{}
+	if devices := vm.acpiMMIODevices(); devices != nil {
+		t.Fatalf("acpiMMIODevices() with no transports = %v, want nil", devices)
+	}
+}
+
+func TestSnapshotVCPUCount_VCPUsField(t *testing.T) {
+	snap := Snapshot{
+		VCPUs: []VCPUState{{ID: 0}, {ID: 1}, {ID: 2}},
+		Config: Config{VCPUs: 1},
+	}
+	if got := snapshotVCPUCount(snap); got != 3 {
+		t.Fatalf("snapshotVCPUCount() = %d, want 3", got)
+	}
+}
+
+func TestSnapshotVCPUCount_ConfigFallback(t *testing.T) {
+	snap := Snapshot{Config: Config{VCPUs: 4}}
+	if got := snapshotVCPUCount(snap); got != 4 {
+		t.Fatalf("snapshotVCPUCount() = %d, want 4", got)
+	}
+}
+
+func TestSnapshotVCPUCount_Default(t *testing.T) {
+	snap := Snapshot{}
+	if got := snapshotVCPUCount(snap); got != 1 {
+		t.Fatalf("snapshotVCPUCount() = %d, want 1", got)
+	}
+}
+
+func TestNormalizeSnapshotVCPUStates_FromVCPUs(t *testing.T) {
+	snap := Snapshot{
+		VCPUs: []VCPUState{{ID: 0}, {ID: 1}},
+	}
+	states := normalizeSnapshotVCPUStates(snap)
+	if len(states) != 2 {
+		t.Fatalf("len = %d, want 2", len(states))
+	}
+}
+
+func TestNormalizeSnapshotVCPUStates_LegacyFallback(t *testing.T) {
+	snap := Snapshot{
+		Regs:    kvm.Regs{RAX: 42},
+		MPState: kvm.MPState{State: 1},
+	}
+	states := normalizeSnapshotVCPUStates(snap)
+	if len(states) != 1 {
+		t.Fatalf("len = %d, want 1", len(states))
+	}
+	if states[0].X86 == nil {
+		t.Fatal("expected X86 state to be set")
+	}
+	if states[0].X86.Regs.RAX != 42 {
+		t.Fatalf("RAX = %d, want 42", states[0].X86.Regs.RAX)
+	}
+}
+
+func TestTransportInBlockDevices_Nil(t *testing.T) {
+	if transportInBlockDevices(nil, nil) {
+		t.Fatal("expected false for nil blocks")
+	}
+}
+
+func TestTransportInBlockDevices_NoMatch(t *testing.T) {
+	if transportInBlockDevices([]*virtio.BlockDevice{nil}, nil) {
+		t.Fatal("expected false for nil transport check")
+	}
+}
+
+func TestPrepareSnapshot_MemoryHotplugReject(t *testing.T) {
+	vm := &VM{cfg: Config{MemoryHotplug: &MemoryHotplugConfig{TotalSizeMiB: 1024}}}
+	err := vm.prepareSnapshot()
+	if err == nil {
+		t.Fatal("prepareSnapshot() with hotplug should fail")
+	}
+}
+
+func TestPrepareSnapshot_AdditionalDrivesReject(t *testing.T) {
+	vm := &VM{cfg: Config{
+		Drives: []DriveConfig{
+			{ID: "root", Root: true},
+			{ID: "data", Root: false},
+		},
+	}}
+	err := vm.prepareSnapshot()
+	if err == nil {
+		t.Fatal("prepareSnapshot() with additional drives should fail")
+	}
+}
+
+func TestPrepareSnapshot_NoBalloon_NoDisk(t *testing.T) {
+	vm := &VM{cfg: Config{}}
+	err := vm.prepareSnapshot()
+	if err != nil {
+		t.Fatalf("prepareSnapshot() error = %v", err)
+	}
+}
+
+func TestSetupMemoryHotplug_NilConfig(t *testing.T) {
+	vm := &VM{cfg: Config{MemoryHotplug: nil}}
+	err := vm.setupMemoryHotplug()
+	if err != nil {
+		t.Fatalf("setupMemoryHotplug() with nil config: error = %v", err)
+	}
+}
+
+func TestWaitIfPaused_StoppedReturnsTrue(t *testing.T) {
+	vm := &VM{
+		state:       StateStopped,
+		pausedVCPUs: make(map[int]struct{}),
+	}
+	if !vm.waitIfPaused(0) {
+		t.Fatal("waitIfPaused() on stopped VM should return true")
+	}
+}
+
+func TestWaitIfPaused_RunningReturnsFalse(t *testing.T) {
+	vm := &VM{
+		state:       StateRunning,
+		pausedVCPUs: make(map[int]struct{}),
+	}
+	if vm.waitIfPaused(0) {
+		t.Fatal("waitIfPaused() on running VM should return false")
+	}
+}
+
+func TestRegisterUnregisterVCPUThread(t *testing.T) {
+	vm := &VM{
+		vcpuTIDs:    make(map[int]int),
+		pausedVCPUs: make(map[int]struct{}),
+	}
+	vm.registerVCPUThread(0, 12345)
+	if vm.vcpuTIDs[0] != 12345 {
+		t.Fatalf("vcpuTIDs[0] = %d, want 12345", vm.vcpuTIDs[0])
+	}
+	vm.pausedVCPUs[0] = struct{}{}
+	vm.unregisterVCPUThread(0)
+	if _, ok := vm.vcpuTIDs[0]; ok {
+		t.Fatal("expected vcpuTIDs[0] to be deleted")
+	}
+	if _, ok := vm.pausedVCPUs[0]; ok {
+		t.Fatal("expected pausedVCPUs[0] to be deleted")
+	}
+}
+
+func TestReadSnapshot_MissingFile(t *testing.T) {
+	_, err := readSnapshot(t.TempDir())
+	if err == nil {
+		t.Fatal("readSnapshot() with missing file should fail")
+	}
+}
+
+func TestReadSnapshot_InvalidJSON(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "snapshot.json"), []byte("{invalid"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := readSnapshot(dir)
+	if err == nil {
+		t.Fatal("readSnapshot() with invalid JSON should fail")
+	}
+}
+
+func TestReadSnapshot_Valid(t *testing.T) {
+	dir := t.TempDir()
+	snap := Snapshot{Version: 2, ID: "test"}
+	data, _ := json.MarshalIndent(snap, "", "  ")
+	if err := os.WriteFile(filepath.Join(dir, "snapshot.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readSnapshot(dir)
+	if err != nil {
+		t.Fatalf("readSnapshot() error = %v", err)
+	}
+	if got.ID != "test" || got.Version != 2 {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+func TestFinishStop_Idempotent(t *testing.T) {
+	vm := &VM{
+		doneCh: make(chan struct{}),
+		events: NewEventLog(),
+	}
+	vm.finishStop()
+	vm.finishStop() // should not panic or close doneCh twice
+}
+
+func TestVMState_Accessor(t *testing.T) {
+	vm := &VM{state: StatePaused}
+	if vm.State() != StatePaused {
+		t.Fatalf("State() = %s, want paused", vm.State())
+	}
+}
+
+func TestVMID_Accessor(t *testing.T) {
+	vm := &VM{cfg: Config{ID: "my-vm"}}
+	if vm.ID() != "my-vm" {
+		t.Fatalf("ID() = %q, want my-vm", vm.ID())
+	}
+}
+
+func TestVMConfig_Accessor(t *testing.T) {
+	vm := &VM{cfg: Config{MemMB: 512, ID: "cfg-test"}}
+	cfg := vm.VMConfig()
+	if cfg.MemMB != 512 || cfg.ID != "cfg-test" {
+		t.Fatalf("VMConfig() = %+v", cfg)
+	}
+}
+
+func TestEvents_Accessor(t *testing.T) {
+	el := NewEventLog()
+	vm := &VM{events: el}
+	if vm.Events() != el {
+		t.Fatal("Events() should return the event log")
+	}
+}
+
 func TestBuildDirtyFilePatch_ZeroPageSize(t *testing.T) {
 	data := make([]byte, 4096)
 	src := bytes.NewReader(data)

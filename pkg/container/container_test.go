@@ -1617,3 +1617,174 @@ func TestBuildRootfs_NoSource(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// --- Additional non-KVM coverage tests ---
+
+func TestRun_CrossArch(t *testing.T) {
+	badArch := "mips"
+	_, err := Run(RunOptions{Arch: badArch})
+	if err == nil {
+		t.Fatal("Run() with invalid arch should fail")
+	}
+	if !strings.Contains(err.Error(), "not compatible") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSortedKeys(t *testing.T) {
+	src := map[string]string{"c": "3", "a": "1", "b": "2"}
+	got := sortedKeys(src)
+	want := []string{"a", "b", "c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sortedKeys() = %v, want %v", got, want)
+	}
+}
+
+func TestSortedKeys_Empty(t *testing.T) {
+	got := sortedKeys(map[string]string{})
+	if len(got) != 0 {
+		t.Fatalf("sortedKeys(empty) = %v, want empty", got)
+	}
+}
+
+func TestImageCacheDir_Custom(t *testing.T) {
+	got := imageCacheDir("/custom/cache")
+	if got != "/custom/cache/layers" {
+		t.Fatalf("imageCacheDir('/custom/cache') = %q, want /custom/cache/layers", got)
+	}
+}
+
+func TestWorkerSocket_NilHandle(t *testing.T) {
+	// A plain vmm.Handle that doesn't implement WorkerBacked should return ""
+	got := workerSocket(nil)
+	if got != "" {
+		t.Fatalf("workerSocket(nil) = %q, want empty", got)
+	}
+}
+
+func TestBalloonNeedsGuestAgent(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *vmm.BalloonConfig
+		want bool
+	}{
+		{"nil", nil, false},
+		{"no stats no auto", &vmm.BalloonConfig{AmountMiB: 64}, false},
+		{"with stats", &vmm.BalloonConfig{StatsPollingIntervalS: 1}, true},
+		{"auto conservative", &vmm.BalloonConfig{Auto: vmm.BalloonAutoConservative}, true},
+		{"auto off", &vmm.BalloonConfig{Auto: vmm.BalloonAutoOff}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := balloonNeedsGuestAgent(tt.cfg); got != tt.want {
+				t.Fatalf("balloonNeedsGuestAgent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHotplugNeedsGuestAgent(t *testing.T) {
+	if hotplugNeedsGuestAgent(nil) {
+		t.Fatal("hotplugNeedsGuestAgent(nil) = true, want false")
+	}
+	if !hotplugNeedsGuestAgent(&vmm.MemoryHotplugConfig{}) {
+		t.Fatal("hotplugNeedsGuestAgent(non-nil) = false, want true")
+	}
+}
+
+func TestStableHashKey_Deterministic(t *testing.T) {
+	payload := map[string]string{"a": "1", "b": "2"}
+	h1, err := stableHashKey(payload)
+	if err != nil {
+		t.Fatalf("stableHashKey: %v", err)
+	}
+	h2, err := stableHashKey(payload)
+	if err != nil {
+		t.Fatalf("stableHashKey: %v", err)
+	}
+	if h1 != h2 {
+		t.Fatalf("stableHashKey not deterministic: %q != %q", h1, h2)
+	}
+	if len(h1) != 64 { // sha256 hex
+		t.Fatalf("stableHashKey length = %d, want 64", len(h1))
+	}
+}
+
+func TestStableHashKey_DifferentPayloads(t *testing.T) {
+	h1, _ := stableHashKey(map[string]string{"a": "1"})
+	h2, _ := stableHashKey(map[string]string{"a": "2"})
+	if h1 == h2 {
+		t.Fatal("different payloads should produce different hashes")
+	}
+}
+
+func TestRunArtifactCacheKey_Deterministic(t *testing.T) {
+	opts := RunOptions{Image: "ubuntu:22.04", Arch: "amd64", DiskSizeMB: 2048}
+	k1, err := runArtifactCacheKey(opts)
+	if err != nil {
+		t.Fatalf("runArtifactCacheKey: %v", err)
+	}
+	k2, err := runArtifactCacheKey(opts)
+	if err != nil {
+		t.Fatalf("runArtifactCacheKey: %v", err)
+	}
+	if k1 != k2 {
+		t.Fatalf("not deterministic: %q != %q", k1, k2)
+	}
+}
+
+func TestRunArtifactCacheKey_DifferentForDifferentImages(t *testing.T) {
+	k1, _ := runArtifactCacheKey(RunOptions{Image: "ubuntu:22.04"})
+	k2, _ := runArtifactCacheKey(RunOptions{Image: "alpine:3.18"})
+	if k1 == k2 {
+		t.Fatal("different images should produce different cache keys")
+	}
+}
+
+func TestResolveRunWorkDir_Explicit(t *testing.T) {
+	dir, err := resolveRunWorkDir(RunOptions{WorkDir2: "/explicit/dir"})
+	if err != nil {
+		t.Fatalf("resolveRunWorkDir: %v", err)
+	}
+	if dir != "/explicit/dir" {
+		t.Fatalf("dir = %q, want /explicit/dir", dir)
+	}
+}
+
+func TestResolveRunWorkDir_CacheBasedDeterministic(t *testing.T) {
+	opts := RunOptions{Image: "ubuntu:22.04", CacheDir: t.TempDir()}
+	d1, err := resolveRunWorkDir(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2, err := resolveRunWorkDir(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d1 != d2 {
+		t.Fatalf("resolveRunWorkDir not deterministic: %q != %q", d1, d2)
+	}
+	if !strings.Contains(d1, "artifacts") {
+		t.Fatalf("dir = %q, expected to contain 'artifacts'", d1)
+	}
+}
+
+func TestAppendVirtioFSKernelModule_NoSharedFS(t *testing.T) {
+	mods := appendVirtioFSKernelModule(nil, sharedFSPlan{})
+	if len(mods) != 0 {
+		t.Fatalf("expected no modules, got %d", len(mods))
+	}
+}
+
+func TestAppendVirtioFSKernelModule_WithSharedFS(t *testing.T) {
+	plan := resolveSharedFSMounts([]Mount{
+		{Source: "/host", Target: "/guest", Backend: MountBackendVirtioFS},
+	})
+	mods := appendVirtioFSKernelModule(nil, plan)
+	if len(mods) != 1 {
+		t.Fatalf("expected 1 module, got %d", len(mods))
+	}
+	if mods[0].Name != "virtiofs" {
+		t.Fatalf("module name = %q, want virtiofs", mods[0].Name)
+	}
+}

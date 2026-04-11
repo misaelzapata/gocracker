@@ -1117,3 +1117,223 @@ func TestCopyRegularFileRejectsSymlinkSource(t *testing.T) {
 		t.Fatalf("expected symlink source rejection, got %v", err)
 	}
 }
+
+// --- Additional coverage tests for jailer ---
+
+func TestApplySingleResourceLimit_ParseError(t *testing.T) {
+	err := applySingleResourceLimit("invalid-format")
+	if err == nil || !strings.Contains(err.Error(), "invalid --resource-limit") {
+		t.Fatalf("expected parse error, got %v", err)
+	}
+}
+
+func TestApplySingleResourceLimit_InvalidValue(t *testing.T) {
+	err := applySingleResourceLimit("no-file=notanumber")
+	if err == nil || !strings.Contains(err.Error(), "parse") {
+		t.Fatalf("expected parse error, got %v", err)
+	}
+}
+
+func TestApplySingleResourceLimit_UnsupportedResource(t *testing.T) {
+	err := applySingleResourceLimit("unknown-resource=1024")
+	if err == nil || !strings.Contains(err.Error(), "unsupported") {
+		t.Fatalf("expected unsupported error, got %v", err)
+	}
+}
+
+func TestCleanStaleMounts_NonexistentDir(t *testing.T) {
+	// Should not panic
+	cleanStaleMounts("/nonexistent/path/that/does/not/exist")
+}
+
+func TestCleanStaleMounts_EmptyDir(t *testing.T) {
+	// Empty or root should be skipped
+	cleanStaleMounts("")
+	cleanStaleMounts("/")
+}
+
+func TestCleanStaleMounts_TempDir(t *testing.T) {
+	dir := t.TempDir()
+	// Should not panic, dir exists but has no mounts
+	cleanStaleMounts(dir)
+}
+
+func TestMkdirAllNoSymlink_EmptyPath(t *testing.T) {
+	err := mkdirAllNoSymlink("", 0755)
+	if err != nil {
+		t.Fatalf("mkdirAllNoSymlink('') = %v, want nil", err)
+	}
+}
+
+func TestMkdirAllNoSymlink_DotPath(t *testing.T) {
+	err := mkdirAllNoSymlink(".", 0755)
+	if err != nil {
+		t.Fatalf("mkdirAllNoSymlink('.') = %v, want nil", err)
+	}
+}
+
+func TestMkdirAllNoSymlink_ExistingDirNoOp(t *testing.T) {
+	dir := t.TempDir()
+	err := mkdirAllNoSymlink(dir, 0755)
+	if err != nil {
+		t.Fatalf("mkdirAllNoSymlink(existing) = %v, want nil", err)
+	}
+}
+
+func TestMkdirAllNoSymlink_CreatesNestedDirs(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "a", "b", "c")
+	err := mkdirAllNoSymlink(nested, 0755)
+	if err != nil {
+		t.Fatalf("mkdirAllNoSymlink() = %v", err)
+	}
+	info, err := os.Stat(nested)
+	if err != nil || !info.IsDir() {
+		t.Fatal("expected nested dir to exist")
+	}
+}
+
+func TestMkdirAllNoSymlink_RejectsFileInPath(t *testing.T) {
+	root := t.TempDir()
+	filePath := filepath.Join(root, "file")
+	if err := os.WriteFile(filePath, []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := mkdirAllNoSymlink(filepath.Join(filePath, "child"), 0755)
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("expected 'not a directory' error, got %v", err)
+	}
+}
+
+func TestEnsureSymlink_NewLink(t *testing.T) {
+	root := t.TempDir()
+	link := filepath.Join(root, "mylink")
+	err := ensureSymlink(link, "target")
+	if err != nil {
+		t.Fatalf("ensureSymlink() = %v", err)
+	}
+	got, err := os.Readlink(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "target" {
+		t.Fatalf("readlink = %q, want target", got)
+	}
+}
+
+func TestEnsureSymlink_UpdateExisting(t *testing.T) {
+	root := t.TempDir()
+	link := filepath.Join(root, "mylink")
+	if err := os.Symlink("old-target", link); err != nil {
+		t.Fatal(err)
+	}
+	err := ensureSymlink(link, "new-target")
+	if err != nil {
+		t.Fatalf("ensureSymlink() = %v", err)
+	}
+	got, err := os.Readlink(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "new-target" {
+		t.Fatalf("readlink = %q, want new-target", got)
+	}
+}
+
+func TestEnsureSymlink_AlreadyCorrect(t *testing.T) {
+	root := t.TempDir()
+	link := filepath.Join(root, "mylink")
+	if err := os.Symlink("target", link); err != nil {
+		t.Fatal(err)
+	}
+	err := ensureSymlink(link, "target")
+	if err != nil {
+		t.Fatalf("ensureSymlink() = %v", err)
+	}
+}
+
+func TestBinaryDependencyMounts_NonexistentFile(t *testing.T) {
+	mounts, err := binaryDependencyMounts("/nonexistent/file")
+	if err != nil {
+		t.Fatalf("binaryDependencyMounts() error = %v", err)
+	}
+	// Static or missing binary: should return nil
+	if mounts != nil {
+		t.Logf("got %d mounts (may be from ldd error handling)", len(mounts))
+	}
+}
+
+func TestAppendUniqueStrings_Jailer(t *testing.T) {
+	dst := []string{"a", "b"}
+	got := appendUniqueStrings(dst, "b", "c", "a", "d")
+	want := []string{"a", "b", "c", "d"}
+	if len(got) != len(want) {
+		t.Fatalf("appendUniqueStrings() = %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("appendUniqueStrings()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestConfigValidateAcceptsMultipleEnvEntries(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		ID:       "test-vm",
+		ExecFile: execFile,
+		UID:      1000,
+		GID:      1000,
+		Env:      []string{"KEY=value", "FOO=bar"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+}
+
+func TestConfigValidateAcceptsMixedMounts(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		ID:       "test-vm",
+		ExecFile: execFile,
+		UID:      1000,
+		GID:      1000,
+		Mounts:   []string{"ro:/usr/lib:/usr/lib", "rw:/data:/data"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+}
+
+func TestExecEnv_WithPathAlready(t *testing.T) {
+	cfg := Config{Env: []string{"PATH=/custom/bin", "FOO=bar"}}
+	env := cfg.execEnv()
+	pathCount := 0
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "PATH=") {
+			pathCount++
+		}
+	}
+	if pathCount != 1 {
+		t.Fatalf("expected exactly 1 PATH entry, got %d in %v", pathCount, env)
+	}
+}
+
+func TestExecEnv_EmptyAddsDefaultPath(t *testing.T) {
+	cfg := Config{}
+	env := cfg.execEnv()
+	if len(env) != 1 {
+		t.Fatalf("expected 1 entry, got %d: %v", len(env), env)
+	}
+	if !strings.HasPrefix(env[0], "PATH=") {
+		t.Fatalf("expected PATH, got %q", env[0])
+	}
+}
