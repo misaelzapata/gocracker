@@ -1,0 +1,10 @@
+# Historical dockerfile/service entries that are shell-capable and stable
+# enough to prove guest + PTY behavior without mixing in Compose.
+distribution-registry
+go-gitea-gitea
+qdrant-qdrant
+meilisearch-meilisearch
+gogs-gogs
+rabbitmq-server
+redis-redis
+memcached-memcached

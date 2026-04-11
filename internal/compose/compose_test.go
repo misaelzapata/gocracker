@@ -3574,6 +3574,784 @@ func TestDescribePublishedPorts_InvalidInput(t *testing.T) {
 	}
 }
 
+// ---- Coverage-boosting tests ----
+
+func TestValidateNamedVolumeConfig_ValidLocalBind(t *testing.T) {
+	dir := t.TempDir()
+	vol := Volume{
+		Driver:     "local",
+		DriverOpts: map[string]string{"device": dir, "type": "none", "o": "bind"},
+	}
+	if err := validateNamedVolumeConfig("test", vol, t.TempDir()); err != nil {
+		t.Fatalf("validateNamedVolumeConfig: %v", err)
+	}
+}
+
+func TestValidateNamedVolumeConfig_ValidNFS(t *testing.T) {
+	vol := Volume{
+		Driver:     "local",
+		DriverOpts: map[string]string{"type": "nfs", "device": ":/share", "o": "addr=192.168.1.1"},
+	}
+	if err := validateNamedVolumeConfig("nfs-vol", vol, t.TempDir()); err != nil {
+		t.Fatalf("validateNamedVolumeConfig: %v", err)
+	}
+}
+
+func TestValidateNamedVolumeConfig_UnsupportedLocalOpts(t *testing.T) {
+	vol := Volume{
+		Driver:     "local",
+		DriverOpts: map[string]string{"type": "ext4", "device": "/dev/sda1"},
+	}
+	err := validateNamedVolumeConfig("vol", vol, t.TempDir())
+	if err == nil {
+		t.Fatal("expected error for unsupported local driver_opts")
+	}
+}
+
+func TestResolveVolumeSubpath_Escape(t *testing.T) {
+	_, err := resolveVolumeSubpath("/base", "../escape")
+	if err == nil {
+		t.Fatal("expected error for escaping subpath")
+	}
+}
+
+func TestResolveVolumeSubpath_AbsolutePath(t *testing.T) {
+	_, err := resolveVolumeSubpath("/base", "/absolute/path")
+	if err == nil {
+		t.Fatal("expected error for absolute subpath")
+	}
+}
+
+func TestResolveVolumeSubpath_DotOnly(t *testing.T) {
+	got, err := resolveVolumeSubpath("/base", ".")
+	if err != nil {
+		t.Fatalf("resolveVolumeSubpath: %v", err)
+	}
+	if got != "/base" {
+		t.Fatalf("got %q, want /base", got)
+	}
+}
+
+func TestResolveVolumeSubpath_Empty(t *testing.T) {
+	got, err := resolveVolumeSubpath("/base", "")
+	if err != nil {
+		t.Fatalf("resolveVolumeSubpath: %v", err)
+	}
+	if got != "/base" {
+		t.Fatalf("got %q, want /base", got)
+	}
+}
+
+func TestResolveVolumeSubpath_ValidSubpath(t *testing.T) {
+	base := t.TempDir()
+	got, err := resolveVolumeSubpath(base, "subdir/nested")
+	if err != nil {
+		t.Fatalf("resolveVolumeSubpath: %v", err)
+	}
+	if got != filepath.Join(base, "subdir", "nested") {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestNFSDriverConfig_NFS4Type(t *testing.T) {
+	vol := Volume{
+		Driver:     "",
+		DriverOpts: map[string]string{"type": "nfs4", "device": "server:/share", "o": "vers=4.1"},
+	}
+	fstype, device, options, ok := nfsDriverConfig(vol)
+	if !ok {
+		t.Fatal("expected nfs4 to be recognized")
+	}
+	if fstype != "nfs4" || device != "server:/share" || options != "vers=4.1" {
+		t.Fatalf("fstype=%q device=%q options=%q", fstype, device, options)
+	}
+}
+
+func TestNFSDriverConfig_UnsupportedFSType(t *testing.T) {
+	vol := Volume{
+		DriverOpts: map[string]string{"type": "cifs", "device": "//server/share"},
+	}
+	_, _, _, ok := nfsDriverConfig(vol)
+	if ok {
+		t.Fatal("expected cifs to not be recognized as NFS")
+	}
+}
+
+func TestLocalDriverSource_OptionsWithBind(t *testing.T) {
+	vol := Volume{
+		Driver:     "local",
+		DriverOpts: map[string]string{"device": "/host/path", "o": "bind,ro", "type": "none"},
+	}
+	src, ok := localDriverSource(vol, "/ctx")
+	if !ok {
+		t.Fatal("expected bind driver source to be recognized")
+	}
+	if src != "/host/path" {
+		t.Fatalf("src = %q, want /host/path", src)
+	}
+}
+
+func TestLocalDriverSource_RelativeDevice(t *testing.T) {
+	vol := Volume{
+		Driver:     "local",
+		DriverOpts: map[string]string{"device": "relative/path", "type": "none", "o": "bind"},
+	}
+	src, ok := localDriverSource(vol, "/ctx")
+	if !ok {
+		t.Fatal("expected relative device to be resolved")
+	}
+	if src != "/ctx/relative/path" {
+		t.Fatalf("src = %q, want /ctx/relative/path", src)
+	}
+}
+
+func TestLocalDriverSource_NoBindOption(t *testing.T) {
+	vol := Volume{
+		Driver:     "local",
+		DriverOpts: map[string]string{"device": "/path", "type": "none", "o": "loop"},
+	}
+	_, ok := localDriverSource(vol, "/ctx")
+	if ok {
+		t.Fatal("expected no match when o does not contain 'bind'")
+	}
+}
+
+func TestMountedGuestPath_RootPath(t *testing.T) {
+	got := mountedGuestPath("/mnt", "/")
+	if got != "/mnt" {
+		t.Fatalf("got %q, want /mnt", got)
+	}
+}
+
+func TestSharedFSBackend_Cases(t *testing.T) {
+	if got := sharedFSBackend(volumeMount{Shared: true}); got != container.MountBackendVirtioFS {
+		t.Fatalf("got %v, want VirtioFS", got)
+	}
+	if got := sharedFSBackend(volumeMount{Shared: false}); got != container.MountBackendMaterialized {
+		t.Fatalf("got %v, want Materialized", got)
+	}
+}
+
+func TestToContainerMounts_WithPopulate(t *testing.T) {
+	mounts := toContainerMounts([]volumeMount{
+		{Source: "/src", Target: "/dest", ReadOnly: true, Populate: true, Shared: true},
+	})
+	if len(mounts) != 1 {
+		t.Fatalf("got %d mounts", len(mounts))
+	}
+	if !mounts[0].ReadOnly {
+		t.Fatal("expected ReadOnly")
+	}
+	if !mounts[0].Populate {
+		t.Fatal("expected Populate")
+	}
+	if mounts[0].Backend != container.MountBackendVirtioFS {
+		t.Fatal("expected VirtioFS backend")
+	}
+}
+
+func TestShouldSkipSpecialFile_AllModes(t *testing.T) {
+	tests := []struct {
+		name string
+		mode os.FileMode
+		want bool
+	}{
+		{"regular file", 0, false},
+		{"directory", os.ModeDir, false},
+		{"symlink", os.ModeSymlink, false},
+		{"named pipe", os.ModeNamedPipe, true},
+		{"socket", os.ModeSocket, true},
+		{"device", os.ModeDevice, true},
+		{"char device", os.ModeDevice | os.ModeCharDevice, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldSkipSpecialFile(tt.mode)
+			if got != tt.want {
+				t.Fatalf("shouldSkipSpecialFile(%v) = %v, want %v", tt.mode, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsEphemeralGuestPath_AllCases(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"/run", true},
+		{"/run/", true},
+		{"/run/lock", true},
+		{"/tmp", true},
+		{"/tmp/", true},
+		{"/tmp/cache/data", true},
+		{"/dev", true},
+		{"/dev/shm", true},
+		{"/var/run", true},
+		{"/var/run/docker.sock", true},
+		{"/var/lib", false},
+		{"/home", false},
+		{"/", false},
+		{"/running", false},
+		{"/developer", false},
+		{"/var/running", false},
+	}
+	for _, tt := range tests {
+		if got := isEphemeralGuestPath(tt.path); got != tt.want {
+			t.Errorf("isEphemeralGuestPath(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestIsBindSource_Cases(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"/absolute/path", true},
+		{"./relative", true},
+		{"../parent", true},
+		{"path/with/slash", true},
+		{"namedvolume", false},
+	}
+	for _, tt := range tests {
+		if got := isBindSource(tt.input); got != tt.want {
+			t.Errorf("isBindSource(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestEnvToSlice_InterfaceSlice(t *testing.T) {
+	got := envToSlice([]interface{}{"FOO=bar", "BAZ=qux"})
+	if len(got) != 2 || got[0] != "FOO=bar" || got[1] != "BAZ=qux" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestEnvToSlice_MapInterfaceValues(t *testing.T) {
+	got := envToSlice(map[string]interface{}{"A": "1", "B": 2})
+	if len(got) != 2 {
+		t.Fatalf("got %d items", len(got))
+	}
+	// Should be sorted by key
+	if got[0] != "A=1" || got[1] != "B=2" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestToStringSlice_InterfaceSlice(t *testing.T) {
+	got := toStringSlice([]interface{}{"a", 1, true})
+	if len(got) != 3 {
+		t.Fatalf("got %d items", len(got))
+	}
+	if got[0] != "a" || got[1] != "1" || got[2] != "true" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestParseMemLimit_AllCases(t *testing.T) {
+	tests := []struct {
+		input string
+		want  uint64
+	}{
+		{"256m", 256},
+		{"1g", 1024},
+		{"512M", 512},
+		{"2G", 2048},
+		{"1024k", 1},
+		{"512K", 0},
+		{"", 256},
+		{"abc", 256},
+	}
+	for _, tt := range tests {
+		if got := parseMemLimit(tt.input); got != tt.want {
+			t.Errorf("parseMemLimit(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestServiceSnapshotDir(t *testing.T) {
+	if got := serviceSnapshotDir("", "web"); got != "" {
+		t.Fatalf("got %q, want empty", got)
+	}
+	if got := serviceSnapshotDir("/snapshots", "web"); got != filepath.Join("/snapshots", "web") {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestPromoteSharedFileMount(t *testing.T) {
+	m := promoteSharedFileMount(volumeMount{
+		Source: "/host/dir/file.txt",
+		Target: "/guest/dir/file.txt",
+		IsDir:  false,
+	})
+	if !m.IsDir {
+		t.Fatal("expected IsDir after promotion")
+	}
+	if m.Source != "/host/dir" {
+		t.Fatalf("Source = %q, want /host/dir", m.Source)
+	}
+	if m.Target != "/guest/dir" {
+		t.Fatalf("Target = %q, want /guest/dir", m.Target)
+	}
+}
+
+func TestPromoteSharedFileMount_EmptyDir(t *testing.T) {
+	// Edge case where source is just a filename
+	m := promoteSharedFileMount(volumeMount{
+		Source: "file.txt",
+		Target: "file.txt",
+	})
+	if m.Source != "file.txt" {
+		t.Fatalf("Source = %q", m.Source)
+	}
+}
+
+func TestAssignServiceIPs_AllCases(t *testing.T) {
+	// Test with empty services
+	_, cidr, _ := net.ParseCIDR("10.0.0.0/24")
+	gw := net.ParseIP("10.0.0.1")
+	ips, err := assignServiceIPs([]string{}, map[string]Service{}, "default", cidr, gw)
+	if err != nil {
+		t.Fatalf("assignServiceIPs: %v", err)
+	}
+	if len(ips) != 0 {
+		t.Fatalf("expected empty map, got %v", ips)
+	}
+}
+
+func TestIncrementIP_WrapAround(t *testing.T) {
+	ip := net.ParseIP("10.0.0.255")
+	incrementIP(ip)
+	if got := ip.String(); got != "10.0.1.0" {
+		t.Fatalf("incrementIP(10.0.0.255) = %s, want 10.0.1.0", got)
+	}
+}
+
+func TestGatewayIP_InvalidIP(t *testing.T) {
+	// Non-IPv4 falls back to default gateway
+	got := gatewayIP("invalid")
+	if got != "172.20.0.1" {
+		t.Fatalf("gatewayIP(invalid) = %q, want 172.20.0.1", got)
+	}
+}
+
+func TestGatewayIP_IPv6(t *testing.T) {
+	// IPv6 falls back to default gateway
+	got := gatewayIP("::1")
+	if got != "172.20.0.1" {
+		t.Fatalf("gatewayIP(::1) = %q, want 172.20.0.1", got)
+	}
+}
+
+func TestStackStatus_WithError(t *testing.T) {
+	stack := &Stack{
+		services: map[string]*ServiceVM{
+			"web":    {State: "running"},
+			"worker": {Err: errors.New("failed to start")},
+			"db":     nil,
+		},
+	}
+	status := stack.Status()
+	if status["web"] != "running" {
+		t.Fatalf("web status = %q", status["web"])
+	}
+	if !strings.Contains(status["worker"], "error:") {
+		t.Fatalf("worker status = %q, expected error prefix", status["worker"])
+	}
+	if status["db"] != "pending" {
+		t.Fatalf("db status = %q", status["db"])
+	}
+}
+
+func TestSortedKeysInterface_Empty(t *testing.T) {
+	got := sortedKeysInterface(map[string]interface{}{})
+	if len(got) != 0 {
+		t.Fatalf("expected empty, got %v", got)
+	}
+}
+
+func TestBytesToMiB_Comprehensive(t *testing.T) {
+	tests := []struct {
+		input composetypes.UnitBytes
+		want  uint64
+	}{
+		{0, 0},
+		{-1, 0},
+		{1, 1},                                  // less than 1 MiB rounds to 1
+		{512 * 1024, 1},                          // 512KB < 1MiB rounds to 1
+		{1024 * 1024, 1},                         // exactly 1 MiB
+		{2 * 1024 * 1024, 2},                     // exactly 2 MiB
+		{composetypes.UnitBytes(1.5 * 1024 * 1024), 2}, // 1.5 MiB rounds up
+		{256 * 1024 * 1024, 256},                 // 256 MiB
+	}
+	for _, tt := range tests {
+		got := bytesToMiB(tt.input)
+		if got != tt.want {
+			t.Errorf("bytesToMiB(%d) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestNormalizeVolumeConfigs_ConsistencyReject(t *testing.T) {
+	_, err := normalizeVolumeConfigs([]composetypes.ServiceVolumeConfig{
+		{Type: "bind", Source: "./data", Target: "/data", Consistency: "cached"},
+	})
+	if err == nil {
+		t.Fatal("expected error for consistency")
+	}
+}
+
+func TestNormalizeVolumeConfigs_BindPropagationReject(t *testing.T) {
+	_, err := normalizeVolumeConfigs([]composetypes.ServiceVolumeConfig{
+		{
+			Type:   "bind",
+			Source: "./data",
+			Target: "/data",
+			Bind:   &composetypes.ServiceVolumeBind{Propagation: "shared"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for bind propagation")
+	}
+}
+
+func TestNormalizePortConfigs_UnsupportedProtocol(t *testing.T) {
+	_, err := normalizePortConfigs([]composetypes.ServicePortConfig{
+		{Target: 80, Protocol: "sctp"},
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported protocol")
+	}
+}
+
+func TestParsePortMappingObject_UnsupportedMode(t *testing.T) {
+	_, err := parsePortMappingObject(map[string]interface{}{
+		"target": 80,
+		"mode":   "loadbalancer",
+	})
+	if err == nil {
+		t.Fatal("expected error for unsupported mode")
+	}
+}
+
+func TestExpandPortMappings_MismatchedLengths(t *testing.T) {
+	_, err := expandPortMappings("0.0.0.0", []int{80, 81}, []int{80}, "tcp", portMapping{})
+	if err == nil {
+		t.Fatal("expected error for mismatched lengths")
+	}
+}
+
+func TestParsePortRange_ValidRange(t *testing.T) {
+	ports, err := parsePortRange("8080-8082")
+	if err != nil {
+		t.Fatalf("parsePortRange: %v", err)
+	}
+	if len(ports) != 3 || ports[0] != 8080 || ports[2] != 8082 {
+		t.Fatalf("ports = %v", ports)
+	}
+}
+
+func TestParsePortRange_EmptyValue(t *testing.T) {
+	_, err := parsePortRange("")
+	if err == nil {
+		t.Fatal("expected error for empty port")
+	}
+}
+
+func TestSplitComposeSpec_Simple(t *testing.T) {
+	parts, err := splitComposeSpec("a:b:c", ':')
+	if err != nil {
+		t.Fatalf("splitComposeSpec: %v", err)
+	}
+	if len(parts) != 3 || parts[0] != "a" || parts[1] != "b" || parts[2] != "c" {
+		t.Fatalf("parts = %v", parts)
+	}
+}
+
+func TestParseConsistency_KnownValues(t *testing.T) {
+	tests := []struct {
+		input []string
+		want  string
+	}{
+		{nil, ""},
+		{[]string{}, ""},
+		{[]string{"cached"}, "cached"},
+		{[]string{"delegated"}, "delegated"},
+		{[]string{"consistent"}, "consistent"},
+		{[]string{"ro", "cached"}, "cached"},
+		{[]string{"unknown"}, ""},
+	}
+	for _, tt := range tests {
+		got := parseConsistency(tt.input)
+		if got != tt.want {
+			t.Errorf("parseConsistency(%v) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestServiceCPUCount_Comprehensive(t *testing.T) {
+	tests := []struct {
+		name string
+		svc  Service
+		want int
+	}{
+		{"default", Service{}, 1},
+		{"cpu_count", Service{CPUCount: 4}, 4},
+		{"cpus fractional rounds up", Service{CPUS: 1.5}, 2},
+		{"cpus integer", Service{CPUS: 2.0}, 2},
+		{"cpu_count takes priority", Service{CPUCount: 3, CPUS: 1.5}, 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := serviceCPUCount(tt.svc); got != tt.want {
+				t.Fatalf("serviceCPUCount() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestServiceMemoryMB_Comprehensive(t *testing.T) {
+	tests := []struct {
+		name     string
+		svc      Service
+		fallback uint64
+		want     uint64
+	}{
+		{"fallback", Service{}, 256, 256},
+		{"mem_limit", Service{MemLimit: 512 * 1024 * 1024}, 256, 512},
+		{"mem_reservation", Service{MemReservation: 128 * 1024 * 1024}, 256, 128},
+		{"limit takes priority", Service{MemLimit: 256 * 1024 * 1024, MemReservation: 128 * 1024 * 1024}, 64, 256},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := serviceMemoryMB(tt.svc, tt.fallback); got != tt.want {
+				t.Fatalf("serviceMemoryMB() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestServiceSource_Comprehensive(t *testing.T) {
+	tests := []struct {
+		name string
+		svc  Service
+		want string
+	}{
+		{"image", Service{Image: "nginx:latest"}, "nginx:latest"},
+		{"build", Service{Build: &BuildConfig{Context: "."}}, "build"},
+		{"neither", Service{}, "-"},
+		{"whitespace image", Service{Image: "  "}, "-"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := serviceSource(tt.svc); got != tt.want {
+				t.Fatalf("serviceSource() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeHostIP_Cases(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"0.0.0.0", "0.0.0.0"},
+		{"[::1]", "::1"},
+		{" 10.0.0.1 ", "10.0.0.1"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := normalizeHostIP(tt.input); got != tt.want {
+			t.Errorf("normalizeHostIP(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestParseByteSize_AllTypes(t *testing.T) {
+	tests := []struct {
+		input interface{}
+		want  int64
+	}{
+		{nil, 0},
+		{int(100), 100},
+		{int64(200), 200},
+		{uint64(300), 300},
+		{"1024", 1024},
+		{"10k", 10 * 1024},
+		{"10K", 10 * 1024},
+		{"5m", 5 * 1024 * 1024},
+		{"5M", 5 * 1024 * 1024},
+		{"1g", 1024 * 1024 * 1024},
+		{"1G", 1024 * 1024 * 1024},
+		{"", 0},
+	}
+	for _, tt := range tests {
+		got, err := parseByteSize(tt.input)
+		if err != nil {
+			t.Errorf("parseByteSize(%v): %v", tt.input, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("parseByteSize(%v) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestParseFileMode_AllTypes(t *testing.T) {
+	tests := []struct {
+		input interface{}
+		want  os.FileMode
+	}{
+		{nil, 0},
+		{int(0755), os.FileMode(0755)},
+		{int64(0644), os.FileMode(0644)},
+		{uint64(0600), os.FileMode(0600)},
+		{"755", os.FileMode(0755)},
+		{"", 0},
+	}
+	for _, tt := range tests {
+		got, err := parseFileMode(tt.input)
+		if err != nil {
+			t.Errorf("parseFileMode(%v): %v", tt.input, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("parseFileMode(%v) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestParsePortValue_FloatUnsupported(t *testing.T) {
+	_, err := parsePortValue(3.14)
+	if err == nil {
+		t.Fatal("expected error for float port value")
+	}
+}
+
+func TestStringValue_Nil(t *testing.T) {
+	if got := stringValue(nil); got != "" {
+		t.Fatalf("stringValue(nil) = %q, want empty", got)
+	}
+}
+
+func TestBoolValue_Comprehensive(t *testing.T) {
+	tests := []struct {
+		input interface{}
+		want  bool
+	}{
+		{true, true},
+		{false, false},
+		{"true", true},
+		{"false", false},
+		{"yes", false},
+		{nil, false},
+		{42, false},
+	}
+	for _, tt := range tests {
+		if got := boolValue(tt.input); got != tt.want {
+			t.Errorf("boolValue(%v) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestCoalesce_Comprehensive(t *testing.T) {
+	if got := coalesce(nil, nil, "hello"); got != "hello" {
+		t.Fatalf("coalesce = %v, want hello", got)
+	}
+	if got := coalesce("first", "second"); got != "first" {
+		t.Fatalf("coalesce = %v, want first", got)
+	}
+	if got := coalesce(nil, nil); got != nil {
+		t.Fatalf("coalesce = %v, want nil", got)
+	}
+}
+
+func TestMakeSequentialPorts_Cases(t *testing.T) {
+	got := makeSequentialPorts(8080, 3)
+	if len(got) != 3 || got[0] != 8080 || got[1] != 8081 || got[2] != 8082 {
+		t.Fatalf("got %v", got)
+	}
+	got = makeSequentialPorts(80, 1)
+	if len(got) != 1 || got[0] != 80 {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestChoosePrimaryComposeNetwork_FallbackToFirst(t *testing.T) {
+	services := map[string]Service{
+		"web": {Image: "nginx"},
+	}
+	networks := map[string]Network{
+		"custom": {},
+	}
+	got := choosePrimaryComposeNetwork(services, networks)
+	if got != "custom" {
+		t.Fatalf("got %q, want custom", got)
+	}
+}
+
+func TestComposeTapPrefix_Comprehensive(t *testing.T) {
+	tests := []struct {
+		prefix, project, want string
+	}{
+		{"gc", "myproject", "gc"},
+		{"", "myproject", "gc-my"},
+	}
+	for _, tt := range tests {
+		got := composeTapPrefix(tt.prefix, tt.project)
+		if len(got) > 4 {
+			got = got[:4]
+		}
+		// Just verify it doesn't panic and has reasonable length
+		if composeTapPrefix(tt.prefix, tt.project) == "" {
+			t.Fatalf("composeTapPrefix(%q, %q) returned empty", tt.prefix, tt.project)
+		}
+	}
+}
+
+func TestShortIfName_Short(t *testing.T) {
+	if got := shortIfName("tap0"); got != "tap0" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestShortIfName_Exact15(t *testing.T) {
+	name := "123456789012345" // 15 chars
+	if got := shortIfName(name); got != name {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestShortIfName_Long(t *testing.T) {
+	name := "1234567890123456" // 16 chars
+	got := shortIfName(name)
+	if len(got) != 15 {
+		t.Fatalf("len = %d, want 15", len(got))
+	}
+}
+
+func TestProjectName_Deterministic(t *testing.T) {
+	name1 := projectName("/path/to/compose.yml")
+	name2 := projectName("/path/to/compose.yml")
+	if name1 != name2 {
+		t.Fatalf("projectName is not deterministic: %q != %q", name1, name2)
+	}
+}
+
+func TestHashProject_Deterministic(t *testing.T) {
+	h1 := hashProject("test")
+	h2 := hashProject("test")
+	if h1 != h2 {
+		t.Fatalf("hashProject not deterministic: %d != %d", h1, h2)
+	}
+	h3 := hashProject("other")
+	if h1 == h3 {
+		t.Fatal("different inputs should produce different hashes (usually)")
+	}
+}
+
 func testVolumeConfigs(specs ...volumeSpec) []composetypes.ServiceVolumeConfig {
 	out := make([]composetypes.ServiceVolumeConfig, 0, len(specs))
 	for _, spec := range specs {

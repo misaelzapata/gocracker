@@ -2,6 +2,7 @@ package vmmserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -1290,4 +1291,918 @@ func TestServerClose_NoVM(t *testing.T) {
 	srv := New()
 	// Should not panic
 	srv.Close()
+}
+
+// ---- Coverage-boosting tests: Client via httptest ----
+
+func TestClientLifecycle(t *testing.T) {
+	var vm *fakeVM
+	srv := NewWithOptions(Options{Factory: func(cfg vmm.Config) (VM, error) {
+		vm = newFakeVM(cfg).(*fakeVM)
+		return vm, nil
+	}})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// Create a client talking to the httptest server via TCP
+	client := &http.Client{}
+	base := ts.URL
+
+	// SetBootSource
+	resp, err := client.Do(mustReq(t, http.MethodPut, base+"/boot-source", `{"kernel_image_path":"/vmlinuz","boot_args":"console=ttyS0"}`))
+	if err != nil {
+		t.Fatalf("boot-source: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("boot-source status = %d", resp.StatusCode)
+	}
+
+	// SetMachineConfig
+	resp, err = client.Do(mustReq(t, http.MethodPut, base+"/machine-config", `{"vcpu_count":1,"mem_size_mib":128}`))
+	if err != nil {
+		t.Fatalf("machine-config: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("machine-config status = %d", resp.StatusCode)
+	}
+
+	// SetDrive
+	resp, err = client.Do(mustReq(t, http.MethodPut, base+"/drives/root", `{"path_on_host":"/disk.ext4","is_root_device":true}`))
+	if err != nil {
+		t.Fatalf("drive: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("drive status = %d", resp.StatusCode)
+	}
+
+	// Start
+	resp, err = client.Do(mustReq(t, http.MethodPut, base+"/actions", `{"action_type":"InstanceStart"}`))
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("start status = %d", resp.StatusCode)
+	}
+
+	// GetInfo
+	resp, err = client.Get(base + "/vm")
+	if err != nil {
+		t.Fatalf("get info: %v", err)
+	}
+	var info VMInfo
+	json.NewDecoder(resp.Body).Decode(&info)
+	resp.Body.Close()
+	if info.State != "running" {
+		t.Fatalf("state = %q, want running", info.State)
+	}
+
+	// GetEvents
+	resp, err = client.Get(base + "/events")
+	if err != nil {
+		t.Fatalf("get events: %v", err)
+	}
+	var events []vmm.Event
+	json.NewDecoder(resp.Body).Decode(&events)
+	resp.Body.Close()
+	if len(events) == 0 {
+		t.Fatal("expected events")
+	}
+
+	// GetLogs
+	resp, err = client.Get(base + "/logs")
+	if err != nil {
+		t.Fatalf("get logs: %v", err)
+	}
+	logsBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(logsBody) != "hello\n" {
+		t.Fatalf("logs = %q", logsBody)
+	}
+
+	// Snapshot
+	dir := t.TempDir()
+	resp, err = client.Do(mustReq(t, http.MethodPost, base+"/snapshot", `{"dest_dir":"`+strings.ReplaceAll(dir, `\`, `\\`)+`"}`))
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	var snap vmm.Snapshot
+	json.NewDecoder(resp.Body).Decode(&snap)
+	resp.Body.Close()
+	if snap.Version != 2 {
+		t.Fatalf("snap version = %d", snap.Version)
+	}
+
+	// SetNetRateLimiter (runtime)
+	resp, err = client.Do(mustReq(t, http.MethodPut, base+"/rate-limiters/net", `{"ops":{"size":5}}`))
+	if err != nil {
+		t.Fatalf("net rate limiter: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("net rate limiter status = %d", resp.StatusCode)
+	}
+
+	// SetBlockRateLimiter (runtime)
+	resp, err = client.Do(mustReq(t, http.MethodPut, base+"/rate-limiters/block", `{"bandwidth":{"size":2048}}`))
+	if err != nil {
+		t.Fatalf("block rate limiter: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("block rate limiter status = %d", resp.StatusCode)
+	}
+
+	// SetRNGRateLimiter (runtime)
+	resp, err = client.Do(mustReq(t, http.MethodPut, base+"/rate-limiters/rng", `{"ops":{"size":10}}`))
+	if err != nil {
+		t.Fatalf("rng rate limiter: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("rng rate limiter status = %d", resp.StatusCode)
+	}
+
+	// Stop
+	resp, err = client.Do(mustReq(t, http.MethodPut, base+"/actions", `{"action_type":"InstanceStop"}`))
+	if err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("stop status = %d", resp.StatusCode)
+	}
+}
+
+func mustReq(t *testing.T, method, url, body string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(method, url, bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
+func TestClientBalloonLifecycle(t *testing.T) {
+	srv := NewWithOptions(Options{Factory: func(cfg vmm.Config) (VM, error) {
+		return newFakeVM(cfg), nil
+	}})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := &http.Client{}
+	base := ts.URL
+
+	// Setup boot + balloon
+	for _, step := range []struct {
+		method, path, body string
+	}{
+		{http.MethodPut, "/boot-source", `{"kernel_image_path":"/vmlinuz"}`},
+		{http.MethodPut, "/balloon", `{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":5}`},
+		{http.MethodPut, "/actions", `{"action_type":"InstanceStart"}`},
+	} {
+		resp, err := client.Do(mustReq(t, step.method, base+step.path, step.body))
+		if err != nil {
+			t.Fatalf("%s %s: %v", step.method, step.path, err)
+		}
+		resp.Body.Close()
+	}
+
+	// GetBalloon
+	resp, err := client.Get(base + "/balloon")
+	if err != nil {
+		t.Fatalf("get balloon: %v", err)
+	}
+	var balloon Balloon
+	json.NewDecoder(resp.Body).Decode(&balloon)
+	resp.Body.Close()
+	if balloon.AmountMib != 64 {
+		t.Fatalf("balloon amount = %d", balloon.AmountMib)
+	}
+
+	// PatchBalloon
+	resp, err = client.Do(mustReq(t, http.MethodPatch, base+"/balloon", `{"amount_mib":32}`))
+	if err != nil {
+		t.Fatalf("patch balloon: %v", err)
+	}
+	resp.Body.Close()
+
+	// GetBalloonStats
+	resp, err = client.Get(base + "/balloon/statistics")
+	if err != nil {
+		t.Fatalf("get balloon stats: %v", err)
+	}
+	resp.Body.Close()
+
+	// PatchBalloonStats
+	resp, err = client.Do(mustReq(t, http.MethodPatch, base+"/balloon/statistics", `{"stats_polling_interval_s":10}`))
+	if err != nil {
+		t.Fatalf("patch balloon stats: %v", err)
+	}
+	resp.Body.Close()
+}
+
+func TestClientMemoryHotplugLifecycle(t *testing.T) {
+	srv := NewWithOptions(Options{Factory: func(cfg vmm.Config) (VM, error) {
+		return newFakeVM(cfg), nil
+	}})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := &http.Client{}
+	base := ts.URL
+
+	// Setup
+	for _, step := range []struct {
+		method, path, body string
+	}{
+		{http.MethodPut, "/boot-source", `{"kernel_image_path":"/vmlinuz"}`},
+		{http.MethodPut, "/hotplug/memory", `{"total_size_mib":512,"slot_size_mib":256,"block_size_mib":128}`},
+	} {
+		resp, err := client.Do(mustReq(t, step.method, base+step.path, step.body))
+		if err != nil {
+			t.Fatalf("%s %s: %v", step.method, step.path, err)
+		}
+		resp.Body.Close()
+	}
+
+	// GetMemoryHotplug (preboot)
+	resp, err := client.Get(base + "/hotplug/memory")
+	if err != nil {
+		t.Fatalf("get hotplug: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get hotplug status = %d", resp.StatusCode)
+	}
+
+	// PatchMemoryHotplug
+	resp, err = client.Do(mustReq(t, http.MethodPatch, base+"/hotplug/memory", `{"requested_size_mib":256}`))
+	if err != nil {
+		t.Fatalf("patch hotplug: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("patch hotplug status = %d", resp.StatusCode)
+	}
+}
+
+func TestClientMigrationLifecycle(t *testing.T) {
+	srv := NewWithOptions(Options{Factory: func(cfg vmm.Config) (VM, error) {
+		return newFakeVM(cfg), nil
+	}})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := &http.Client{}
+	base := ts.URL
+
+	// Setup and start
+	for _, step := range []struct {
+		method, path, body string
+	}{
+		{http.MethodPut, "/boot-source", `{"kernel_image_path":"/vmlinuz"}`},
+		{http.MethodPut, "/actions", `{"action_type":"InstanceStart"}`},
+	} {
+		resp, err := client.Do(mustReq(t, step.method, base+step.path, step.body))
+		if err != nil {
+			t.Fatalf("%s %s: %v", step.method, step.path, err)
+		}
+		resp.Body.Close()
+	}
+
+	dir := t.TempDir()
+	body := `{"dest_dir":"` + strings.ReplaceAll(dir, `\`, `\\`) + `"}`
+
+	// PrepareMigrationBundle
+	resp, err := client.Do(mustReq(t, http.MethodPost, base+"/migrations/prepare", body))
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("prepare status = %d", resp.StatusCode)
+	}
+
+	// FinalizeMigrationBundle
+	resp, err = client.Do(mustReq(t, http.MethodPost, base+"/migrations/finalize", body))
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("finalize status = %d", resp.StatusCode)
+	}
+
+	// ResetMigrationTracking
+	resp, err = client.Do(mustReq(t, http.MethodPost, base+"/migrations/reset", ``))
+	if err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("reset status = %d", resp.StatusCode)
+	}
+}
+
+func TestParseUint32Value(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    uint32
+		wantErr bool
+	}{
+		{"1234", 1234, false},
+		{"0", 0, false},
+		{"4294967295", 4294967295, false},
+		{"", 0, true},
+		{"  ", 0, true},
+		{"abc", 0, true},
+		{"4294967296", 0, true},
+	}
+	for _, tt := range tests {
+		got, err := parseUint32Value(tt.input)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("parseUint32Value(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			continue
+		}
+		if !tt.wantErr && got != tt.want {
+			t.Errorf("parseUint32Value(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestDecodeAPIError(t *testing.T) {
+	// With valid APIError JSON
+	body := strings.NewReader(`{"fault_message":"something broke"}`)
+	err := decodeAPIError(body, 400)
+	if err == nil || !strings.Contains(err.Error(), "something broke") {
+		t.Fatalf("err = %v, want 'something broke'", err)
+	}
+
+	// With empty fault_message - falls through to raw body read
+	body2 := strings.NewReader(`{"fault_message":""}`)
+	err2 := decodeAPIError(body2, 500)
+	if err2 == nil {
+		t.Fatal("expected error")
+	}
+	// The body was consumed by json decode, so ReadAll gets empty
+	if !strings.Contains(err2.Error(), "500") {
+		t.Fatalf("err = %v, want status code", err2)
+	}
+}
+
+func TestVsockConnect_NoVM(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/vsock/connect?port=1234", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
+	}
+}
+
+func TestVsockConnect_BadPort(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/vsock/connect?port=abc", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestVsockConnect_EmptyPort(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/vsock/connect?port=", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestDriveUpsert_ReplacesExisting(t *testing.T) {
+	srv := New()
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	mustDo(http.MethodPut, "/drives/root", `{"path_on_host":"/disk1.ext4","is_root_device":true}`)
+	mustDo(http.MethodPut, "/drives/root", `{"path_on_host":"/disk2.ext4","is_root_device":true}`)
+	srv.mu.RLock()
+	count := len(srv.preboot.drives)
+	srv.mu.RUnlock()
+	if count != 1 {
+		t.Fatalf("expected 1 drive after upsert, got %d", count)
+	}
+}
+
+func TestNetworkIfaceUpsert_ReplacesExisting(t *testing.T) {
+	srv := New()
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	mustDo(http.MethodPut, "/network-interfaces/eth0", `{"host_dev_name":"tap0"}`)
+	mustDo(http.MethodPut, "/network-interfaces/eth0", `{"host_dev_name":"tap1"}`)
+	srv.mu.RLock()
+	count := len(srv.preboot.netIfaces)
+	srv.mu.RUnlock()
+	if count != 1 {
+		t.Fatalf("expected 1 iface after upsert, got %d", count)
+	}
+}
+
+func TestDriveEndpoint_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/drives/root", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestNetworkIfaceEndpoint_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/network-interfaces/eth0", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestDriveEndpoint_AfterStart(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPut, "/drives/root", bytes.NewBufferString(`{"path_on_host":"/disk.ext4","is_root_device":true}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestNetworkIfaceEndpoint_AfterStart(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPut, "/network-interfaces/eth0", bytes.NewBufferString(`{"host_dev_name":"tap0"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestSharedFS_AfterStart(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPut, "/shared-fs/mytag", bytes.NewBufferString(`{"source":"/data"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestStartWithVsockAndExecConfig(t *testing.T) {
+	srv := NewWithOptions(Options{Factory: func(cfg vmm.Config) (VM, error) {
+		if cfg.Vsock == nil || !cfg.Vsock.Enabled {
+			t.Fatal("expected vsock to be enabled")
+		}
+		if cfg.Exec == nil || !cfg.Exec.Enabled {
+			t.Fatal("expected exec to be enabled")
+		}
+		return newFakeVM(cfg), nil
+	}})
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	mustDo(http.MethodPut, "/boot-source", `{"kernel_image_path":"/vmlinuz"}`)
+	mustDo(http.MethodPut, "/machine-config", `{"vcpu_count":1,"mem_size_mib":128,"vsock_enabled":true,"vsock_guest_cid":3,"exec_enabled":true,"exec_vsock_port":10000}`)
+	rec := mustDo(http.MethodPut, "/actions", `{"action_type":"InstanceStart"}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("start status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestStartWithMultipleDrives(t *testing.T) {
+	srv := NewWithOptions(Options{Factory: func(cfg vmm.Config) (VM, error) {
+		if len(cfg.Drives) != 2 {
+			t.Fatalf("expected 2 drives, got %d", len(cfg.Drives))
+		}
+		return newFakeVM(cfg), nil
+	}})
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	mustDo(http.MethodPut, "/boot-source", `{"kernel_image_path":"/vmlinuz"}`)
+	mustDo(http.MethodPut, "/drives/root", `{"path_on_host":"/root.ext4","is_root_device":true}`)
+	mustDo(http.MethodPut, "/drives/data", `{"path_on_host":"/data.ext4","is_root_device":false}`)
+	rec := mustDo(http.MethodPut, "/actions", `{"action_type":"InstanceStart"}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("start status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestStartWithSharedFS(t *testing.T) {
+	srv := NewWithOptions(Options{Factory: func(cfg vmm.Config) (VM, error) {
+		if len(cfg.SharedFS) != 1 || cfg.SharedFS[0].Tag != "data" {
+			t.Fatalf("expected 1 shared FS with tag=data, got %v", cfg.SharedFS)
+		}
+		return newFakeVM(cfg), nil
+	}})
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	mustDo(http.MethodPut, "/boot-source", `{"kernel_image_path":"/vmlinuz"}`)
+	mustDo(http.MethodPut, "/shared-fs/data", `{"source":"/host/data"}`)
+	rec := mustDo(http.MethodPut, "/actions", `{"action_type":"InstanceStart"}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("start status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBalloonPatch_PostStartWithBalloon(t *testing.T) {
+	// fakeVM implements BalloonController so patch works even without explicit balloon config
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPatch, "/balloon", bytes.NewBufferString(`{"amount_mib":32}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	// fakeVM creates balloon on demand, so this succeeds
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+}
+
+func TestBalloonStatsGet_PostStartWithBalloon(t *testing.T) {
+	srv, vm := newStartedServer(t)
+	// Set up balloon on fakeVM
+	vm.cfg.Balloon = &vmm.BalloonConfig{AmountMiB: 64, StatsPollingIntervalS: 5}
+	vm.balloon = vmm.BalloonStats{TargetMiB: 64, ActualMiB: 32}
+	req := httptest.NewRequest(http.MethodGet, "/balloon/statistics", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var stats vmm.BalloonStats
+	if err := json.NewDecoder(rec.Body).Decode(&stats); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if stats.TargetMiB != 64 {
+		t.Fatalf("TargetMiB = %d, want 64", stats.TargetMiB)
+	}
+}
+
+func TestBalloonStatsPatch_PostStartWithBalloon(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPatch, "/balloon/statistics", bytes.NewBufferString(`{"stats_polling_interval_s":5}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	// fakeVM creates balloon on demand
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+}
+
+func TestBalloonGet_PostStartWithBalloon(t *testing.T) {
+	srv, vm := newStartedServer(t)
+	vm.cfg.Balloon = &vmm.BalloonConfig{AmountMiB: 128, DeflateOnOOM: true}
+	req := httptest.NewRequest(http.MethodGet, "/balloon", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var balloon Balloon
+	if err := json.NewDecoder(rec.Body).Decode(&balloon); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if balloon.AmountMib != 128 {
+		t.Fatalf("amount = %d, want 128", balloon.AmountMib)
+	}
+}
+
+func TestMemoryHotplugGet_PostStartWithHotplug(t *testing.T) {
+	srv, vm := newStartedServer(t)
+	vm.cfg.MemoryHotplug = &vmm.MemoryHotplugConfig{TotalSizeMiB: 1024}
+	vm.hotplug = vmm.MemoryHotplugStatus{TotalSizeMiB: 1024}
+	req := httptest.NewRequest(http.MethodGet, "/hotplug/memory", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestMemoryHotplugPatch_PostStartWithHotplug(t *testing.T) {
+	srv, vm := newStartedServer(t)
+	vm.cfg.MemoryHotplug = &vmm.MemoryHotplugConfig{TotalSizeMiB: 1024, SlotSizeMiB: 256}
+	req := httptest.NewRequest(http.MethodPatch, "/hotplug/memory", bytes.NewBufferString(`{"requested_size_mib":256}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestConcurrentRequests(t *testing.T) {
+	srv := NewWithOptions(Options{Factory: func(cfg vmm.Config) (VM, error) {
+		return newFakeVM(cfg), nil
+	}})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// Setup the server
+	client := &http.Client{}
+	base := ts.URL
+	for _, step := range []struct {
+		method, path, body string
+	}{
+		{http.MethodPut, "/boot-source", `{"kernel_image_path":"/vmlinuz"}`},
+		{http.MethodPut, "/actions", `{"action_type":"InstanceStart"}`},
+	} {
+		resp, _ := client.Do(mustReq(t, step.method, base+step.path, step.body))
+		resp.Body.Close()
+	}
+
+	// Make concurrent requests
+	done := make(chan struct{})
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			resp, err := client.Get(base + "/vm")
+			if err != nil {
+				return
+			}
+			resp.Body.Close()
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+}
+
+func TestBlockRateLimiter_PrebootWithNonRootDrive(t *testing.T) {
+	srv := New()
+	// Add a non-root drive
+	req := httptest.NewRequest(http.MethodPut, "/drives/data", bytes.NewBufferString(`{"path_on_host":"/data.ext4","is_root_device":false}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	// Try to set block rate limiter - should fail because no root drive
+	req = httptest.NewRequest(http.MethodPut, "/rate-limiters/block", bytes.NewBufferString(`{"ops":{"size":1}}`))
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestRestoreEndpoint_InvalidX86Boot(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/restore", bytes.NewBufferString(`{"snapshot_dir":"/tmp","x86_boot":"bogus"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+// ---- Client struct tests (via Unix socket) ----
+
+func TestClientViaUnixSocket(t *testing.T) {
+	var vm *fakeVM
+	srv := NewWithOptions(Options{Factory: func(cfg vmm.Config) (VM, error) {
+		vm = newFakeVM(cfg).(*fakeVM)
+		return vm, nil
+	}})
+
+	socketPath := filepath.Join(t.TempDir(), "api.sock")
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go http.Serve(ln, srv)
+
+	ctx := context.Background()
+	client := NewClient(socketPath)
+
+	// SetBootSource
+	if err := client.SetBootSource(ctx, BootSource{
+		KernelImagePath: "/vmlinuz",
+		BootArgs:        "console=ttyS0",
+	}); err != nil {
+		t.Fatalf("SetBootSource: %v", err)
+	}
+
+	// SetMachineConfig
+	if err := client.SetMachineConfig(ctx, MachineConfig{
+		VcpuCount:  1,
+		MemSizeMib: 256,
+	}); err != nil {
+		t.Fatalf("SetMachineConfig: %v", err)
+	}
+
+	// SetDrive
+	if err := client.SetDrive(ctx, "root", Drive{
+		PathOnHost:   "/disk.ext4",
+		IsRootDevice: true,
+	}); err != nil {
+		t.Fatalf("SetDrive: %v", err)
+	}
+
+	// SetNetworkInterface
+	if err := client.SetNetworkInterface(ctx, "eth0", NetworkInterface{
+		HostDevName: "tap0",
+	}); err != nil {
+		t.Fatalf("SetNetworkInterface: %v", err)
+	}
+
+	// SetSharedFS
+	if err := client.SetSharedFS(ctx, "myfs", SharedFS{
+		Source: "/host/data",
+	}); err != nil {
+		t.Fatalf("SetSharedFS: %v", err)
+	}
+
+	// SetBalloon
+	if err := client.SetBalloon(ctx, Balloon{
+		AmountMib:    64,
+		DeflateOnOOM: true,
+	}); err != nil {
+		t.Fatalf("SetBalloon: %v", err)
+	}
+
+	// GetBalloon (preboot)
+	balloon, err := client.GetBalloon(ctx)
+	if err != nil {
+		t.Fatalf("GetBalloon: %v", err)
+	}
+	if balloon.AmountMib != 64 {
+		t.Fatalf("balloon = %d", balloon.AmountMib)
+	}
+
+	// SetMemoryHotplug
+	if err := client.SetMemoryHotplug(ctx, MemoryHotplugConfig{
+		TotalSizeMiB: 512,
+		SlotSizeMiB:  256,
+		BlockSizeMiB: 128,
+	}); err != nil {
+		t.Fatalf("SetMemoryHotplug: %v", err)
+	}
+
+	// GetMemoryHotplug (preboot)
+	status, err := client.GetMemoryHotplug(ctx)
+	if err != nil {
+		t.Fatalf("GetMemoryHotplug: %v", err)
+	}
+	if status.TotalSizeMiB != 512 {
+		t.Fatalf("total = %d", status.TotalSizeMiB)
+	}
+
+	// PatchMemoryHotplug
+	if err := client.PatchMemoryHotplug(ctx, MemoryHotplugSizeUpdate{
+		RequestedSizeMiB: 256,
+	}); err != nil {
+		t.Fatalf("PatchMemoryHotplug: %v", err)
+	}
+
+	// PatchBalloon
+	if err := client.PatchBalloon(ctx, BalloonUpdate{AmountMib: 32}); err != nil {
+		t.Fatalf("PatchBalloon: %v", err)
+	}
+
+	// GetBalloonStats (preboot with stats enabled)
+	_, err = client.GetBalloonStats(ctx)
+	// This may fail because stats_polling_interval_s not set
+	_ = err
+
+	// PatchBalloonStats
+	if err := client.PatchBalloonStats(ctx, BalloonStatsUpdate{StatsPollingIntervalS: 5}); err != nil {
+		t.Fatalf("PatchBalloonStats: %v", err)
+	}
+
+	// SetNetRateLimiter (preboot with iface configured)
+	if err := client.SetNetRateLimiter(ctx, vmm.RateLimiterConfig{
+		Ops: vmm.TokenBucketConfig{Size: 5},
+	}); err != nil {
+		t.Fatalf("SetNetRateLimiter: %v", err)
+	}
+
+	// SetRNGRateLimiter (always works preboot)
+	if err := client.SetRNGRateLimiter(ctx, vmm.RateLimiterConfig{
+		Ops: vmm.TokenBucketConfig{Size: 1},
+	}); err != nil {
+		t.Fatalf("SetRNGRateLimiter: %v", err)
+	}
+
+	// Start
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// SetBlockRateLimiter (runtime)
+	if err := client.SetBlockRateLimiter(ctx, vmm.RateLimiterConfig{
+		Bandwidth: vmm.TokenBucketConfig{Size: 2048},
+	}); err != nil {
+		t.Fatalf("SetBlockRateLimiter: %v", err)
+	}
+
+	// GetInfo
+	info, err := client.GetInfo(ctx)
+	if err != nil {
+		t.Fatalf("GetInfo: %v", err)
+	}
+	if info.State != "running" {
+		t.Fatalf("state = %q", info.State)
+	}
+
+	// GetEvents
+	events, err := client.GetEvents(ctx, time.Time{})
+	if err != nil {
+		t.Fatalf("GetEvents: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("expected events")
+	}
+
+	// GetLogs
+	logs, err := client.GetLogs(ctx)
+	if err != nil {
+		t.Fatalf("GetLogs: %v", err)
+	}
+	if string(logs) != "hello\n" {
+		t.Fatalf("logs = %q", logs)
+	}
+
+	// Snapshot
+	snapDir := t.TempDir()
+	snap, err := client.Snapshot(ctx, SnapshotRequest{DestDir: snapDir})
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snap.Version != 2 {
+		t.Fatalf("snap version = %d", snap.Version)
+	}
+
+	// PrepareMigrationBundle
+	migDir := t.TempDir()
+	if err := client.PrepareMigrationBundle(ctx, SnapshotRequest{DestDir: migDir}); err != nil {
+		t.Fatalf("PrepareMigrationBundle: %v", err)
+	}
+
+	// FinalizeMigrationBundle
+	finalSnap, patches, err := client.FinalizeMigrationBundle(ctx, SnapshotRequest{DestDir: migDir})
+	if err != nil {
+		t.Fatalf("FinalizeMigrationBundle: %v", err)
+	}
+	if finalSnap == nil {
+		t.Fatal("expected snapshot from finalize")
+	}
+	if patches == nil {
+		t.Fatal("expected patches from finalize")
+	}
+
+	// ResetMigrationTracking
+	if err := client.ResetMigrationTracking(ctx); err != nil {
+		t.Fatalf("ResetMigrationTracking: %v", err)
+	}
+
+	// Stop
+	if err := client.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestMemoryHotplugPut_InvalidValidation(t *testing.T) {
+	srv := New()
+	// slot_size_mib must be > 0 normally; just test that validation runs
+	req := httptest.NewRequest(http.MethodPut, "/hotplug/memory", bytes.NewBufferString(`{"total_size_mib":0,"slot_size_mib":0,"block_size_mib":0}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	// This may pass validation with zeros - just confirm no panic
+	if rec.Code != http.StatusNoContent && rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
 }

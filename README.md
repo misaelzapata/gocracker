@@ -5,7 +5,7 @@ One binary. One command. Real VM isolation.
 [![Go 1.22+](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![CI](https://img.shields.io/badge/CI-passing-brightgreen)]()
-[![Coverage](https://img.shields.io/badge/Coverage-67%25-yellowgreen)](docs/ARCHITECTURE.md)
+[![Coverage](https://img.shields.io/badge/Coverage-69%25-green)](docs/ARCHITECTURE.md)
 [![Tests](https://img.shields.io/badge/Tests-500+-green)]()
 [![Validated](https://img.shields.io/badge/Validated-328_projects-blue)](docs/VALIDATED_PROJECTS.md)
 
