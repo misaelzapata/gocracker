@@ -481,3 +481,223 @@ func TestSanitizeRuntimePathComponent(t *testing.T) {
 func guestSpecForTest(imgConfig oci.ImageConfig, opts RunOptions) runtimecfg.GuestSpec {
 	return buildGuestSpec(imgConfig, opts, resolveSharedFSMounts(opts.Mounts))
 }
+
+// --- Additional tests ---
+
+func TestJailerEnabled(t *testing.T) {
+	tests := []struct {
+		mode string
+		want bool
+	}{
+		{"", true},
+		{"on", true},
+		{"ON", true},
+		{" on ", true},
+		{"off", false},
+		{"OFF", false},
+		{" off ", false},
+		{"auto", true}, // unknown defaults to true
+	}
+	for _, tt := range tests {
+		if got := jailerEnabled(tt.mode); got != tt.want {
+			t.Errorf("jailerEnabled(%q) = %v, want %v", tt.mode, got, tt.want)
+		}
+	}
+}
+
+func TestResolvedCacheDir_Default(t *testing.T) {
+	got := resolvedCacheDir("")
+	if got == "" {
+		t.Fatal("resolvedCacheDir(\"\") returned empty string")
+	}
+	if !strings.Contains(got, "gocracker") {
+		t.Fatalf("resolvedCacheDir(\"\") = %q, expected to contain 'gocracker'", got)
+	}
+}
+
+func TestResolvedCacheDir_Explicit(t *testing.T) {
+	got := resolvedCacheDir("/custom/cache")
+	if got != "/custom/cache" {
+		t.Fatalf("resolvedCacheDir('/custom/cache') = %q, want /custom/cache", got)
+	}
+}
+
+func TestResolvedCacheDir_Whitespace(t *testing.T) {
+	got := resolvedCacheDir("  /custom/cache  ")
+	if got != "/custom/cache" {
+		t.Fatalf("resolvedCacheDir('  /custom/cache  ') = %q, want /custom/cache", got)
+	}
+}
+
+func TestSanitizeRuntimePathComponent_AlphaNumeric(t *testing.T) {
+	got := sanitizeRuntimePathComponent("hello-world_1.2")
+	if got != "hello-world_1.2" {
+		t.Fatalf("sanitizeRuntimePathComponent('hello-world_1.2') = %q", got)
+	}
+}
+
+func TestSanitizeRuntimePathComponent_Uppercase(t *testing.T) {
+	got := sanitizeRuntimePathComponent("MyVM")
+	if got != "MyVM" {
+		t.Fatalf("sanitizeRuntimePathComponent('MyVM') = %q, want MyVM", got)
+	}
+}
+
+func TestBuildGuestSpec_EmptyEntrypointAndCmd(t *testing.T) {
+	spec := guestSpecForTest(oci.ImageConfig{}, RunOptions{})
+	if spec.Process.Exec != "" {
+		t.Fatalf("process.Exec = %q, want empty for no entrypoint/cmd", spec.Process.Exec)
+	}
+	if len(spec.Process.Args) != 0 {
+		t.Fatalf("process.Args = %v, want empty", spec.Process.Args)
+	}
+}
+
+func TestBuildGuestSpec_EnvOrder(t *testing.T) {
+	spec := guestSpecForTest(oci.ImageConfig{
+		Env: []string{"A=1", "B=2"},
+	}, RunOptions{
+		Env: []string{"C=3"},
+	})
+	want := []string{"A=1", "B=2", "C=3"}
+	if !reflect.DeepEqual(spec.Env, want) {
+		t.Fatalf("env = %#v, want %#v (image env first, then opts)", spec.Env, want)
+	}
+}
+
+func TestBuildGuestSpec_HostsFromOpts(t *testing.T) {
+	spec := guestSpecForTest(oci.ImageConfig{}, RunOptions{
+		Hosts: []string{"db=10.0.0.2", "cache=10.0.0.3"},
+	})
+	if len(spec.Hosts) != 2 {
+		t.Fatalf("hosts = %d, want 2", len(spec.Hosts))
+	}
+}
+
+func TestBuildGuestSpec_InteractiveExecClearProcess(t *testing.T) {
+	spec := buildGuestSpec(oci.ImageConfig{
+		Entrypoint: []string{"/bin/sh"},
+	}, RunOptions{
+		InteractiveExec: true,
+	}, resolveSharedFSMounts(nil))
+	if spec.Process.Exec != "" {
+		t.Fatalf("interactive exec should clear process, got Exec=%q", spec.Process.Exec)
+	}
+}
+
+func TestBuildGuestSpec_UserFromImage(t *testing.T) {
+	spec := guestSpecForTest(oci.ImageConfig{
+		User: "nobody",
+	}, RunOptions{})
+	if spec.User != "nobody" {
+		t.Fatalf("user = %q, want nobody", spec.User)
+	}
+}
+
+func TestBuildCmdline_NoTapNoStaticIP(t *testing.T) {
+	cmdline := buildCmdline(oci.ImageConfig{}, RunOptions{})
+	if strings.Contains(cmdline, "gc.ip=") {
+		t.Fatalf("unexpected gc.ip in:\n%s", cmdline)
+	}
+	if strings.Contains(cmdline, "gc.gw=") {
+		t.Fatalf("unexpected gc.gw in:\n%s", cmdline)
+	}
+	if strings.Contains(cmdline, "gc.wait_network") {
+		t.Fatalf("unexpected gc.wait_network in:\n%s", cmdline)
+	}
+}
+
+func TestBuildCmdline_GatewayOnlyIgnored(t *testing.T) {
+	cmdline := buildCmdline(oci.ImageConfig{}, RunOptions{
+		Gateway: "10.0.0.1",
+	})
+	if strings.Contains(cmdline, "gc.gw=") {
+		t.Fatalf("gateway without static IP should be ignored:\n%s", cmdline)
+	}
+}
+
+func TestBuildGuestSpec_PID1ModeDefault(t *testing.T) {
+	spec := guestSpecForTest(oci.ImageConfig{}, RunOptions{})
+	if spec.PID1Mode != "" {
+		t.Fatalf("pid1 mode = %q, want empty (default)", spec.PID1Mode)
+	}
+}
+
+func TestBuildGuestSpec_InteractiveExecDefaultsToSupervised(t *testing.T) {
+	spec := buildGuestSpec(oci.ImageConfig{}, RunOptions{
+		InteractiveExec: true,
+	}, resolveSharedFSMounts(nil))
+	if spec.PID1Mode != runtimecfg.PID1ModeSupervised {
+		t.Fatalf("pid1 mode = %q, want %q for interactive exec", spec.PID1Mode, runtimecfg.PID1ModeSupervised)
+	}
+}
+
+func TestBuildGuestSpec_ExecEnabled(t *testing.T) {
+	spec := guestSpecForTest(oci.ImageConfig{}, RunOptions{
+		ExecEnabled: true,
+	})
+	if !spec.Exec.Enabled {
+		t.Fatal("exec should be enabled")
+	}
+	if spec.Exec.VsockPort != runtimecfg.DefaultExecVsockPort {
+		t.Fatalf("exec vsock port = %d, want %d", spec.Exec.VsockPort, runtimecfg.DefaultExecVsockPort)
+	}
+}
+
+func TestPrepareBootDisk_BootDiskInSubdir(t *testing.T) {
+	workDir := t.TempDir()
+	templateDisk := filepath.Join(workDir, "disk.ext4")
+	if err := os.WriteFile(templateDisk, []byte("data"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	bootDisk, cleanup, err := prepareBootDisk(workDir, templateDisk, "gc-test")
+	if err != nil {
+		t.Fatalf("prepareBootDisk() error = %v", err)
+	}
+	defer cleanup()
+
+	if _, err := os.Stat(bootDisk); err != nil {
+		t.Fatalf("boot disk should exist: %v", err)
+	}
+	// Boot disk should be under runs/ subdir, not same as template
+	if bootDisk == templateDisk {
+		t.Fatalf("bootDisk = template, want different path")
+	}
+	if !strings.Contains(bootDisk, "runs") {
+		t.Fatalf("bootDisk = %q, expected to be under runs/", bootDisk)
+	}
+}
+
+func TestRunResult_CloseNil(t *testing.T) {
+	// Should not panic
+	var r *RunResult
+	r.Close()
+
+	r2 := &RunResult{}
+	r2.Close()
+}
+
+func TestNetworkModeConstants(t *testing.T) {
+	if NetworkModeNone != "" {
+		t.Errorf("NetworkModeNone = %q, want empty", NetworkModeNone)
+	}
+	if NetworkModeAuto != "auto" {
+		t.Errorf("NetworkModeAuto = %q, want auto", NetworkModeAuto)
+	}
+	if JailerModeOn != "on" {
+		t.Errorf("JailerModeOn = %q, want on", JailerModeOn)
+	}
+	if JailerModeOff != "off" {
+		t.Errorf("JailerModeOff = %q, want off", JailerModeOff)
+	}
+}
+
+func TestMountBackendConstants(t *testing.T) {
+	if MountBackendMaterialized != "" {
+		t.Errorf("MountBackendMaterialized = %q, want empty", MountBackendMaterialized)
+	}
+	if MountBackendVirtioFS != "virtiofs" {
+		t.Errorf("MountBackendVirtioFS = %q, want virtiofs", MountBackendVirtioFS)
+	}
+}

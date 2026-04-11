@@ -1419,6 +1419,345 @@ func testHealthcheck(test []string, interval, timeout, startPeriod time.Duration
 	}
 }
 
+// --- Additional tests ---
+
+func TestParsePortMapping_UDPProtocol(t *testing.T) {
+	got, err := parsePortMapping("53:53/udp")
+	if err != nil {
+		t.Fatalf("parsePortMapping: %v", err)
+	}
+	if got.Protocol != "udp" || got.HostPort != 53 || got.ContainerPort != 53 {
+		t.Fatalf("unexpected mapping: %#v", got)
+	}
+}
+
+func TestParsePortMapping_InvalidProtocol(t *testing.T) {
+	_, err := parsePortMapping("80:80/sctp")
+	if err == nil || !strings.Contains(err.Error(), "unsupported port mapping protocol") {
+		t.Fatalf("expected unsupported protocol error, got %v", err)
+	}
+}
+
+func TestParsePortMapping_EmptyString(t *testing.T) {
+	_, err := parsePortMapping("")
+	if err == nil {
+		t.Fatal("expected error for empty port mapping")
+	}
+}
+
+func TestParsePortMapping_InvalidPort(t *testing.T) {
+	_, err := parsePortMapping("abc:80")
+	if err == nil {
+		t.Fatal("expected error for invalid port")
+	}
+}
+
+func TestParsePortMapping_InvalidHostIP(t *testing.T) {
+	_, err := parsePortMapping("notanip:8080:80")
+	if err == nil {
+		t.Fatal("expected error for invalid host IP")
+	}
+}
+
+func TestParseVolumeString_TargetOnly(t *testing.T) {
+	spec, err := parseVolumeString("/data")
+	if err != nil {
+		t.Fatalf("parseVolumeString: %v", err)
+	}
+	if spec.Type != "volume" || spec.Target != "/data" {
+		t.Fatalf("unexpected spec: %#v", spec)
+	}
+}
+
+func TestParseVolumeString_BindMount(t *testing.T) {
+	spec, err := parseVolumeString("./src:/app")
+	if err != nil {
+		t.Fatalf("parseVolumeString: %v", err)
+	}
+	if spec.Type != "bind" || spec.Source != "./src" || spec.Target != "/app" {
+		t.Fatalf("unexpected spec: %#v", spec)
+	}
+}
+
+func TestParseVolumeString_ReadOnly(t *testing.T) {
+	spec, err := parseVolumeString("./config:/etc/config:ro")
+	if err != nil {
+		t.Fatalf("parseVolumeString: %v", err)
+	}
+	if !spec.ReadOnly {
+		t.Fatal("expected read-only volume")
+	}
+}
+
+func TestParseVolumeString_NamedVolume(t *testing.T) {
+	spec, err := parseVolumeString("mydata:/data")
+	if err != nil {
+		t.Fatalf("parseVolumeString: %v", err)
+	}
+	if spec.Type != "volume" || spec.Source != "mydata" || spec.Target != "/data" {
+		t.Fatalf("unexpected spec: %#v", spec)
+	}
+}
+
+func TestParseVolumeObject_BindType(t *testing.T) {
+	spec, err := parseVolumeObject(map[string]interface{}{
+		"type":   "bind",
+		"source": "/host/data",
+		"target": "/container/data",
+	})
+	if err != nil {
+		t.Fatalf("parseVolumeObject: %v", err)
+	}
+	if spec.Type != "bind" || spec.Source != "/host/data" || spec.Target != "/container/data" {
+		t.Fatalf("unexpected spec: %#v", spec)
+	}
+}
+
+func TestParseVolumeObject_MissingTarget(t *testing.T) {
+	_, err := parseVolumeObject(map[string]interface{}{
+		"type":   "bind",
+		"source": "/host/data",
+	})
+	if err == nil || !strings.Contains(err.Error(), "target is required") {
+		t.Fatalf("expected missing target error, got %v", err)
+	}
+}
+
+func TestParseVolumeObject_UnsupportedType(t *testing.T) {
+	_, err := parseVolumeObject(map[string]interface{}{
+		"type":   "nfs",
+		"source": "server:/share",
+		"target": "/data",
+	})
+	if err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("expected unsupported type error, got %v", err)
+	}
+}
+
+func TestSortServices_TransitiveDeps(t *testing.T) {
+	services := map[string]Service{
+		"frontend": {
+			Image:     "nginx",
+			DependsOn: testDependsOn(map[string]string{"backend": "service_started"}),
+		},
+		"backend": {
+			Image:     "myapp",
+			DependsOn: testDependsOn(map[string]string{"db": "service_started", "cache": "service_started"}),
+		},
+		"db":    {Image: "postgres"},
+		"cache": {Image: "redis"},
+	}
+	order, err := sortServices(services)
+	if err != nil {
+		t.Fatalf("sortServices: %v", err)
+	}
+	indexOf := map[string]int{}
+	for i, name := range order {
+		indexOf[name] = i
+	}
+	if indexOf["db"] >= indexOf["backend"] {
+		t.Errorf("db should come before backend")
+	}
+	if indexOf["cache"] >= indexOf["backend"] {
+		t.Errorf("cache should come before backend")
+	}
+	if indexOf["backend"] >= indexOf["frontend"] {
+		t.Errorf("backend should come before frontend")
+	}
+}
+
+func TestSortServices_SelfDep(t *testing.T) {
+	services := map[string]Service{
+		"a": {Image: "a", DependsOn: testDependsOn(map[string]string{"a": "service_started"})},
+	}
+	_, err := sortServices(services)
+	if err == nil {
+		t.Fatal("expected error for self-dependency")
+	}
+}
+
+func TestValidateServiceDependencies_Valid(t *testing.T) {
+	err := validateServiceDependencies(map[string]Service{
+		"api": {
+			DependsOn: testDependsOn(map[string]string{"db": "service_started"}),
+		},
+		"db": {},
+	})
+	if err != nil {
+		t.Fatalf("validateServiceDependencies() = %v, want nil", err)
+	}
+}
+
+func TestParseMemLimit_EdgeCases(t *testing.T) {
+	tests := []struct {
+		input string
+		want  uint64
+	}{
+		{"", 256},
+		{"0m", 0},
+		{"100M", 100},
+		{"2g", 2048},
+		{"4096k", 4},
+	}
+	for _, tt := range tests {
+		got := parseMemLimit(tt.input)
+		if got != tt.want {
+			t.Errorf("parseMemLimit(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestAssignTapNames_WithProject(t *testing.T) {
+	names := assignTapNames([]string{"a", "b"}, "gc", "myproj")
+	if len(names) != 2 {
+		t.Fatalf("got %d names, want 2", len(names))
+	}
+	// Verify they start with prefix
+	for _, name := range names {
+		if !strings.HasPrefix(name, "gc") {
+			t.Fatalf("tap name %q does not start with gc", name)
+		}
+	}
+}
+
+func TestAssignIPs_SingleService(t *testing.T) {
+	ips := assignIPs([]string{"web"}, "172.20.0.1")
+	if ips["web"] != "172.20.0.2" {
+		t.Fatalf("web IP = %q, want 172.20.0.2", ips["web"])
+	}
+}
+
+func TestAssignIPs_InvalidGateway(t *testing.T) {
+	ips := assignIPs([]string{"web"}, "bad")
+	// Should fall back to 172.20.0.1 as gateway
+	if ips["web"] != "172.20.0.2" {
+		t.Fatalf("web IP = %q, want 172.20.0.2 (fallback gateway)", ips["web"])
+	}
+}
+
+func TestSplitComposeSpec_Brackets(t *testing.T) {
+	parts, err := splitComposeSpec("[::1]:8080:80", ':')
+	if err != nil {
+		t.Fatalf("splitComposeSpec: %v", err)
+	}
+	if len(parts) != 3 || parts[0] != "[::1]" || parts[1] != "8080" || parts[2] != "80" {
+		t.Fatalf("unexpected parts: %#v", parts)
+	}
+}
+
+func TestSplitComposeSpec_UnbalancedBracket(t *testing.T) {
+	_, err := splitComposeSpec("[::1:8080", ':')
+	if err == nil {
+		t.Fatal("expected error for unbalanced bracket")
+	}
+}
+
+func TestSplitComposeSpec_ExtraCloseBracket(t *testing.T) {
+	_, err := splitComposeSpec("]:8080", ':')
+	if err == nil {
+		t.Fatal("expected error for extra close bracket")
+	}
+}
+
+func TestParseConsistency(t *testing.T) {
+	tests := []struct {
+		input []string
+		want  string
+	}{
+		{nil, ""},
+		{[]string{}, ""},
+		{[]string{"cached"}, "cached"},
+		{[]string{"delegated"}, "delegated"},
+		{[]string{"consistent"}, "consistent"},
+		{[]string{"ro"}, ""},
+		{[]string{"ro", "cached"}, "cached"},
+	}
+	for _, tt := range tests {
+		got := parseConsistency(tt.input)
+		if got != tt.want {
+			t.Errorf("parseConsistency(%v) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestServiceStateString_NilService(t *testing.T) {
+	if got := serviceStateString(nil); got != "pending" {
+		t.Fatalf("serviceStateString(nil) = %q, want pending", got)
+	}
+}
+
+func TestServiceStateString_WithState(t *testing.T) {
+	svc := &ServiceVM{State: "running"}
+	if got := serviceStateString(svc); got != "running" {
+		t.Fatalf("serviceStateString() = %q, want running", got)
+	}
+}
+
+func TestServiceStateString_WithVM(t *testing.T) {
+	svc := &ServiceVM{
+		VM:    fakeHandleForComposeTest{state: vmm.StatePaused},
+		State: "should-not-use-this",
+	}
+	if got := serviceStateString(svc); got != "paused" {
+		t.Fatalf("serviceStateString() = %q, want paused (from VM)", got)
+	}
+}
+
+func TestServiceVMID_FromResult(t *testing.T) {
+	svc := &ServiceVM{
+		Result: &container.RunResult{ID: "vm-123"},
+	}
+	if got := serviceVMID(svc); got != "vm-123" {
+		t.Fatalf("serviceVMID() = %q, want vm-123", got)
+	}
+}
+
+func TestServiceVMID_FromVMID(t *testing.T) {
+	svc := &ServiceVM{
+		VMID: "explicit-id",
+	}
+	if got := serviceVMID(svc); got != "explicit-id" {
+		t.Fatalf("serviceVMID() = %q, want explicit-id", got)
+	}
+}
+
+func TestServiceVMID_Nil(t *testing.T) {
+	if got := serviceVMID(nil); got != "" {
+		t.Fatalf("serviceVMID(nil) = %q, want empty", got)
+	}
+}
+
+func TestDependsOnConditions(t *testing.T) {
+	svc := Service{
+		DependsOn: testDependsOn(map[string]string{
+			"db":    "service_healthy",
+			"cache": "service_started",
+		}),
+	}
+	conds := dependsOnConditions(svc)
+	if conds["db"] != "service_healthy" {
+		t.Fatalf("db condition = %q, want service_healthy", conds["db"])
+	}
+	if conds["cache"] != "service_started" {
+		t.Fatalf("cache condition = %q, want service_started", conds["cache"])
+	}
+}
+
+func TestDependsOnConditions_Empty(t *testing.T) {
+	svc := Service{}
+	conds := dependsOnConditions(svc)
+	if len(conds) != 0 {
+		t.Fatalf("expected 0 conditions, got %d", len(conds))
+	}
+}
+
+func TestStackNameForComposePath(t *testing.T) {
+	name := StackNameForComposePath("/home/user/project/docker-compose.yml")
+	if name == "" {
+		t.Fatal("StackNameForComposePath() returned empty string")
+	}
+}
+
 func testVolumeConfigs(specs ...volumeSpec) []composetypes.ServiceVolumeConfig {
 	out := make([]composetypes.ServiceVolumeConfig, 0, len(specs))
 	for _, spec := range specs {

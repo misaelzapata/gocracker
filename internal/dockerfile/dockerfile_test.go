@@ -481,3 +481,544 @@ func TestParse_OnlyComments(t *testing.T) {
 		t.Errorf("got %d instructions from comments-only, want 0", len(instrs))
 	}
 }
+
+func TestParse_MultiStageBuilds(t *testing.T) {
+	input := `FROM golang:1.21 AS builder
+WORKDIR /src
+COPY . .
+RUN go build -o /app
+
+FROM scratch
+COPY --from=builder /app /app
+ENTRYPOINT ["/app"]
+`
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// Count FROM instructions
+	fromCount := 0
+	for _, instr := range instrs {
+		if instr.Cmd == "FROM" {
+			fromCount++
+		}
+	}
+	if fromCount != 2 {
+		t.Fatalf("got %d FROM instructions, want 2", fromCount)
+	}
+
+	// First FROM should have AS alias
+	if instrs[0].Cmd != "FROM" {
+		t.Fatalf("first instruction = %q, want FROM", instrs[0].Cmd)
+	}
+	args := strings.Join(instrs[0].Args, " ")
+	if !strings.Contains(args, "AS") || !strings.Contains(args, "builder") {
+		t.Fatalf("first FROM args = %q, want AS builder", args)
+	}
+
+	// Find the COPY --from instruction
+	var copyInstr *Instruction
+	for i := range instrs {
+		if instrs[i].Cmd == "COPY" && len(instrs[i].Args) > 0 && strings.HasPrefix(instrs[i].Args[0], "--from=") {
+			copyInstr = &instrs[i]
+			break
+		}
+	}
+	if copyInstr == nil {
+		t.Fatal("no COPY --from instruction found")
+	}
+	if copyInstr.Args[0] != "--from=builder" {
+		t.Fatalf("COPY --from arg = %q, want --from=builder", copyInstr.Args[0])
+	}
+}
+
+func TestParse_COPYFromHandling(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantFrom string
+	}{
+		{
+			name:     "COPY from named stage",
+			input:    "FROM scratch AS build\nCOPY app /app\nFROM scratch\nCOPY --from=build /app /app\n",
+			wantFrom: "--from=build",
+		},
+		{
+			name:     "COPY from numeric index",
+			input:    "FROM scratch\nCOPY app /app\nFROM scratch\nCOPY --from=0 /app /app\n",
+			wantFrom: "--from=0",
+		},
+		{
+			name:     "COPY from remote image",
+			input:    "FROM scratch\nCOPY --from=nginx:latest /etc/nginx/nginx.conf /etc/nginx/nginx.conf\n",
+			wantFrom: "--from=nginx:latest",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			instrs, err := parse(strings.NewReader(tt.input))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			var found bool
+			for _, instr := range instrs {
+				if instr.Cmd == "COPY" {
+					for _, arg := range instr.Args {
+						if arg == tt.wantFrom {
+							found = true
+						}
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("did not find COPY with %s in instructions", tt.wantFrom)
+			}
+		})
+	}
+}
+
+func TestParse_RUNMountTypes(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		mountType string
+		target    string
+	}{
+		{
+			name:      "cache mount",
+			input:     "FROM scratch\nRUN --mount=type=cache,target=/var/cache/apt apt-get update\n",
+			mountType: "cache",
+			target:    "/var/cache/apt",
+		},
+		{
+			name:      "bind mount",
+			input:     "FROM scratch\nRUN --mount=type=bind,source=go.sum,target=go.sum echo ok\n",
+			mountType: "bind",
+			target:    "go.sum",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			instrs, err := parse(strings.NewReader(tt.input))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			var runInstr *Instruction
+			for i := range instrs {
+				if instrs[i].Cmd == "RUN" {
+					runInstr = &instrs[i]
+					break
+				}
+			}
+			if runInstr == nil {
+				t.Fatal("no RUN instruction found")
+			}
+			if len(runInstr.RunMounts) == 0 {
+				t.Fatal("expected at least one run mount")
+			}
+			if runInstr.RunMounts[0].Type != tt.mountType {
+				t.Fatalf("mount type = %q, want %q", runInstr.RunMounts[0].Type, tt.mountType)
+			}
+			if runInstr.RunMounts[0].Target != tt.target {
+				t.Fatalf("mount target = %q, want %q", runInstr.RunMounts[0].Target, tt.target)
+			}
+		})
+	}
+}
+
+func TestParse_ARGENVSubstitution(t *testing.T) {
+	input := `ARG BASE=ubuntu
+ARG TAG=22.04
+FROM scratch
+`
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	argCount := 0
+	for _, instr := range instrs {
+		if instr.Cmd == "ARG" {
+			argCount++
+		}
+	}
+	if argCount != 2 {
+		t.Fatalf("got %d ARG instructions, want 2", argCount)
+	}
+	// Verify the first ARG has default value
+	firstArg := instrs[0]
+	if firstArg.Cmd != "ARG" {
+		t.Fatalf("first instruction = %q, want ARG", firstArg.Cmd)
+	}
+	if len(firstArg.Args) != 1 || firstArg.Args[0] != "BASE=ubuntu" {
+		t.Fatalf("ARG args = %v, want [BASE=ubuntu]", firstArg.Args)
+	}
+}
+
+func TestParse_USERDirective(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "simple user",
+			input: "FROM scratch\nUSER nobody\n",
+			want:  "nobody",
+		},
+		{
+			name:  "user:group",
+			input: "FROM scratch\nUSER appuser:appgroup\n",
+			want:  "appuser:appgroup",
+		},
+		{
+			name:  "numeric uid",
+			input: "FROM scratch\nUSER 1000\n",
+			want:  "1000",
+		},
+		{
+			name:  "numeric uid:gid",
+			input: "FROM scratch\nUSER 1000:1000\n",
+			want:  "1000:1000",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			instrs, err := parse(strings.NewReader(tt.input))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			var userInstr *Instruction
+			for i := range instrs {
+				if instrs[i].Cmd == "USER" {
+					userInstr = &instrs[i]
+					break
+				}
+			}
+			if userInstr == nil {
+				t.Fatal("no USER instruction found")
+			}
+			if len(userInstr.Args) != 1 || userInstr.Args[0] != tt.want {
+				t.Fatalf("USER args = %v, want [%s]", userInstr.Args, tt.want)
+			}
+		})
+	}
+}
+
+func TestParse_WORKDIRHandling(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "absolute path",
+			input: "FROM scratch\nWORKDIR /app\n",
+			want:  "/app",
+		},
+		{
+			name:  "nested path",
+			input: "FROM scratch\nWORKDIR /usr/local/share\n",
+			want:  "/usr/local/share",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			instrs, err := parse(strings.NewReader(tt.input))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			var workdirInstr *Instruction
+			for i := range instrs {
+				if instrs[i].Cmd == "WORKDIR" {
+					workdirInstr = &instrs[i]
+					break
+				}
+			}
+			if workdirInstr == nil {
+				t.Fatal("no WORKDIR instruction found")
+			}
+			if len(workdirInstr.Args) != 1 || workdirInstr.Args[0] != tt.want {
+				t.Fatalf("WORKDIR args = %v, want [%s]", workdirInstr.Args, tt.want)
+			}
+		})
+	}
+}
+
+func TestParse_HeredocMultipleBlocks(t *testing.T) {
+	input := "FROM scratch\nRUN <<EOF\necho hello\necho world\nEOF\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var runInstr *Instruction
+	for i := range instrs {
+		if instrs[i].Cmd == "RUN" {
+			runInstr = &instrs[i]
+			break
+		}
+	}
+	if runInstr == nil {
+		t.Fatal("no RUN instruction found")
+	}
+	script := runInstr.Args[0]
+	if !strings.Contains(script, "echo hello") || !strings.Contains(script, "echo world") {
+		t.Fatalf("heredoc body = %q, want both echo lines", script)
+	}
+}
+
+func TestExpand_VariousCases(t *testing.T) {
+	b := &builder{
+		env: map[string]string{
+			"APP_NAME": "myapp",
+			"PORT":     "8080",
+		},
+		args: map[string]string{
+			"VERSION": "2.0",
+			"BUILD":   "release",
+		},
+	}
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"$APP_NAME", "myapp"},
+		{"${APP_NAME}", "myapp"},
+		{"${APP_NAME}:${PORT}", "myapp:8080"},
+		{"v$VERSION-$BUILD", "v2.0-release"},
+		{"literal", "literal"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		got := b.expand(tt.input)
+		if got != tt.want {
+			t.Errorf("expand(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestSanitizeRunMountCacheKey_VariousCases(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"/root/.cache/uv", "root_.cache_uv"},
+		{"/var/cache/apt", "var_cache_apt"},
+		{".", "root"},
+		{"", "root"},
+		{"/", "root"},
+		{" /tmp/build ", "tmp_build"},
+	}
+	for _, tt := range tests {
+		got := sanitizeRunMountCacheKey(tt.input)
+		if got != tt.want {
+			t.Errorf("sanitizeRunMountCacheKey(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestResolveContextMountSource_Cases(t *testing.T) {
+	root := t.TempDir()
+	tests := []struct {
+		name    string
+		root    string
+		src     string
+		wantErr bool
+	}{
+		{"empty source returns root", root, "", false},
+		{"relative path inside", root, "subdir", false},
+		{"escape via ..", root, "../secret", true},
+		{"double escape", root, "../../etc/passwd", true},
+		{"empty root", "", "anything", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := resolveContextMountSource(tt.root, tt.src)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("resolveContextMountSource(%q, %q) error = %v, wantErr %v", tt.root, tt.src, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestBuildRunCommand_VariousCases(t *testing.T) {
+	tests := []struct {
+		name    string
+		shell   []string
+		workdir string
+		args    []string
+		want    []string
+	}{
+		{
+			name:    "no workdir",
+			shell:   []string{"/bin/sh", "-c"},
+			workdir: "",
+			args:    []string{"echo hello"},
+			want:    []string{"/bin/sh", "-c", "echo hello"},
+		},
+		{
+			name:    "with workdir",
+			shell:   []string{"/bin/sh", "-c"},
+			workdir: "/app",
+			args:    []string{"make build"},
+			want:    []string{"/bin/sh", "-c", "cd '/app' && make build"},
+		},
+		{
+			name:    "custom shell",
+			shell:   []string{"/bin/bash", "-eo", "pipefail", "-c"},
+			workdir: "",
+			args:    []string{"pip install ."},
+			want:    []string{"/bin/bash", "-eo", "pipefail", "-c", "pip install ."},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &builder{
+				shell:   tt.shell,
+				workdir: tt.workdir,
+			}
+			got := b.buildRunCommand(tt.args)
+			if strings.Join(got, "\x00") != strings.Join(tt.want, "\x00") {
+				t.Fatalf("buildRunCommand() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCommandConfigArgs_ExecForm(t *testing.T) {
+	b := &builder{shell: []string{"/bin/sh", "-c"}}
+	got := b.commandConfigArgs(Instruction{
+		Cmd:       "CMD",
+		Args:      []string{"/app", "--port", "8080"},
+		ShellForm: false,
+	})
+	want := []string{"/app", "--port", "8080"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("commandConfigArgs(exec form) = %#v, want %#v", got, want)
+	}
+}
+
+func TestSplitArgs_VariousCases(t *testing.T) {
+	tests := []struct {
+		cmd  string
+		raw  string
+		want int
+	}{
+		{"CMD", `["echo","hello"]`, 2},
+		{"CMD", `["single"]`, 1},
+		{"RUN", "apt-get update && install", 1},
+		{"EXPOSE", "8080 9090", 2},
+	}
+	for _, tt := range tests {
+		args := splitArgs(tt.cmd, tt.raw)
+		if len(args) != tt.want {
+			t.Errorf("splitArgs(%q, %q) len = %d, want %d (args=%v)", tt.cmd, tt.raw, len(args), tt.want, args)
+		}
+	}
+}
+
+func TestParse_ENVMultipleForms(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "key=value form",
+			input: "FROM scratch\nENV MY_VAR=hello OTHER=world\n",
+		},
+		{
+			name:  "single pair",
+			input: "FROM scratch\nENV SINGLE=value\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			instrs, err := parse(strings.NewReader(tt.input))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			var envInstr *Instruction
+			for i := range instrs {
+				if instrs[i].Cmd == "ENV" {
+					envInstr = &instrs[i]
+					break
+				}
+			}
+			if envInstr == nil {
+				t.Fatal("no ENV instruction found")
+			}
+		})
+	}
+}
+
+func TestParse_ARGWithoutDefault(t *testing.T) {
+	input := "ARG MYVAR\nFROM scratch\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if instrs[0].Cmd != "ARG" {
+		t.Fatalf("first instruction = %q, want ARG", instrs[0].Cmd)
+	}
+	if len(instrs[0].Args) != 1 || instrs[0].Args[0] != "MYVAR" {
+		t.Fatalf("ARG args = %v, want [MYVAR]", instrs[0].Args)
+	}
+}
+
+func TestHasDockerfileInstructions(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"empty", "", false},
+		{"only whitespace", "   \n  \n  ", false},
+		{"only comments", "# comment\n# another\n", false},
+		{"has FROM", "FROM scratch\n", true},
+		{"comment then FROM", "# comment\nFROM scratch\n", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasDockerfileInstructions(tt.content)
+			if got != tt.want {
+				t.Fatalf("hasDockerfileInstructions(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeAddFromForBuildKit(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "ADD --from becomes COPY --from",
+			input: "ADD --from=builder /app /app",
+			want:  "COPY --from=builder /app /app",
+		},
+		{
+			name:  "regular ADD unchanged",
+			input: "ADD file.tar.gz /app",
+			want:  "ADD file.tar.gz /app",
+		},
+		{
+			name:  "comment line unchanged",
+			input: "# ADD --from=builder comment",
+			want:  "# ADD --from=builder comment",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeAddFromForBuildKit(tt.input)
+			if got != tt.want {
+				t.Fatalf("normalizeAddFromForBuildKit(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
