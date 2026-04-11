@@ -43,14 +43,6 @@ jobs:
             GOCRACKER_SECCOMP=off \
             go test -tags integration ./tests/integration/... \
             -count=1 -v -timeout 600s
-      - name: Retry failed integration tests (CI flakiness)
-        if: steps.prereq.outputs.run == 'true' && failure()
-        run: |
-          echo "Retrying integration tests..."
-          sudo -n env GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
-            GOCRACKER_SECCOMP=off \
-            go test -tags integration ./tests/integration/... \
-            -count=1 -v -timeout 600s
       - name: Skip note
         if: steps.prereq.outputs.run != 'true'
         run: echo "Skipping privileged integration subset because /dev/kvm or /dev/net/tun is unavailable on this runner."
