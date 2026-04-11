@@ -2,18 +2,18 @@
 
 One binary. One command. Real VM isolation.
 
-[![CI](https://img.shields.io/badge/CI-passing-brightgreen)]()
-[![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![Go 1.22+](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![CI](https://img.shields.io/badge/CI-passing-brightgreen)]()
 [![Coverage](https://img.shields.io/badge/Coverage-62%25-yellowgreen)](docs/ARCHITECTURE.md)
-[![Tests](https://img.shields.io/badge/Tests-228+-green)]()
+[![Tests](https://img.shields.io/badge/Tests-500+-green)]()
+[![Validated](https://img.shields.io/badge/Validated-328_projects-blue)](docs/VALIDATED_PROJECTS.md)
 
-[![Linux](https://img.shields.io/badge/Linux-KVM-FCC624?logo=linux&logoColor=black)](https://www.kernel.org)
-[![x86-64](https://img.shields.io/badge/x86--64-supported-green)]()
-[![ARM64](https://img.shields.io/badge/ARM64-supported-green)]()
+[![Linux KVM](https://img.shields.io/badge/Linux-KVM-FCC624?logo=linux&logoColor=black)](https://www.kernel.org)
+[![x86-64](https://img.shields.io/badge/x86--64-supported-brightgreen)]()
+[![ARM64](https://img.shields.io/badge/ARM64-supported-brightgreen)]()
 [![OCI](https://img.shields.io/badge/OCI-compatible-purple?logo=open-containers-initiative)](https://opencontainers.org)
-[![Firecracker Inspired](https://img.shields.io/badge/Inspired_by-Firecracker-FF9900?logo=amazon-aws)](https://firecracker-microvm.github.io)
-[![Projects Tested](https://img.shields.io/badge/Validated-328_real--world_projects-blue)](docs/VALIDATED_PROJECTS.md)
+[![Inspired by Firecracker](https://img.shields.io/badge/Inspired_by-Firecracker-FF9900?logo=amazon-aws)](https://firecracker-microvm.github.io)
 
 ## What is gocracker?
 
