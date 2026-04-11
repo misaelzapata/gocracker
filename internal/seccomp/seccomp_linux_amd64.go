@@ -132,7 +132,7 @@ func profileSyscalls(profile Profile) []uintptr {
 	case ProfileVMM:
 		return union(runtimeSyscalls(), fileSyscalls(), netSyscalls(), vmSyscalls())
 	case ProfileVCPU:
-		return union(runtimeSyscalls(), fileSyscalls(), vcpuSyscalls())
+		return union(runtimeSyscalls(), fileSyscalls(), netSyscalls(), vcpuSyscalls())
 	default:
 		return nil
 	}
@@ -161,12 +161,14 @@ func runtimeSyscalls() []uintptr {
 		unix.SYS_PREAD64,
 		unix.SYS_PWRITE64,
 		unix.SYS_ACCESS,
+		unix.SYS_FACCESSAT,
 		unix.SYS_PIPE,
 		unix.SYS_PIPE2,
 		unix.SYS_DUP,
 		unix.SYS_DUP2,
 		unix.SYS_DUP3,
 		unix.SYS_NANOSLEEP,
+		unix.SYS_SETITIMER,
 		unix.SYS_CLOCK_GETTIME,
 		unix.SYS_CLOCK_NANOSLEEP,
 		unix.SYS_SCHED_YIELD,
@@ -180,6 +182,7 @@ func runtimeSyscalls() []uintptr {
 		unix.SYS_SET_ROBUST_LIST,
 		unix.SYS_GETPID,
 		unix.SYS_GETTID,
+		unix.SYS_KILL,
 		unix.SYS_TGKILL,
 		unix.SYS_ARCH_PRCTL,
 		unix.SYS_PRCTL,
@@ -195,6 +198,9 @@ func runtimeSyscalls() []uintptr {
 		unix.SYS_EPOLL_WAIT,
 		unix.SYS_EPOLL_PWAIT,
 		unix.SYS_EVENTFD2,
+		unix.SYS_TIMER_CREATE,
+		unix.SYS_TIMER_SETTIME,
+		unix.SYS_TIMER_DELETE,
 		unix.SYS_CLONE,
 		unix.SYS_CLONE3,
 		unix.SYS_EXIT,
