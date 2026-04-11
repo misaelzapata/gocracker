@@ -36,13 +36,13 @@ jobs:
       - name: Build gocracker binary
         if: steps.prereq.outputs.run == 'true'
         run: make build
-      - name: Privileged integration subset
+      - name: Privileged integration tests
         if: steps.prereq.outputs.run == 'true'
         run: |
           sudo -n env GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
-            go test -tags integration ./tests/integration \
-            -run 'TestAPIServeRunExec|TestCLIComposeServeExec|TestCLIRunInteractiveExec|TestCLIComposeExecInteractive|TestVirtioBalloon(LocalStatsAndExec|WorkerReclaimsRSS)' \
-            -count=1 -v -timeout 300s
+            GOCRACKER_SECCOMP=off \
+            go test -tags integration ./tests/integration/... \
+            -count=1 -v -timeout 600s
       - name: Skip note
         if: steps.prereq.outputs.run != 'true'
         run: echo "Skipping privileged integration subset because /dev/kvm or /dev/net/tun is unavailable on this runner."
