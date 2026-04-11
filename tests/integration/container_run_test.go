@@ -121,9 +121,9 @@ func main() {
 	} else {
 		fmt.Printf("cmdline-unexpected: %s\n", cmdline)
 	}
-	// Also check that init= is set (container.Run sets the workload as init).
-	if strings.Contains(cmdline, "init=") {
-		fmt.Println("cmdline-init-ok")
+	// Check that root=/dev/vda is set (container.Run mounts the disk as root).
+	if strings.Contains(cmdline, "root=/dev/vda") {
+		fmt.Println("cmdline-root-ok")
 	}
 }
 `)
@@ -150,7 +150,7 @@ func main() {
 	if !waitForSerial(&serial, 12*time.Second, "cmdline-console-ok") {
 		t.Fatalf("guest /proc/cmdline did not contain console=ttyS0:\n%s", serial.String())
 	}
-	if !waitForSerial(&serial, 2*time.Second, "cmdline-init-ok") {
-		t.Fatalf("guest /proc/cmdline did not contain init=:\n%s", serial.String())
+	if !waitForSerial(&serial, 2*time.Second, "cmdline-root-ok") {
+		t.Fatalf("guest /proc/cmdline did not contain root=/dev/vda:\n%s", serial.String())
 	}
 }
