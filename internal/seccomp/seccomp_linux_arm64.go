@@ -201,6 +201,10 @@ func runtimeSyscalls() []uintptr {
 		unix.SYS_GETEGID,
 		unix.SYS_RSEQ,
 		unix.SYS_RESTART_SYSCALL,
+		unix.SYS_WAIT4,
+		unix.SYS_WAITID,
+		unix.SYS_PIDFD_OPEN,
+		unix.SYS_PROCESS_VM_READV,
 	}
 }
 

@@ -123,6 +123,7 @@ type RunResult struct {
 	GuestIP      string
 	Gateway      string
 	WorkerSocket string
+	Duration     time.Duration
 	cleanup      func()
 }
 
@@ -449,7 +450,8 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		}()
 	}
 
-	gclog.Container.Info("started", "id", opts.ID, "duration", time.Since(t0).Round(time.Millisecond))
+	bootDuration := time.Since(t0).Round(time.Millisecond)
+	gclog.Container.Info("started", "id", opts.ID, "duration", bootDuration)
 	return &RunResult{
 		VM:       vm,
 		DiskPath: bootDiskPath,
@@ -458,6 +460,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		TapName:  opts.TapName,
 		GuestIP:  trimCIDR(opts.StaticIP),
 		Gateway:  opts.Gateway,
+		Duration: bootDuration,
 		cleanup:  cleanupFn,
 	}, nil
 }

@@ -109,6 +109,9 @@ func LaunchVMM(cfg vmm.Config, opts VMMOptions) (vmm.Handle, func(), error) {
 	if opts.ChrootBase == "" {
 		opts.ChrootBase = DefaultChrootBaseDir()
 	}
+	if err := os.MkdirAll(opts.ChrootBase, 0755); err != nil {
+		return nil, nil, fmt.Errorf("create chroot base %s: %w", opts.ChrootBase, err)
+	}
 	jailerExec, jailerPrefix, err := resolveLauncher(opts.JailerBinary, "jailer")
 	if err != nil {
 		return nil, nil, err
@@ -127,7 +130,15 @@ func LaunchVMM(cfg vmm.Config, opts VMMOptions) (vmm.Handle, func(), error) {
 	mounts := []string{
 		"rw:" + runDir + ":/worker",
 	}
-	jailRoot := filepath.Join(opts.ChrootBase, filepath.Base(vmmExec), jailedCfg.ID, "root")
+	// Use a unique temp dir per VM session to prevent stale bind mount
+	// interference between sessions. Previous approach reused a shared
+	// base dir which caused ENOENT when mounts leaked from crashed VMs.
+	jailDir, err := os.MkdirTemp(opts.ChrootBase, jailedCfg.ID+"-")
+	if err != nil {
+		_ = os.RemoveAll(runDir)
+		return nil, nil, fmt.Errorf("create jail dir: %w", err)
+	}
+	jailRoot := filepath.Join(jailDir, "root")
 	jailedCfg.KernelPath = "/worker/kernel"
 	mounts = append(mounts, "ro:"+cfg.KernelPath+":"+jailedCfg.KernelPath)
 	if cfg.InitrdPath != "" {
@@ -364,6 +375,9 @@ func LaunchRestoredVMM(snapshotDir string, opts vmm.RestoreOptions, workerOpts V
 func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, resume bool, workerOpts VMMOptions) (vmm.Handle, func(), error) {
 	if workerOpts.ChrootBase == "" {
 		workerOpts.ChrootBase = DefaultChrootBaseDir()
+	}
+	if err := os.MkdirAll(workerOpts.ChrootBase, 0755); err != nil {
+		return nil, nil, fmt.Errorf("create chroot base %s: %w", workerOpts.ChrootBase, err)
 	}
 	jailerExec, jailerPrefix, err := resolveLauncher(workerOpts.JailerBinary, "jailer")
 	if err != nil {

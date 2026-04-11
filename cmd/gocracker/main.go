@@ -847,7 +847,11 @@ func mustBalloonAutoMode(raw string) vmm.BalloonAutoMode {
 }
 
 func printResult(r *container.RunResult) {
-	fmt.Printf("\n✓ VM %s is %s\n", r.ID, r.VM.State())
+	if r.Duration > 0 {
+		fmt.Printf("\n✓ VM %s is %s (%s)\n", r.ID, r.VM.State(), r.Duration)
+	} else {
+		fmt.Printf("\n✓ VM %s is %s\n", r.ID, r.VM.State())
+	}
 	if r.DiskPath != "" {
 		fmt.Printf("  disk:   %s\n", r.DiskPath)
 	}
