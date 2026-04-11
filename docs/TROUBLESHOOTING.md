@@ -159,3 +159,13 @@ blocked (check `dmesg` or `journalctl` for seccomp audit messages).
 - Retrieve UART logs via the API: `GET /vms/{id}/logs`.
 - Check VM events: `GET /vms/{id}/events` for boot progress and errors.
 - Stream events in real time: `curl -sN http://localhost:8080/vms/{id}/events/stream`.
+
+---
+
+## More Documentation
+
+- [Getting Started](GETTING_STARTED.md) | [Networking](NETWORKING.md) | [Architecture](ARCHITECTURE.md) | [Compose](COMPOSE.md)
+- [API Reference](API.md) | [CLI Reference](CLI_REFERENCE.md) | [Snapshots](SNAPSHOTS.md)
+- [Examples](EXAMPLES.md) | [Validated Projects](VALIDATED_PROJECTS.md) | [Troubleshooting](TROUBLESHOOTING.md)
+- [How gocracker Fits In](COMPETITIVE_ANALYSIS.md) | [Security Policy](../SECURITY.md)
+

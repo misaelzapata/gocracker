@@ -130,3 +130,13 @@ manifest is at [`tests/external-repos/manifest.tsv`](../tests/external-repos/man
 Highlights: Traefik, Caddy, Envoy, Prometheus, Grafana, PostgreSQL, Redis,
 MinIO, Gitea, MLflow, Ollama, Meilisearch, RabbitMQ, NATS, and more across
 Go, Python, Node.js, PHP, Rust, Ruby, Java, Elixir, C, and C++.
+
+---
+
+## More Documentation
+
+- [Getting Started](GETTING_STARTED.md) | [Networking](NETWORKING.md) | [Architecture](ARCHITECTURE.md) | [Compose](COMPOSE.md)
+- [API Reference](API.md) | [CLI Reference](CLI_REFERENCE.md) | [Snapshots](SNAPSHOTS.md)
+- [Examples](EXAMPLES.md) | [Validated Projects](VALIDATED_PROJECTS.md) | [Troubleshooting](TROUBLESHOOTING.md)
+- [How gocracker Fits In](COMPETITIVE_ANALYSIS.md) | [Security Policy](../SECURITY.md)
+

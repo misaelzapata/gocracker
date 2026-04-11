@@ -187,3 +187,13 @@ are surfaced via:
 - `GET /vms/{id}/events` -- JSON event list.
 - `GET /events/stream` -- Server-Sent Events (SSE) for real-time monitoring.
 - `GET /logs` -- UART console output (64KB buffer).
+
+---
+
+## More Documentation
+
+- [Getting Started](GETTING_STARTED.md) | [Networking](NETWORKING.md) | [Architecture](ARCHITECTURE.md) | [Compose](COMPOSE.md)
+- [API Reference](API.md) | [CLI Reference](CLI_REFERENCE.md) | [Snapshots](SNAPSHOTS.md)
+- [Examples](EXAMPLES.md) | [Validated Projects](VALIDATED_PROJECTS.md) | [Troubleshooting](TROUBLESHOOTING.md)
+- [How gocracker Fits In](COMPETITIVE_ANALYSIS.md) | [Security Policy](../SECURITY.md)
+
