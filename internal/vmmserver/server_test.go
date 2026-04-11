@@ -615,3 +615,679 @@ func TestServerStartRejectsUnsupportedPrebootTopology(t *testing.T) {
 		t.Fatalf("fault = %q", apiErr.FaultMessage)
 	}
 }
+
+// --- Additional coverage-boosting tests ---
+
+func newStartedServer(t *testing.T) (*Server, *fakeVM) {
+	t.Helper()
+	var vm *fakeVM
+	srv := NewWithOptions(Options{Factory: func(cfg vmm.Config) (VM, error) {
+		vm = newFakeVM(cfg).(*fakeVM)
+		return vm, nil
+	}})
+	mustDo := func(method, path, body string) {
+		t.Helper()
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("%s %s status = %d body=%s", method, path, rec.Code, rec.Body.String())
+		}
+	}
+	mustDo(http.MethodPut, "/boot-source", `{"kernel_image_path":"/vmlinuz","boot_args":"console=ttyS0"}`)
+	mustDo(http.MethodPut, "/machine-config", `{"vcpu_count":1,"mem_size_mib":256}`)
+	mustDo(http.MethodPut, "/drives/root", `{"path_on_host":"/disk.ext4","is_root_device":true}`)
+	mustDo(http.MethodPut, "/actions", `{"action_type":"InstanceStart"}`)
+	return srv, vm
+}
+
+func TestBalloonPatch_PrebootNoBalloon(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPatch, "/balloon", bytes.NewBufferString(`{"amount_mib":32}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBalloonPatch_PrebootWithBalloon(t *testing.T) {
+	srv := New()
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := mustDo(http.MethodPut, "/balloon", `{"amount_mib":64,"deflate_on_oom":true}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("put balloon status = %d", rec.Code)
+	}
+	if rec := mustDo(http.MethodPatch, "/balloon", `{"amount_mib":32}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("patch balloon status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBalloonPatch_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPatch, "/balloon", bytes.NewBufferString(`{bad json`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestBalloonStatsPatch_PrebootNoBalloon(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPatch, "/balloon/statistics", bytes.NewBufferString(`{"stats_polling_interval_s":5}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBalloonStatsGet_PrebootNoBalloon(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/balloon/statistics", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestBalloonStatsGet_PrebootWithBalloonAndStats(t *testing.T) {
+	srv := New()
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := mustDo(http.MethodPut, "/balloon", `{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":5}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("put balloon status = %d", rec.Code)
+	}
+	rec := mustDo(http.MethodGet, "/balloon/statistics", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var stats vmm.BalloonStats
+	if err := json.NewDecoder(rec.Body).Decode(&stats); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if stats.TargetMiB != 64 {
+		t.Fatalf("TargetMiB = %d, want 64", stats.TargetMiB)
+	}
+}
+
+func TestMemoryHotplugPatch_PrebootNotConfigured(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPatch, "/hotplug/memory", bytes.NewBufferString(`{"requested_size_mib":128}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestMemoryHotplugPatch_PrebootExceedsTotal(t *testing.T) {
+	srv := New()
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := mustDo(http.MethodPut, "/hotplug/memory", `{"total_size_mib":512,"slot_size_mib":256,"block_size_mib":128}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("put status = %d", rec.Code)
+	}
+	rec := mustDo(http.MethodPatch, "/hotplug/memory", `{"requested_size_mib":1024}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMemoryHotplugPatch_PrebootNotAligned(t *testing.T) {
+	srv := New()
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := mustDo(http.MethodPut, "/hotplug/memory", `{"total_size_mib":512,"slot_size_mib":256,"block_size_mib":128}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("put status = %d", rec.Code)
+	}
+	rec := mustDo(http.MethodPatch, "/hotplug/memory", `{"requested_size_mib":100}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMemoryHotplugPut_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/hotplug/memory", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestNetRateLimiter_RuntimeUpdate(t *testing.T) {
+	srv, vm := newStartedServer(t)
+	_ = srv
+	req := httptest.NewRequest(http.MethodPut, "/rate-limiters/net", bytes.NewBufferString(`{"ops":{"size":5,"refill_time_ms":10}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if vm.netRL == nil || vm.netRL.Ops.Size != 5 {
+		t.Fatalf("net rate limiter not updated: %+v", vm.netRL)
+	}
+}
+
+func TestBlockRateLimiter_RuntimeUpdate(t *testing.T) {
+	srv, vm := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPut, "/rate-limiters/block", bytes.NewBufferString(`{"bandwidth":{"size":2048}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if vm.blkRL == nil || vm.blkRL.Bandwidth.Size != 2048 {
+		t.Fatalf("block rate limiter not updated: %+v", vm.blkRL)
+	}
+}
+
+func TestRNGRateLimiter_RuntimeUpdate(t *testing.T) {
+	srv, vm := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPut, "/rate-limiters/rng", bytes.NewBufferString(`{"ops":{"size":10}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if vm.rngRL == nil || vm.rngRL.Ops.Size != 10 {
+		t.Fatalf("rng rate limiter not updated: %+v", vm.rngRL)
+	}
+}
+
+func TestNetRateLimiter_InvalidJSON(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPut, "/rate-limiters/net", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestBlockRateLimiter_InvalidJSON(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPut, "/rate-limiters/block", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestRNGRateLimiter_InvalidJSON(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPut, "/rate-limiters/rng", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestNetRateLimiter_PrebootNoIface(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/rate-limiters/net", bytes.NewBufferString(`{"ops":{"size":1}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBlockRateLimiter_PrebootNoDrive(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/rate-limiters/block", bytes.NewBufferString(`{"ops":{"size":1}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRNGRateLimiter_PrebootCreatesConfig(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/rate-limiters/rng", bytes.NewBufferString(`{"ops":{"size":1}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSnapshotEndpoint_NoVM(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/snapshot", bytes.NewBufferString(`{"dest_dir":"/tmp"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestSnapshotEndpoint_EmptyDir(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/snapshot", bytes.NewBufferString(`{"dest_dir":""}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSnapshotEndpoint_InvalidJSON(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/snapshot", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestMigrationPrepare_NoVM(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/migrations/prepare", bytes.NewBufferString(`{"dest_dir":"/tmp"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestMigrationPrepare_EmptyDir(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/migrations/prepare", bytes.NewBufferString(`{"dest_dir":""}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMigrationFinalize_NoVM(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/migrations/finalize", bytes.NewBufferString(`{"dest_dir":"/tmp"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestMigrationFinalize_EmptyDir(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/migrations/finalize", bytes.NewBufferString(`{"dest_dir":""}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestMigrationReset_NoVM(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/migrations/reset", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestMigrationPrepare_WithRunningVM(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	dir := t.TempDir()
+	req := httptest.NewRequest(http.MethodPost, "/migrations/prepare", bytes.NewBufferString(`{"dest_dir":"`+strings.ReplaceAll(dir, `\`, `\\`)+`"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMigrationFinalize_WithRunningVM(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	dir := t.TempDir()
+	req := httptest.NewRequest(http.MethodPost, "/migrations/finalize", bytes.NewBufferString(`{"dest_dir":"`+strings.ReplaceAll(dir, `\`, `\\`)+`"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMigrationReset_WithRunningVM(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/migrations/reset", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestEventsEndpoint_NoVM(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestLogsEndpoint_NoVM(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/logs", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestVMInfoEndpoint_NoVM(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/vm", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestBalloonGet_PrebootWithBalloon(t *testing.T) {
+	srv := New()
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := mustDo(http.MethodPut, "/balloon", `{"amount_mib":128,"deflate_on_oom":true}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("put balloon status = %d", rec.Code)
+	}
+	rec := mustDo(http.MethodGet, "/balloon", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get balloon status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var balloon Balloon
+	if err := json.NewDecoder(rec.Body).Decode(&balloon); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if balloon.AmountMib != 128 || !balloon.DeflateOnOOM {
+		t.Fatalf("balloon = %+v", balloon)
+	}
+}
+
+func TestBalloonGet_PrebootNoBalloon(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/balloon", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestSharedFS_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/shared-fs/mytag", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestSharedFS_EmptySource(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/shared-fs/mytag", bytes.NewBufferString(`{"source":"","tag":"mytag"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSharedFS_Valid(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/shared-fs/mytag", bytes.NewBufferString(`{"source":"/host/data","tag":"mytag"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSharedFS_UpsertReplaces(t *testing.T) {
+	srv := New()
+	mustDo := func(body string) {
+		req := httptest.NewRequest(http.MethodPut, "/shared-fs/mytag", bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	mustDo(`{"source":"/host/data1","tag":"mytag"}`)
+	mustDo(`{"source":"/host/data2","tag":"mytag"}`)
+	// Should have replaced, not appended
+	srv.mu.RLock()
+	count := len(srv.preboot.sharedFS)
+	srv.mu.RUnlock()
+	if count != 1 {
+		t.Fatalf("expected 1 shared FS entry after upsert, got %d", count)
+	}
+}
+
+func TestActionEndpoint_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/actions", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestBalloonPut_AfterStart(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPut, "/balloon", bytes.NewBufferString(`{"amount_mib":64}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected conflict after start, status = %d", rec.Code)
+	}
+}
+
+func TestCloneVMLimiter_ServerPackage(t *testing.T) {
+	if got := cloneVMLimiter(nil); got != nil {
+		t.Fatalf("expected nil")
+	}
+	orig := &vmm.RateLimiterConfig{Bandwidth: vmm.TokenBucketConfig{Size: 100}}
+	clone := cloneVMLimiter(orig)
+	if clone == orig {
+		t.Fatal("should be different pointer")
+	}
+	if clone.Bandwidth.Size != 100 {
+		t.Fatalf("size = %d", clone.Bandwidth.Size)
+	}
+}
+
+func TestCloneMemoryHotplug_ServerPackage(t *testing.T) {
+	if got := cloneMemoryHotplug(nil); got != nil {
+		t.Fatal("expected nil")
+	}
+	orig := &vmm.MemoryHotplugConfig{TotalSizeMiB: 512}
+	clone := cloneMemoryHotplug(orig)
+	if clone == orig {
+		t.Fatal("should be different pointer")
+	}
+	if clone.TotalSizeMiB != 512 {
+		t.Fatalf("total = %d", clone.TotalSizeMiB)
+	}
+}
+
+func TestVMConfigID_Default(t *testing.T) {
+	srv := New()
+	if id := srv.vmConfigID(); id != "root-vm" {
+		t.Fatalf("vmConfigID() = %q, want root-vm", id)
+	}
+}
+
+func TestVMConfigID_Custom(t *testing.T) {
+	srv := NewWithOptions(Options{VMID: "my-vm"})
+	if id := srv.vmConfigID(); id != "my-vm" {
+		t.Fatalf("vmConfigID() = %q, want my-vm", id)
+	}
+}
+
+func TestStopVM_NoVM(t *testing.T) {
+	srv := New()
+	if err := srv.stopVM(); err == nil {
+		t.Fatal("expected error stopping nil VM")
+	}
+}
+
+func TestEventsEndpoint_InvalidSince(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/events?since=not-a-date", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestBalloonStatsPatch_PrebootWithBalloon(t *testing.T) {
+	srv := New()
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := mustDo(http.MethodPut, "/balloon", `{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":5}`); rec.Code != http.StatusNoContent {
+		t.Fatalf("put balloon status = %d", rec.Code)
+	}
+	rec := mustDo(http.MethodPatch, "/balloon/statistics", `{"stats_polling_interval_s":10}`)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("patch stats status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRestoreEndpoint_AlreadyStarted(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/restore", bytes.NewBufferString(`{"snapshot_dir":"/tmp"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestRestoreEndpoint_EmptyDir(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/restore", bytes.NewBufferString(`{"snapshot_dir":""}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestRestoreEndpoint_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/restore", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestMemoryHotplugPatch_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPatch, "/hotplug/memory", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestBalloonStatsPatch_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPatch, "/balloon/statistics", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestBalloonPut_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/balloon", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestMigrationPrepare_InvalidJSON(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/migrations/prepare", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestMigrationFinalize_InvalidJSON(t *testing.T) {
+	srv, _ := newStartedServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/migrations/finalize", bytes.NewBufferString(`{bad`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestServerClose(t *testing.T) {
+	srv, vm := newStartedServer(t)
+	srv.Close()
+	if !vm.stopped {
+		t.Fatal("expected VM to be stopped after Close()")
+	}
+}
+
+func TestServerClose_NoVM(t *testing.T) {
+	srv := New()
+	// Should not panic
+	srv.Close()
+}

@@ -894,6 +894,213 @@ func TestMkdirAllNoSymlink_DeepNested(t *testing.T) {
 	}
 }
 
+// --- New coverage-boosting tests ---
+
+func TestRunCLI_Help(t *testing.T) {
+	// --help causes flag.ErrHelp which is returned by Parse with ContinueOnError
+	err := RunCLI([]string{"--help"})
+	if err == nil {
+		t.Fatal("expected error from --help (flag.ErrHelp)")
+	}
+}
+
+func TestRunCLI_UnknownFlag(t *testing.T) {
+	err := RunCLI([]string{"--nonexistent-flag"})
+	if err == nil {
+		t.Fatal("expected error from unknown flag")
+	}
+}
+
+func TestRunCLI_MissingID(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+	// No --id flag: Run should fail at validate
+	err := RunCLI([]string{"--exec-file", execFile, "--uid", "1000", "--gid", "1000"})
+	if err == nil || !strings.Contains(err.Error(), "--id is required") {
+		t.Fatalf("expected --id required, got %v", err)
+	}
+}
+
+func TestCopyRegularFile_Success(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src.bin")
+	if err := os.WriteFile(src, []byte("binary content here"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(root, "subdir", "dst.bin")
+	if err := copyRegularFile(src, dst, 0755); err != nil {
+		t.Fatalf("copyRegularFile: %v", err)
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dst: %v", err)
+	}
+	if string(data) != "binary content here" {
+		t.Fatalf("dst content = %q", string(data))
+	}
+}
+
+func TestCopyRegularFile_NonexistentSource(t *testing.T) {
+	root := t.TempDir()
+	err := copyRegularFile("/nonexistent/src.bin", filepath.Join(root, "dst.bin"), 0755)
+	if err == nil {
+		t.Fatal("expected error for nonexistent source")
+	}
+}
+
+func TestCopyRegularFile_OverwriteExisting(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src.bin")
+	os.WriteFile(src, []byte("new"), 0644)
+	dst := filepath.Join(root, "dst.bin")
+	os.WriteFile(dst, []byte("old"), 0644)
+
+	if err := copyRegularFile(src, dst, 0755); err != nil {
+		t.Fatalf("copyRegularFile: %v", err)
+	}
+	data, _ := os.ReadFile(dst)
+	if string(data) != "new" {
+		t.Fatalf("dst = %q, want new", string(data))
+	}
+}
+
+func TestMkdirAllNoSymlink_ConcurrentSafe(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "a", "b", "c")
+
+	errs := make(chan error, 10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			errs <- mkdirAllNoSymlink(path, 0755)
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent mkdirAllNoSymlink: %v", err)
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("path should exist as directory: %v", err)
+	}
+}
+
+func TestMkdirAllNoSymlink_RelativePath(t *testing.T) {
+	// Relative paths should be converted to absolute
+	// We use a name that won't exist already
+	origDir, _ := os.Getwd()
+	root := t.TempDir()
+	os.Chdir(root)
+	defer os.Chdir(origDir)
+
+	if err := mkdirAllNoSymlink("reldir/sub", 0755); err != nil {
+		t.Fatalf("mkdirAllNoSymlink(relative): %v", err)
+	}
+	info, err := os.Stat(filepath.Join(root, "reldir", "sub"))
+	if err != nil || !info.IsDir() {
+		t.Fatal("relative path should have been created")
+	}
+}
+
+func TestBinaryDependencyMounts_CurrentBinary(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skip("cannot find current executable")
+	}
+	mounts, err := binaryDependencyMounts(exe)
+	if err != nil {
+		t.Fatalf("binaryDependencyMounts: %v", err)
+	}
+	// Go binaries are statically linked, so mounts may be empty — that's fine
+	for _, m := range mounts {
+		if !strings.HasPrefix(m, "ro:") {
+			t.Fatalf("mount should start with ro:, got %q", m)
+		}
+		parts := strings.SplitN(m, ":", 3)
+		if len(parts) != 3 {
+			t.Fatalf("mount format wrong: %q", m)
+		}
+		if !filepath.IsAbs(parts[1]) {
+			t.Fatalf("mount source should be absolute: %q", parts[1])
+		}
+	}
+}
+
+func TestBinaryDependencyMounts_NonexistentBinary(t *testing.T) {
+	// ldd on nonexistent file should return nil, nil (not fail hard)
+	mounts, err := binaryDependencyMounts("/nonexistent/binary")
+	if err != nil {
+		t.Fatalf("expected nil error for nonexistent binary, got %v", err)
+	}
+	if len(mounts) != 0 {
+		t.Fatalf("expected empty mounts, got %v", mounts)
+	}
+}
+
+func TestExecEnv_MultipleEnvEntries(t *testing.T) {
+	cfg := Config{Env: []string{"A=1", "B=2", "C=3"}}
+	result := cfg.execEnv()
+	if len(result) != 4 { // 3 custom + PATH
+		t.Fatalf("expected 4 entries, got %d: %v", len(result), result)
+	}
+	// Verify order: custom entries first, then PATH
+	if result[0] != "A=1" || result[1] != "B=2" || result[2] != "C=3" {
+		t.Fatalf("unexpected order: %v", result)
+	}
+	if !strings.HasPrefix(result[3], "PATH=") {
+		t.Fatalf("last entry should be PATH, got %q", result[3])
+	}
+}
+
+func TestExecEnv_PathInMiddle(t *testing.T) {
+	cfg := Config{Env: []string{"A=1", "PATH=/custom", "B=2"}}
+	result := cfg.execEnv()
+	if len(result) != 3 { // no extra PATH added
+		t.Fatalf("expected 3 entries (PATH already present), got %d: %v", len(result), result)
+	}
+}
+
+func TestConfigChrootDir_NestedExecPath(t *testing.T) {
+	cfg := Config{
+		ID:            "vm-abc",
+		ExecFile:      "/opt/nested/path/to/gocracker-vmm",
+		ChrootBaseDir: "/jail",
+	}
+	got := cfg.chrootDir()
+	want := "/jail/gocracker-vmm/vm-abc/root"
+	if got != want {
+		t.Fatalf("chrootDir() = %q, want %q", got, want)
+	}
+}
+
+func TestParseMount_Whitespace(t *testing.T) {
+	spec, err := parseMount("  ro : /usr/lib : /usr/lib ")
+	if err != nil {
+		t.Fatalf("parseMount with whitespace: %v", err)
+	}
+	if !spec.readOnly || spec.source != "/usr/lib" || spec.target != "/usr/lib" {
+		t.Fatalf("spec = %+v", spec)
+	}
+}
+
+func TestMultiFlag_EmptyString(t *testing.T) {
+	var f multiFlag
+	if got := f.String(); got != "" {
+		t.Fatalf("empty multiFlag.String() = %q", got)
+	}
+}
+
+func TestMultiFlag_SingleValue(t *testing.T) {
+	var f multiFlag
+	f.Set("only-one")
+	if got := f.String(); got != "only-one" {
+		t.Fatalf("single multiFlag.String() = %q, want only-one", got)
+	}
+}
+
 func TestCopyRegularFileRejectsSymlinkSource(t *testing.T) {
 	root := t.TempDir()
 	realSrc := filepath.Join(root, "real.bin")

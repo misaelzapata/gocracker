@@ -4,11 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/gocracker/gocracker/internal/guestexec"
 	"github.com/gocracker/gocracker/internal/kvm"
+	"github.com/gocracker/gocracker/internal/virtio"
+	"golang.org/x/sys/unix"
 )
 
 func TestStateString(t *testing.T) {
@@ -1727,5 +1734,793 @@ func TestHotplugConversions(t *testing.T) {
 	}
 	if got := hotplugBytesToMiB(0); got != 0 {
 		t.Fatalf("hotplugBytesToMiB(0) = %d", got)
+	}
+}
+
+// --- Coverage-boosting tests: rate limiters, balloon, migration, etc. ---
+
+func TestUpdateNetRateLimiter_NilDevice(t *testing.T) {
+	vm := &VM{netDev: nil}
+	err := vm.UpdateNetRateLimiter(&RateLimiterConfig{})
+	if err == nil {
+		t.Fatal("expected error when netDev is nil")
+	}
+	if err.Error() != "virtio-net is not configured" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestUpdateBlockRateLimiter_NilDevice(t *testing.T) {
+	vm := &VM{blkDev: nil}
+	err := vm.UpdateBlockRateLimiter(&RateLimiterConfig{})
+	if err == nil {
+		t.Fatal("expected error when blkDev is nil")
+	}
+	if err.Error() != "virtio-blk is not configured" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestUpdateRNGRateLimiter_NilDevice(t *testing.T) {
+	vm := &VM{rngDev: nil}
+	err := vm.UpdateRNGRateLimiter(&RateLimiterConfig{})
+	if err == nil {
+		t.Fatal("expected error when rngDev is nil")
+	}
+	if err.Error() != "virtio-rng is not configured" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestGetBalloonConfig_NilDevice(t *testing.T) {
+	vm := &VM{balloonDev: nil, cfg: Config{}}
+	_, err := vm.GetBalloonConfig()
+	if err == nil {
+		t.Fatal("expected error when balloon not configured")
+	}
+}
+
+func TestUpdateBalloon_NilDevice(t *testing.T) {
+	vm := &VM{balloonDev: nil, cfg: Config{}}
+	err := vm.UpdateBalloon(BalloonUpdate{AmountMiB: 64})
+	if err == nil {
+		t.Fatal("expected error when balloon not configured")
+	}
+}
+
+func TestGetBalloonStats_NilDevice(t *testing.T) {
+	vm := &VM{balloonDev: nil}
+	_, err := vm.GetBalloonStats()
+	if err == nil {
+		t.Fatal("expected error when balloon not configured")
+	}
+}
+
+func TestUpdateBalloonStats_NilDevice(t *testing.T) {
+	vm := &VM{balloonDev: nil, cfg: Config{}}
+	err := vm.UpdateBalloonStats(BalloonStatsUpdate{StatsPollingIntervalS: 5})
+	if err == nil {
+		t.Fatal("expected error when balloon not configured")
+	}
+}
+
+func TestDialVsock_NilDevice(t *testing.T) {
+	vm := &VM{vsockDev: nil}
+	_, err := vm.DialVsock(10022)
+	if err == nil {
+		t.Fatal("expected error when vsock not configured")
+	}
+}
+
+func TestNextConservativeBalloonTarget_NoStats(t *testing.T) {
+	stats := BalloonStats{TotalMemory: 0, AvailableMemory: 0}
+	_, ok := nextConservativeBalloonTarget(stats, BalloonStats{}, 1024)
+	if ok {
+		t.Fatal("expected ok=false when no stats available")
+	}
+}
+
+func TestNextConservativeBalloonTarget_OOMPressureDeflates(t *testing.T) {
+	stats := BalloonStats{
+		TotalMemory:     1 << 30,
+		AvailableMemory: 10 << 20, // very low
+		TargetMiB:       200,
+		OOMKill:         5,
+	}
+	last := BalloonStats{OOMKill: 3} // OOM increased
+	gotMiB, gotOK := nextConservativeBalloonTarget(stats, last, 1024)
+	if !gotOK {
+		t.Fatal("expected ok=true for OOM pressure")
+	}
+	if gotMiB >= 200 {
+		t.Fatalf("expected deflation below 200, got %d", gotMiB)
+	}
+}
+
+func TestNextConservativeBalloonTarget_AllocStallDeflates(t *testing.T) {
+	stats := BalloonStats{
+		TotalMemory:     1 << 30,
+		AvailableMemory: 10 << 20,
+		TargetMiB:       128,
+		AllocStall:      10,
+	}
+	last := BalloonStats{AllocStall: 5}
+	gotMiB, gotOK := nextConservativeBalloonTarget(stats, last, 1024)
+	if !gotOK {
+		t.Fatal("expected ok=true for alloc stall pressure")
+	}
+	if gotMiB >= 128 {
+		t.Fatalf("expected deflation below 128, got %d", gotMiB)
+	}
+}
+
+func TestNextConservativeBalloonTarget_SmallBaseUsesLowerReserve(t *testing.T) {
+	// With baseMemMiB<=512, reserve should be 64 and highWater 128
+	stats := BalloonStats{
+		TotalMemory:     512 << 20,
+		AvailableMemory: 260 << 20, // > 128 + 64
+		TargetMiB:       0,
+	}
+	gotMiB, gotOK := nextConservativeBalloonTarget(stats, BalloonStats{}, 512)
+	if !gotOK {
+		t.Fatal("expected ok=true for headroom inflate on small base")
+	}
+	if gotMiB == 0 {
+		t.Fatal("expected nonzero inflate target")
+	}
+}
+
+func TestNextConservativeBalloonTarget_MaxTargetCapping(t *testing.T) {
+	// If next target exceeds maxTarget (baseMem - reserve), it should be capped
+	stats := BalloonStats{
+		TotalMemory:     512 << 20,
+		AvailableMemory: 500 << 20,
+		TargetMiB:       500,
+	}
+	gotMiB, gotOK := nextConservativeBalloonTarget(stats, BalloonStats{}, 256)
+	if gotOK && gotMiB > 256 {
+		t.Fatalf("target %d exceeds base mem 256", gotMiB)
+	}
+}
+
+func TestNextConservativeBalloonTarget_PressureBelowStep(t *testing.T) {
+	// Target < step size should go to 0
+	stats := BalloonStats{
+		TotalMemory:     1 << 30,
+		AvailableMemory: 10 << 20,
+		TargetMiB:       32,
+		OOMKill:         1,
+	}
+	last := BalloonStats{OOMKill: 0}
+	gotMiB, gotOK := nextConservativeBalloonTarget(stats, last, 1024)
+	if !gotOK {
+		t.Fatal("expected ok=true")
+	}
+	if gotMiB != 0 {
+		t.Fatalf("expected target 0 for small deflation, got %d", gotMiB)
+	}
+}
+
+func TestNormalizeSnapshotMachineArch_Valid(t *testing.T) {
+	tests := []struct {
+		raw     string
+		want    MachineArch
+		wantErr bool
+	}{
+		{"", ArchAMD64, false},
+		{"  ", ArchAMD64, false},
+		{"amd64", ArchAMD64, false},
+		{"arm64", ArchARM64, false},
+		{"bogus", "", true},
+	}
+	for _, tt := range tests {
+		got, err := normalizeSnapshotMachineArch(tt.raw)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("normalizeSnapshotMachineArch(%q) error = %v, wantErr %v", tt.raw, err, tt.wantErr)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("normalizeSnapshotMachineArch(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+}
+
+func TestIsIgnorableKVMClockCtrlError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"EINVAL", unix.EINVAL, true},
+		{"ENOTTY", unix.ENOTTY, true},
+		{"ENOSYS", unix.ENOSYS, true},
+		{"EPERM", unix.EPERM, false},
+		{"nil", nil, false},
+		{"generic", fmt.Errorf("something"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isIgnorableKVMClockCtrlError(tt.err)
+			if got != tt.want {
+				t.Fatalf("isIgnorableKVMClockCtrlError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClearSignalRestart_Succeeds(t *testing.T) {
+	// Use a harmless signal to test clearSignalRestart doesn't return error
+	err := clearSignalRestart(syscall.SIGUSR2)
+	if err != nil {
+		t.Fatalf("clearSignalRestart(SIGUSR2) error = %v", err)
+	}
+}
+
+func TestExecAgentPort(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want uint32
+	}{
+		{"nil exec", Config{}, 10022},
+		{"exec disabled", Config{Exec: &ExecConfig{Enabled: false}}, 10022},
+		{"exec enabled no port", Config{Exec: &ExecConfig{Enabled: true}}, 10022},
+		{"exec enabled custom port", Config{Exec: &ExecConfig{Enabled: true, VsockPort: 9999}}, 9999},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := execAgentPort(tt.cfg)
+			if got != tt.want {
+				t.Fatalf("execAgentPort() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRewriteSnapshotPathsForBundle(t *testing.T) {
+	snap := &Snapshot{
+		MemFile: "old-mem.bin",
+		Config: Config{
+			KernelPath: "/host/vmlinuz",
+			InitrdPath: "/host/initrd",
+			DiskImage:  "/host/disk.ext4",
+		},
+	}
+	rewriteSnapshotPathsForBundle(snap)
+	if snap.MemFile != migrationMemFile {
+		t.Fatalf("MemFile = %q, want %q", snap.MemFile, migrationMemFile)
+	}
+	if snap.Config.KernelPath != "artifacts/kernel" {
+		t.Fatalf("KernelPath = %q, want artifacts/kernel", snap.Config.KernelPath)
+	}
+	if snap.Config.InitrdPath != "artifacts/initrd" {
+		t.Fatalf("InitrdPath = %q, want artifacts/initrd", snap.Config.InitrdPath)
+	}
+	if snap.Config.DiskImage != "artifacts/disk.ext4" {
+		t.Fatalf("DiskImage = %q, want artifacts/disk.ext4", snap.Config.DiskImage)
+	}
+}
+
+func TestRewriteSnapshotPathsForBundle_EmptyPaths(t *testing.T) {
+	snap := &Snapshot{
+		Config: Config{},
+	}
+	rewriteSnapshotPathsForBundle(snap)
+	if snap.Config.KernelPath != "" {
+		t.Fatalf("empty KernelPath should stay empty, got %q", snap.Config.KernelPath)
+	}
+	if snap.Config.InitrdPath != "" {
+		t.Fatalf("empty InitrdPath should stay empty, got %q", snap.Config.InitrdPath)
+	}
+	if snap.Config.DiskImage != "" {
+		t.Fatalf("empty DiskImage should stay empty, got %q", snap.Config.DiskImage)
+	}
+}
+
+func TestMergeDirtyBitmaps(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b []uint64
+		want []uint64
+	}{
+		{"both nil", nil, nil, nil},
+		{"a only", []uint64{0x1, 0x2}, nil, []uint64{0x1, 0x2}},
+		{"b only", nil, []uint64{0x3, 0x4}, []uint64{0x3, 0x4}},
+		{"same size", []uint64{0x1, 0x0}, []uint64{0x0, 0x2}, []uint64{0x1, 0x2}},
+		{"a longer", []uint64{0x1, 0x2, 0x3}, []uint64{0x4}, []uint64{0x5, 0x2, 0x3}},
+		{"b longer", []uint64{0x1}, []uint64{0x2, 0x4}, []uint64{0x3, 0x4}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mergeDirtyBitmaps(tt.a, tt.b)
+			if len(got) != len(tt.want) {
+				t.Fatalf("len = %d, want %d", len(got), len(tt.want))
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("bitmap[%d] = %x, want %x", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestSameFilePath(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want bool
+	}{
+		{"/a/b/c", "/a/b/c", true},
+		{"/a/b/../b/c", "/a/b/c", true},
+		{"/a/b/c", "/a/b/d", false},
+		{"", "", true},
+	}
+	for _, tt := range tests {
+		if got := sameFilePath(tt.a, tt.b); got != tt.want {
+			t.Errorf("sameFilePath(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+func TestBundleAsset_EmptySrc(t *testing.T) {
+	got, err := bundleAsset(t.TempDir(), "", "artifacts/kernel")
+	if err != nil {
+		t.Fatalf("bundleAsset(empty) error = %v", err)
+	}
+	if got != "" {
+		t.Fatalf("expected empty result, got %q", got)
+	}
+}
+
+func TestBundleAsset_SameFile(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "artifacts", "kernel")
+	if err := os.MkdirAll(filepath.Dir(src), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte("kernel"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := bundleAsset(dir, "artifacts/kernel", "artifacts/kernel")
+	if err != nil {
+		t.Fatalf("bundleAsset(same) error = %v", err)
+	}
+	if got != "artifacts/kernel" {
+		t.Fatalf("got %q, want artifacts/kernel", got)
+	}
+}
+
+func TestBundleAsset_CopiesFile(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := t.TempDir()
+	src := filepath.Join(srcDir, "vmlinuz")
+	if err := os.WriteFile(src, []byte("kernel-data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := bundleAsset(dir, src, "artifacts/kernel")
+	if err != nil {
+		t.Fatalf("bundleAsset() error = %v", err)
+	}
+	if got != "artifacts/kernel" {
+		t.Fatalf("got %q, want artifacts/kernel", got)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "artifacts", "kernel"))
+	if err != nil {
+		t.Fatalf("read copied file: %v", err)
+	}
+	if string(data) != "kernel-data" {
+		t.Fatalf("copied data = %q", data)
+	}
+}
+
+func TestResolveSnapshotPath_Extended(t *testing.T) {
+	tests := []struct {
+		dir, value, want string
+	}{
+		{"/snap", "", ""},
+		{"/snap", "/absolute/path", "/absolute/path"},
+		{"/snap", "mem.bin", "/snap/mem.bin"},
+		{"/snap", "artifacts/kernel", "/snap/artifacts/kernel"},
+	}
+	for _, tt := range tests {
+		got := resolveSnapshotPath(tt.dir, tt.value)
+		if got != tt.want {
+			t.Errorf("resolveSnapshotPath(%q, %q) = %q, want %q", tt.dir, tt.value, got, tt.want)
+		}
+	}
+}
+
+func TestBalloonStatsJSON_RoundTrip(t *testing.T) {
+	stats := BalloonStats{
+		TargetPages:     256,
+		ActualPages:     128,
+		TargetMiB:       1,
+		ActualMiB:       0,
+		SwapIn:          10,
+		FreeMemory:      1024,
+		TotalMemory:     2048,
+		AvailableMemory: 512,
+		OOMKill:         1,
+	}
+	data, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var restored BalloonStats
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if restored.TargetPages != 256 || restored.OOMKill != 1 || restored.FreeMemory != 1024 {
+		t.Fatalf("roundtrip mismatch: %+v", restored)
+	}
+}
+
+func TestBalloonUpdateJSON_RoundTrip(t *testing.T) {
+	update := BalloonUpdate{AmountMiB: 128}
+	data, err := json.Marshal(update)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var restored BalloonUpdate
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if restored.AmountMiB != 128 {
+		t.Fatalf("AmountMiB = %d, want 128", restored.AmountMiB)
+	}
+}
+
+func TestMemoryHotplugConfigJSON_RoundTrip(t *testing.T) {
+	cfg := MemoryHotplugConfig{
+		TotalSizeMiB: 2048,
+		SlotSizeMiB:  512,
+		BlockSizeMiB: 128,
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var restored MemoryHotplugConfig
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if restored.TotalSizeMiB != 2048 || restored.SlotSizeMiB != 512 || restored.BlockSizeMiB != 128 {
+		t.Fatalf("roundtrip mismatch: %+v", restored)
+	}
+}
+
+func TestMemoryHotplugStatusJSON_RoundTrip(t *testing.T) {
+	status := MemoryHotplugStatus{
+		TotalSizeMiB:     1024,
+		SlotSizeMiB:      256,
+		BlockSizeMiB:     128,
+		PluggedSizeMiB:   512,
+		RequestedSizeMiB: 768,
+	}
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var restored MemoryHotplugStatus
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if restored.PluggedSizeMiB != 512 || restored.RequestedSizeMiB != 768 {
+		t.Fatalf("roundtrip mismatch: %+v", restored)
+	}
+}
+
+func TestWorkerMetadataJSON_RoundTrip(t *testing.T) {
+	meta := WorkerMetadata{
+		Kind:       "worker",
+		SocketPath: "/tmp/sock",
+		WorkerPID:  1234,
+		JailRoot:   "/jail",
+		RunDir:     "/run",
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var restored WorkerMetadata
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if restored.Kind != "worker" || restored.SocketPath != "/tmp/sock" || restored.WorkerPID != 1234 {
+		t.Fatalf("roundtrip mismatch: %+v", restored)
+	}
+}
+
+func TestMergeBalloonStats(t *testing.T) {
+	base := virtio.BalloonStats{
+		TargetPages: 100,
+		ActualPages: 50,
+		TargetMiB:   1,
+	}
+	extra := guestexec.MemoryStats{
+		SwapIn:          1,
+		SwapOut:         2,
+		FreeMemory:      3000,
+		TotalMemory:     8000,
+		AvailableMemory: 5000,
+		OOMKill:         7,
+	}
+	merged := mergeBalloonStats(base, extra)
+	if merged.TargetPages != 100 {
+		t.Fatalf("TargetPages = %d, want 100 (from base)", merged.TargetPages)
+	}
+	if merged.SwapIn != 1 || merged.SwapOut != 2 || merged.FreeMemory != 3000 || merged.OOMKill != 7 {
+		t.Fatalf("merged extra stats mismatch: %+v", merged)
+	}
+	if merged.UpdatedAt.IsZero() {
+		t.Fatal("UpdatedAt should be set")
+	}
+}
+
+func TestExecAgentBroker_ListenWrongPort(t *testing.T) {
+	broker := newExecAgentBroker(10022)
+	defer broker.close()
+	_, err := broker.listen(9999)
+	if err == nil {
+		t.Fatal("expected error for wrong port")
+	}
+}
+
+func TestExecAgentBroker_ListenAndAcquire(t *testing.T) {
+	broker := newExecAgentBroker(10022)
+	defer broker.close()
+
+	// listen provides a guest conn; acquire gets the host conn
+	guestConn, err := broker.listen(10022)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer guestConn.Close()
+
+	hostConn, err := broker.acquire()
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer hostConn.Close()
+}
+
+func TestExecAgentBroker_ClosedBroker(t *testing.T) {
+	broker := newExecAgentBroker(10022)
+	broker.close()
+
+	// acquire on closed broker should error
+	_, err := broker.acquire()
+	if err == nil {
+		t.Fatal("expected error from closed broker acquire")
+	}
+}
+
+func TestExecAgentBroker_BacklogFull(t *testing.T) {
+	broker := newExecAgentBroker(10022)
+	defer broker.close()
+
+	// Fill the backlog (capacity 1)
+	conn1, err := broker.listen(10022)
+	if err != nil {
+		t.Fatalf("first listen: %v", err)
+	}
+	defer conn1.Close()
+
+	// Second listen should fail because backlog is full
+	_, err = broker.listen(10022)
+	if err == nil {
+		t.Fatal("expected error when backlog is full")
+	}
+}
+
+func TestCopyReaderAtRange(t *testing.T) {
+	src := bytes.NewReader([]byte("hello world"))
+	var dst bytes.Buffer
+	err := copyReaderAtRange(&dst, src, 6, 5)
+	if err != nil {
+		t.Fatalf("copyReaderAtRange: %v", err)
+	}
+	if dst.String() != "world" {
+		t.Fatalf("got %q, want world", dst.String())
+	}
+}
+
+func TestCopyReaderAtRange_ZeroLength(t *testing.T) {
+	src := bytes.NewReader([]byte("hello"))
+	var dst bytes.Buffer
+	err := copyReaderAtRange(&dst, src, 0, 0)
+	if err != nil {
+		t.Fatalf("copyReaderAtRange: %v", err)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("expected empty output, got %d bytes", dst.Len())
+	}
+}
+
+func TestBuildDirtyFilePatch_EmptyBitmap(t *testing.T) {
+	var dst bytes.Buffer
+	src := bytes.NewReader([]byte("data"))
+	patch, err := buildDirtyFilePatch(&dst, src, 4, "test.bin", 4096, nil, nil)
+	if err != nil {
+		t.Fatalf("buildDirtyFilePatch: %v", err)
+	}
+	if len(patch.Entries) != 0 {
+		t.Fatalf("expected no entries, got %d", len(patch.Entries))
+	}
+}
+
+func TestBuildDirtyFilePatch_ZeroSrcSize(t *testing.T) {
+	var dst bytes.Buffer
+	src := bytes.NewReader(nil)
+	patch, err := buildDirtyFilePatch(&dst, src, 0, "test.bin", 4096, []uint64{0xFF}, nil)
+	if err != nil {
+		t.Fatalf("buildDirtyFilePatch: %v", err)
+	}
+	if len(patch.Entries) != 0 {
+		t.Fatalf("expected no entries for zero src, got %d", len(patch.Entries))
+	}
+}
+
+func TestBuildDirtyFilePatch_SingleDirtyPage(t *testing.T) {
+	data := make([]byte, 8192)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	src := bytes.NewReader(data)
+	var dst bytes.Buffer
+	var offset uint64
+	// Mark page 1 as dirty (bit 1 of word 0)
+	patch, err := buildDirtyFilePatch(&dst, src, uint64(len(data)), "test.bin", 4096, []uint64{0x2}, &offset)
+	if err != nil {
+		t.Fatalf("buildDirtyFilePatch: %v", err)
+	}
+	if len(patch.Entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(patch.Entries))
+	}
+	if patch.Entries[0].Offset != 4096 {
+		t.Fatalf("entry offset = %d, want 4096", patch.Entries[0].Offset)
+	}
+	if patch.Entries[0].Length != 4096 {
+		t.Fatalf("entry length = %d, want 4096", patch.Entries[0].Length)
+	}
+}
+
+func TestBuildDirtyFilePatch_ZeroPageSize(t *testing.T) {
+	data := make([]byte, 4096)
+	src := bytes.NewReader(data)
+	var dst bytes.Buffer
+	// pageSize 0 should default to 4096
+	patch, err := buildDirtyFilePatch(&dst, src, 4096, "test.bin", 0, []uint64{0x1}, nil)
+	if err != nil {
+		t.Fatalf("buildDirtyFilePatch: %v", err)
+	}
+	if patch.PageSize != 4096 {
+		t.Fatalf("page size = %d, want 4096 default", patch.PageSize)
+	}
+}
+
+func TestErrorsIsNotExist(t *testing.T) {
+	if errorsIsNotExist(nil) {
+		t.Fatal("nil should not be not-exist")
+	}
+	if errorsIsNotExist(fmt.Errorf("random")) {
+		t.Fatal("random error should not be not-exist")
+	}
+	if !errorsIsNotExist(os.ErrNotExist) {
+		t.Fatal("os.ErrNotExist should be not-exist")
+	}
+}
+
+func TestDirtyPatchEntryJSON(t *testing.T) {
+	e := DirtyPatchEntry{Offset: 100, Length: 200, DataOffset: 300}
+	data, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored DirtyPatchEntry
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Offset != 100 || restored.Length != 200 || restored.DataOffset != 300 {
+		t.Fatalf("roundtrip: %+v", restored)
+	}
+}
+
+func TestMigrationPatchSetJSON(t *testing.T) {
+	ps := MigrationPatchSet{
+		Version: 1,
+		Patches: []DirtyFilePatch{
+			{Path: "mem.bin", PageSize: 4096, Entries: []DirtyPatchEntry{{Offset: 0, Length: 4096}}},
+		},
+	}
+	data, err := json.Marshal(ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored MigrationPatchSet
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Version != 1 || len(restored.Patches) != 1 {
+		t.Fatalf("roundtrip: %+v", restored)
+	}
+}
+
+func TestSnapshotVCPUCount(t *testing.T) {
+	tests := []struct {
+		name string
+		snap Snapshot
+		want int
+	}{
+		{"from VCPUs", Snapshot{VCPUs: []VCPUState{{ID: 0}, {ID: 1}}}, 2},
+		{"from config", Snapshot{Config: Config{VCPUs: 4}}, 4},
+		{"default", Snapshot{}, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := snapshotVCPUCount(tt.snap)
+			if got != tt.want {
+				t.Fatalf("snapshotVCPUCount() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplyMigrationPatches_NoPatches(t *testing.T) {
+	dir := t.TempDir()
+	// No patches.json => should succeed silently
+	err := ApplyMigrationPatches(dir)
+	if err != nil {
+		t.Fatalf("ApplyMigrationPatches(empty dir) error = %v", err)
+	}
+}
+
+func TestApplyMigrationPatches_EmptyPatchSet(t *testing.T) {
+	dir := t.TempDir()
+	ps := MigrationPatchSet{Version: 1}
+	data, _ := json.Marshal(ps)
+	if err := os.WriteFile(filepath.Join(dir, migrationPatchMeta), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := ApplyMigrationPatches(dir)
+	if err != nil {
+		t.Fatalf("ApplyMigrationPatches(empty patches) error = %v", err)
+	}
+}
+
+func TestApplyMigrationPatches_WithPatch(t *testing.T) {
+	dir := t.TempDir()
+	// Create target file
+	targetPath := filepath.Join(dir, "mem.bin")
+	originalData := []byte("AAAA")
+	if err := os.WriteFile(targetPath, originalData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Create patch data
+	patchData := []byte("BB")
+	if err := os.WriteFile(filepath.Join(dir, migrationPatchData), patchData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Create patch metadata
+	ps := MigrationPatchSet{
+		Version: 1,
+		Patches: []DirtyFilePatch{
+			{
+				Path:     "mem.bin",
+				PageSize: 1,
+				Entries:  []DirtyPatchEntry{{Offset: 1, Length: 2, DataOffset: 0}},
+			},
+		},
+	}
+	data, _ := json.Marshal(ps)
+	if err := os.WriteFile(filepath.Join(dir, migrationPatchMeta), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrationPatches(dir); err != nil {
+		t.Fatalf("ApplyMigrationPatches error = %v", err)
+	}
+	result, _ := os.ReadFile(targetPath)
+	if string(result) != "ABBA" {
+		t.Fatalf("patched data = %q, want ABBA", result)
 	}
 }

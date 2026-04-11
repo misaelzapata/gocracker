@@ -180,6 +180,10 @@ func (s *Session) Close() {
 		drainInput(s.stdin)
 		if s.rawState != nil {
 			_ = term.Restore(int(s.stdin.Fd()), s.rawState)
+			// Print a newline so the shell prompt reappears cleanly
+			// after raw mode is restored, without requiring the user
+			// to press Enter.
+			fmt.Fprintln(s.stdout)
 		}
 	})
 }
