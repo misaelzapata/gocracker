@@ -547,3 +547,353 @@ func TestTerminalQueryResponse(t *testing.T) {
 		})
 	}
 }
+
+// ---- NEW TESTS: ParseMode additional edge cases ----
+
+func TestParseMode_AllCases(t *testing.T) {
+	// Valid cases already tested above, add comprehensive invalid cases
+	invalidInputs := []string{"yes", "no", "on", "enabled", "disabled", "1", "0", "tty", "pty"}
+	for _, input := range invalidInputs {
+		_, err := ParseMode(input)
+		if err == nil {
+			t.Errorf("ParseMode(%q) should return error", input)
+		}
+	}
+}
+
+// ---- NEW TESTS: Session nil safety for detach and requestStop ----
+
+func TestSessionDetachIdempotent(t *testing.T) {
+	s := &Session{
+		detachCh: make(chan struct{}),
+		stopCh:   make(chan struct{}),
+	}
+	// Call detach multiple times; should not panic
+	s.detach()
+	s.detach()
+	select {
+	case <-s.Detached():
+		// good
+	default:
+		t.Fatal("detachCh should be closed")
+	}
+}
+
+func TestSessionRequestStopIdempotent(t *testing.T) {
+	s := &Session{
+		detachCh: make(chan struct{}),
+		stopCh:   make(chan struct{}),
+	}
+	s.requestStop()
+	s.requestStop()
+	select {
+	case <-s.StopRequested():
+		// good
+	default:
+		t.Fatal("stopCh should be closed")
+	}
+}
+
+// ---- NEW TESTS: NewSession mode=force without wait ----
+
+func TestNewSessionForceWaitFalse(t *testing.T) {
+	_, err := NewSession(ModeForce, false, os.Stdin, os.Stdout)
+	if err == nil {
+		t.Fatal("expected error for force mode without wait")
+	}
+}
+
+// ---- NEW TESTS: filterConsoleInput pass-through ----
+
+func TestFilterConsoleInput_Regular(t *testing.T) {
+	data, detach := filterConsoleInput([]byte("hello"))
+	if detach {
+		t.Fatal("detach should be false")
+	}
+	if string(data) != "hello" {
+		t.Fatalf("output = %q, want hello", data)
+	}
+}
+
+func TestFilterConsoleInput_Empty(t *testing.T) {
+	data, detach := filterConsoleInput([]byte{})
+	if detach {
+		t.Fatal("detach should be false")
+	}
+	if len(data) != 0 {
+		t.Fatalf("output = %q, want empty", data)
+	}
+}
+
+// ---- NEW TESTS: isHostTerminalReply comprehensive ----
+
+func TestIsHostTerminalReply_Comprehensive(t *testing.T) {
+	tests := []struct {
+		name string
+		seq  []byte
+		want bool
+	}{
+		{"cursor position report 1;1", []byte("\x1b[1;1R"), true},
+		{"cursor position with ?", []byte("\x1b[?24;80R"), true},
+		{"bracketed paste h", []byte("\x1b[?2004h"), true},
+		{"bracketed paste l", []byte("\x1b[?2004l"), true},
+		{"arrow up", []byte("\x1b[A"), false},
+		{"arrow down", []byte("\x1b[B"), false},
+		{"arrow right", []byte("\x1b[C"), false},
+		{"arrow left", []byte("\x1b[D"), false},
+		{"home key", []byte("\x1b[H"), false},
+		{"clear screen", []byte("\x1b[2J"), false},
+		{"bold on", []byte("\x1b[1m"), false},
+		{"too short 2 bytes", []byte("\x1b["), false},
+		{"not CSI", []byte("\x1bO"), false},
+		{"single byte", []byte{0x1b}, false},
+		{"non-numeric before R", []byte("\x1b[abR"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isHostTerminalReply(tt.seq)
+			if got != tt.want {
+				t.Fatalf("isHostTerminalReply(%q) = %v, want %v", tt.seq, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---- NEW TESTS: shouldDropTerminalReply comprehensive ----
+
+func TestShouldDropTerminalReply_Comprehensive(t *testing.T) {
+	tests := []struct {
+		name string
+		seq  []byte
+		want bool
+	}{
+		{"bracketed paste h", []byte("\x1b[?2004h"), true},
+		{"bracketed paste l", []byte("\x1b[?2004l"), true},
+		{"cursor report", []byte("\x1b[24;80R"), true},
+		{"status report", []byte("\x1b[?0n"), true},
+		{"color SGR", []byte("\x1b[31m"), false},
+		{"cursor up", []byte("\x1b[A"), false},
+		{"clear line", []byte("\x1b[K"), false},
+		{"too short", []byte{0x1b}, false},
+		{"empty", []byte{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldDropTerminalReply(tt.seq)
+			if got != tt.want {
+				t.Fatalf("shouldDropTerminalReply(%q) = %v, want %v", tt.seq, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---- NEW TESTS: inputReplyFilter edge cases ----
+
+func TestInputReplyFilterMultipleRepliesInOneChunk(t *testing.T) {
+	f := newInputReplyFilter()
+	data := f.process([]byte("abc\x1b[24;80R\x1b[?2004hdef"))
+	if got, want := string(data), "abcdef"; got != want {
+		t.Fatalf("process() = %q, want %q", got, want)
+	}
+}
+
+func TestInputReplyFilterSplitCursorReport(t *testing.T) {
+	f := newInputReplyFilter()
+	out1 := f.process([]byte("text\x1b[24"))
+	// carry should have the partial CSI
+	if got := string(out1); got != "text" {
+		t.Fatalf("first chunk = %q, want text", got)
+	}
+	out2 := f.process([]byte(";80Rmore"))
+	if got, want := string(out2), "more"; got != want {
+		t.Fatalf("second chunk = %q, want %q", got, want)
+	}
+}
+
+func TestInputReplyFilterPassesNonCSIEscape(t *testing.T) {
+	f := newInputReplyFilter()
+	// \x1bO is SS3, not CSI - should pass through
+	data := f.process([]byte("\x1bOP"))
+	if got := string(data); got != "\x1bOP" {
+		t.Fatalf("process() = %q, want \\x1bOP", got)
+	}
+}
+
+func TestInputReplyFilterPassesFunctionKeys(t *testing.T) {
+	f := newInputReplyFilter()
+	// F1-F4 use SS3 (passed), F5+ use CSI
+	data := f.process([]byte("\x1b[15~")) // F5
+	if got, want := string(data), "\x1b[15~"; got != want {
+		t.Fatalf("process() = %q, want %q", got, want)
+	}
+}
+
+// ---- NEW TESTS: filterTerminalQueries ----
+
+func TestFilterTerminalQueries_NoQueries(t *testing.T) {
+	payload, reply, carry := filterTerminalQueries([]byte("plain text"))
+	if string(payload) != "plain text" {
+		t.Fatalf("payload = %q", payload)
+	}
+	if len(reply) != 0 {
+		t.Fatalf("reply = %q", reply)
+	}
+	if len(carry) != 0 {
+		t.Fatalf("carry = %q", carry)
+	}
+}
+
+func TestFilterTerminalQueries_PrivateCursorQuery(t *testing.T) {
+	payload, reply, carry := filterTerminalQueries([]byte("abc\x1b[?6ndef"))
+	if string(payload) != "abcdef" {
+		t.Fatalf("payload = %q", payload)
+	}
+	if string(reply) != "\x1b[1;1R" {
+		t.Fatalf("reply = %q", reply)
+	}
+	if len(carry) != 0 {
+		t.Fatalf("carry = %q", carry)
+	}
+}
+
+func TestFilterTerminalQueries_DropsReplyAndQuery(t *testing.T) {
+	// Output from guest containing a cursor position query AND a reply echo
+	payload, reply, carry := filterTerminalQueries([]byte("prompt\x1b[6n\x1b[1;1R"))
+	if string(payload) != "prompt" {
+		t.Fatalf("payload = %q", payload)
+	}
+	if string(reply) != "\x1b[1;1R" {
+		t.Fatalf("reply = %q, want cursor report answer", reply)
+	}
+	if len(carry) != 0 {
+		t.Fatalf("carry = %q", carry)
+	}
+}
+
+func TestFilterTerminalQueries_CarriesPartialEscape(t *testing.T) {
+	payload, reply, carry := filterTerminalQueries([]byte("text\x1b"))
+	if string(payload) != "text" {
+		t.Fatalf("payload = %q", payload)
+	}
+	if len(reply) != 0 {
+		t.Fatalf("reply = %q", reply)
+	}
+	if string(carry) != "\x1b" {
+		t.Fatalf("carry = %q, want \\x1b", carry)
+	}
+}
+
+func TestFilterTerminalQueries_PassesThroughNonCSI(t *testing.T) {
+	payload, reply, carry := filterTerminalQueries([]byte("\x1bOP")) // F1 key via SS3
+	if string(payload) != "\x1bOP" {
+		t.Fatalf("payload = %q, want \\x1bOP", payload)
+	}
+	if len(reply) != 0 {
+		t.Fatalf("reply = %q", reply)
+	}
+	if len(carry) != 0 {
+		t.Fatalf("carry = %q", carry)
+	}
+}
+
+// ---- NEW TESTS: filterTerminalReplies additional cases ----
+
+func TestFilterTerminalReplies_NonCSIEscape(t *testing.T) {
+	out, carry := filterTerminalReplies([]byte("\x1bOQ"))
+	if string(out) != "\x1bOQ" {
+		t.Fatalf("output = %q, want \\x1bOQ", out)
+	}
+	if len(carry) != 0 {
+		t.Fatalf("carry = %q", carry)
+	}
+}
+
+func TestFilterTerminalReplies_PartialCSI(t *testing.T) {
+	out, carry := filterTerminalReplies([]byte("abc\x1b[24"))
+	if string(out) != "abc" {
+		t.Fatalf("output = %q", out)
+	}
+	if string(carry) != "\x1b[24" {
+		t.Fatalf("carry = %q", carry)
+	}
+}
+
+// ---- NEW TESTS: terminalOutputFilter double flush ----
+
+func TestTerminalOutputFilterFlush_Empty(t *testing.T) {
+	f := terminalOutputFilter{}
+	tail := f.Flush()
+	if tail != nil {
+		t.Fatalf("flush of empty filter = %q, want nil", tail)
+	}
+}
+
+// ---- NEW TESTS: terminalInputFilter EOF with carry ----
+
+func TestTerminalInputFilterEOFWithCarry(t *testing.T) {
+	// Reader that produces an ESC byte then EOF
+	filter := newTerminalInputFilter(&chunkReader{
+		chunks: [][]byte{
+			{0x1b},
+		},
+	})
+	data, err := io.ReadAll(filter)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	// The carry ESC byte should be flushed on EOF
+	if string(data) != "\x1b" {
+		t.Fatalf("data = %q, want \\x1b", data)
+	}
+}
+
+// ---- NEW TESTS: pumpInput with reply filtering ----
+
+func TestSessionPumpInputFiltersReplies(t *testing.T) {
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer stdinR.Close()
+
+	masterR, masterW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer masterR.Close()
+
+	s := &Session{
+		master:   masterW,
+		stdin:    stdinR,
+		detachCh: make(chan struct{}),
+		stopCh:   make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.pumpInput()
+		close(done)
+	}()
+
+	// Write text with an embedded cursor position report that should be filtered
+	if _, err := stdinW.Write([]byte("abc\x1b[24;80Rdef")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	_ = stdinW.Close()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pumpInput did not exit")
+	}
+
+	_ = masterW.Close()
+	data, err := io.ReadAll(masterR)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	// The cursor position report should be stripped
+	if got := string(data); !bytes.Contains(data, []byte("abcdef")) {
+		t.Fatalf("forwarded = %q, want abcdef (with reply stripped)", got)
+	}
+}

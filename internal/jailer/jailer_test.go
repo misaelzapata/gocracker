@@ -541,3 +541,372 @@ func TestMultiFlag(t *testing.T) {
 		t.Fatalf("multiFlag.String() = %q, want %q", s, "a,b")
 	}
 }
+
+// --- Coverage-boosting tests ---
+
+func TestMultiFlag_SetReturnsNil(t *testing.T) {
+	var f multiFlag
+	if err := f.Set("value"); err != nil {
+		t.Fatalf("Set() = %v, want nil", err)
+	}
+	if len(f) != 1 || f[0] != "value" {
+		t.Fatalf("after Set: %v, want [value]", f)
+	}
+}
+
+func TestMultiFlag_Multiple(t *testing.T) {
+	var f multiFlag
+	_ = f.Set("a")
+	_ = f.Set("b")
+	_ = f.Set("c")
+	if len(f) != 3 {
+		t.Fatalf("len = %d, want 3", len(f))
+	}
+	if f.String() != "a,b,c" {
+		t.Fatalf("String() = %q", f.String())
+	}
+}
+
+func TestConfigValidateRejectsExecFileDir(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		ID:       "test-vm",
+		ExecFile: dir,
+		UID:      1000,
+		GID:      1000,
+	}
+	err := cfg.validate()
+	if err == nil || !strings.Contains(err.Error(), "must be a file") {
+		t.Fatalf("expected 'must be a file' error, got %v", err)
+	}
+}
+
+func TestConfigValidateRejectsNonexistentExecFile(t *testing.T) {
+	cfg := Config{
+		ID:       "test-vm",
+		ExecFile: "/nonexistent/path/to/binary",
+		UID:      1000,
+		GID:      1000,
+	}
+	err := cfg.validate()
+	if err == nil || !strings.Contains(err.Error(), "stat exec-file") {
+		t.Fatalf("expected stat error, got %v", err)
+	}
+}
+
+func TestConfigValidateAcceptsZeroCgroupVersion(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		ID:            "test-vm",
+		ExecFile:      execFile,
+		UID:           1000,
+		GID:           1000,
+		CgroupVersion: 0,
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil for CgroupVersion=0", err)
+	}
+}
+
+func TestConfigValidateAcceptsValidMounts(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		ID:       "test-vm",
+		ExecFile: execFile,
+		UID:      1000,
+		GID:      1000,
+		Mounts:   []string{"ro:/usr/lib:/usr/lib", "rw:/data:/data"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+}
+
+func TestConfigValidateAcceptsValidEnv(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		ID:       "test-vm",
+		ExecFile: execFile,
+		UID:      1000,
+		GID:      1000,
+		Env:      []string{"FOO=bar", "PATH=/usr/bin"},
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+}
+
+func TestParseMountExtended(t *testing.T) {
+	tests := []struct {
+		name    string
+		entry   string
+		wantRO  bool
+		wantSrc string
+		wantDst string
+		wantErr bool
+		errMsg  string
+	}{
+		{"ro basic", "ro:/src:/dst", true, "/src", "/dst", false, ""},
+		{"rw basic", "rw:/src:/dst", false, "/src", "/dst", false, ""},
+		{"RO uppercase", "RO:/src:/dst", true, "/src", "/dst", false, ""},
+		{"RW uppercase", "RW:/src:/dst", false, "/src", "/dst", false, ""},
+		{"spaces in mode", " ro :/src:/dst", true, "/src", "/dst", false, ""},
+		{"spaces in paths", "ro: /src : /dst ", true, "/src", "/dst", false, ""},
+		{"invalid mode", "xx:/src:/dst", false, "", "", true, "invalid --mount mode"},
+		{"empty mode", ":/src:/dst", false, "", "", true, "invalid --mount mode"},
+		{"too few parts", "ro:/src", false, "", "", true, "invalid --mount"},
+		{"relative source", "ro:src:/dst", false, "", "", true, "must be absolute"},
+		{"relative target", "ro:/src:dst", false, "", "", true, "must be absolute"},
+		{"root target", "ro:/src:/", false, "", "", true, "not allowed"},
+		{"path normalization", "ro:/src//extra:/dst/../dst", true, "/src//extra", "/dst", false, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec, err := parseMount(tt.entry)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseMount(%q) error = %v, wantErr %v", tt.entry, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Fatalf("error = %q, want to contain %q", err.Error(), tt.errMsg)
+				}
+				return
+			}
+			if spec.readOnly != tt.wantRO {
+				t.Fatalf("readOnly = %v, want %v", spec.readOnly, tt.wantRO)
+			}
+			if spec.source != tt.wantSrc {
+				t.Fatalf("source = %q, want %q", spec.source, tt.wantSrc)
+			}
+		})
+	}
+}
+
+func TestChrootDirDefaultBase(t *testing.T) {
+	cfg := Config{
+		ID:       "vm-1",
+		ExecFile: "/usr/bin/myapp",
+	}
+	got := cfg.chrootDir()
+	want := "/srv/jailer/myapp/vm-1/root"
+	if got != want {
+		t.Fatalf("chrootDir() = %q, want %q", got, want)
+	}
+}
+
+func TestChrootDirEmptyBase(t *testing.T) {
+	cfg := Config{
+		ID:            "vm-1",
+		ExecFile:      "/usr/bin/myapp",
+		ChrootBaseDir: "",
+	}
+	got := cfg.chrootDir()
+	want := "/srv/jailer/myapp/vm-1/root"
+	if got != want {
+		t.Fatalf("chrootDir() with empty base = %q, want %q", got, want)
+	}
+}
+
+func TestAppendUniqueStrings_Extended(t *testing.T) {
+	tests := []struct {
+		name   string
+		dst    []string
+		values []string
+		want   int
+	}{
+		{"all unique", []string{"a"}, []string{"b", "c"}, 3},
+		{"all duplicates", []string{"a", "b"}, []string{"a", "b"}, 2},
+		{"mixed", []string{"a", "b"}, []string{"b", "c", "a", "d"}, 4},
+		{"empty both", nil, nil, 0},
+		{"empty values", []string{"a"}, nil, 1},
+		{"empty dst", nil, []string{"a", "a"}, 1},
+		{"duplicate in values", nil, []string{"a", "a", "b", "b"}, 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := appendUniqueStrings(tt.dst, tt.values...)
+			if len(got) != tt.want {
+				t.Fatalf("len = %d, want %d; got %v", len(got), tt.want, got)
+			}
+		})
+	}
+}
+
+func TestMkdirAllNoSymlink_ExistingDir(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "existing")
+	if err := os.Mkdir(path, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Should succeed without error on existing directory
+	if err := mkdirAllNoSymlink(path, 0755); err != nil {
+		t.Fatalf("mkdirAllNoSymlink on existing dir = %v", err)
+	}
+}
+
+func TestMkdirAllNoSymlink_RootPath(t *testing.T) {
+	if err := mkdirAllNoSymlink("/", 0755); err != nil {
+		t.Fatalf("mkdirAllNoSymlink('/') = %v", err)
+	}
+}
+
+func TestMkdirAllNoSymlink_FileNotDir(t *testing.T) {
+	root := t.TempDir()
+	filePath := filepath.Join(root, "file")
+	if err := os.WriteFile(filePath, []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := mkdirAllNoSymlink(filepath.Join(filePath, "child"), 0755)
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("expected 'not a directory' error, got %v", err)
+	}
+}
+
+func TestExecEnv_Extended(t *testing.T) {
+	t.Run("empty env returns PATH only", func(t *testing.T) {
+		cfg := Config{}
+		result := cfg.execEnv()
+		if len(result) != 1 {
+			t.Fatalf("expected 1 entry, got %d: %v", len(result), result)
+		}
+		if !strings.HasPrefix(result[0], "PATH=") {
+			t.Fatalf("expected PATH=..., got %q", result[0])
+		}
+	})
+	t.Run("custom env without PATH gets PATH appended", func(t *testing.T) {
+		cfg := Config{Env: []string{"FOO=bar", "BAZ=qux"}}
+		result := cfg.execEnv()
+		if len(result) != 3 {
+			t.Fatalf("expected 3 entries, got %d: %v", len(result), result)
+		}
+		hasPath := false
+		for _, e := range result {
+			if strings.HasPrefix(e, "PATH=") {
+				hasPath = true
+			}
+		}
+		if !hasPath {
+			t.Fatal("expected PATH to be appended")
+		}
+	})
+	t.Run("custom env with PATH keeps original", func(t *testing.T) {
+		cfg := Config{Env: []string{"PATH=/custom/bin", "FOO=bar"}}
+		result := cfg.execEnv()
+		if len(result) != 2 {
+			t.Fatalf("expected 2 entries (no extra PATH), got %d: %v", len(result), result)
+		}
+		if result[0] != "PATH=/custom/bin" {
+			t.Fatalf("expected original PATH, got %q", result[0])
+		}
+	})
+}
+
+func TestConfigValidateRejectsMultipleMountErrors(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		mounts []string
+	}{
+		{"invalid format", []string{"invalid"}},
+		{"invalid mode", []string{"xx:/src:/dst"}},
+		{"relative source", []string{"ro:src:/dst"}},
+		{"relative target", []string{"ro:/src:dst"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				ID:       "test-vm",
+				ExecFile: execFile,
+				UID:      1000,
+				GID:      1000,
+				Mounts:   tt.mounts,
+			}
+			if err := cfg.validate(); err == nil {
+				t.Fatal("expected error for invalid mount")
+			}
+		})
+	}
+}
+
+func TestConfigValidateMultipleEnvEntries(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("first valid, second invalid", func(t *testing.T) {
+		cfg := Config{
+			ID:       "test-vm",
+			ExecFile: execFile,
+			UID:      1000,
+			GID:      1000,
+			Env:      []string{"GOOD=val", "BADENTRY"},
+		}
+		err := cfg.validate()
+		if err == nil || !strings.Contains(err.Error(), "invalid --env") {
+			t.Fatalf("expected invalid env error, got %v", err)
+		}
+	})
+
+	t.Run("all valid", func(t *testing.T) {
+		cfg := Config{
+			ID:       "test-vm",
+			ExecFile: execFile,
+			UID:      1000,
+			GID:      1000,
+			Env:      []string{"A=1", "B=2", "C="},
+		}
+		if err := cfg.validate(); err != nil {
+			t.Fatalf("validate() = %v, want nil", err)
+		}
+	})
+}
+
+func TestMkdirAllNoSymlink_DeepNested(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "a", "b", "c", "d", "e")
+	if err := mkdirAllNoSymlink(path, 0755); err != nil {
+		t.Fatalf("mkdirAllNoSymlink deep path: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatal("expected directory")
+	}
+}
+
+func TestCopyRegularFileRejectsSymlinkSource(t *testing.T) {
+	root := t.TempDir()
+	realSrc := filepath.Join(root, "real.bin")
+	if err := osWriteFile(realSrc); err != nil {
+		t.Fatal(err)
+	}
+	linkSrc := filepath.Join(root, "link.bin")
+	if err := os.Symlink(realSrc, linkSrc); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(root, "dst.bin")
+	err := copyRegularFile(linkSrc, dst, 0755)
+	if err == nil || !strings.Contains(err.Error(), "must not be a symlink") {
+		t.Fatalf("expected symlink source rejection, got %v", err)
+	}
+}

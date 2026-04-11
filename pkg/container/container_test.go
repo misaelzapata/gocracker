@@ -11,6 +11,7 @@ import (
 	"github.com/gocracker/gocracker/internal/guest"
 	"github.com/gocracker/gocracker/internal/oci"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
+	"github.com/gocracker/gocracker/pkg/vmm"
 )
 
 func TestBuildCmdline_Defaults(t *testing.T) {
@@ -699,5 +700,540 @@ func TestMountBackendConstants(t *testing.T) {
 	}
 	if MountBackendVirtioFS != "virtiofs" {
 		t.Errorf("MountBackendVirtioFS = %q, want virtiofs", MountBackendVirtioFS)
+	}
+}
+
+// --- Coverage-boosting tests ---
+
+func TestBuildVsockConfig_Disabled(t *testing.T) {
+	cfg := buildVsockConfig(RunOptions{})
+	if cfg != nil {
+		t.Fatal("expected nil vsock config when exec not enabled and no balloon")
+	}
+}
+
+func TestBuildVsockConfig_ExecEnabled(t *testing.T) {
+	cfg := buildVsockConfig(RunOptions{ExecEnabled: true})
+	if cfg == nil || !cfg.Enabled {
+		t.Fatal("expected vsock config when exec enabled")
+	}
+}
+
+func TestBuildVsockConfig_BalloonWithStats(t *testing.T) {
+	cfg := buildVsockConfig(RunOptions{
+		Balloon: &vmm.BalloonConfig{StatsPollingIntervalS: 5},
+	})
+	if cfg == nil || !cfg.Enabled {
+		t.Fatal("expected vsock config when balloon needs guest agent")
+	}
+}
+
+func TestBuildVsockConfig_BalloonAuto(t *testing.T) {
+	cfg := buildVsockConfig(RunOptions{
+		Balloon: &vmm.BalloonConfig{Auto: vmm.BalloonAutoConservative},
+	})
+	if cfg == nil || !cfg.Enabled {
+		t.Fatal("expected vsock config when balloon auto=conservative")
+	}
+}
+
+func TestBuildVsockConfig_MemoryHotplug(t *testing.T) {
+	cfg := buildVsockConfig(RunOptions{
+		MemoryHotplug: &vmm.MemoryHotplugConfig{TotalSizeMiB: 1024},
+	})
+	if cfg == nil || !cfg.Enabled {
+		t.Fatal("expected vsock config when memory hotplug configured")
+	}
+}
+
+func TestBuildExecConfig_Disabled(t *testing.T) {
+	cfg := buildExecConfig(RunOptions{})
+	if cfg != nil {
+		t.Fatal("expected nil exec config when not enabled")
+	}
+}
+
+func TestBuildExecConfig_Enabled(t *testing.T) {
+	cfg := buildExecConfig(RunOptions{ExecEnabled: true})
+	if cfg == nil || !cfg.Enabled {
+		t.Fatal("expected exec config when enabled")
+	}
+	if cfg.VsockPort != runtimecfg.DefaultExecVsockPort {
+		t.Fatalf("VsockPort = %d, want %d", cfg.VsockPort, runtimecfg.DefaultExecVsockPort)
+	}
+}
+
+func TestBuildExecConfig_BalloonTrigger(t *testing.T) {
+	cfg := buildExecConfig(RunOptions{
+		Balloon: &vmm.BalloonConfig{Auto: vmm.BalloonAutoConservative},
+	})
+	if cfg == nil || !cfg.Enabled {
+		t.Fatal("expected exec config when balloon needs guest agent")
+	}
+}
+
+func TestCloneBalloonConfig_Nil(t *testing.T) {
+	if got := cloneBalloonConfig(nil); got != nil {
+		t.Fatalf("cloneBalloonConfig(nil) = %v, want nil", got)
+	}
+}
+
+func TestCloneBalloonConfig_DeepCopy(t *testing.T) {
+	orig := &vmm.BalloonConfig{
+		AmountMiB:    128,
+		DeflateOnOOM: true,
+		Auto:         vmm.BalloonAutoConservative,
+		SnapshotPages: []uint32{1, 2, 3},
+	}
+	clone := cloneBalloonConfig(orig)
+	if clone == orig {
+		t.Fatal("clone should be a different pointer")
+	}
+	if clone.AmountMiB != 128 || clone.Auto != vmm.BalloonAutoConservative {
+		t.Fatalf("clone values mismatch: %+v", clone)
+	}
+	if len(clone.SnapshotPages) != 3 {
+		t.Fatalf("SnapshotPages len = %d", len(clone.SnapshotPages))
+	}
+	clone.SnapshotPages[0] = 999
+	if orig.SnapshotPages[0] != 1 {
+		t.Fatal("modifying clone affected original SnapshotPages")
+	}
+}
+
+func TestCloneBalloonConfig_NoSnapshotPages(t *testing.T) {
+	orig := &vmm.BalloonConfig{AmountMiB: 64}
+	clone := cloneBalloonConfig(orig)
+	if clone.AmountMiB != 64 {
+		t.Fatalf("AmountMiB = %d", clone.AmountMiB)
+	}
+	if clone.SnapshotPages != nil {
+		t.Fatal("expected nil SnapshotPages")
+	}
+}
+
+func TestCloneMemoryHotplugConfig_Nil(t *testing.T) {
+	if got := cloneMemoryHotplugConfig(nil); got != nil {
+		t.Fatalf("cloneMemoryHotplugConfig(nil) = %v, want nil", got)
+	}
+}
+
+func TestCloneMemoryHotplugConfig_DeepCopy(t *testing.T) {
+	orig := &vmm.MemoryHotplugConfig{TotalSizeMiB: 2048, SlotSizeMiB: 512, BlockSizeMiB: 128}
+	clone := cloneMemoryHotplugConfig(orig)
+	if clone == orig {
+		t.Fatal("clone should be a different pointer")
+	}
+	if clone.TotalSizeMiB != 2048 || clone.SlotSizeMiB != 512 {
+		t.Fatalf("clone values mismatch: %+v", clone)
+	}
+	clone.TotalSizeMiB = 999
+	if orig.TotalSizeMiB != 2048 {
+		t.Fatal("modifying clone affected original")
+	}
+}
+
+func TestRuntimeDrives_NoAdditionalDrives(t *testing.T) {
+	drives := runtimeDrives("/tmp/root.ext4", RunOptions{})
+	if drives != nil {
+		t.Fatalf("expected nil drives, got %v", drives)
+	}
+}
+
+func TestRuntimeDrives_WithAdditionalDrives(t *testing.T) {
+	drives := runtimeDrives("/tmp/root.ext4", RunOptions{
+		Drives: []vmm.DriveConfig{
+			{ID: "data", Path: "/tmp/data.ext4", ReadOnly: true},
+			{ID: "logs", Path: "/tmp/logs.ext4"},
+		},
+	})
+	if len(drives) != 3 {
+		t.Fatalf("expected 3 drives (root + 2), got %d", len(drives))
+	}
+	if drives[0].ID != "root" || !drives[0].Root || drives[0].Path != "/tmp/root.ext4" {
+		t.Fatalf("root drive mismatch: %+v", drives[0])
+	}
+	if drives[1].ID != "data" || drives[1].Root || !drives[1].ReadOnly {
+		t.Fatalf("data drive mismatch: %+v", drives[1])
+	}
+	if drives[2].ID != "logs" || drives[2].Root {
+		t.Fatalf("logs drive mismatch: %+v", drives[2])
+	}
+}
+
+func TestRuntimeDrives_WithRateLimiter(t *testing.T) {
+	rl := &vmm.RateLimiterConfig{Bandwidth: vmm.TokenBucketConfig{Size: 1000}}
+	drives := runtimeDrives("/tmp/root.ext4", RunOptions{
+		Drives: []vmm.DriveConfig{
+			{ID: "data", Path: "/tmp/data.ext4", RateLimiter: rl},
+		},
+	})
+	if len(drives) != 2 {
+		t.Fatalf("expected 2 drives, got %d", len(drives))
+	}
+	if drives[1].RateLimiter == nil {
+		t.Fatal("expected rate limiter on data drive")
+	}
+	if drives[1].RateLimiter == rl {
+		t.Fatal("expected deep copy of rate limiter")
+	}
+}
+
+func TestCloneStringMap_Nil(t *testing.T) {
+	if got := cloneStringMap(nil); got != nil {
+		t.Fatalf("cloneStringMap(nil) = %v, want nil", got)
+	}
+}
+
+func TestCloneStringMap_Empty(t *testing.T) {
+	if got := cloneStringMap(map[string]string{}); got != nil {
+		t.Fatalf("cloneStringMap(empty) = %v, want nil", got)
+	}
+}
+
+func TestCloneStringMap_DeepCopy(t *testing.T) {
+	orig := map[string]string{"a": "1", "b": "2"}
+	clone := cloneStringMap(orig)
+	if len(clone) != 2 || clone["a"] != "1" || clone["b"] != "2" {
+		t.Fatalf("clone values mismatch: %v", clone)
+	}
+	clone["a"] = "999"
+	if orig["a"] != "1" {
+		t.Fatal("modifying clone affected original")
+	}
+}
+
+func TestHasMaterializedMounts(t *testing.T) {
+	tests := []struct {
+		name   string
+		mounts []Mount
+		want   bool
+	}{
+		{"nil", nil, false},
+		{"empty", []Mount{}, false},
+		{"materialized only", []Mount{{Source: "/a", Target: "/b"}}, true},
+		{"virtiofs only", []Mount{{Source: "/a", Target: "/b", Backend: MountBackendVirtioFS}}, false},
+		{"mixed", []Mount{
+			{Source: "/a", Target: "/b", Backend: MountBackendVirtioFS},
+			{Source: "/c", Target: "/d"},
+		}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasMaterializedMounts(tt.mounts); got != tt.want {
+				t.Fatalf("hasMaterializedMounts() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveSharedFSMounts_Empty(t *testing.T) {
+	plan := resolveSharedFSMounts(nil)
+	if len(plan.Exports) != 0 || len(plan.Mounts) != 0 {
+		t.Fatalf("expected empty plan, got %+v", plan)
+	}
+}
+
+func TestResolveSharedFSMounts_NoVirtioFS(t *testing.T) {
+	plan := resolveSharedFSMounts([]Mount{
+		{Source: "/a", Target: "/b"},
+	})
+	if len(plan.Exports) != 0 {
+		t.Fatalf("expected no exports for non-virtiofs mounts, got %d", len(plan.Exports))
+	}
+}
+
+func TestResolveSharedFSMounts_WithVirtioFS(t *testing.T) {
+	plan := resolveSharedFSMounts([]Mount{
+		{Source: "/host/data", Target: "/guest/data", Backend: MountBackendVirtioFS},
+		{Source: "/host/logs", Target: "/guest/logs", Backend: MountBackendVirtioFS},
+	})
+	if len(plan.Exports) != 2 {
+		t.Fatalf("expected 2 exports, got %d", len(plan.Exports))
+	}
+	if len(plan.Mounts) != 2 {
+		t.Fatalf("expected 2 mounts, got %d", len(plan.Mounts))
+	}
+}
+
+func TestResolveSharedFSMounts_DedupSameSource(t *testing.T) {
+	plan := resolveSharedFSMounts([]Mount{
+		{Source: "/host/data", Target: "/guest/data1", Backend: MountBackendVirtioFS},
+		{Source: "/host/data", Target: "/guest/data2", Backend: MountBackendVirtioFS},
+	})
+	if len(plan.Exports) != 1 {
+		t.Fatalf("expected 1 export (deduped), got %d", len(plan.Exports))
+	}
+	if len(plan.Mounts) != 2 {
+		t.Fatalf("expected 2 mounts, got %d", len(plan.Mounts))
+	}
+	if plan.Mounts[0].Tag != plan.Mounts[1].Tag {
+		t.Fatal("expected same tag for deduped source")
+	}
+}
+
+func TestTrimCIDR(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"10.0.0.1", "10.0.0.1"},
+		{"10.0.0.1/24", "10.0.0.1"},
+		{"192.168.1.5/32", "192.168.1.5"},
+	}
+	for _, tt := range tests {
+		got := trimCIDR(tt.input)
+		if got != tt.want {
+			t.Errorf("trimCIDR(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestFirstNonNegative_Container(t *testing.T) {
+	tests := []struct {
+		values []int
+		want   int
+	}{
+		{[]int{5, 10}, 5},
+		{[]int{-1, 10}, 10},
+		{[]int{-1, -2, 3}, 3},
+		{[]int{0, 10}, 0},
+		{[]int{-1, -2}, 0},
+		{nil, 0},
+	}
+	for _, tt := range tests {
+		got := firstNonNegative(tt.values...)
+		if got != tt.want {
+			t.Errorf("firstNonNegative(%v) = %d, want %d", tt.values, got, tt.want)
+		}
+	}
+}
+
+func TestGuestAgentRequired(t *testing.T) {
+	tests := []struct {
+		name    string
+		balloon *vmm.BalloonConfig
+		hotplug *vmm.MemoryHotplugConfig
+		want    bool
+	}{
+		{"both nil", nil, nil, false},
+		{"balloon nil", nil, &vmm.MemoryHotplugConfig{TotalSizeMiB: 1024}, true},
+		{"hotplug nil, balloon no agent", &vmm.BalloonConfig{AmountMiB: 64}, nil, false},
+		{"balloon with stats", &vmm.BalloonConfig{StatsPollingIntervalS: 5}, nil, true},
+		{"balloon auto conservative", &vmm.BalloonConfig{Auto: vmm.BalloonAutoConservative}, nil, true},
+		{"both present", &vmm.BalloonConfig{StatsPollingIntervalS: 1}, &vmm.MemoryHotplugConfig{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := guestAgentRequired(tt.balloon, tt.hotplug); got != tt.want {
+				t.Fatalf("guestAgentRequired() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildGuestSpec_SharedFS(t *testing.T) {
+	mounts := []Mount{
+		{Source: "/host/data", Target: "/guest/data", Backend: MountBackendVirtioFS, ReadOnly: true},
+	}
+	sharedFS := resolveSharedFSMounts(mounts)
+	spec := buildGuestSpec(oci.ImageConfig{}, RunOptions{}, sharedFS)
+	if len(spec.SharedFS) != 1 {
+		t.Fatalf("expected 1 shared FS mount, got %d", len(spec.SharedFS))
+	}
+	if spec.SharedFS[0].Target != "/guest/data" || !spec.SharedFS[0].ReadOnly {
+		t.Fatalf("SharedFS mount mismatch: %+v", spec.SharedFS[0])
+	}
+}
+
+func TestBuildGuestSpec_UserFromOpts(t *testing.T) {
+	spec := guestSpecForTest(oci.ImageConfig{User: "root"}, RunOptions{})
+	if spec.User != "root" {
+		t.Fatalf("user = %q, want root", spec.User)
+	}
+}
+
+func TestBuildGuestSpec_MemoryHotplugEnablesExec(t *testing.T) {
+	spec := guestSpecForTest(oci.ImageConfig{}, RunOptions{
+		MemoryHotplug: &vmm.MemoryHotplugConfig{TotalSizeMiB: 1024},
+	})
+	if !spec.Exec.Enabled {
+		t.Fatal("exec should be enabled when memory hotplug is configured")
+	}
+}
+
+func TestBuildCmdline_WithSharedFSMounts(t *testing.T) {
+	cmdline := buildCmdline(oci.ImageConfig{}, RunOptions{
+		Mounts: []Mount{
+			{Source: "/host/data", Target: "/guest/data", Backend: MountBackendVirtioFS},
+		},
+	})
+	// VirtioFS only mounts should NOT trigger gc.fs_sync
+	if strings.Contains(cmdline, "gc.fs_sync=1") {
+		t.Fatalf("unexpected gc.fs_sync for virtiofs-only mounts:\n%s", cmdline)
+	}
+}
+
+func TestBuildCmdline_MixedMounts(t *testing.T) {
+	cmdline := buildCmdline(oci.ImageConfig{}, RunOptions{
+		Mounts: []Mount{
+			{Source: "/host/data", Target: "/guest/data", Backend: MountBackendVirtioFS},
+			{Source: "/host/config", Target: "/guest/config"},
+		},
+	})
+	// Materialized mount present, should trigger gc.fs_sync
+	if !strings.Contains(cmdline, "gc.fs_sync=1") {
+		t.Fatalf("expected gc.fs_sync for mixed mounts:\n%s", cmdline)
+	}
+}
+
+func TestSanitizeRuntimePathComponent_AllSpecialChars(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", "vm"},
+		{"  ", "vm"},
+		{"abc", "abc"},
+		{"ABC", "ABC"},
+		{"123", "123"},
+		{"a-b", "a-b"},
+		{"a_b", "a_b"},
+		{"a.b", "a.b"},
+		{"a/b", "a_b"},
+		{"a:b", "a_b"},
+		{"a b", "a_b"},
+		{"a*b?c", "a_b_c"},
+		{"@#$%", "____"},
+	}
+	for _, tt := range tests {
+		got := sanitizeRuntimePathComponent(tt.input)
+		if got != tt.want {
+			t.Errorf("sanitizeRuntimePathComponent(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestEffectiveSlice(t *testing.T) {
+	tests := []struct {
+		name     string
+		override []string
+		fallback []string
+		wantLen  int
+		wantFirst string
+	}{
+		{"override wins", []string{"a", "b"}, []string{"c"}, 2, "a"},
+		{"fallback used", nil, []string{"c", "d"}, 2, "c"},
+		{"empty override uses fallback", []string{}, []string{"x"}, 1, "x"},
+		{"both nil", nil, nil, 0, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := effectiveSlice(tt.override, tt.fallback)
+			if len(got) != tt.wantLen {
+				t.Fatalf("len = %d, want %d", len(got), tt.wantLen)
+			}
+			if tt.wantLen > 0 && got[0] != tt.wantFirst {
+				t.Fatalf("first = %q, want %q", got[0], tt.wantFirst)
+			}
+		})
+	}
+}
+
+func TestEffectiveSlice_IndependentCopy(t *testing.T) {
+	fallback := []string{"a", "b"}
+	got := effectiveSlice(nil, fallback)
+	got[0] = "z"
+	if fallback[0] != "a" {
+		t.Fatal("effectiveSlice should return a copy")
+	}
+}
+
+func TestCloneVMLimiter_Nil(t *testing.T) {
+	if got := cloneVMLimiter(nil); got != nil {
+		t.Fatalf("cloneVMLimiter(nil) = %v, want nil", got)
+	}
+}
+
+func TestCloneVMLimiter_DeepCopy(t *testing.T) {
+	orig := &vmm.RateLimiterConfig{
+		Bandwidth: vmm.TokenBucketConfig{Size: 100},
+		Ops:       vmm.TokenBucketConfig{Size: 200},
+	}
+	clone := cloneVMLimiter(orig)
+	if clone == orig {
+		t.Fatal("clone should be a different pointer")
+	}
+	clone.Bandwidth.Size = 999
+	if orig.Bandwidth.Size != 100 {
+		t.Fatal("modifying clone affected original")
+	}
+}
+
+func TestBuildGuestSpec_BalloonAutoConservativeEnablesExec(t *testing.T) {
+	spec := guestSpecForTest(oci.ImageConfig{}, RunOptions{
+		Balloon: &vmm.BalloonConfig{Auto: vmm.BalloonAutoConservative},
+	})
+	if !spec.Exec.Enabled {
+		t.Fatal("exec should be enabled when balloon auto is conservative")
+	}
+}
+
+func TestBuildGuestSpec_CmdOnly(t *testing.T) {
+	spec := guestSpecForTest(oci.ImageConfig{
+		Cmd: []string{"sh", "-c", "echo hello"},
+	}, RunOptions{})
+	if spec.Process.Exec != "sh" {
+		t.Fatalf("process.Exec = %q, want sh", spec.Process.Exec)
+	}
+	if len(spec.Process.Args) != 2 {
+		t.Fatalf("process.Args = %v, want 2 args", spec.Process.Args)
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"simple", "'simple'"},
+		{"with space", "'with space'"},
+		{"it's", "'it'\\''s'"},
+		{"", "''"},
+	}
+	for _, tt := range tests {
+		got := shellQuote(tt.input)
+		if got != tt.want {
+			t.Errorf("shellQuote(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestDefaultCacheDir(t *testing.T) {
+	dir := defaultCacheDir()
+	if dir == "" {
+		t.Fatal("defaultCacheDir() returned empty string")
+	}
+	if !strings.Contains(dir, "gocracker") {
+		t.Fatalf("defaultCacheDir() = %q, expected to contain gocracker", dir)
+	}
+}
+
+func TestResolvedCacheDir_AllCases(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"/custom", "/custom"},
+		{"  /custom  ", "/custom"},
+		{"", defaultCacheDir()},
+		{"  ", defaultCacheDir()},
+	}
+	for _, tt := range tests {
+		got := resolvedCacheDir(tt.input)
+		if got != tt.want {
+			t.Errorf("resolvedCacheDir(%q) = %q, want %q", tt.input, got, tt.want)
+		}
 	}
 }

@@ -1,6 +1,7 @@
 package vsock
 
 import (
+	"encoding/binary"
 	"testing"
 )
 
@@ -383,5 +384,288 @@ func TestHdrSizeConstant(t *testing.T) {
 func TestDialTimeout(t *testing.T) {
 	if dialTimeout.Seconds() != 15 {
 		t.Errorf("dialTimeout = %v, want 15s", dialTimeout)
+	}
+}
+
+// --- Coverage-boosting tests ---
+
+func TestConfigBytes_GuestCID(t *testing.T) {
+	// ConfigBytes should return 8 bytes encoding GuestCID (3) as LE uint64
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint64(b, GuestCID)
+	if b[0] != 3 {
+		t.Errorf("GuestCID LE byte[0] = %d, want 3", b[0])
+	}
+	for i := 1; i < 8; i++ {
+		if b[i] != 0 {
+			t.Errorf("GuestCID LE byte[%d] = %d, want 0", i, b[i])
+		}
+	}
+}
+
+func TestMarshalParseHdr_AllOpTypes(t *testing.T) {
+	ops := []struct {
+		name string
+		op   uint16
+	}{
+		{"request", opRequest},
+		{"response", opResponse},
+		{"reset", opReset},
+		{"shutdown", opShutdown},
+		{"rw", opRW},
+		{"credit_update", opCreditUpdate},
+		{"credit_request", opCreditRequest},
+	}
+	for _, tt := range ops {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &pktHdr{
+				SrcCID:   HostCID,
+				DstCID:   GuestCID,
+				SrcPort:  1024,
+				DstPort:  9999,
+				Len:      256,
+				Type:     1,
+				Op:       tt.op,
+				Flags:    0x10,
+				BufAlloc: 32768,
+				FwdCnt:   512,
+			}
+			b := marshalHdr(h)
+			var parsed pktHdr
+			parseHdr(b, &parsed)
+
+			if parsed.SrcCID != HostCID {
+				t.Errorf("SrcCID = %d, want %d", parsed.SrcCID, HostCID)
+			}
+			if parsed.DstCID != GuestCID {
+				t.Errorf("DstCID = %d, want %d", parsed.DstCID, GuestCID)
+			}
+			if parsed.SrcPort != 1024 {
+				t.Errorf("SrcPort = %d", parsed.SrcPort)
+			}
+			if parsed.DstPort != 9999 {
+				t.Errorf("DstPort = %d", parsed.DstPort)
+			}
+			if parsed.Len != 256 {
+				t.Errorf("Len = %d", parsed.Len)
+			}
+			if parsed.Type != 1 {
+				t.Errorf("Type = %d", parsed.Type)
+			}
+			if parsed.Op != tt.op {
+				t.Errorf("Op = %d, want %d", parsed.Op, tt.op)
+			}
+			if parsed.Flags != 0x10 {
+				t.Errorf("Flags = %d", parsed.Flags)
+			}
+			if parsed.BufAlloc != 32768 {
+				t.Errorf("BufAlloc = %d", parsed.BufAlloc)
+			}
+			if parsed.FwdCnt != 512 {
+				t.Errorf("FwdCnt = %d", parsed.FwdCnt)
+			}
+		})
+	}
+}
+
+func TestMarshalHdr_CreditRequestPacket(t *testing.T) {
+	h := &pktHdr{
+		SrcCID:   HostCID,
+		DstCID:   GuestCID,
+		SrcPort:  1025,
+		DstPort:  5000,
+		Op:       opCreditRequest,
+		Type:     1,
+		BufAlloc: 0,
+		FwdCnt:   0,
+	}
+	b := marshalHdr(h)
+	var parsed pktHdr
+	parseHdr(b, &parsed)
+	if parsed.Op != opCreditRequest {
+		t.Errorf("Op = %d, want %d (opCreditRequest)", parsed.Op, opCreditRequest)
+	}
+	if parsed.Len != 0 {
+		t.Errorf("Len = %d, want 0 for credit request", parsed.Len)
+	}
+}
+
+func TestMarshalHdr_ResetPacket(t *testing.T) {
+	h := &pktHdr{
+		SrcCID:  HostCID,
+		DstCID:  GuestCID,
+		SrcPort: 1024,
+		DstPort: 9999,
+		Op:      opReset,
+		Type:    1,
+	}
+	b := marshalHdr(h)
+	var parsed pktHdr
+	parseHdr(b, &parsed)
+	if parsed.Op != opReset {
+		t.Errorf("Op = %d, want %d (opReset)", parsed.Op, opReset)
+	}
+}
+
+func TestPktHdr_ZeroValueRoundtrip(t *testing.T) {
+	h := &pktHdr{}
+	b := marshalHdr(h)
+	var parsed pktHdr
+	parseHdr(b, &parsed)
+	if parsed != *h {
+		t.Errorf("zero-value roundtrip mismatch: got %+v", parsed)
+	}
+}
+
+func TestMarshalHdr_LargePayloadLen(t *testing.T) {
+	h := &pktHdr{
+		SrcCID: GuestCID,
+		DstCID: HostCID,
+		Len:    1 << 20, // 1 MiB
+		Op:     opRW,
+		Type:   1,
+	}
+	b := marshalHdr(h)
+	var parsed pktHdr
+	parseHdr(b, &parsed)
+	if parsed.Len != 1<<20 {
+		t.Errorf("Len = %d, want %d", parsed.Len, 1<<20)
+	}
+}
+
+func TestMarshalHdr_HighPortNumbers(t *testing.T) {
+	h := &pktHdr{
+		SrcCID:  GuestCID,
+		DstCID:  HostCID,
+		SrcPort: 65535,
+		DstPort: 65535,
+		Op:      opRW,
+		Type:    1,
+	}
+	b := marshalHdr(h)
+	var parsed pktHdr
+	parseHdr(b, &parsed)
+	if parsed.SrcPort != 65535 || parsed.DstPort != 65535 {
+		t.Errorf("ports = %d/%d, want 65535/65535", parsed.SrcPort, parsed.DstPort)
+	}
+}
+
+func TestMarshalHdr_FlowControlFields(t *testing.T) {
+	tests := []struct {
+		name     string
+		bufAlloc uint32
+		fwdCnt   uint32
+	}{
+		{"small", 4096, 0},
+		{"medium", 65536, 8192},
+		{"large", 1 << 20, 1 << 19},
+		{"max", ^uint32(0), ^uint32(0)},
+		{"zero", 0, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &pktHdr{
+				SrcCID:   GuestCID,
+				DstCID:   HostCID,
+				Op:       opCreditUpdate,
+				Type:     1,
+				BufAlloc: tt.bufAlloc,
+				FwdCnt:   tt.fwdCnt,
+			}
+			b := marshalHdr(h)
+			var parsed pktHdr
+			parseHdr(b, &parsed)
+			if parsed.BufAlloc != tt.bufAlloc {
+				t.Errorf("BufAlloc = %d, want %d", parsed.BufAlloc, tt.bufAlloc)
+			}
+			if parsed.FwdCnt != tt.fwdCnt {
+				t.Errorf("FwdCnt = %d, want %d", parsed.FwdCnt, tt.fwdCnt)
+			}
+		})
+	}
+}
+
+func TestMarshalHdr_BiDirectionalRoundtrip(t *testing.T) {
+	// Guest -> Host
+	g2h := &pktHdr{
+		SrcCID:   GuestCID,
+		DstCID:   HostCID,
+		SrcPort:  5000,
+		DstPort:  1024,
+		Len:      100,
+		Type:     1,
+		Op:       opRW,
+		BufAlloc: 65536,
+		FwdCnt:   50,
+	}
+	b := marshalHdr(g2h)
+	var parsed pktHdr
+	parseHdr(b, &parsed)
+	if parsed.SrcCID != GuestCID || parsed.DstCID != HostCID {
+		t.Error("guest->host direction mismatch")
+	}
+
+	// Host -> Guest (response)
+	h2g := &pktHdr{
+		SrcCID:   HostCID,
+		DstCID:   GuestCID,
+		SrcPort:  1024,
+		DstPort:  5000,
+		Len:      200,
+		Type:     1,
+		Op:       opRW,
+		BufAlloc: 32768,
+		FwdCnt:   100,
+	}
+	b = marshalHdr(h2g)
+	parseHdr(b, &parsed)
+	if parsed.SrcCID != HostCID || parsed.DstCID != GuestCID {
+		t.Error("host->guest direction mismatch")
+	}
+	if parsed.FwdCnt != 100 {
+		t.Errorf("FwdCnt = %d, want 100", parsed.FwdCnt)
+	}
+}
+
+func TestConnKeyEquality(t *testing.T) {
+	k1 := connKey{guestPort: 100, hostPort: 200}
+	k2 := connKey{guestPort: 100, hostPort: 200}
+	k3 := connKey{guestPort: 100, hostPort: 201}
+
+	if k1 != k2 {
+		t.Error("identical connKeys should be equal")
+	}
+	if k1 == k3 {
+		t.Error("different connKeys should not be equal")
+	}
+}
+
+func TestMarshalHdr_ShutdownFlags(t *testing.T) {
+	// Test various shutdown flag combinations
+	flags := []struct {
+		name  string
+		flags uint32
+	}{
+		{"no flags", 0},
+		{"recv only", 1},
+		{"send only", 2},
+		{"both", 3},
+	}
+	for _, tt := range flags {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &pktHdr{
+				SrcCID: HostCID,
+				DstCID: GuestCID,
+				Op:     opShutdown,
+				Type:   1,
+				Flags:  tt.flags,
+			}
+			b := marshalHdr(h)
+			var parsed pktHdr
+			parseHdr(b, &parsed)
+			if parsed.Flags != tt.flags {
+				t.Errorf("Flags = %d, want %d", parsed.Flags, tt.flags)
+			}
+		})
 	}
 }

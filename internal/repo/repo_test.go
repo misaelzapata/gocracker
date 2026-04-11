@@ -459,3 +459,284 @@ func TestLocateFilesExact_ComposeYAMLVariants(t *testing.T) {
 		})
 	}
 }
+
+// ---- NEW TESTS ----
+
+func TestIsLocalPath_ExhaustiveCases(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		// Local paths
+		{"/", true},
+		{"/home/user/project", true},
+		{"/tmp/foo", true},
+		{"./relative", true},
+		{"./", true},
+		{"../parent", true},
+		{"../", true},
+		{".", true},
+
+		// Non-local paths
+		{"", false},
+		{"https://github.com/user/repo", false},
+		{"http://github.com/user/repo", false},
+		{"git@github.com:user/repo.git", false},
+		{"ssh://git@github.com/user/repo", false},
+		{"file:///path/to/repo", false},
+		{"github.com/user/repo", false},
+		{"user/repo", false},
+		{"repo", false},
+		{"some-remote", false},
+		{"a", false},
+	}
+	for _, tt := range tests {
+		got := isLocalPath(tt.input)
+		if got != tt.want {
+			t.Errorf("isLocalPath(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestIsHexString_Comprehensive(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"", false},
+		{"0", true},
+		{"9", true},
+		{"a", true},
+		{"f", true},
+		{"A", true},
+		{"F", true},
+		{"0123456789", true},
+		{"abcdef", true},
+		{"ABCDEF", true},
+		{"aAbBcCdDeEfF0123456789", true},
+		{"g", false},
+		{"G", false},
+		{"xyz", false},
+		{"0x1", false},
+		{" ", false},
+		{"abc def", false},
+		{"abc\n", false},
+		{"abc!", false},
+		// 40-char full SHA
+		{"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", true},
+		// 39-char short SHA
+		{"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b", true},
+	}
+	for _, tt := range tests {
+		got := isHexString(tt.input)
+		if got != tt.want {
+			t.Errorf("isHexString(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestSubdirPointsToDockerfile_Comprehensive(t *testing.T) {
+	dir := t.TempDir()
+	// Create test files
+	for _, name := range []string{
+		"Dockerfile",
+		"Dockerfile.prod",
+		"Dockerfile.dev",
+		"dockerfile",
+		"notadockerfile.txt",
+		"README.md",
+	} {
+		os.WriteFile(filepath.Join(dir, name), []byte("FROM scratch\n"), 0644)
+	}
+	os.MkdirAll(filepath.Join(dir, "subdir"), 0755)
+
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{filepath.Join(dir, "Dockerfile"), true},
+		{filepath.Join(dir, "Dockerfile.prod"), true},
+		{filepath.Join(dir, "Dockerfile.dev"), true},
+		{filepath.Join(dir, "dockerfile"), true},
+		{filepath.Join(dir, "notadockerfile.txt"), false},
+		{filepath.Join(dir, "README.md"), false},
+		{filepath.Join(dir, "subdir"), false},
+		{filepath.Join(dir, "nonexistent"), false},
+	}
+	for _, tt := range tests {
+		got := subdirPointsToDockerfile(tt.path)
+		if got != tt.want {
+			t.Errorf("subdirPointsToDockerfile(%q) = %v, want %v", filepath.Base(tt.path), got, tt.want)
+		}
+	}
+}
+
+func TestResolveLocal_WithSubdirAndDockerfile(t *testing.T) {
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "sub")
+	os.MkdirAll(subdir, 0755)
+	dfPath := filepath.Join(subdir, "Dockerfile")
+	os.WriteFile(dfPath, []byte("FROM scratch\n"), 0644)
+
+	src := Source{URL: dir, Subdir: "sub"}
+	result, err := resolveLocal(src)
+	if err != nil {
+		t.Fatalf("resolveLocal: %v", err)
+	}
+	if result.ContextDir != subdir {
+		t.Errorf("ContextDir = %q, want %q", result.ContextDir, subdir)
+	}
+	if result.DockerfilePath != dfPath {
+		t.Errorf("DockerfilePath = %q, want %q", result.DockerfilePath, dfPath)
+	}
+}
+
+func TestResolveLocal_WithSubdirAndCompose(t *testing.T) {
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "deploy")
+	os.MkdirAll(subdir, 0755)
+	composePath := filepath.Join(subdir, "docker-compose.yml")
+	os.WriteFile(composePath, []byte("version: '3'\n"), 0644)
+
+	src := Source{URL: dir, Subdir: "deploy"}
+	result, err := resolveLocal(src)
+	if err != nil {
+		t.Fatalf("resolveLocal: %v", err)
+	}
+	if result.ComposePath != composePath {
+		t.Errorf("ComposePath = %q, want %q", result.ComposePath, composePath)
+	}
+}
+
+func TestLocateFilesExact_OnlyDockerfileProd(t *testing.T) {
+	dir := t.TempDir()
+	dfPath := filepath.Join(dir, "Dockerfile.prod")
+	os.WriteFile(dfPath, []byte("FROM ubuntu\n"), 0644)
+
+	r := &CloneResult{Dir: dir, ContextDir: dir}
+	locateFilesExact(r)
+	if r.DockerfilePath != dfPath {
+		t.Errorf("DockerfilePath = %q, want %q", r.DockerfilePath, dfPath)
+	}
+}
+
+func TestLocateFilesExact_LowercaseDockerfile(t *testing.T) {
+	dir := t.TempDir()
+	dfPath := filepath.Join(dir, "dockerfile")
+	os.WriteFile(dfPath, []byte("FROM scratch\n"), 0644)
+
+	r := &CloneResult{Dir: dir, ContextDir: dir}
+	locateFilesExact(r)
+	if r.DockerfilePath != dfPath {
+		t.Errorf("DockerfilePath = %q, want %q", r.DockerfilePath, dfPath)
+	}
+}
+
+func TestLocateFilesExact_DockerComposePriority(t *testing.T) {
+	dir := t.TempDir()
+	// Create all four compose variants
+	for _, name := range []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} {
+		os.WriteFile(filepath.Join(dir, name), []byte("version: '3'\n"), 0644)
+	}
+
+	r := &CloneResult{Dir: dir, ContextDir: dir}
+	locateFilesExact(r)
+	// docker-compose.yml should win
+	if filepath.Base(r.ComposePath) != "docker-compose.yml" {
+		t.Errorf("ComposePath = %q, want docker-compose.yml", filepath.Base(r.ComposePath))
+	}
+}
+
+func TestLocateFilesExact_DockerfileOverDockerfileProd(t *testing.T) {
+	dir := t.TempDir()
+	// Create both
+	os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0644)
+	os.WriteFile(filepath.Join(dir, "Dockerfile.prod"), []byte("FROM ubuntu\n"), 0644)
+
+	r := &CloneResult{Dir: dir, ContextDir: dir}
+	locateFilesExact(r)
+	if filepath.Base(r.DockerfilePath) != "Dockerfile" {
+		t.Errorf("DockerfilePath = %q, want Dockerfile (not Dockerfile.prod)", filepath.Base(r.DockerfilePath))
+	}
+}
+
+func TestLocateFiles_NonExact_FindsRecursive(t *testing.T) {
+	dir := t.TempDir()
+	nestedDir := filepath.Join(dir, "app")
+	os.MkdirAll(nestedDir, 0755)
+	dfPath := filepath.Join(nestedDir, "Dockerfile")
+	os.WriteFile(dfPath, []byte("FROM scratch\n"), 0644)
+
+	r := &CloneResult{Dir: dir, ContextDir: dir}
+	locateFiles(r, false)
+	if r.DockerfilePath != dfPath {
+		t.Errorf("DockerfilePath = %q, want %q", r.DockerfilePath, dfPath)
+	}
+}
+
+func TestCloneResult_Summary(t *testing.T) {
+	r := &CloneResult{
+		Dir:            "/tmp/repo",
+		ContextDir:     "/tmp/repo",
+		DockerfilePath: "/tmp/repo/Dockerfile",
+		ComposePath:    "/tmp/repo/docker-compose.yml",
+	}
+	// Just verify Summary() does not panic
+	r.Summary()
+}
+
+func TestCloneResult_SummaryNoDockerfile(t *testing.T) {
+	r := &CloneResult{
+		Dir:        "/tmp/repo",
+		ContextDir: "/tmp/repo",
+	}
+	r.Summary()
+}
+
+func TestResolve_DepthDefault(t *testing.T) {
+	dir := t.TempDir()
+	src := Source{URL: dir}
+	result, err := Resolve(src)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	defer result.Cleanup()
+	if !result.IsLocal {
+		t.Fatal("expected IsLocal")
+	}
+}
+
+func TestResolve_WithDockerfileAndCompose(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0644)
+	os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte("version: '3'\n"), 0644)
+
+	src := Source{URL: dir}
+	result, err := Resolve(src)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	defer result.Cleanup()
+
+	if result.DockerfilePath == "" {
+		t.Error("expected DockerfilePath to be set")
+	}
+	if result.ComposePath == "" {
+		t.Error("expected ComposePath to be set")
+	}
+}
+
+func TestResolveLocal_DotPath(t *testing.T) {
+	// "." should resolve to current working directory
+	src := Source{URL: "."}
+	result, err := resolveLocal(src)
+	if err != nil {
+		t.Fatalf("resolveLocal(.): %v", err)
+	}
+	if !result.IsLocal {
+		t.Fatal("expected IsLocal")
+	}
+	if result.Dir == "" {
+		t.Fatal("Dir should not be empty")
+	}
+}

@@ -1022,3 +1022,809 @@ func TestNormalizeAddFromForBuildKit(t *testing.T) {
 		})
 	}
 }
+
+// ---- NEW TESTS: parse instruction types comprehensively ----
+
+func TestParse_ONBUILD(t *testing.T) {
+	input := "FROM scratch\nONBUILD RUN echo triggered\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var found bool
+	for _, instr := range instrs {
+		if instr.Cmd == "ONBUILD" {
+			found = true
+			if len(instr.Args) != 1 || !strings.Contains(instr.Args[0], "RUN echo triggered") {
+				t.Fatalf("ONBUILD args = %v", instr.Args)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("ONBUILD instruction not found")
+	}
+}
+
+func TestParse_STOPSIGNAL(t *testing.T) {
+	input := "FROM scratch\nSTOPSIGNAL SIGKILL\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var found bool
+	for _, instr := range instrs {
+		if instr.Cmd == "STOPSIGNAL" {
+			found = true
+			if len(instr.Args) != 1 || instr.Args[0] != "SIGKILL" {
+				t.Fatalf("STOPSIGNAL args = %v", instr.Args)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("STOPSIGNAL instruction not found")
+	}
+}
+
+func TestParse_SHELL(t *testing.T) {
+	input := "FROM scratch\nSHELL [\"/bin/bash\", \"-eo\", \"pipefail\", \"-c\"]\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var shellInstr *Instruction
+	for i := range instrs {
+		if instrs[i].Cmd == "SHELL" {
+			shellInstr = &instrs[i]
+			break
+		}
+	}
+	if shellInstr == nil {
+		t.Fatal("SHELL instruction not found")
+	}
+	if len(shellInstr.Args) != 4 || shellInstr.Args[0] != "/bin/bash" {
+		t.Fatalf("SHELL args = %v", shellInstr.Args)
+	}
+}
+
+func TestParse_VOLUME(t *testing.T) {
+	input := "FROM scratch\nVOLUME /data /logs\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var volInstr *Instruction
+	for i := range instrs {
+		if instrs[i].Cmd == "VOLUME" {
+			volInstr = &instrs[i]
+			break
+		}
+	}
+	if volInstr == nil {
+		t.Fatal("VOLUME instruction not found")
+	}
+	if len(volInstr.Args) < 2 {
+		t.Fatalf("VOLUME args = %v, want at least 2", volInstr.Args)
+	}
+}
+
+func TestParse_EXPOSE_Multiple(t *testing.T) {
+	input := "FROM scratch\nEXPOSE 8080 9090/udp\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var expInstr *Instruction
+	for i := range instrs {
+		if instrs[i].Cmd == "EXPOSE" {
+			expInstr = &instrs[i]
+			break
+		}
+	}
+	if expInstr == nil {
+		t.Fatal("EXPOSE instruction not found")
+	}
+	if len(expInstr.Args) < 2 {
+		t.Fatalf("EXPOSE args = %v, want at least 2", expInstr.Args)
+	}
+}
+
+func TestParse_LABEL(t *testing.T) {
+	input := "FROM scratch\nLABEL version=\"1.0\" maintainer=\"test@example.com\"\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var labelInstr *Instruction
+	for i := range instrs {
+		if instrs[i].Cmd == "LABEL" {
+			labelInstr = &instrs[i]
+			break
+		}
+	}
+	if labelInstr == nil {
+		t.Fatal("LABEL instruction not found")
+	}
+}
+
+func TestParse_MultiStageNamedStages(t *testing.T) {
+	input := `FROM golang:1.21 AS builder
+WORKDIR /src
+RUN echo build
+
+FROM alpine:3.18 AS runner
+COPY --from=builder /src /app
+
+FROM scratch AS final
+COPY --from=runner /app /app
+CMD ["/app"]
+`
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	fromCount := 0
+	for _, instr := range instrs {
+		if instr.Cmd == "FROM" {
+			fromCount++
+		}
+	}
+	if fromCount != 3 {
+		t.Fatalf("got %d FROM, want 3", fromCount)
+	}
+}
+
+func TestParse_ARGBeforeFROM(t *testing.T) {
+	input := `ARG BASE_IMAGE=ubuntu
+ARG VERSION=22.04
+FROM ${BASE_IMAGE}:${VERSION}
+RUN echo hi
+`
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if instrs[0].Cmd != "ARG" || instrs[1].Cmd != "ARG" {
+		t.Fatalf("expected first two instructions to be ARG, got %s and %s", instrs[0].Cmd, instrs[1].Cmd)
+	}
+	if instrs[2].Cmd != "FROM" {
+		t.Fatalf("expected FROM after ARGs, got %s", instrs[2].Cmd)
+	}
+}
+
+func TestParse_HEALTHCHECK_NONE(t *testing.T) {
+	input := "FROM scratch\nHEALTHCHECK NONE\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var hcInstr *Instruction
+	for i := range instrs {
+		if instrs[i].Cmd == "HEALTHCHECK" {
+			hcInstr = &instrs[i]
+			break
+		}
+	}
+	if hcInstr == nil {
+		t.Fatal("HEALTHCHECK instruction not found")
+	}
+	if len(hcInstr.Args) != 1 || !strings.EqualFold(hcInstr.Args[0], "NONE") {
+		t.Fatalf("HEALTHCHECK args = %v, want [NONE]", hcInstr.Args)
+	}
+}
+
+func TestParse_HEALTHCHECK_WithOptions(t *testing.T) {
+	input := "FROM scratch\nHEALTHCHECK --interval=30s --timeout=10s --retries=3 CMD curl -f http://localhost/\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var hcInstr *Instruction
+	for i := range instrs {
+		if instrs[i].Cmd == "HEALTHCHECK" {
+			hcInstr = &instrs[i]
+			break
+		}
+	}
+	if hcInstr == nil {
+		t.Fatal("HEALTHCHECK instruction not found")
+	}
+	argsJoined := strings.Join(hcInstr.Args, " ")
+	if !strings.Contains(argsJoined, "--interval=") {
+		t.Fatalf("HEALTHCHECK args = %q, missing interval", argsJoined)
+	}
+}
+
+func TestParse_COPYChmod(t *testing.T) {
+	input := "FROM scratch\nCOPY --chmod=755 app /app\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var found bool
+	for _, instr := range instrs {
+		if instr.Cmd == "COPY" {
+			for _, arg := range instr.Args {
+				if arg == "--chmod=755" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("COPY --chmod=755 not found")
+	}
+}
+
+func TestParse_COPYChown(t *testing.T) {
+	input := "FROM scratch\nCOPY --chown=1000:1000 app /app\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var found bool
+	for _, instr := range instrs {
+		if instr.Cmd == "COPY" {
+			for _, arg := range instr.Args {
+				if arg == "--chown=1000:1000" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("COPY --chown not found")
+	}
+}
+
+func TestParse_COPYLink(t *testing.T) {
+	input := "FROM scratch\nCOPY --link app /app\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var found bool
+	for _, instr := range instrs {
+		if instr.Cmd == "COPY" {
+			for _, arg := range instr.Args {
+				if arg == "--link" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("COPY --link not found")
+	}
+}
+
+func TestParse_COPYExclude(t *testing.T) {
+	input := "FROM scratch\nCOPY --exclude=*.tmp . /app\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var found bool
+	for _, instr := range instrs {
+		if instr.Cmd == "COPY" {
+			for _, arg := range instr.Args {
+				if strings.HasPrefix(arg, "--exclude=") {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("COPY --exclude not found")
+	}
+}
+
+func TestParse_COPYParents(t *testing.T) {
+	input := "FROM scratch\nCOPY --parents src/dir /app/\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var found bool
+	for _, instr := range instrs {
+		if instr.Cmd == "COPY" {
+			for _, arg := range instr.Args {
+				if arg == "--parents" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("COPY --parents not found")
+	}
+}
+
+func TestParse_ADDChecksum(t *testing.T) {
+	input := "FROM scratch\nADD --checksum=sha256:abcdef1234567890 https://example.com/file.tar.gz /app/\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var found bool
+	for _, instr := range instrs {
+		if instr.Cmd == "ADD" {
+			for _, arg := range instr.Args {
+				if strings.HasPrefix(arg, "--checksum=") {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("ADD --checksum not found")
+	}
+}
+
+func TestParse_ADDKeepGitDir(t *testing.T) {
+	input := "FROM scratch\nADD --keep-git-dir=true https://github.com/example/repo.git /app/\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var found bool
+	for _, instr := range instrs {
+		if instr.Cmd == "ADD" {
+			for _, arg := range instr.Args {
+				if strings.HasPrefix(arg, "--keep-git-dir=") {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("ADD --keep-git-dir not found")
+	}
+}
+
+func TestParse_RUNMountTmpfs(t *testing.T) {
+	input := "FROM scratch\nRUN --mount=type=tmpfs,target=/tmp/build echo hi\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var runInstr *Instruction
+	for i := range instrs {
+		if instrs[i].Cmd == "RUN" {
+			runInstr = &instrs[i]
+			break
+		}
+	}
+	if runInstr == nil {
+		t.Fatal("no RUN instruction found")
+	}
+	if len(runInstr.RunMounts) != 1 || runInstr.RunMounts[0].Type != "tmpfs" {
+		t.Fatalf("mount type = %v, want tmpfs", runInstr.RunMounts)
+	}
+}
+
+func TestParse_RUNMountSecret(t *testing.T) {
+	input := "FROM scratch\nRUN --mount=type=secret,id=mysecret,target=/run/secret cat /run/secret\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var runInstr *Instruction
+	for i := range instrs {
+		if instrs[i].Cmd == "RUN" {
+			runInstr = &instrs[i]
+			break
+		}
+	}
+	if runInstr == nil {
+		t.Fatal("no RUN instruction found")
+	}
+	if len(runInstr.RunMounts) != 1 || runInstr.RunMounts[0].Type != "secret" {
+		t.Fatalf("mount = %#v, want type=secret", runInstr.RunMounts)
+	}
+	if runInstr.RunMounts[0].SecretID == "" {
+		t.Fatal("expected SecretID to be set for secret mount")
+	}
+}
+
+func TestParse_ENVOldForm(t *testing.T) {
+	// Old single-pair form: ENV KEY VALUE (no equals sign)
+	input := "FROM scratch\nENV MY_KEY my value with spaces\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var envInstr *Instruction
+	for i := range instrs {
+		if instrs[i].Cmd == "ENV" {
+			envInstr = &instrs[i]
+			break
+		}
+	}
+	if envInstr == nil {
+		t.Fatal("ENV instruction not found")
+	}
+	if len(envInstr.Args) < 2 {
+		t.Fatalf("ENV args = %v, expected at least 2", envInstr.Args)
+	}
+}
+
+// ---- NEW TESTS: expand with default/alt syntax ----
+
+func TestExpand_DefaultSyntax(t *testing.T) {
+	b := &builder{
+		env:  map[string]string{},
+		args: map[string]string{},
+	}
+	// ${VAR:-default} should return "default" when VAR is not set
+	got := b.expand("${UNSET:-fallback}")
+	if got != "fallback" {
+		t.Fatalf("expand(${UNSET:-fallback}) = %q, want fallback", got)
+	}
+}
+
+func TestExpand_AltSyntax(t *testing.T) {
+	b := &builder{
+		env:  map[string]string{"SET": "value"},
+		args: map[string]string{},
+	}
+	// ${VAR:+alt} should return "alt" when VAR is set
+	got := b.expand("${SET:+replacement}")
+	if got != "replacement" {
+		t.Fatalf("expand(${SET:+replacement}) = %q, want replacement", got)
+	}
+}
+
+func TestExpand_AltSyntax_Unset(t *testing.T) {
+	b := &builder{
+		env:  map[string]string{},
+		args: map[string]string{},
+	}
+	// ${VAR:+alt} should return "" when VAR is not set
+	got := b.expand("${UNSET:+replacement}")
+	if got != "" {
+		t.Fatalf("expand(${UNSET:+replacement}) = %q, want empty", got)
+	}
+}
+
+// ---- NEW TESTS: splitArgs edge cases ----
+
+func TestSplitArgs_EmptyRaw(t *testing.T) {
+	args := splitArgs("CMD", "")
+	if args != nil {
+		t.Fatalf("splitArgs(CMD, \"\") = %v, want nil", args)
+	}
+}
+
+func TestSplitArgs_WhitespaceOnly(t *testing.T) {
+	args := splitArgs("CMD", "   ")
+	if args != nil {
+		t.Fatalf("splitArgs(CMD, \"   \") = %v, want nil", args)
+	}
+}
+
+func TestSplitArgs_ExecFormEntrypoint(t *testing.T) {
+	args := splitArgs("ENTRYPOINT", `["/usr/bin/app","--config","/etc/app.conf"]`)
+	if len(args) != 3 || args[0] != "/usr/bin/app" {
+		t.Fatalf("splitArgs(ENTRYPOINT, exec form) = %v", args)
+	}
+}
+
+// ---- NEW TESTS: hasDockerfileInstructions edge cases ----
+
+func TestHasDockerfileInstructions_TabsAndSpaces(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"tabs only", "\t\t\n\t", false},
+		{"instruction with leading space", "  FROM scratch", true},
+		{"mixed comments and blank", "# comment\n\n# more\n", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasDockerfileInstructions(tt.content)
+			if got != tt.want {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// ---- NEW TESTS: normalizeAddFromForBuildKit additional cases ----
+
+func TestNormalizeAddFromForBuildKit_Lowercase(t *testing.T) {
+	input := "add --from=builder /app /app"
+	got := normalizeAddFromForBuildKit(input)
+	if !strings.HasPrefix(got, "COPY") {
+		t.Fatalf("lowercase add --from should be converted, got %q", got)
+	}
+}
+
+func TestNormalizeAddFromForBuildKit_NoFrom(t *testing.T) {
+	input := "ADD file.tar /dest"
+	got := normalizeAddFromForBuildKit(input)
+	if got != input {
+		t.Fatalf("ADD without --from should be unchanged, got %q", got)
+	}
+}
+
+func TestNormalizeAddFromForBuildKit_IndentedAdd(t *testing.T) {
+	input := "  ADD --from=builder /app /app"
+	got := normalizeAddFromForBuildKit(input)
+	if !strings.Contains(got, "COPY") {
+		t.Fatalf("indented ADD --from should be converted, got %q", got)
+	}
+}
+
+func TestNormalizeAddFromForBuildKit_MultipleLines(t *testing.T) {
+	input := "FROM scratch\nADD --from=builder /app /app\nADD file.tar /dest\n"
+	got := normalizeAddFromForBuildKit(input)
+	lines := strings.Split(got, "\n")
+	if !strings.HasPrefix(lines[1], "COPY") {
+		t.Fatalf("second line should be COPY, got %q", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "ADD") {
+		t.Fatalf("third line should remain ADD, got %q", lines[2])
+	}
+}
+
+// ---- NEW TESTS: commandConfigArgs ----
+
+func TestCommandConfigArgs_EmptyArgs(t *testing.T) {
+	b := &builder{shell: []string{"/bin/sh", "-c"}}
+	got := b.commandConfigArgs(Instruction{
+		Cmd:       "CMD",
+		Args:      []string{},
+		ShellForm: true,
+	})
+	if got != nil {
+		t.Fatalf("commandConfigArgs(empty shell form) = %v, want nil", got)
+	}
+}
+
+func TestCommandConfigArgs_ShellFormWithCustomShell(t *testing.T) {
+	b := &builder{shell: []string{"/bin/bash", "-eo", "pipefail", "-c"}}
+	got := b.commandConfigArgs(Instruction{
+		Cmd:       "ENTRYPOINT",
+		Args:      []string{"start.sh"},
+		ShellForm: true,
+	})
+	want := []string{"/bin/bash", "-eo", "pipefail", "-c", "start.sh"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+}
+
+// ---- NEW TESTS: buildRunCommand additional cases ----
+
+func TestBuildRunCommand_ExecForm(t *testing.T) {
+	b := &builder{
+		shell:   []string{"/bin/sh", "-c"},
+		workdir: "",
+	}
+	got := b.buildRunCommand([]string{"/usr/bin/app", "--flag"})
+	if len(got) != 2 || got[0] != "/usr/bin/app" {
+		t.Fatalf("exec form buildRunCommand = %v", got)
+	}
+}
+
+func TestBuildRunCommand_ExecFormWithWorkdir(t *testing.T) {
+	b := &builder{
+		shell:   []string{"/bin/sh", "-c"},
+		workdir: "/app",
+	}
+	got := b.buildRunCommand([]string{"/usr/bin/app", "--flag"})
+	// Should wrap with shell to cd first
+	if len(got) < 4 {
+		t.Fatalf("buildRunCommand with workdir and exec form = %v", got)
+	}
+}
+
+func TestBuildRunCommand_EmptyArgs(t *testing.T) {
+	b := &builder{shell: []string{"/bin/sh", "-c"}}
+	got := b.buildRunCommand(nil)
+	if got != nil {
+		t.Fatalf("buildRunCommand(nil) = %v, want nil", got)
+	}
+}
+
+// ---- NEW TESTS: parseInstruction edge cases ----
+
+func TestParseInstruction_EmptyInput(t *testing.T) {
+	_, err := parseInstruction("")
+	if err == nil {
+		t.Fatal("expected error for empty instruction")
+	}
+}
+
+func TestParseInstruction_CMDExecForm(t *testing.T) {
+	instr, err := parseInstruction(`CMD ["echo", "hello"]`)
+	if err != nil {
+		t.Fatalf("parseInstruction: %v", err)
+	}
+	if instr.Cmd != "CMD" {
+		t.Fatalf("cmd = %q, want CMD", instr.Cmd)
+	}
+	if instr.ShellForm {
+		t.Fatal("exec form should not be marked as ShellForm")
+	}
+}
+
+func TestParseInstruction_CMDShellForm(t *testing.T) {
+	instr, err := parseInstruction("CMD echo hello world")
+	if err != nil {
+		t.Fatalf("parseInstruction: %v", err)
+	}
+	if !instr.ShellForm {
+		t.Fatal("shell form should be marked as ShellForm")
+	}
+}
+
+func TestParseInstruction_ENTRYPOINTExecForm(t *testing.T) {
+	instr, err := parseInstruction(`ENTRYPOINT ["/bin/app"]`)
+	if err != nil {
+		t.Fatalf("parseInstruction: %v", err)
+	}
+	if instr.Cmd != "ENTRYPOINT" || instr.ShellForm {
+		t.Fatalf("cmd=%q shellForm=%v", instr.Cmd, instr.ShellForm)
+	}
+	if len(instr.Args) != 1 || instr.Args[0] != "/bin/app" {
+		t.Fatalf("args = %v", instr.Args)
+	}
+}
+
+// ---- NEW TESTS: resolveContextMountSource ----
+
+func TestResolveContextMountSource_EmptySource(t *testing.T) {
+	root := t.TempDir()
+	got, err := resolveContextMountSource(root, "")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if got != root {
+		t.Fatalf("got %q, want %q", got, root)
+	}
+}
+
+func TestResolveContextMountSource_ValidSubdir(t *testing.T) {
+	root := t.TempDir()
+	got, err := resolveContextMountSource(root, "subdir/path")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	want := filepath.Join(root, "subdir/path")
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestResolveContextMountSource_AbsoluteSource(t *testing.T) {
+	root := t.TempDir()
+	got, err := resolveContextMountSource(root, "/absolute/path")
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	want := filepath.Join(root, "absolute/path")
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// ---- NEW TESTS: sanitizeRunMountCacheKey additional cases ----
+
+func TestSanitizeRunMountCacheKey_Complex(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"/root/.cache/pip", "root_.cache_pip"},
+		{"/go/pkg/mod", "go_pkg_mod"},
+		{"relative/path", "relative_path"},
+		{"  /trimmed/  ", "trimmed"},
+	}
+	for _, tt := range tests {
+		got := sanitizeRunMountCacheKey(tt.input)
+		if got != tt.want {
+			t.Errorf("sanitizeRunMountCacheKey(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+// ---- NEW TESTS: parseFromArgs ----
+
+func TestParseFromArgs_Empty(t *testing.T) {
+	_, _, err := parseFromArgs(nil)
+	if err == nil {
+		t.Fatal("expected error for empty args")
+	}
+}
+
+func TestParseFromArgs_ImageOnly(t *testing.T) {
+	image, alias, err := parseFromArgs([]string{"ubuntu:22.04"})
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if image != "ubuntu:22.04" || alias != "" {
+		t.Fatalf("image=%q alias=%q", image, alias)
+	}
+}
+
+func TestParseFromArgs_WithAS(t *testing.T) {
+	image, alias, err := parseFromArgs([]string{"golang:1.21", "AS", "builder"})
+	if err != nil {
+		t.Fatalf("error: %v", err)
+	}
+	if image != "golang:1.21" || alias != "builder" {
+		t.Fatalf("image=%q alias=%q", image, alias)
+	}
+}
+
+// ---- NEW TESTS: MAINTAINER (deprecated) ----
+
+func TestParse_MAINTAINER(t *testing.T) {
+	input := "FROM scratch\nMAINTAINER test@example.com\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var found bool
+	for _, instr := range instrs {
+		if instr.Cmd == "MAINTAINER" {
+			found = true
+			if len(instr.Args) != 1 || instr.Args[0] != "test@example.com" {
+				t.Fatalf("MAINTAINER args = %v", instr.Args)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("MAINTAINER instruction not found")
+	}
+}
+
+// ---- NEW TESTS: COPY --from with numeric index ----
+
+func TestParse_COPYFromNumeric(t *testing.T) {
+	input := "FROM scratch\nRUN echo build\nFROM scratch\nCOPY --from=0 /app /app\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var found bool
+	for _, instr := range instrs {
+		if instr.Cmd == "COPY" {
+			for _, arg := range instr.Args {
+				if arg == "--from=0" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("COPY --from=0 not found")
+	}
+}
+
+// ---- NEW TESTS: ADD --from becomes COPY (via normalizeAddFromForBuildKit) ----
+
+func TestParse_ADDFromBecomesCOPY(t *testing.T) {
+	input := "FROM scratch AS builder\nRUN echo build\nFROM scratch\nADD --from=builder /app /app\n"
+	instrs, err := parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// ADD --from= should have been converted to COPY --from= by normalizeAddFromForBuildKit
+	var found bool
+	for _, instr := range instrs {
+		if instr.Cmd == "COPY" {
+			for _, arg := range instr.Args {
+				if arg == "--from=builder" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("ADD --from=builder should have been converted to COPY --from=builder")
+	}
+}
