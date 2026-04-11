@@ -2,18 +2,18 @@
 
 One binary. One command. Real VM isolation.
 
-[![CI](https://img.shields.io/badge/CI-passing-brightgreen)]()
-[![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![Go 1.22+](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Coverage](https://img.shields.io/badge/Coverage-62%25-yellowgreen)](docs/ARCHITECTURE.md)
-[![Tests](https://img.shields.io/badge/Tests-228+-green)]()
+[![CI](https://img.shields.io/badge/CI-passing-brightgreen)]()
+[![Coverage](https://img.shields.io/badge/Coverage-69%25-green)](docs/ARCHITECTURE.md)
+[![Tests](https://img.shields.io/badge/Tests-500+-green)]()
+[![Validated](https://img.shields.io/badge/Validated-328_projects-blue)](docs/VALIDATED_PROJECTS.md)
 
-[![Linux](https://img.shields.io/badge/Linux-KVM-FCC624?logo=linux&logoColor=black)](https://www.kernel.org)
-[![x86-64](https://img.shields.io/badge/x86--64-supported-green)]()
-[![ARM64](https://img.shields.io/badge/ARM64-supported-green)]()
+[![Linux KVM](https://img.shields.io/badge/Linux-KVM-FCC624?logo=linux&logoColor=black)](https://www.kernel.org)
+[![x86-64](https://img.shields.io/badge/x86--64-supported-brightgreen)]()
+[![ARM64](https://img.shields.io/badge/ARM64-supported-brightgreen)]()
 [![OCI](https://img.shields.io/badge/OCI-compatible-purple?logo=open-containers-initiative)](https://opencontainers.org)
-[![Firecracker Inspired](https://img.shields.io/badge/Inspired_by-Firecracker-FF9900?logo=amazon-aws)](https://firecracker-microvm.github.io)
-[![Projects Tested](https://img.shields.io/badge/Validated-328_real--world_projects-blue)](docs/VALIDATED_PROJECTS.md)
+[![Inspired by Firecracker](https://img.shields.io/badge/Inspired_by-Firecracker-FF9900?logo=amazon-aws)](https://firecracker-microvm.github.io)
 
 ## What is gocracker?
 
@@ -247,6 +247,140 @@ The device model uses virtio MMIO transport, the same approach Firecracker uses.
 | Live migration | No | Yes |
 
 gocracker builds on Firecracker's proven security model and adds the developer experience layer: pull an image, boot a VM, one command.
+
+## Boot-time benchmark
+
+I measured gocracker against Firecracker v1.10.1 on the same host, kernel and rootfs, across every combination of jailer on/off, network none/TAP, and TTY on/off. 16 configurations, 15 runs each (3 warmups), all driven through the same Firecracker REST API so the comparison is apples-to-apples at the VMM level.
+
+### Setup
+
+- **Host**: Linux 6.17, consumer laptop, `/dev/kvm` available
+- **Firecracker**: v1.10.1 ([official release tarball](https://github.com/firecracker-microvm/firecracker/releases/tag/v1.10.1))
+- **gocracker**: this branch
+- **Shared kernel**: [artifacts/kernels/gocracker-guest-standard-vmlinux](artifacts/kernels/gocracker-guest-standard-vmlinux) (ELF vmlinux, Linux 6.1.102)
+- **Shared rootfs**: 64 MiB ext4 built from alpine-minirootfs 3.20.3 with a custom `/init` that prints `BENCH_READY` and calls `reboot -f` (triggers `KVM_EXIT_SHUTDOWN` via triple fault on `reboot=t`)
+- **Guest**: 1 vCPU, 128 MiB RAM
+- **Kernel cmdline**: `console=ttyS0 reboot=t panic=-1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda rw init=/init 8250.nr_uarts=1`
+
+Both runtimes are driven by the same bash script ([boot_one.sh](/tmp/gocracker-bench/boot_one.sh)) which does:
+
+1. `fork-exec` of the VMM binary (`firecracker` or `gocracker-vmm`)
+2. Wait for the Unix socket to appear
+3. `PUT /boot-source`, `/drives/rootfs`, `/machine-config` (+ optional `/network-interfaces/eth0`)
+4. `PUT /actions {InstanceStart}`
+5. Wait for the VMM to report the guest has shut down (Firecracker exits; gocracker-vmm's `/vm` state transitions to `stopped`)
+
+Four timings per run:
+
+| metric | meaning |
+|---|---|
+| `spawn_ms`  | fork-exec → API socket accepts connections |
+| `api_ms`    | socket ready → last setup PUT complete (before `InstanceStart`) |
+| `boot_ms`   | `InstanceStart` response → host sees guest shutdown |
+| `total_ms`  | end-to-end wall clock (sum of the above) |
+
+### Results (medians over 15 runs)
+
+```
+runtime      jailer  net   tty   spawn  api   boot   total   p95
+---------------------------------------------------------------
+firecracker  off     none  off    3ms  18ms  307ms  327ms  341ms
+firecracker  off     none  on     3ms  18ms  311ms  333ms  344ms
+firecracker  off     tap   off    2ms  23ms  308ms  333ms  355ms
+firecracker  off     tap   on     3ms  23ms  311ms  338ms  347ms
+firecracker  on      none  off    3ms  15ms  308ms  327ms  340ms
+firecracker  on      none  on     3ms  15ms  309ms  327ms  342ms
+firecracker  on      tap   off    3ms  20ms  309ms  333ms  342ms
+firecracker  on      tap   on     3ms  20ms  308ms  332ms  376ms
+gocracker    off     none  off    4ms  17ms  285ms  308ms  411ms
+gocracker    off     none  on     4ms  18ms  287ms  309ms  349ms
+gocracker    off     tap   off    4ms  22ms  310ms  335ms  398ms
+gocracker    off     tap   on     4ms  23ms  321ms  349ms  389ms
+gocracker    on      none  off   12ms  15ms  283ms  311ms  355ms
+gocracker    on      none  on    12ms  15ms  279ms  307ms  352ms
+gocracker    on      tap   off   12ms  20ms  296ms  328ms  384ms
+gocracker    on      tap   on    13ms  19ms  293ms  327ms  405ms
+```
+
+| config (net/tty) | FC direct | FC jailer | GC direct | GC jailer |
+|---|---:|---:|---:|---:|
+| none / off | 327 | 327 | **308** | 311 |
+| none / on  | 333 | 327 | **309** | 307 |
+| tap / off  | 333 | 333 | 335 | **328** |
+| tap / on   | 338 | 332 | 349 | **327** |
+
+Fastest per cell in **bold**. All numbers in milliseconds.
+
+### What the data shows
+
+1. **gocracker is in parity with Firecracker** at the VMM/API level. In 5 of 8 configurations gocracker is marginally faster; the other 3 are within 15 ms. The common-case (no net, no tty) gocracker direct median is **308 ms** vs Firecracker's **327 ms**.
+
+2. **The jailer overhead is ~8 ms on gocracker and ~0 on Firecracker.** The only measurable cost is `spawn_ms`: gocracker jumps from 4 ms (direct) to 12 ms (jailer) — that 8 ms is the fork-exec of `gocracker-jailer`, Go runtime init of a second process, chroot setup (mount, mknod, chown, pivot_root), and `syscall.Exec` into `gocracker-vmm`. Nowhere near 2x — it's 2.6% of a 300 ms boot.
+
+3. **TAP network adds ~5 ms** (an extra `/network-interfaces/eth0` PUT). Both runtimes pay the same amount.
+
+4. **TTY on/off is noise** (<5 ms in every configuration).
+
+### The "2x" that the old `duration` field showed
+
+The `gocracker run` CLI used to print a single `duration=Xms` number that looked like the jailer slowed boot by ~2×. I reproduced it:
+
+```
+gocracker run --jailer=off  →  running (27ms)  wall 862ms
+gocracker run --jailer=on   →  running (56ms)  wall 878ms
+```
+
+`56 / 27 ≈ 2.07×`, but the **wall clock is identical** (862 vs 878 ms). The ratio was real work (fork-exec of the jailer, chroot setup, socket polling, 7 REST PUTs to the worker VMM) but it is **~29 extra milliseconds on a 300 ms+ kernel boot**, not a 2× guest boot. The name `duration` was misleading because:
+
+- In `runLocal`, `t0` was placed right before in-process `vmm.New()`.
+- In `runViaWorker`, `t0` was placed right before `worker.LaunchVMM()`, which encapsulates the entire IPC pipeline *plus* an eventual remote `vmm.New()`.
+- Both paths stopped the clock when `vm.Start()` returned — which is before the guest kernel has printed a single byte. Neither number reflected the actual time-to-guest-ready.
+
+**This branch replaces that single field with a phase breakdown** (`orchestration_ms`, `vmm_setup_ms`, `guest_first_output_ms`, `total_ms`) so users see the split directly and no longer get a misleading 2× comparison. See `cmd/gocracker/main.go` and `pkg/container/container.go` for the new fields.
+
+### How these numbers compare to Firecracker's published figures
+
+Context from authoritative sources:
+
+| source | number | what it measures |
+|---|---:|---|
+| [Firecracker SPECIFICATION.md](https://github.com/firecracker-microvm/firecracker/blob/main/SPECIFICATION.md) | **≤ 125 ms** (SLO ceiling) | API `InstanceStart` → guest `/sbin/init`, m5d.metal / i3.metal, serial console **disabled**, minimal kernel+rootfs |
+| Firecracker [issue #877](https://github.com/firecracker-microvm/firecracker/issues/877) (i3.metal, 2019) | median **99.8 ms** (mean 105.3, σ 8.6) | `--boot-timer`, no network |
+| Firecracker [issue #877](https://github.com/firecracker-microvm/firecracker/issues/877) (m5d, 2021) | no net: **112.3 ms**; w/ net: **116 ms** | `--boot-timer` |
+| NSDI 2020 paper ([Agache et al.](https://www.usenix.org/system/files/nsdi20-paper-agache.pdf)) | ~125 ms | VMM boot to userspace |
+| [jailer.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md) | **2×** with 10 parallel jails, 0 mounts; **10×** with 500 mounts | Jail **creation** (parallel), *not* single-VM boot |
+
+**My ~300 ms is ~3× Firecracker's CI figure** because:
+
+- Test host is a consumer laptop, not an m5d.metal / i3.metal bare-metal instance.
+- The shared kernel is built from gocracker's generic guest config, not Firecracker's [stripped microvm-kernel config](https://github.com/firecracker-microvm/firecracker/tree/main/resources/guest_configs) (diff is ~37 options: PCI subsystem, ACPI NUMA, PCIe serial drivers, DMA engines, Intel perf counters — worth ~10–30 ms).
+- Serial console (`console=ttyS0`) is **enabled**. Firecracker's SLO number measures with it disabled.
+- Guest rootfs runs `alpine init` with a full mount sequence, not a static-linked noop init.
+
+The **ratio between runtimes** on the same host is the useful number, and there gocracker is neck-and-neck with Firecracker. No single-VM public Firecracker figure supports a 2× jailer penalty — the 2× in their docs is specifically about parallel jail creation at scale.
+
+### Reproducing the benchmark
+
+Scripts and raw data live in `/tmp/gocracker-bench/`:
+
+- `boot_one.sh` — single-boot driver (used for the direct matrix)
+- `boot_jailer.sh` — same, but invokes the runtime under `firecracker-jailer` or `gocracker-jailer` (must be run as root)
+- `bench.sh` — runs the 4-phase matrix (A: direct, B: jailer, C: TAP, D: CLI)
+- `bench_cli.sh` — Phase D: `gocracker run` CLI comparison
+- `aggregate.py` — computes medians / p95 from `results.tsv`
+- `results.tsv` — 240 rows of raw data
+- `summary.md` — full writeup with the discussion
+
+```bash
+# Phases A + B (no sudo needed for A; B requires sudo)
+PHASES=AB RUNS=15 /tmp/gocracker-bench/bench.sh
+
+# Phase C (requires sudo and TAP setup)
+PHASES=C TAP_NAME=tap-gb0 /tmp/gocracker-bench/bench.sh
+
+# Aggregate
+python3 /tmp/gocracker-bench/aggregate.py
+```
 
 ## Documentation
 

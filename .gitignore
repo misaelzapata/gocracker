@@ -17,3 +17,4 @@ artifacts/kernels/host-*
 .vscode/
 __pycache__/
 2026-*.txt
+gocracker-bottleneck.md

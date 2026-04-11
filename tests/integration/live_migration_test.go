@@ -64,10 +64,7 @@ func main() {
 		t.Fatal("run response did not include a VM id")
 	}
 
-	srcVM := waitForVM(t, src.URL, runResp.ID, 45*time.Second)
-	if srcVM.State != "running" {
-		t.Fatalf("source VM state = %s, want running", srcVM.State)
-	}
+	_ = waitForVMRunning(t, src.URL, runResp.ID, 45*time.Second)
 
 	migrateReq := api.MigrateRequest{DestinationURL: dst.URL}
 	var migrateResp api.MigrationResponse
@@ -292,6 +289,22 @@ func waitForVM(t *testing.T, baseURL, vmID string, timeout time.Duration) api.VM
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("vm %s did not appear at %s within %s", vmID, baseURL, timeout)
+	return api.VMInfo{}
+}
+
+func waitForVMRunning(t *testing.T, baseURL, vmID string, timeout time.Duration) api.VMInfo {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		vms := listVMs(t, baseURL)
+		for _, vm := range vms {
+			if vm.ID == vmID && vm.State == "running" {
+				return vm
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("vm %s did not reach running state at %s within %s", vmID, baseURL, timeout)
 	return api.VMInfo{}
 }
 

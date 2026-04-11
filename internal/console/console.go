@@ -180,6 +180,11 @@ func (s *Session) Close() {
 		drainInput(s.stdin)
 		if s.rawState != nil {
 			_ = term.Restore(int(s.stdin.Fd()), s.rawState)
+			// Reset terminal to sane state and print newline so the
+			// shell prompt reappears without requiring Enter.
+			// \033c = RIS (Reset to Initial State)
+			// \033[?25h = show cursor (in case it was hidden)
+			fmt.Fprint(s.stdout, "\033[?25h\r\n")
 		}
 	})
 }

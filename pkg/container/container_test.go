@@ -1237,3 +1237,554 @@ func TestResolvedCacheDir_AllCases(t *testing.T) {
 		}
 	}
 }
+
+// --- Additional coverage-boosting tests ---
+
+func TestBuildCmdline_WithInterface(t *testing.T) {
+	// gc.iface is not set in the current code, but gc.wait_network is
+	cmdline := buildCmdline(oci.ImageConfig{}, RunOptions{
+		TapName:  "tap1",
+		StaticIP: "10.0.0.2/24",
+		Gateway:  "10.0.0.1",
+	})
+	if !strings.Contains(cmdline, "gc.ip=10.0.0.2/24") {
+		t.Fatalf("missing gc.ip:\n%s", cmdline)
+	}
+	if !strings.Contains(cmdline, "gc.gw=10.0.0.1") {
+		t.Fatalf("missing gc.gw:\n%s", cmdline)
+	}
+	// When static IP is set, wait_network should NOT be set
+	if strings.Contains(cmdline, "gc.wait_network") {
+		t.Fatalf("unexpected gc.wait_network when static IP is set:\n%s", cmdline)
+	}
+}
+
+func TestBuildCmdline_WithKernelModulesRemovesNoModule(t *testing.T) {
+	cmdline := buildCmdlineWithPlan(RunOptions{}, sharedFSPlan{}, true)
+	if strings.Contains(cmdline, "nomodule") {
+		t.Fatalf("cmdline should not contain nomodule when allowKernelModules=true:\n%s", cmdline)
+	}
+}
+
+func TestBuildCmdline_WithoutKernelModulesHasNoModule(t *testing.T) {
+	cmdline := buildCmdlineWithPlan(RunOptions{}, sharedFSPlan{}, false)
+	if !strings.Contains(cmdline, "nomodule") {
+		t.Fatalf("cmdline should contain nomodule when allowKernelModules=false:\n%s", cmdline)
+	}
+}
+
+func TestResolveSharedFSMounts_MixedBackends(t *testing.T) {
+	mounts := []Mount{
+		{Source: "/a", Target: "/guest/a", Backend: MountBackendVirtioFS},
+		{Source: "/b", Target: "/guest/b"}, // materialized
+		{Source: "/c", Target: "/guest/c", Backend: MountBackendVirtioFS},
+	}
+	plan := resolveSharedFSMounts(mounts)
+	// Only virtiofs mounts should produce exports
+	if len(plan.Exports) != 2 {
+		t.Fatalf("expected 2 exports, got %d", len(plan.Exports))
+	}
+	if len(plan.Mounts) != 2 {
+		t.Fatalf("expected 2 mounts (virtiofs only), got %d", len(plan.Mounts))
+	}
+}
+
+func TestHasMaterializedMounts_OnlyVirtioFS(t *testing.T) {
+	mounts := []Mount{
+		{Source: "/a", Target: "/b", Backend: MountBackendVirtioFS},
+		{Source: "/c", Target: "/d", Backend: MountBackendVirtioFS},
+	}
+	if hasMaterializedMounts(mounts) {
+		t.Fatal("expected false for virtiofs-only mounts")
+	}
+}
+
+func TestGuestAgentRequired_BalloonNoStats(t *testing.T) {
+	// Balloon with no stats and auto=off should NOT require agent
+	got := guestAgentRequired(&vmm.BalloonConfig{AmountMiB: 64, Auto: vmm.BalloonAutoOff}, nil)
+	if got {
+		t.Fatal("balloon without stats or auto should not require guest agent")
+	}
+}
+
+func TestGuestAgentRequired_HotplugOnly(t *testing.T) {
+	got := guestAgentRequired(nil, &vmm.MemoryHotplugConfig{})
+	if !got {
+		t.Fatal("hotplug config should require guest agent")
+	}
+}
+
+func TestEffectiveSlice_OverrideReturnsIndependentCopy(t *testing.T) {
+	override := []string{"a", "b"}
+	got := effectiveSlice(override, nil)
+	got[0] = "z"
+	if override[0] != "a" {
+		t.Fatal("effectiveSlice should return independent copy of override")
+	}
+}
+
+func TestEffectiveSlice_BothEmpty(t *testing.T) {
+	got := effectiveSlice([]string{}, []string{})
+	if len(got) != 0 {
+		t.Fatalf("expected empty slice, got %v", got)
+	}
+}
+
+func TestShellQuote_SpecialChars(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"hello world", "'hello world'"},
+		{"path/to/file", "'path/to/file'"},
+		{`"quoted"`, `'"quoted"'`},
+		{"back\\slash", "'back\\slash'"},
+		{"new\nline", "'new\nline'"},
+		{"tab\there", "'tab\there'"},
+		{"multi'quote'test", "'multi'\\''quote'\\''test'"},
+	}
+	for _, tt := range tests {
+		got := shellQuote(tt.input)
+		if got != tt.want {
+			t.Errorf("shellQuote(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestCloneStringMap_PreservesValues(t *testing.T) {
+	orig := map[string]string{"key1": "val1", "key2": "val2", "key3": "val3"}
+	clone := cloneStringMap(orig)
+	for k, v := range orig {
+		if clone[k] != v {
+			t.Fatalf("clone[%q] = %q, want %q", k, clone[k], v)
+		}
+	}
+}
+
+func TestCloneVMLimiter_NilReturnsNil(t *testing.T) {
+	got := cloneVMLimiter(nil)
+	if got != nil {
+		t.Fatalf("expected nil, got %+v", got)
+	}
+}
+
+func TestBuildWorkDirForCache(t *testing.T) {
+	opts := BuildOptions{
+		Image:    "ubuntu:22.04",
+		CacheDir: "/tmp/test-cache",
+	}
+	dir := buildWorkDirForCache(opts, "fallback-id")
+	if dir == "" {
+		t.Fatal("expected non-empty dir")
+	}
+	if !strings.Contains(dir, "build-artifacts") {
+		t.Fatalf("expected dir under build-artifacts, got %q", dir)
+	}
+}
+
+func TestBuildWorkDirForCache_FallbackOnEmptyImage(t *testing.T) {
+	opts := BuildOptions{
+		CacheDir: "/tmp/test-cache",
+	}
+	dir := buildWorkDirForCache(opts, "fallback-id")
+	// Should still produce a valid hash-based path even for empty opts
+	if dir == "" {
+		t.Fatal("expected non-empty dir")
+	}
+}
+
+func TestSanitizeRuntimePathComponent_LongInput(t *testing.T) {
+	long := strings.Repeat("abcdefghij", 50) // 500 chars
+	got := sanitizeRuntimePathComponent(long)
+	if got != long {
+		t.Fatalf("expected passthrough of alphanumeric input, got len=%d", len(got))
+	}
+}
+
+func TestSanitizeRuntimePathComponent_OnlySpecialChars(t *testing.T) {
+	got := sanitizeRuntimePathComponent("!@#$%^&*()")
+	// All replaced with underscore
+	for _, r := range got {
+		if r != '_' {
+			t.Fatalf("expected all underscores, got %q", got)
+		}
+	}
+}
+
+func TestBuildGuestSpec_PID1ModeExplicitOverridesInteractive(t *testing.T) {
+	spec := buildGuestSpec(oci.ImageConfig{}, RunOptions{
+		PID1Mode:  "direct",
+		ConsoleIn: strings.NewReader(""),
+	}, resolveSharedFSMounts(nil))
+	if spec.PID1Mode != "direct" {
+		t.Fatalf("pid1 mode = %q, want direct (explicit should override interactive default)", spec.PID1Mode)
+	}
+}
+
+func TestBuildGuestSpec_NoEnv(t *testing.T) {
+	spec := guestSpecForTest(oci.ImageConfig{}, RunOptions{})
+	if len(spec.Env) != 0 {
+		t.Fatalf("expected empty env, got %v", spec.Env)
+	}
+}
+
+func TestTrimCIDR_MoreCases(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"fd00::1/64", "fd00::1"},
+		{"::1/128", "::1"},
+		{"no-slash", "no-slash"},
+	}
+	for _, tt := range tests {
+		got := trimCIDR(tt.input)
+		if got != tt.want {
+			t.Errorf("trimCIDR(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestBuildVsockConfig_BalloonNoAgent(t *testing.T) {
+	// Balloon without stats or auto should not trigger vsock
+	cfg := buildVsockConfig(RunOptions{
+		Balloon: &vmm.BalloonConfig{AmountMiB: 64, Auto: vmm.BalloonAutoOff},
+	})
+	if cfg != nil {
+		t.Fatal("expected nil vsock config for balloon without agent requirement")
+	}
+}
+
+func TestBuildExecConfig_MemoryHotplugTrigger(t *testing.T) {
+	cfg := buildExecConfig(RunOptions{
+		MemoryHotplug: &vmm.MemoryHotplugConfig{TotalSizeMiB: 1024},
+	})
+	if cfg == nil || !cfg.Enabled {
+		t.Fatal("expected exec config when memory hotplug needs guest agent")
+	}
+}
+
+func TestRunResult_CloseWithCleanup(t *testing.T) {
+	called := false
+	r := &RunResult{cleanup: func() { called = true }}
+	r.Close()
+	if !called {
+		t.Fatal("cleanup was not called")
+	}
+}
+
+func TestStableHashKey_DeterministicOutput(t *testing.T) {
+	payload := map[string]any{"a": "b", "c": 1}
+	key1, err := stableHashKey(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key2, err := stableHashKey(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key1 != key2 {
+		t.Fatalf("expected deterministic output, got %q and %q", key1, key2)
+	}
+	if len(key1) != 64 { // sha256 hex
+		t.Fatalf("expected 64 hex chars, got %d", len(key1))
+	}
+}
+
+func TestNormalizedStringMap_Nil(t *testing.T) {
+	got := normalizedStringMap(nil)
+	if got != nil {
+		t.Fatalf("expected nil, got %v", got)
+	}
+}
+
+func TestNormalizedStringMap_Empty(t *testing.T) {
+	got := normalizedStringMap(map[string]string{})
+	if got != nil {
+		t.Fatalf("expected nil, got %v", got)
+	}
+}
+
+func TestNormalizedStringMap_Sorted(t *testing.T) {
+	got := normalizedStringMap(map[string]string{"z": "1", "a": "2", "m": "3"})
+	if len(got) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(got))
+	}
+	if got["z"] != "1" || got["a"] != "2" || got["m"] != "3" {
+		t.Fatalf("values mismatch: %v", got)
+	}
+}
+
+func TestCloneBalloonConfig_WithSnapshotPages(t *testing.T) {
+	orig := &vmm.BalloonConfig{
+		AmountMiB:     256,
+		SnapshotPages: []uint32{10, 20, 30},
+	}
+	clone := cloneBalloonConfig(orig)
+	if len(clone.SnapshotPages) != 3 {
+		t.Fatalf("clone SnapshotPages len = %d", len(clone.SnapshotPages))
+	}
+	clone.SnapshotPages[0] = 0
+	if orig.SnapshotPages[0] != 10 {
+		t.Fatal("clone modified original SnapshotPages")
+	}
+}
+
+func TestCloneMemoryHotplugConfig_Values(t *testing.T) {
+	orig := &vmm.MemoryHotplugConfig{
+		TotalSizeMiB: 4096,
+		SlotSizeMiB:  1024,
+		BlockSizeMiB: 256,
+	}
+	clone := cloneMemoryHotplugConfig(orig)
+	if clone.TotalSizeMiB != 4096 || clone.SlotSizeMiB != 1024 || clone.BlockSizeMiB != 256 {
+		t.Fatalf("clone mismatch: %+v", clone)
+	}
+}
+
+func TestRuntimeDrives_RateLimiterCloned(t *testing.T) {
+	rl := &vmm.RateLimiterConfig{Bandwidth: vmm.TokenBucketConfig{Size: 500}}
+	drives := runtimeDrives("/root.ext4", RunOptions{
+		Drives: []vmm.DriveConfig{{ID: "data", Path: "/data", RateLimiter: rl}},
+	})
+	if len(drives) != 2 {
+		t.Fatalf("expected 2, got %d", len(drives))
+	}
+	if drives[1].RateLimiter == rl {
+		t.Fatal("expected deep copy of rate limiter")
+	}
+}
+
+func TestImageCacheDir(t *testing.T) {
+	got := imageCacheDir("/custom")
+	if got != "/custom/layers" {
+		t.Fatalf("imageCacheDir = %q, want /custom/layers", got)
+	}
+}
+
+func TestImageCacheDir_Default(t *testing.T) {
+	got := imageCacheDir("")
+	if !strings.Contains(got, "layers") {
+		t.Fatalf("imageCacheDir = %q, expected to contain 'layers'", got)
+	}
+}
+
+func TestFirstNonNegative_AllNegative(t *testing.T) {
+	got := firstNonNegative(-1, -2, -3)
+	if got != 0 {
+		t.Fatalf("expected 0 for all negative, got %d", got)
+	}
+}
+
+func TestFirstNonNegative_ZeroIsNonNegative(t *testing.T) {
+	got := firstNonNegative(0, 5)
+	if got != 0 {
+		t.Fatalf("expected 0, got %d", got)
+	}
+}
+
+func TestResolveSharedFSMounts_ReadOnlyPropagated(t *testing.T) {
+	mounts := []Mount{
+		{Source: "/host", Target: "/guest", Backend: MountBackendVirtioFS, ReadOnly: true},
+	}
+	plan := resolveSharedFSMounts(mounts)
+	if len(plan.Mounts) != 1 {
+		t.Fatal("expected 1 mount")
+	}
+	if !plan.Mounts[0].ReadOnly {
+		t.Fatal("expected ReadOnly to be propagated")
+	}
+}
+
+func TestBuildGuestSpec_SharedFSPopulatesExports(t *testing.T) {
+	mounts := []Mount{
+		{Source: "/host1", Target: "/g1", Backend: MountBackendVirtioFS},
+		{Source: "/host2", Target: "/g2", Backend: MountBackendVirtioFS},
+	}
+	sharedFS := resolveSharedFSMounts(mounts)
+	spec := buildGuestSpec(oci.ImageConfig{}, RunOptions{}, sharedFS)
+	if len(spec.SharedFS) != 2 {
+		t.Fatalf("expected 2 shared FS entries, got %d", len(spec.SharedFS))
+	}
+}
+
+func TestBuildRootfs_NoSource(t *testing.T) {
+	_, err := buildRootfs(t.TempDir(), RunOptions{})
+	if err == nil {
+		t.Fatal("expected error for no source")
+	}
+	if !strings.Contains(err.Error(), "specify") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// --- Additional non-KVM coverage tests ---
+
+func TestRun_CrossArch(t *testing.T) {
+	badArch := "mips"
+	_, err := Run(RunOptions{Arch: badArch})
+	if err == nil {
+		t.Fatal("Run() with invalid arch should fail")
+	}
+	if !strings.Contains(err.Error(), "not compatible") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSortedKeys(t *testing.T) {
+	src := map[string]string{"c": "3", "a": "1", "b": "2"}
+	got := sortedKeys(src)
+	want := []string{"a", "b", "c"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sortedKeys() = %v, want %v", got, want)
+	}
+}
+
+func TestSortedKeys_Empty(t *testing.T) {
+	got := sortedKeys(map[string]string{})
+	if len(got) != 0 {
+		t.Fatalf("sortedKeys(empty) = %v, want empty", got)
+	}
+}
+
+func TestImageCacheDir_Custom(t *testing.T) {
+	got := imageCacheDir("/custom/cache")
+	if got != "/custom/cache/layers" {
+		t.Fatalf("imageCacheDir('/custom/cache') = %q, want /custom/cache/layers", got)
+	}
+}
+
+func TestWorkerSocket_NilHandle(t *testing.T) {
+	// A plain vmm.Handle that doesn't implement WorkerBacked should return ""
+	got := workerSocket(nil)
+	if got != "" {
+		t.Fatalf("workerSocket(nil) = %q, want empty", got)
+	}
+}
+
+func TestBalloonNeedsGuestAgent(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *vmm.BalloonConfig
+		want bool
+	}{
+		{"nil", nil, false},
+		{"no stats no auto", &vmm.BalloonConfig{AmountMiB: 64}, false},
+		{"with stats", &vmm.BalloonConfig{StatsPollingIntervalS: 1}, true},
+		{"auto conservative", &vmm.BalloonConfig{Auto: vmm.BalloonAutoConservative}, true},
+		{"auto off", &vmm.BalloonConfig{Auto: vmm.BalloonAutoOff}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := balloonNeedsGuestAgent(tt.cfg); got != tt.want {
+				t.Fatalf("balloonNeedsGuestAgent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHotplugNeedsGuestAgent(t *testing.T) {
+	if hotplugNeedsGuestAgent(nil) {
+		t.Fatal("hotplugNeedsGuestAgent(nil) = true, want false")
+	}
+	if !hotplugNeedsGuestAgent(&vmm.MemoryHotplugConfig{}) {
+		t.Fatal("hotplugNeedsGuestAgent(non-nil) = false, want true")
+	}
+}
+
+func TestStableHashKey_Deterministic(t *testing.T) {
+	payload := map[string]string{"a": "1", "b": "2"}
+	h1, err := stableHashKey(payload)
+	if err != nil {
+		t.Fatalf("stableHashKey: %v", err)
+	}
+	h2, err := stableHashKey(payload)
+	if err != nil {
+		t.Fatalf("stableHashKey: %v", err)
+	}
+	if h1 != h2 {
+		t.Fatalf("stableHashKey not deterministic: %q != %q", h1, h2)
+	}
+	if len(h1) != 64 { // sha256 hex
+		t.Fatalf("stableHashKey length = %d, want 64", len(h1))
+	}
+}
+
+func TestStableHashKey_DifferentPayloads(t *testing.T) {
+	h1, _ := stableHashKey(map[string]string{"a": "1"})
+	h2, _ := stableHashKey(map[string]string{"a": "2"})
+	if h1 == h2 {
+		t.Fatal("different payloads should produce different hashes")
+	}
+}
+
+func TestRunArtifactCacheKey_Deterministic(t *testing.T) {
+	opts := RunOptions{Image: "ubuntu:22.04", Arch: "amd64", DiskSizeMB: 2048}
+	k1, err := runArtifactCacheKey(opts)
+	if err != nil {
+		t.Fatalf("runArtifactCacheKey: %v", err)
+	}
+	k2, err := runArtifactCacheKey(opts)
+	if err != nil {
+		t.Fatalf("runArtifactCacheKey: %v", err)
+	}
+	if k1 != k2 {
+		t.Fatalf("not deterministic: %q != %q", k1, k2)
+	}
+}
+
+func TestRunArtifactCacheKey_DifferentForDifferentImages(t *testing.T) {
+	k1, _ := runArtifactCacheKey(RunOptions{Image: "ubuntu:22.04"})
+	k2, _ := runArtifactCacheKey(RunOptions{Image: "alpine:3.18"})
+	if k1 == k2 {
+		t.Fatal("different images should produce different cache keys")
+	}
+}
+
+func TestResolveRunWorkDir_Explicit(t *testing.T) {
+	dir, err := resolveRunWorkDir(RunOptions{WorkDir2: "/explicit/dir"})
+	if err != nil {
+		t.Fatalf("resolveRunWorkDir: %v", err)
+	}
+	if dir != "/explicit/dir" {
+		t.Fatalf("dir = %q, want /explicit/dir", dir)
+	}
+}
+
+func TestResolveRunWorkDir_CacheBasedDeterministic(t *testing.T) {
+	opts := RunOptions{Image: "ubuntu:22.04", CacheDir: t.TempDir()}
+	d1, err := resolveRunWorkDir(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2, err := resolveRunWorkDir(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d1 != d2 {
+		t.Fatalf("resolveRunWorkDir not deterministic: %q != %q", d1, d2)
+	}
+	if !strings.Contains(d1, "artifacts") {
+		t.Fatalf("dir = %q, expected to contain 'artifacts'", d1)
+	}
+}
+
+func TestAppendVirtioFSKernelModule_NoSharedFS(t *testing.T) {
+	mods := appendVirtioFSKernelModule(nil, sharedFSPlan{})
+	if len(mods) != 0 {
+		t.Fatalf("expected no modules, got %d", len(mods))
+	}
+}
+
+func TestAppendVirtioFSKernelModule_WithSharedFS(t *testing.T) {
+	plan := resolveSharedFSMounts([]Mount{
+		{Source: "/host", Target: "/guest", Backend: MountBackendVirtioFS},
+	})
+	mods := appendVirtioFSKernelModule(nil, plan)
+	if len(mods) != 1 {
+		t.Fatalf("expected 1 module, got %d", len(mods))
+	}
+	if mods[0].Name != "virtiofs" {
+		t.Fatalf("module name = %q, want virtiofs", mods[0].Name)
+	}
+}

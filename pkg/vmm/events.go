@@ -137,6 +137,10 @@ type Handle interface {
 	DeviceList() []DeviceInfo
 	ConsoleOutput() []byte
 	WaitStopped(ctx context.Context) error
+	// FirstOutputAt returns the wall-clock instant at which the guest
+	// first transmitted a byte on the serial console (UART). Zero time
+	// if the guest has not yet printed anything or is not tracked.
+	FirstOutputAt() time.Time
 }
 
 type WorkerMetadata struct {

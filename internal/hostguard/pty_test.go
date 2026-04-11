@@ -136,3 +136,49 @@ func TestCheckPTYSupport(t *testing.T) {
 	// Just test it does not panic. On a normal system /dev/ptmx should exist.
 	_ = CheckPTYSupport()
 }
+
+func TestDevPtsMountOptions_OnlyDevPtsInPath(t *testing.T) {
+	t.Parallel()
+	// Line contains /dev/pts but not as mount point (e.g. part of longer path)
+	mountInfo := "30 29 0:26 / /dev/ptsx rw,nosuid shared:3 - devpts devpts rw,gid=5\n"
+	_, ok := devPtsMountOptions(mountInfo)
+	if ok {
+		t.Fatal("should not match /dev/ptsx as /dev/pts mount")
+	}
+}
+
+func TestDevPtsMountOptions_ExtraSpaces(t *testing.T) {
+	t.Parallel()
+	// Standard format with extra fields before separator
+	mountInfo := "30 29 0:26 / /dev/pts rw,nosuid,noexec,relatime master:3 shared:3 - devpts devpts rw,gid=5,mode=620,ptmxmode=666\n"
+	opts, ok := devPtsMountOptions(mountInfo)
+	if !ok {
+		t.Fatal("expected devpts options")
+	}
+	if opts != "rw,gid=5,mode=620,ptmxmode=666" {
+		t.Fatalf("opts = %q", opts)
+	}
+}
+
+func TestDevPtsMountOptions_DevptsButWrongSuffix(t *testing.T) {
+	t.Parallel()
+	// devpts appears as fs type but devpts keyword not first in suffix
+	mountInfo := "30 29 0:26 / /dev/pts rw shared:3 - ext4 devpts rw\n"
+	_, ok := devPtsMountOptions(mountInfo)
+	if ok {
+		t.Fatal("should not match when first field after - is ext4")
+	}
+}
+
+func TestDevPtsMountOptions_MultipleSeparators(t *testing.T) {
+	t.Parallel()
+	// Two " - " separators - should use first
+	mountInfo := "30 29 0:26 / /dev/pts rw shared:3 - devpts devpts rw,opts - extra\n"
+	opts, ok := devPtsMountOptions(mountInfo)
+	if !ok {
+		t.Fatal("expected match even with extra - in line")
+	}
+	if opts != "rw,opts" {
+		t.Fatalf("opts = %q, want rw,opts", opts)
+	}
+}

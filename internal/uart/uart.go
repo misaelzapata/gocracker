@@ -6,6 +6,7 @@ package uart
 import (
 	"io"
 	"sync"
+	"time"
 )
 
 // UART register offsets from base port
@@ -90,6 +91,11 @@ type UART struct {
 	// Buffered console output for API retrieval (ring buffer)
 	outBuf    []byte
 	outBufMax int
+
+	// Timestamp of the first byte the guest transmitted (zero until seen).
+	// Used by the boot-time instrumentation to report a guest_first_output_ms
+	// phase that is honest about "when did the kernel actually start speaking".
+	firstOutputAt time.Time
 
 	// IRQ callback: called when interrupt state changes
 	irqFn func(asserted bool)
@@ -193,6 +199,10 @@ func (u *UART) Write(offset, val uint8) {
 		if u.mcr&MCRLoopback != 0 {
 			u.injectLoopbackByteLocked(val)
 			return
+		}
+		// Record first-ever TX timestamp for guest_first_output_ms metric.
+		if u.firstOutputAt.IsZero() {
+			u.firstOutputAt = time.Now()
 		}
 		// Transmit character to output
 		if u.out != nil {
@@ -340,6 +350,16 @@ func (u *UART) OutputBytes() []byte {
 	out := make([]byte, len(u.outBuf))
 	copy(out, u.outBuf)
 	return out
+}
+
+// FirstOutputAt returns the wall-clock time at which the guest first
+// transmitted a byte through this UART, or the zero time if the guest
+// has not yet written anything. Used by the boot-time instrumentation
+// to compute the guest_first_output_ms phase.
+func (u *UART) FirstOutputAt() time.Time {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.firstOutputAt
 }
 
 // Ports returns the I/O port range for this UART [base, base+8).

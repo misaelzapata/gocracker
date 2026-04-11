@@ -54,6 +54,7 @@ func (f *fakeHandle) Events() vmm.EventSource                    { return f.even
 func (f *fakeHandle) VMConfig() vmm.Config                       { return f.cfg }
 func (f *fakeHandle) DeviceList() []vmm.DeviceInfo               { return nil }
 func (f *fakeHandle) ConsoleOutput() []byte                      { return []byte("logs") }
+func (f *fakeHandle) FirstOutputAt() time.Time                   { return time.Time{} }
 func (f *fakeHandle) WaitStopped(ctx context.Context) error      { <-ctx.Done(); return ctx.Err() }
 func (f *fakeHandle) UpdateNetRateLimiter(cfg *vmm.RateLimiterConfig) error {
 	f.netRL = cfg

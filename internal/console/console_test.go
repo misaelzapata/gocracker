@@ -897,3 +897,177 @@ func TestSessionPumpInputFiltersReplies(t *testing.T) {
 		t.Fatalf("forwarded = %q, want abcdef (with reply stripped)", got)
 	}
 }
+
+// ---- Coverage: pumpOutput with pipes ----
+
+func TestSessionPumpOutputForwardsData(t *testing.T) {
+	// Set up two pipe pairs to simulate master and stdout
+	masterR, masterW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe(master): %v", err)
+	}
+	defer masterR.Close()
+
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe(stdout): %v", err)
+	}
+	defer stdoutR.Close()
+	defer stdoutW.Close()
+
+	s := &Session{
+		master:   masterR, // pumpOutput reads from master
+		stdout:   stdoutW, // pumpOutput writes to stdout
+		detachCh: make(chan struct{}),
+		stopCh:   make(chan struct{}),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.pumpOutput()
+		close(done)
+	}()
+
+	// Write data to master
+	if _, err := masterW.Write([]byte("hello from guest")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	_ = masterW.Close()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pumpOutput did not exit")
+	}
+
+	_ = stdoutW.Close()
+	data, err := io.ReadAll(stdoutR)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Contains(data, []byte("hello from guest")) {
+		t.Fatalf("output = %q, expected 'hello from guest'", data)
+	}
+}
+
+// ---- Coverage: filterTerminalQueries with partial CSI at end ----
+
+func TestFilterTerminalQueries_PartialCSIAtEnd(t *testing.T) {
+	payload, reply, carry := filterTerminalQueries([]byte("text\x1b[24"))
+	if string(payload) != "text" {
+		t.Fatalf("payload = %q, want text", payload)
+	}
+	if len(reply) != 0 {
+		t.Fatalf("reply = %q, want empty", reply)
+	}
+	if string(carry) != "\x1b[24" {
+		t.Fatalf("carry = %q, want \\x1b[24", carry)
+	}
+}
+
+// ---- Coverage: filterTerminalQueries non-CSI passthrough ----
+
+func TestFilterTerminalQueries_MultipleQueries(t *testing.T) {
+	// Two cursor position queries back to back
+	payload, reply, carry := filterTerminalQueries([]byte("\x1b[6n\x1b[?6n"))
+	if string(payload) != "" {
+		t.Fatalf("payload = %q, want empty", payload)
+	}
+	if string(reply) != "\x1b[1;1R\x1b[1;1R" {
+		t.Fatalf("reply = %q, want two cursor position replies", reply)
+	}
+	if len(carry) != 0 {
+		t.Fatalf("carry = %q", carry)
+	}
+}
+
+// ---- Coverage: shouldDropTerminalReply for status report variants ----
+
+func TestShouldDropTerminalReply_StatusReportVariants(t *testing.T) {
+	tests := []struct {
+		name string
+		seq  []byte
+		want bool
+	}{
+		{"status report 0n", []byte("\x1b[0n"), true},
+		{"status report ?0n", []byte("\x1b[?0n"), true},
+		{"device attributes", []byte("\x1b[?1c"), false},
+		{"select graphic rendition", []byte("\x1b[38;5;1m"), false},
+		{"erase line", []byte("\x1b[2K"), false},
+		{"scroll up", []byte("\x1b[1S"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldDropTerminalReply(tt.seq)
+			if got != tt.want {
+				t.Fatalf("shouldDropTerminalReply(%q) = %v, want %v", tt.seq, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---- Coverage: isHostTerminalReply more variants ----
+
+func TestIsHostTerminalReply_MoreVariants(t *testing.T) {
+	tests := []struct {
+		name string
+		seq  []byte
+		want bool
+	}{
+		{"cursor report with large numbers", []byte("\x1b[999;999R"), true},
+		{"cursor report with question mark", []byte("\x1b[?1;1R"), true},
+		{"delete char", []byte("\x1b[1P"), false},
+		{"insert line", []byte("\x1b[1L"), false},
+		{"set mode", []byte("\x1b[4h"), false},
+		{"reset mode", []byte("\x1b[4l"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isHostTerminalReply(tt.seq)
+			if got != tt.want {
+				t.Fatalf("isHostTerminalReply(%q) = %v, want %v", tt.seq, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---- Coverage: terminalOutputFilter with query and reply in same call ----
+
+func TestTerminalOutputFilter_QueryAndReplyInSameCall(t *testing.T) {
+	f := terminalOutputFilter{}
+	payload, reply := f.Filter([]byte("prompt\x1b[6n\x1b[24;80R"))
+	if string(payload) != "prompt" {
+		t.Fatalf("payload = %q, want prompt", payload)
+	}
+	// Should generate reply for query and strip the echoed reply
+	if string(reply) != "\x1b[1;1R" {
+		t.Fatalf("reply = %q", reply)
+	}
+}
+
+// ---- Coverage: inputReplyFilter with multiple escape sequences ----
+
+func TestInputReplyFilterMixedSequences(t *testing.T) {
+	f := newInputReplyFilter()
+	// Arrow up + cursor report + regular text
+	data := f.process([]byte("\x1b[Aabc\x1b[1;1Rdef\x1b[B"))
+	if got, want := string(data), "\x1b[Aabcdef\x1b[B"; got != want {
+		t.Fatalf("process() = %q, want %q", got, want)
+	}
+}
+
+// ---- Coverage: wrapPTYOpenError ----
+
+func TestWrapPTYOpenError_NilError(t *testing.T) {
+	got := wrapPTYOpenError(nil)
+	if got != nil {
+		t.Fatalf("expected nil, got %v", got)
+	}
+}
+
+// ---- Coverage: drainInput with nil ----
+
+func TestDrainInput_Nil(t *testing.T) {
+	// Should not panic on nil
+	drainInput(nil)
+}

@@ -4,6 +4,7 @@ package integration
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -238,6 +239,561 @@ func TestSnapshotRestoreRoundTrip(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if got := restored.State(); got != vmm.StateRunning && got != vmm.StateStopped {
 		t.Fatalf("restored state = %s, want running or stopped", got)
+	}
+}
+
+func TestPauseResumeRoundTrip(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	var serial lockedBuffer
+	vm, err := vmm.New(vmm.Config{
+		MemMB:      128,
+		KernelPath: kernel,
+		Cmdline:    "console=ttyS0 reboot=k panic=1 nomodule i8042.noaux i8042.nomux i8042.dumbkbd swiotlb=noforce",
+		ConsoleOut: &serial,
+	})
+	if err != nil {
+		t.Fatalf("vmm.New: %v", err)
+	}
+	defer vm.Stop()
+
+	if err := vm.Start(); err != nil {
+		t.Fatalf("vm.Start: %v", err)
+	}
+
+	// Wait for the VM to be fully running before pausing.
+	if !waitForVMState(vm, vmm.StateRunning, 5*time.Second) {
+		t.Fatalf("VM never reached running state, got %s", vm.State())
+	}
+
+	// Give vCPUs time to enter the KVM run loop so pause can interrupt them.
+	time.Sleep(200 * time.Millisecond)
+
+	if err := vm.Pause(); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if s := vm.State(); s != vmm.StatePaused {
+		t.Fatalf("expected paused after Pause(), got %s", s)
+	}
+
+	if err := vm.Resume(); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if s := vm.State(); s != vmm.StateRunning {
+		t.Fatalf("expected running after Resume(), got %s", s)
+	}
+
+	vm.Stop()
+	time.Sleep(100 * time.Millisecond)
+	if s := vm.State(); s != vmm.StateStopped {
+		t.Fatalf("expected stopped after Stop(), got %s", s)
+	}
+}
+
+func TestConsoleOutputCapture(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	var serial lockedBuffer
+	vm, err := vmm.New(vmm.Config{
+		MemMB:      128,
+		KernelPath: kernel,
+		Cmdline:    "console=ttyS0 reboot=k panic=1 nomodule i8042.noaux i8042.nomux i8042.dumbkbd swiotlb=noforce",
+		ConsoleOut: &serial,
+	})
+	if err != nil {
+		t.Fatalf("vmm.New: %v", err)
+	}
+	defer vm.Stop()
+
+	if err := vm.Start(); err != nil {
+		t.Fatalf("vm.Start: %v", err)
+	}
+
+	// The kernel should print "Linux version" early in boot on the serial console.
+	if !waitForSerial(&serial, 12*time.Second, "Linux version") {
+		t.Fatalf("kernel boot message not observed in serial output:\n%s", serial.String())
+	}
+
+	// Also verify ConsoleOutput() returns the same data.
+	consoleBytes := vm.ConsoleOutput()
+	if len(consoleBytes) == 0 {
+		t.Fatal("ConsoleOutput() returned empty buffer")
+	}
+	if !strings.Contains(string(consoleBytes), "Linux version") {
+		t.Fatalf("ConsoleOutput() does not contain kernel boot messages:\n%s", string(consoleBytes))
+	}
+}
+
+func TestDeviceList(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	vm, err := vmm.New(vmm.Config{
+		MemMB:      128,
+		KernelPath: kernel,
+		Cmdline:    "console=ttyS0 reboot=k panic=1 nomodule i8042.noaux i8042.nomux i8042.dumbkbd swiotlb=noforce",
+	})
+	if err != nil {
+		t.Fatalf("vmm.New: %v", err)
+	}
+	defer vm.Stop()
+
+	if err := vm.Start(); err != nil {
+		t.Fatalf("vm.Start: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	devices := vm.DeviceList()
+	if len(devices) == 0 {
+		t.Fatal("DeviceList() returned no devices")
+	}
+
+	// At minimum there should be a virtio-rng device (always attached).
+	foundRNG := false
+	for _, d := range devices {
+		if d.Type == "rng" || d.Type == "virtio-rng" {
+			foundRNG = true
+			break
+		}
+	}
+	if !foundRNG {
+		t.Logf("devices: %+v", devices)
+		t.Fatal("DeviceList() did not include an RNG device")
+	}
+}
+
+func TestVMEvents(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	vm, err := vmm.New(vmm.Config{
+		MemMB:      128,
+		KernelPath: kernel,
+		Cmdline:    "console=ttyS0 reboot=k panic=1 nomodule i8042.noaux i8042.nomux i8042.dumbkbd swiotlb=noforce",
+	})
+	if err != nil {
+		t.Fatalf("vmm.New: %v", err)
+	}
+	defer vm.Stop()
+
+	if err := vm.Start(); err != nil {
+		t.Fatalf("vm.Start: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	events := vm.Events().Events(time.Time{})
+	if len(events) == 0 {
+		t.Fatal("EventLog has no events after boot")
+	}
+
+	hasType := func(typ vmm.EventType) bool {
+		for _, e := range events {
+			if e.Type == typ {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasType(vmm.EventCreated) {
+		t.Error("missing 'created' event")
+	}
+	if !hasType(vmm.EventRunning) {
+		t.Error("missing 'running' event")
+	}
+
+	vm.Stop()
+	// Wait for stopped events to be emitted.
+	time.Sleep(200 * time.Millisecond)
+
+	events = vm.Events().Events(time.Time{})
+	if !hasType(vmm.EventStopped) {
+		types := make([]string, len(events))
+		for i, e := range events {
+			types[i] = string(e.Type)
+		}
+		t.Fatalf("missing 'stopped' event; got types: %v", types)
+	}
+}
+
+func TestMultipleVMsConcurrent(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	const count = 3
+	type result struct {
+		idx int
+		vm  *vmm.VM
+		err error
+	}
+
+	results := make(chan result, count)
+	for i := 0; i < count; i++ {
+		go func(idx int) {
+			vm, err := vmm.New(vmm.Config{
+				MemMB:      128,
+				KernelPath: kernel,
+				Cmdline:    "console=ttyS0 reboot=k panic=1 nomodule i8042.noaux i8042.nomux i8042.dumbkbd swiotlb=noforce",
+			})
+			if err != nil {
+				results <- result{idx: idx, err: err}
+				return
+			}
+			if err := vm.Start(); err != nil {
+				results <- result{idx: idx, err: err}
+				return
+			}
+			results <- result{idx: idx, vm: vm}
+		}(i)
+	}
+
+	var vms []*vmm.VM
+	for i := 0; i < count; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("VM[%d] failed: %v", r.idx, r.err)
+		}
+		vms = append(vms, r.vm)
+	}
+	defer func() {
+		for _, vm := range vms {
+			vm.Stop()
+		}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	for i, vm := range vms {
+		s := vm.State()
+		if s != vmm.StateRunning && s != vmm.StateStopped {
+			t.Errorf("VM[%d] state = %s, want running or stopped", i, s)
+		}
+	}
+}
+
+func TestStopIdempotent(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	vm, err := vmm.New(vmm.Config{
+		MemMB:      128,
+		KernelPath: kernel,
+		Cmdline:    "console=ttyS0 reboot=k panic=1 nomodule i8042.noaux i8042.nomux i8042.dumbkbd swiotlb=noforce",
+	})
+	if err != nil {
+		t.Fatalf("vmm.New: %v", err)
+	}
+
+	if err := vm.Start(); err != nil {
+		t.Fatalf("vm.Start: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// Call Stop() twice — should not panic.
+	vm.Stop()
+	time.Sleep(100 * time.Millisecond)
+	vm.Stop() // second call must be safe
+	time.Sleep(100 * time.Millisecond)
+
+	if s := vm.State(); s != vmm.StateStopped {
+		t.Errorf("expected stopped, got %s", s)
+	}
+}
+
+func TestBootWithDisk(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	contextDir := t.TempDir()
+	binaryPath := buildGuestProgram(t, `
+package main
+import (
+	"fmt"
+	"os"
+)
+func main() {
+	// Check if /dev/vda exists (virtio block device).
+	if _, err := os.Stat("/dev/vda"); err == nil {
+		fmt.Println("disk-vda-present")
+	} else {
+		fmt.Println("disk-vda-missing")
+	}
+}
+`)
+	copyFileIntoContext(t, binaryPath, filepath.Join(contextDir, "guest"))
+	if err := os.WriteFile(filepath.Join(contextDir, "Dockerfile"), []byte("FROM scratch\nCOPY guest /guest\nCMD [\"/guest\"]\n"), 0644); err != nil {
+		t.Fatalf("write Dockerfile: %v", err)
+	}
+
+	var serial lockedBuffer
+	result, err := container.Run(container.RunOptions{
+		Dockerfile: filepath.Join(contextDir, "Dockerfile"),
+		Context:    contextDir,
+		KernelPath: kernel,
+		MemMB:      256,
+		ConsoleOut: &serial,
+		JailerMode: container.JailerModeOff,
+	})
+	if err != nil {
+		t.Fatalf("container.Run: %v", err)
+	}
+	defer result.Close()
+	defer result.VM.Stop()
+
+	// container.Run always creates a disk image for the rootfs.
+	if !waitForSerial(&serial, 12*time.Second, "disk-vda-present") {
+		t.Fatalf("guest did not find /dev/vda:\n%s", serial.String())
+	}
+}
+
+func TestContainerRunWithEnv(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	contextDir := t.TempDir()
+	binaryPath := buildGuestProgram(t, `
+package main
+import (
+	"fmt"
+	"os"
+)
+func main() {
+	fmt.Printf("MY_VAR=%s\n", os.Getenv("MY_VAR"))
+	fmt.Printf("ANOTHER=%s\n", os.Getenv("ANOTHER"))
+}
+`)
+	copyFileIntoContext(t, binaryPath, filepath.Join(contextDir, "guest"))
+	if err := os.WriteFile(filepath.Join(contextDir, "Dockerfile"), []byte("FROM scratch\nCOPY guest /guest\nCMD [\"/guest\"]\n"), 0644); err != nil {
+		t.Fatalf("write Dockerfile: %v", err)
+	}
+
+	var serial lockedBuffer
+	result, err := container.Run(container.RunOptions{
+		Dockerfile: filepath.Join(contextDir, "Dockerfile"),
+		Context:    contextDir,
+		KernelPath: kernel,
+		MemMB:      256,
+		Env:        []string{"MY_VAR=hello", "ANOTHER=world"},
+		ConsoleOut: &serial,
+		JailerMode: container.JailerModeOff,
+	})
+	if err != nil {
+		t.Fatalf("container.Run: %v", err)
+	}
+	defer result.Close()
+	defer result.VM.Stop()
+
+	if !waitForSerial(&serial, 12*time.Second, "MY_VAR=hello") {
+		t.Fatalf("env var MY_VAR not found in guest output:\n%s", serial.String())
+	}
+	if !waitForSerial(&serial, 2*time.Second, "ANOTHER=world") {
+		t.Fatalf("env var ANOTHER not found in guest output:\n%s", serial.String())
+	}
+}
+
+func TestContainerRunWithWorkdir(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	contextDir := t.TempDir()
+	binaryPath := buildGuestProgram(t, `
+package main
+import (
+	"fmt"
+	"os"
+)
+func main() {
+	dir, err := os.Getwd()
+	if err != nil {
+		fmt.Printf("cwd-error=%v\n", err)
+		return
+	}
+	fmt.Printf("cwd=%s\n", dir)
+}
+`)
+	copyFileIntoContext(t, binaryPath, filepath.Join(contextDir, "guest"))
+	if err := os.WriteFile(filepath.Join(contextDir, "Dockerfile"), []byte("FROM scratch\nCOPY guest /guest\nCMD [\"/guest\"]\n"), 0644); err != nil {
+		t.Fatalf("write Dockerfile: %v", err)
+	}
+
+	var serial lockedBuffer
+	result, err := container.Run(container.RunOptions{
+		Dockerfile: filepath.Join(contextDir, "Dockerfile"),
+		Context:    contextDir,
+		KernelPath: kernel,
+		MemMB:      256,
+		WorkDir:    "/tmp",
+		ConsoleOut: &serial,
+		JailerMode: container.JailerModeOff,
+	})
+	if err != nil {
+		t.Fatalf("container.Run: %v", err)
+	}
+	defer result.Close()
+	defer result.VM.Stop()
+
+	if !waitForSerial(&serial, 12*time.Second, "cwd=/tmp") {
+		t.Fatalf("guest did not start in /tmp:\n%s", serial.String())
+	}
+}
+
+func TestSnapshotContainsExpectedFiles(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	vm, err := vmm.New(vmm.Config{
+		MemMB:      128,
+		KernelPath: kernel,
+		Cmdline:    "console=ttyS0 reboot=k panic=1 nomodule i8042.noaux i8042.nomux i8042.dumbkbd swiotlb=noforce",
+	})
+	if err != nil {
+		t.Fatalf("vmm.New: %v", err)
+	}
+	defer vm.Stop()
+
+	if err := vm.Start(); err != nil {
+		t.Fatalf("vm.Start: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	snapDir := filepath.Join(t.TempDir(), "snapshot")
+	if _, err := vm.TakeSnapshotWithOptions(snapDir, vmm.SnapshotOptions{Resume: false}); err != nil {
+		t.Fatalf("TakeSnapshotWithOptions: %v", err)
+	}
+
+	// Verify snapshot.json exists.
+	snapJSON := filepath.Join(snapDir, "snapshot.json")
+	if _, err := os.Stat(snapJSON); err != nil {
+		t.Fatalf("snapshot.json not found: %v", err)
+	}
+
+	// Verify mem.bin exists.
+	memBin := filepath.Join(snapDir, "mem.bin")
+	if _, err := os.Stat(memBin); err != nil {
+		t.Fatalf("mem.bin not found: %v", err)
+	}
+
+	// mem.bin should have non-zero size (128MB of guest memory).
+	info, err := os.Stat(memBin)
+	if err != nil {
+		t.Fatalf("stat mem.bin: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("mem.bin is empty")
+	}
+}
+
+func TestSnapshotJSONRoundTrip(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	vm, err := vmm.New(vmm.Config{
+		MemMB:      128,
+		KernelPath: kernel,
+		Cmdline:    "console=ttyS0 reboot=k panic=1 nomodule i8042.noaux i8042.nomux i8042.dumbkbd swiotlb=noforce",
+	})
+	if err != nil {
+		t.Fatalf("vmm.New: %v", err)
+	}
+	defer vm.Stop()
+
+	if err := vm.Start(); err != nil {
+		t.Fatalf("vm.Start: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	snapDir := filepath.Join(t.TempDir(), "snapshot")
+	snap, err := vm.TakeSnapshotWithOptions(snapDir, vmm.SnapshotOptions{Resume: false})
+	if err != nil {
+		t.Fatalf("TakeSnapshotWithOptions: %v", err)
+	}
+
+	// Read and decode snapshot.json
+	data, err := os.ReadFile(filepath.Join(snapDir, "snapshot.json"))
+	if err != nil {
+		t.Fatalf("read snapshot.json: %v", err)
+	}
+
+	var decoded vmm.Snapshot
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal snapshot.json: %v", err)
+	}
+
+	// Verify key fields match the original snapshot.
+	if decoded.Config.MemMB != 128 {
+		t.Errorf("decoded MemMB = %d, want 128", decoded.Config.MemMB)
+	}
+	if decoded.Config.KernelPath != kernel {
+		t.Errorf("decoded KernelPath = %q, want %q", decoded.Config.KernelPath, kernel)
+	}
+	if decoded.Version != snap.Version {
+		t.Errorf("decoded Version = %d, want %d", decoded.Version, snap.Version)
+	}
+	if decoded.ID == "" {
+		t.Error("decoded snapshot ID is empty")
+	}
+}
+
+func TestBootWithVirtioRNG(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	contextDir := t.TempDir()
+	binaryPath := buildGuestProgram(t, `
+package main
+import (
+	"fmt"
+	"os"
+)
+func main() {
+	if _, err := os.Stat("/dev/hwrng"); err == nil {
+		fmt.Println("hwrng-present")
+	} else {
+		fmt.Println("hwrng-missing")
+	}
+}
+`)
+	copyFileIntoContext(t, binaryPath, filepath.Join(contextDir, "guest"))
+	if err := os.WriteFile(filepath.Join(contextDir, "Dockerfile"), []byte("FROM scratch\nCOPY guest /guest\nCMD [\"/guest\"]\n"), 0644); err != nil {
+		t.Fatalf("write Dockerfile: %v", err)
+	}
+
+	var serial lockedBuffer
+	result, err := container.Run(container.RunOptions{
+		Dockerfile: filepath.Join(contextDir, "Dockerfile"),
+		Context:    contextDir,
+		KernelPath: kernel,
+		MemMB:      256,
+		ConsoleOut: &serial,
+		JailerMode: container.JailerModeOff,
+	})
+	if err != nil {
+		t.Fatalf("container.Run: %v", err)
+	}
+	defer result.Close()
+	defer result.VM.Stop()
+
+	if !waitForSerial(&serial, 12*time.Second, "hwrng-present") {
+		t.Fatalf("guest did not find /dev/hwrng:\n%s", serial.String())
+	}
+}
+
+func TestUARTState(t *testing.T) {
+	kernel := requireIntegrationKernel(t)
+
+	var serial lockedBuffer
+	vm, err := vmm.New(vmm.Config{
+		MemMB:      128,
+		KernelPath: kernel,
+		Cmdline:    "console=ttyS0 reboot=k panic=1 nomodule i8042.noaux i8042.nomux i8042.dumbkbd swiotlb=noforce",
+		ConsoleOut: &serial,
+	})
+	if err != nil {
+		t.Fatalf("vmm.New: %v", err)
+	}
+	defer vm.Stop()
+
+	if err := vm.Start(); err != nil {
+		t.Fatalf("vm.Start: %v", err)
+	}
+
+	// Wait for some output to ensure UART is in use.
+	if !waitForSerial(&serial, 12*time.Second, "Linux version") {
+		t.Fatalf("no serial output:\n%s", serial.String())
+	}
+
+	// ConsoleOutput returns buffered UART bytes; verify it is non-empty.
+	buf := vm.ConsoleOutput()
+	if len(buf) == 0 {
+		t.Fatal("ConsoleOutput() returned empty after kernel boot")
 	}
 }
 

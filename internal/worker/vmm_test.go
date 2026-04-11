@@ -1,11 +1,14 @@
 package worker
 
 import (
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gocracker/gocracker/pkg/vmm"
 )
@@ -605,5 +608,296 @@ func TestReattachOptionsFields(t *testing.T) {
 	}
 	if opts.Metadata.SocketPath != "/tmp/vmm.sock" {
 		t.Fatalf("Metadata.SocketPath = %q", opts.Metadata.SocketPath)
+	}
+}
+
+// --- New coverage-boosting tests ---
+
+func TestWorkerProcessAlive_InvalidPID(t *testing.T) {
+	// pid <= 0 should return true (assume alive)
+	if !workerProcessAlive(0) {
+		t.Error("workerProcessAlive(0) = false, want true")
+	}
+	if !workerProcessAlive(-1) {
+		t.Error("workerProcessAlive(-1) = false, want true")
+	}
+}
+
+func TestWorkerProcessAlive_CurrentProcess(t *testing.T) {
+	// Our own process should be alive
+	if !workerProcessAlive(os.Getpid()) {
+		t.Error("workerProcessAlive(self) = false, want true")
+	}
+}
+
+func TestWorkerProcessAlive_NonexistentPID(t *testing.T) {
+	// A very high PID is unlikely to exist
+	alive := workerProcessAlive(1<<22 - 1)
+	// We can't assert the exact result since it depends on system state,
+	// but verify it doesn't panic.
+	_ = alive
+}
+
+func TestSocketReachable_EmptyPath(t *testing.T) {
+	if socketReachable("") {
+		t.Error("socketReachable('') = true, want false")
+	}
+}
+
+func TestSocketReachable_NonexistentPath(t *testing.T) {
+	if socketReachable("/nonexistent/path/to/socket.sock") {
+		t.Error("socketReachable(nonexistent) = true, want false")
+	}
+}
+
+func TestSocketReachable_RealSocket(t *testing.T) {
+	// Create a real Unix socket to test positive case
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "test.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	if !socketReachable(sockPath) {
+		t.Error("socketReachable(real socket) = false, want true")
+	}
+}
+
+func TestCloneVMLimiter_Nil(t *testing.T) {
+	if got := cloneVMLimiter(nil); got != nil {
+		t.Fatalf("cloneVMLimiter(nil) = %v, want nil", got)
+	}
+}
+
+func TestCloneVMLimiter_DeepCopy(t *testing.T) {
+	orig := &vmm.RateLimiterConfig{
+		Bandwidth: vmm.TokenBucketConfig{Size: 500, OneTimeBurst: 100, RefillTimeMs: 2000},
+		Ops:       vmm.TokenBucketConfig{Size: 300},
+	}
+	clone := cloneVMLimiter(orig)
+	if clone == orig {
+		t.Fatal("clone should be a different pointer")
+	}
+	if clone.Bandwidth.Size != 500 || clone.Ops.Size != 300 {
+		t.Fatalf("clone values wrong: %+v", clone)
+	}
+	clone.Bandwidth.Size = 999
+	if orig.Bandwidth.Size != 500 {
+		t.Fatal("modifying clone affected original")
+	}
+}
+
+func TestForwardedWorkerEnv_NoEnvSet(t *testing.T) {
+	origVal, wasSet := os.LookupEnv("GOCRACKER_SECCOMP")
+	os.Unsetenv("GOCRACKER_SECCOMP")
+	defer func() {
+		if wasSet {
+			os.Setenv("GOCRACKER_SECCOMP", origVal)
+		}
+	}()
+
+	env := forwardedWorkerEnv()
+	if len(env) != 0 {
+		t.Fatalf("forwardedWorkerEnv() = %v, want empty", env)
+	}
+}
+
+func TestForwardedWorkerEnv_WithEnvSet(t *testing.T) {
+	t.Setenv("GOCRACKER_SECCOMP", "log")
+	env := forwardedWorkerEnv()
+	if len(env) != 1 || env[0] != "GOCRACKER_SECCOMP=log" {
+		t.Fatalf("forwardedWorkerEnv() = %v, want [GOCRACKER_SECCOMP=log]", env)
+	}
+}
+
+func TestWaitForSocket_NonexistentPath(t *testing.T) {
+	err := waitForSocket("/nonexistent/socket.sock", 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error = %q, want 'timed out'", err.Error())
+	}
+}
+
+func TestWaitForSocket_RealSocket(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "test.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	if err := waitForSocket(sockPath, 2*time.Second); err != nil {
+		t.Fatalf("waitForSocket(real) = %v", err)
+	}
+}
+
+func TestWaitForSocketOrExit_Timeout(t *testing.T) {
+	waitErrCh := make(chan error, 1)
+	exited, err := waitForSocketOrExit("/nonexistent/socket.sock", 100*time.Millisecond, waitErrCh)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if exited {
+		t.Error("exited should be false on timeout")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error = %q, want 'timed out'", err.Error())
+	}
+}
+
+func TestWaitForSocketOrExit_ProcessExitsCleanly(t *testing.T) {
+	waitErrCh := make(chan error, 1)
+	waitErrCh <- nil // process exited cleanly before socket
+	exited, err := waitForSocketOrExit("/nonexistent/socket.sock", 2*time.Second, waitErrCh)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !exited {
+		t.Error("exited should be true")
+	}
+	if !strings.Contains(err.Error(), "worker exited before opening socket") {
+		t.Fatalf("error = %q", err.Error())
+	}
+}
+
+func TestWaitForSocketOrExit_ProcessExitsWithError(t *testing.T) {
+	waitErrCh := make(chan error, 1)
+	waitErrCh <- fmt.Errorf("exit status 1")
+	exited, err := waitForSocketOrExit("/nonexistent/socket.sock", 2*time.Second, waitErrCh)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !exited {
+		t.Error("exited should be true")
+	}
+	if !strings.Contains(err.Error(), "exit status 1") {
+		t.Fatalf("error = %q, want to contain exit status", err.Error())
+	}
+}
+
+func TestWaitForSocketOrExit_SocketReady(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "test.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	waitErrCh := make(chan error, 1)
+	exited, err := waitForSocketOrExit(sockPath, 2*time.Second, waitErrCh)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if exited {
+		t.Error("exited should be false when socket ready")
+	}
+}
+
+func TestCopyTree_SimpleDirectory(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "dest")
+
+	// Create files in src
+	os.MkdirAll(filepath.Join(src, "subdir"), 0755)
+	os.WriteFile(filepath.Join(src, "file.txt"), []byte("hello"), 0644)
+	os.WriteFile(filepath.Join(src, "subdir", "nested.txt"), []byte("world"), 0644)
+
+	if err := copyTree(src, dst); err != nil {
+		t.Fatalf("copyTree: %v", err)
+	}
+
+	// Verify files exist in dst
+	data, err := os.ReadFile(filepath.Join(dst, "file.txt"))
+	if err != nil {
+		t.Fatalf("read file.txt: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Fatalf("file.txt = %q, want hello", string(data))
+	}
+	data, err = os.ReadFile(filepath.Join(dst, "subdir", "nested.txt"))
+	if err != nil {
+		t.Fatalf("read nested.txt: %v", err)
+	}
+	if string(data) != "world" {
+		t.Fatalf("nested.txt = %q, want world", string(data))
+	}
+}
+
+func TestCopyTree_EmptyDirectory(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "dest")
+	if err := copyTree(src, dst); err != nil {
+		t.Fatalf("copyTree empty: %v", err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat dst: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("dst should be a directory")
+	}
+}
+
+func TestSubprocessLogBuffer_ConcurrentWrites(t *testing.T) {
+	buf := &subprocessLogBuffer{}
+	done := make(chan struct{})
+	for i := 0; i < 10; i++ {
+		go func(n int) {
+			defer func() { done <- struct{}{} }()
+			for j := 0; j < 100; j++ {
+				buf.Write([]byte(fmt.Sprintf("goroutine %d line %d\n", n, j)))
+			}
+		}(i)
+	}
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+	tail := buf.Tail(5)
+	lines := strings.Split(tail, "\n")
+	if len(lines) != 5 {
+		t.Fatalf("Tail(5) after concurrent writes = %d lines, want 5", len(lines))
+	}
+}
+
+func TestSubprocessLogBuffer_LargeWrite(t *testing.T) {
+	buf := &subprocessLogBuffer{}
+	// Write many lines
+	for i := 0; i < 1000; i++ {
+		buf.Write([]byte(fmt.Sprintf("line %d\n", i)))
+	}
+	tail := buf.Tail(3)
+	lines := strings.Split(tail, "\n")
+	if len(lines) != 3 {
+		t.Fatalf("Tail(3) after 1000 writes = %d lines", len(lines))
+	}
+	// Should contain lines 997, 998, 999
+	if !strings.Contains(lines[2], "999") {
+		t.Fatalf("last line = %q, want to contain 999", lines[2])
+	}
+}
+
+func TestInsertForwardedWorkerEnvFlags_AtEnd(t *testing.T) {
+	t.Setenv("GOCRACKER_SECCOMP", "enforce")
+	args := []string{"--id", "vm-1", "--uid", "1000"}
+	result := insertForwardedWorkerEnvFlags(args, 4)
+	// env flags should be at index 4
+	want := []string{"--id", "vm-1", "--uid", "1000", "--env", "GOCRACKER_SECCOMP=enforce"}
+	if !slices.Equal(result, want) {
+		t.Fatalf("got %v, want %v", result, want)
+	}
+}
+
+func TestInsertForwardedWorkerEnvFlags_AtStart(t *testing.T) {
+	t.Setenv("GOCRACKER_SECCOMP", "off")
+	args := []string{"--", "vmm", "--socket", "/worker/vmm.sock"}
+	result := insertForwardedWorkerEnvFlags(args, 0)
+	if result[0] != "--env" || result[1] != "GOCRACKER_SECCOMP=off" {
+		t.Fatalf("expected env flags at start, got %v", result)
 	}
 }

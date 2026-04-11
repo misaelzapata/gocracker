@@ -107,6 +107,12 @@ func Run(cfg Config) error {
 		defer unix.Close(netnsFD)
 	}
 
+	// Clean any stale mounts and remnants from a previous crash at this
+	// chroot path. Without this, leftover bind mounts accumulate and
+	// cause ENOENT on subsequent runs.
+	cleanStaleMounts(chrootDir)
+	_ = os.RemoveAll(chrootDir)
+
 	if err := mkdirAllNoSymlink(chrootDir, 0755); err != nil {
 		return fmt.Errorf("create chroot dir %s: %w", chrootDir, err)
 	}
@@ -628,6 +634,38 @@ func copyRegularFile(src, dst string, mode os.FileMode) error {
 		return err
 	}
 	return out.Close()
+}
+
+// cleanStaleMounts recursively unmounts any leftover bind mounts inside dir.
+// This handles the case where a previous jailer session crashed before
+// pivot_root, leaving host-visible mounts that prevent reuse of the path.
+func cleanStaleMounts(dir string) {
+	dir = filepath.Clean(dir)
+	if dir == "" || dir == "/" {
+		return
+	}
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	var targets []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 5 {
+			continue
+		}
+		mountpoint := fields[4]
+		if strings.HasPrefix(mountpoint, dir+"/") || mountpoint == dir {
+			targets = append(targets, mountpoint)
+		}
+	}
+	// Unmount deepest first with MNT_DETACH so we don't block.
+	for i := len(targets) - 1; i >= 0; i-- {
+		_ = unix.Unmount(targets[i], unix.MNT_DETACH)
+	}
 }
 
 func mkdirAllNoSymlink(path string, perm os.FileMode) error {

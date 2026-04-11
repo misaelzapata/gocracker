@@ -289,3 +289,67 @@ func TestCheckHostDevices_UsesDevRoot(t *testing.T) {
 	// On a real system this should work; we just test it doesn't panic
 	_ = CheckHostDevices(DeviceRequirements{})
 }
+
+func TestCheckDeviceTree_DirectoryInsteadOfDevice(t *testing.T) {
+	root := t.TempDir()
+	for _, device := range baseDevices {
+		devPath := filepath.Join(root, device.relPath)
+		if err := os.MkdirAll(filepath.Dir(devPath), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if device.relPath == "random" {
+			// Create a directory instead of device
+			if err := os.MkdirAll(devPath, 0755); err != nil {
+				t.Fatalf("mkdir device: %v", err)
+			}
+			continue
+		}
+		if err := os.Symlink(filepath.Join("/dev", device.relPath), devPath); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+	}
+	err := CheckDeviceTree(root, DeviceRequirements{})
+	if err == nil {
+		t.Fatal("expected error for directory instead of device")
+	}
+	if !strings.Contains(err.Error(), "random") {
+		t.Fatalf("error = %q, expected to mention random", err.Error())
+	}
+}
+
+func TestCheckDeviceTree_KVMAvailableOnHost(t *testing.T) {
+	// If /dev/kvm exists on the host, test with it symlinked in
+	if _, err := os.Stat("/dev/kvm"); err != nil {
+		t.Skip("/dev/kvm not available")
+	}
+	root := t.TempDir()
+	for _, device := range baseDevices {
+		devPath := filepath.Join(root, device.relPath)
+		if err := os.MkdirAll(filepath.Dir(devPath), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.Symlink(filepath.Join("/dev", device.relPath), devPath); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+	}
+	// Symlink KVM
+	if err := os.Symlink("/dev/kvm", filepath.Join(root, "kvm")); err != nil {
+		t.Fatalf("symlink kvm: %v", err)
+	}
+	if err := CheckDeviceTree(root, DeviceRequirements{NeedKVM: true}); err != nil {
+		t.Fatalf("CheckDeviceTree with KVM: %v", err)
+	}
+}
+
+func TestCheckDeviceTree_BrokenSymlink(t *testing.T) {
+	root := t.TempDir()
+	devPath := filepath.Join(root, "null")
+	// Create a broken symlink
+	if err := os.Symlink("/nonexistent/path", devPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	err := CheckDeviceTree(root, DeviceRequirements{})
+	if err == nil {
+		t.Fatal("expected error for broken symlink")
+	}
+}

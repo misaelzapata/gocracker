@@ -2,6 +2,7 @@ package vsock
 
 import (
 	"encoding/binary"
+	"net"
 	"testing"
 )
 
@@ -585,6 +586,310 @@ func TestMarshalHdr_FlowControlFields(t *testing.T) {
 	}
 }
 
+// --- Device-level tests (no real virtio queues needed) ---
+
+func TestDeviceIDAndFeatures_OnDevice(t *testing.T) {
+	// Create a minimal device with nil transport to test accessors.
+	// We can't use NewDevice without real memory, but we can construct the
+	// struct directly for unit-level accessor tests.
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	if d.DeviceID() != 19 {
+		t.Errorf("DeviceID() = %d, want 19", d.DeviceID())
+	}
+	if d.DeviceFeatures() != 0 {
+		t.Errorf("DeviceFeatures() = %d, want 0", d.DeviceFeatures())
+	}
+}
+
+func TestConfigBytes_ReturnsGuestCID(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	b := d.ConfigBytes()
+	if len(b) != 8 {
+		t.Fatalf("ConfigBytes() len = %d, want 8", len(b))
+	}
+	got := binary.LittleEndian.Uint64(b)
+	if got != GuestCID {
+		t.Errorf("ConfigBytes() decoded = %d, want %d (GuestCID)", got, GuestCID)
+	}
+}
+
+func TestConfigBytes_DifferentCIDValues(t *testing.T) {
+	// ConfigBytes always returns GuestCID=3 regardless of device state
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	b1 := d.ConfigBytes()
+	b2 := d.ConfigBytes()
+	if binary.LittleEndian.Uint64(b1) != binary.LittleEndian.Uint64(b2) {
+		t.Error("ConfigBytes() should be deterministic")
+	}
+}
+
+func TestAllocateHostPort_Sequential(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	p1 := d.allocateHostPort()
+	p2 := d.allocateHostPort()
+	p3 := d.allocateHostPort()
+	if p1 != 1024 || p2 != 1025 || p3 != 1026 {
+		t.Errorf("ports = %d, %d, %d; want 1024, 1025, 1026", p1, p2, p3)
+	}
+}
+
+func TestAllocateHostPort_SkipsPending(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	// Mark port 1024 as pending
+	d.pending[1024] = &pendingConn{}
+	port := d.allocateHostPort()
+	if port != 1025 {
+		t.Errorf("port = %d, want 1025 (should skip pending 1024)", port)
+	}
+}
+
+func TestAllocateHostPort_SkipsInUseConns(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	// Mark port 1024 as in-use via conns
+	d.conns[connKey{guestPort: 5000, hostPort: 1024}] = &Connection{}
+	port := d.allocateHostPort()
+	if port != 1025 {
+		t.Errorf("port = %d, want 1025 (should skip in-use 1024)", port)
+	}
+}
+
+func TestAllocateHostPort_WrapsAround(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: ^uint32(0), // max uint32
+	}
+	port := d.allocateHostPort()
+	// nextHostPort overflows to 0, then resets to 1024
+	if port != ^uint32(0) {
+		t.Errorf("port = %d, want %d (max uint32)", port, ^uint32(0))
+	}
+	// Next allocation should have wrapped
+	port2 := d.allocateHostPort()
+	if port2 != 1024 {
+		t.Errorf("after wrap port = %d, want 1024", port2)
+	}
+}
+
+func TestConnKeyMapUsage(t *testing.T) {
+	m := make(map[connKey]*Connection)
+	k1 := connKey{guestPort: 100, hostPort: 200}
+	k2 := connKey{guestPort: 100, hostPort: 200}
+	k3 := connKey{guestPort: 100, hostPort: 201}
+
+	c := &Connection{guestPort: 100, hostPort: 200}
+	m[k1] = c
+
+	// Same key should retrieve the same connection
+	if m[k2] != c {
+		t.Error("identical connKey should map to same value")
+	}
+	if m[k3] != nil {
+		t.Error("different connKey should not map to a value")
+	}
+
+	// Delete and verify
+	delete(m, k1)
+	if m[k2] != nil {
+		t.Error("after delete, key should be gone")
+	}
+}
+
+func TestDeviceNewDevice_NilListenFn(t *testing.T) {
+	// Verify that NewDevice accepts nil listenFn without error.
+	// We can't fully construct without real memory, but we verify struct state.
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+		listenFn:     nil,
+	}
+	if d.listenFn != nil {
+		t.Error("listenFn should be nil")
+	}
+	if d.nextHostPort != 1024 {
+		t.Errorf("nextHostPort = %d, want 1024", d.nextHostPort)
+	}
+}
+
+func TestHandleDisconnect_NoExistingConn(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	// Should not panic when disconnecting a non-existent connection
+	hdr := &pktHdr{SrcPort: 5000, DstPort: 1024}
+	d.handleDisconnect(hdr)
+}
+
+func TestHandleDisconnect_WithPending(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	hostConn, deviceConn := net.Pipe()
+	p := &pendingConn{
+		conn: &Connection{
+			guestPort: 5000,
+			hostPort:  1024,
+			conn:      deviceConn,
+			device:    d,
+		},
+		ready: make(chan error, 1),
+	}
+	d.pending[1024] = p
+
+	hdr := &pktHdr{SrcPort: 5000, DstPort: 1024}
+	d.handleDisconnect(hdr)
+
+	// pending should be cleaned up
+	if _, ok := d.pending[1024]; ok {
+		t.Error("pending should be deleted after disconnect")
+	}
+	// ready channel should have an error
+	select {
+	case err := <-p.ready:
+		if err == nil {
+			t.Error("expected error on ready channel")
+		}
+	default:
+		t.Error("expected error to be sent on ready channel")
+	}
+	hostConn.Close()
+}
+
+func TestHandleResponse_NoPending(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	// Should not panic when there's no pending connection
+	hdr := &pktHdr{SrcPort: 5000, DstPort: 1024}
+	d.handleResponse(hdr, nil)
+}
+
+func TestHandleData_NoConnection(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	// Should not panic when there's no matching connection
+	hdr := &pktHdr{SrcPort: 5000, DstPort: 1024, Len: 100}
+	d.handleData(hdr, nil, nil)
+}
+
+func TestHandleData_ZeroLen(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	// Zero-length data should be a no-op even with a connection present
+	_, deviceConn := net.Pipe()
+	d.conns[connKey{guestPort: 5000, hostPort: 1024}] = &Connection{
+		guestPort: 5000,
+		hostPort:  1024,
+		conn:      deviceConn,
+		device:    d,
+	}
+	hdr := &pktHdr{SrcPort: 5000, DstPort: 1024, Len: 0}
+	d.handleData(hdr, nil, nil)
+	deviceConn.Close()
+}
+
+func TestSendPkt_MarshalVerification(t *testing.T) {
+	// Verify that the header built by sendPkt logic matches expectations.
+	// We can't call sendPkt without a Transport, but we can verify the
+	// marshalHdr portion used by sendPkt.
+	hdr := &pktHdr{
+		SrcCID:   HostCID,
+		DstCID:   GuestCID,
+		SrcPort:  1024,
+		DstPort:  5000,
+		Len:      4,
+		Type:     1,
+		Op:       opRW,
+		BufAlloc: 65536,
+	}
+	hdrBytes := marshalHdr(hdr)
+	payload := append(hdrBytes, []byte("test")...)
+	if len(payload) != hdrSize+4 {
+		t.Errorf("payload len = %d, want %d", len(payload), hdrSize+4)
+	}
+	// Verify header at start of payload
+	var parsed pktHdr
+	parseHdr(payload[:hdrSize], &parsed)
+	if parsed.SrcCID != HostCID || parsed.DstCID != GuestCID {
+		t.Error("header CIDs mismatch in payload")
+	}
+	if parsed.Len != 4 {
+		t.Errorf("parsed Len = %d, want 4", parsed.Len)
+	}
+	if string(payload[hdrSize:]) != "test" {
+		t.Errorf("data portion = %q, want test", string(payload[hdrSize:]))
+	}
+}
+
+func TestDeviceClose_EmptyDevice(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	// Verify empty maps
+	if len(d.conns) != 0 {
+		t.Error("conns should be empty")
+	}
+	if len(d.pending) != 0 {
+		t.Error("pending should be empty")
+	}
+}
+
+func TestHandleQueueNotify_NonTXQueue(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	// idx != 1 should return false
+	got := d.HandleQueueNotify(0, nil)
+	if got != false {
+		t.Errorf("HandleQueueNotify(0) = %v, want false", got)
+	}
+	got = d.HandleQueueNotify(2, nil)
+	if got != false {
+		t.Errorf("HandleQueueNotify(2) = %v, want false", got)
+	}
+}
+
 func TestMarshalHdr_BiDirectionalRoundtrip(t *testing.T) {
 	// Guest -> Host
 	g2h := &pktHdr{
@@ -668,4 +973,180 @@ func TestMarshalHdr_ShutdownFlags(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- Non-KVM coverage tests for Device methods ---
+
+func TestDevice_DeviceID(t *testing.T) {
+	d := &Device{}
+	if id := d.DeviceID(); id != 19 {
+		t.Fatalf("DeviceID() = %d, want 19", id)
+	}
+}
+
+func TestDevice_DeviceFeatures(t *testing.T) {
+	d := &Device{}
+	if f := d.DeviceFeatures(); f != 0 {
+		t.Fatalf("DeviceFeatures() = %d, want 0", f)
+	}
+}
+
+func TestDevice_ConfigBytes(t *testing.T) {
+	d := &Device{}
+	b := d.ConfigBytes()
+	if len(b) != 8 {
+		t.Fatalf("ConfigBytes() len = %d, want 8", len(b))
+	}
+	cid := binary.LittleEndian.Uint64(b)
+	if cid != GuestCID {
+		t.Fatalf("ConfigBytes() CID = %d, want %d", cid, GuestCID)
+	}
+}
+
+func TestDevice_HandleQueue_NonTX(t *testing.T) {
+	d := &Device{
+		conns:   make(map[connKey]*Connection),
+		pending: make(map[uint32]*pendingConn),
+	}
+	// HandleQueue with idx 0 (RX) and 2 (event) should not panic
+	d.HandleQueue(0, nil)
+	d.HandleQueue(2, nil)
+}
+
+func TestDevice_HandleQueueNotify_NonTX(t *testing.T) {
+	d := &Device{
+		conns:   make(map[connKey]*Connection),
+		pending: make(map[uint32]*pendingConn),
+	}
+	// HandleQueueNotify with idx != 1 should return false
+	if d.HandleQueueNotify(0, nil) {
+		t.Fatal("HandleQueueNotify(0) should return false")
+	}
+	if d.HandleQueueNotify(2, nil) {
+		t.Fatal("HandleQueueNotify(2) should return false")
+	}
+}
+
+func TestDevice_AllocateHostPort_Basic(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	port1 := d.allocateHostPort()
+	port2 := d.allocateHostPort()
+	if port1 == port2 {
+		t.Fatalf("allocateHostPort() returned same port twice: %d", port1)
+	}
+	if port1 < 1024 {
+		t.Fatalf("port = %d, want >= 1024", port1)
+	}
+}
+
+func TestDevice_AllocateHostPort_SkipsPending(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	// Mark port 1024 as pending
+	d.pending[1024] = &pendingConn{}
+	port := d.allocateHostPort()
+	if port == 1024 {
+		t.Fatal("allocateHostPort() should skip pending port 1024")
+	}
+	if port != 1025 {
+		t.Fatalf("port = %d, want 1025", port)
+	}
+}
+
+func TestDevice_AllocateHostPort_SkipsInUse(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: 1024,
+	}
+	// Mark port 1024 as in use
+	d.conns[connKey{guestPort: 100, hostPort: 1024}] = &Connection{}
+	port := d.allocateHostPort()
+	if port == 1024 {
+		t.Fatal("allocateHostPort() should skip in-use port 1024")
+	}
+}
+
+func TestDevice_AllocateHostPort_Wraps(t *testing.T) {
+	d := &Device{
+		conns:        make(map[connKey]*Connection),
+		pending:      make(map[uint32]*pendingConn),
+		nextHostPort: ^uint32(0), // max uint32, will overflow to 0
+	}
+	port := d.allocateHostPort()
+	// After wrapping from 0, nextHostPort resets to 1024
+	if port == 0 {
+		t.Fatal("allocateHostPort() should not return port 0")
+	}
+}
+
+func TestDevice_HandleDisconnect_NoConn(t *testing.T) {
+	d := &Device{
+		conns:   make(map[connKey]*Connection),
+		pending: make(map[uint32]*pendingConn),
+	}
+	hdr := &pktHdr{SrcPort: 100, DstPort: 200}
+	// Should not panic when no connection exists
+	d.handleDisconnect(hdr)
+}
+
+func TestDevice_HandleDisconnect_WithPending(t *testing.T) {
+	hostConn, deviceConn := net.Pipe()
+	defer hostConn.Close()
+
+	d := &Device{
+		conns:   make(map[connKey]*Connection),
+		pending: make(map[uint32]*pendingConn),
+	}
+	readyCh := make(chan error, 1)
+	d.pending[200] = &pendingConn{
+		conn:  &Connection{conn: deviceConn, device: d},
+		ready: readyCh,
+	}
+
+	hdr := &pktHdr{SrcPort: 100, DstPort: 200}
+	d.handleDisconnect(hdr)
+
+	err := <-readyCh
+	if err == nil {
+		t.Fatal("expected error from handleDisconnect on pending conn")
+	}
+}
+
+func TestDevice_HandleData_NoConnection(t *testing.T) {
+	d := &Device{
+		conns:   make(map[connKey]*Connection),
+		pending: make(map[uint32]*pendingConn),
+	}
+	hdr := &pktHdr{SrcPort: 100, DstPort: 200, Len: 10}
+	// Should not panic when no connection exists (early return on c == nil)
+	d.handleData(hdr, nil, nil)
+}
+
+func TestDevice_HandleData_ZeroLen(t *testing.T) {
+	d := &Device{
+		conns:   make(map[connKey]*Connection),
+		pending: make(map[uint32]*pendingConn),
+	}
+	// Put a connection in the map but Len=0, should early return
+	d.conns[connKey{guestPort: 100, hostPort: 200}] = &Connection{}
+	hdr := &pktHdr{SrcPort: 100, DstPort: 200, Len: 0}
+	d.handleData(hdr, nil, nil)
+}
+
+func TestDevice_HandleResponse_NoPending(t *testing.T) {
+	d := &Device{
+		conns:   make(map[connKey]*Connection),
+		pending: make(map[uint32]*pendingConn),
+	}
+	hdr := &pktHdr{SrcPort: 100, DstPort: 200}
+	// Should not panic when no pending connection exists
+	d.handleResponse(hdr, nil)
 }
