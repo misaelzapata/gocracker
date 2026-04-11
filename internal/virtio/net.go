@@ -135,7 +135,7 @@ func (d *NetDevice) transmit(q *Queue) {
 		chain, err := q.WalkChain(head)
 		if err != nil {
 			gclog.VMM.Warn("virtio-net invalid TX descriptor chain", "head", head, "error", err)
-			_ = q.PushUsedLocked(uint32(head), 0)
+			_ = q.PushUsed(uint32(head), 0)
 			return
 		}
 		var pkt []byte
@@ -143,7 +143,7 @@ func (d *NetDevice) transmit(q *Queue) {
 			buf := make([]byte, desc.Len)
 			if err := q.GuestRead(desc.Addr, buf); err != nil {
 				gclog.VMM.Warn("virtio-net TX guest read failed", "head", head, "error", err)
-				_ = q.PushUsedLocked(uint32(head), 0)
+				_ = q.PushUsed(uint32(head), 0)
 				return
 			}
 			pkt = append(pkt, buf...)
@@ -152,7 +152,7 @@ func (d *NetDevice) transmit(q *Queue) {
 			d.rl.Wait(uint64(len(pkt)), 1)
 		}
 		_ = writeTapFrame(int(d.tapFd.Fd()), pkt)
-		_ = q.PushUsedLocked(uint32(head), 0)
+		_ = q.PushUsed(uint32(head), 0)
 	}); err != nil {
 		gclog.VMM.Warn("virtio-net TX queue iteration failed", "error", err)
 	}
@@ -205,20 +205,23 @@ func (d *NetDevice) deliverRXPacket(pkt []byte) (uint32, bool) {
 	}
 
 	rxQ.mu.Lock()
-	defer rxQ.mu.Unlock()
 
 	avail, err := rxQ.readAvail()
 	if err != nil {
+		rxQ.mu.Unlock()
 		gclog.VMM.Warn("virtio-net RX avail ring read failed", "error", err)
 		return 0, false
 	}
 	if rxQ.LastAvail == avail.Idx {
+		rxQ.mu.Unlock()
 		return 0, false
 	}
 	head := avail.Ring[rxQ.LastAvail%uint16(rxQ.Size)]
 	rxQ.LastAvail++
 
 	chain, err := rxQ.WalkChain(head)
+	rxQ.mu.Unlock()
+
 	if err != nil {
 		gclog.VMM.Warn("virtio-net invalid RX descriptor chain", "head", head, "error", err)
 		return 0, false
@@ -252,7 +255,7 @@ func (d *NetDevice) deliverRXPacket(pkt []byte) (uint32, bool) {
 			break
 		}
 	}
-	_ = rxQ.PushUsedLocked(uint32(head), written)
+	_ = rxQ.PushUsed(uint32(head), written)
 	return written, true
 }
 

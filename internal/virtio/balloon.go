@@ -291,11 +291,11 @@ func (d *BalloonDevice) PollStats() (BalloonStats, error) {
 		chain, err := q.WalkChain(head)
 		if err != nil {
 			pollErr = err
-			_ = q.PushUsedLocked(uint32(head), 0)
+			_ = q.PushUsed(uint32(head), 0)
 			return
 		}
 		stats, pollErr = d.readStatsBuffer(q, chain)
-		_ = q.PushUsedLocked(uint32(head), 0)
+		_ = q.PushUsed(uint32(head), 0)
 	})
 	if err != nil {
 		return BalloonStats{}, err
@@ -322,7 +322,7 @@ func (d *BalloonDevice) handlePFNQueue(q *Queue, inflate bool) bool {
 		chain, err := q.WalkChain(head)
 		if err != nil {
 			gclog.VMM.Warn("virtio-balloon invalid PFN descriptor chain", "head", head, "error", err)
-			_ = q.PushUsedLocked(uint32(head), 0)
+			_ = q.PushUsed(uint32(head), 0)
 			return
 		}
 		for _, desc := range chain {
@@ -343,7 +343,7 @@ func (d *BalloonDevice) handlePFNQueue(q *Queue, inflate bool) bool {
 				}
 			}
 		}
-		_ = q.PushUsedLocked(uint32(head), 0)
+		_ = q.PushUsed(uint32(head), 0)
 	}); err != nil {
 		gclog.VMM.Warn("virtio-balloon PFN queue iteration failed", "error", err)
 	}
