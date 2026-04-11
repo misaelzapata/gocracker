@@ -213,6 +213,8 @@ func cmdRun(args []string) {
 			fatal(err.Error())
 		}
 		stopVMAndWait(result.VM, 15*time.Second)
+		// Final newline to ensure the shell prompt redraws after VM stop messages.
+		fmt.Println()
 		return
 	}
 	if *wait {

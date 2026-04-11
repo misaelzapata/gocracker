@@ -494,7 +494,6 @@ func workerSocket(handle vmm.Handle) string {
 }
 
 func runViaWorker(opts RunOptions) (*RunResult, error) {
-	t0 := time.Now()
 	if opts.MemMB == 0 {
 		opts.MemMB = 256
 	}
@@ -685,6 +684,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		return nil, fmt.Errorf("write runtime spec to boot disk: %w", err)
 	}
 
+	t0 := time.Now()
 	handle, cleanup, err := worker.LaunchVMM(vmm.Config{
 		ID:         opts.ID,
 		MemMB:      opts.MemMB,
