@@ -42,6 +42,7 @@ func (h *testHandle) Events() vmm.EventSource                    { return vmm.Ne
 func (h *testHandle) VMConfig() vmm.Config                       { return h.cfg }
 func (h *testHandle) DeviceList() []vmm.DeviceInfo               { return nil }
 func (h *testHandle) ConsoleOutput() []byte                      { return nil }
+func (h *testHandle) FirstOutputAt() time.Time                   { return time.Time{} }
 func (h *testHandle) WaitStopped(ctx context.Context) error      { return h.waitErr }
 func (h *testHandle) DialVsock(port uint32) (net.Conn, error) {
 	if h.dial == nil {

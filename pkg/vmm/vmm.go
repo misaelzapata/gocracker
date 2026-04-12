@@ -719,6 +719,17 @@ func (m *VM) ConsoleOutput() []byte {
 	return m.archBackend.consoleOutput(m)
 }
 
+// FirstOutputAt returns the wall-clock instant at which the guest first
+// transmitted a byte on the UART console. Zero time until the guest has
+// written anything. Used by boot-time instrumentation to report the
+// guest_first_output_ms phase.
+func (m *VM) FirstOutputAt() time.Time {
+	if m.uart0 == nil {
+		return time.Time{}
+	}
+	return m.uart0.FirstOutputAt()
+}
+
 // ---- Snapshot / Restore ----
 
 type Snapshot struct {

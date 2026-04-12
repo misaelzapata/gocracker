@@ -907,6 +907,19 @@ func printResult(r *container.RunResult) {
 	} else {
 		fmt.Printf("\n✓ VM %s is %s\n", r.ID, state)
 	}
+	// Per-phase boot time breakdown. This replaces the old single
+	// "duration=Xms" number that compared apples to oranges between the
+	// runLocal and runViaWorker paths. See the "Boot-time benchmark"
+	// section of the README for the methodology.
+	t := r.Timings
+	if t.Total > 0 || t.VMMSetup > 0 || t.Orchestration > 0 {
+		fmt.Printf("  boot:   orchestration=%dms  vmm_setup=%dms  start=%dms  guest_first_output=%dms  total=%dms\n",
+			t.Orchestration.Milliseconds(),
+			t.VMMSetup.Milliseconds(),
+			t.Start.Milliseconds(),
+			t.GuestFirstOutput.Milliseconds(),
+			t.Total.Milliseconds())
+	}
 	if r.DiskPath != "" {
 		fmt.Printf("  disk:   %s\n", r.DiskPath)
 	}
