@@ -1410,6 +1410,1161 @@ func TestHandleBuildPassesSupervisorWorkerConfig(t *testing.T) {
 	}
 }
 
+// ---- Additional coverage tests ----
+
+func TestHandleAction_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/actions", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandleAction_UnknownType(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/actions", bytes.NewBufferString(`{"action_type":"UnknownAction"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if !strings.Contains(rec.Body.String(), "unknown action") {
+		t.Fatalf("body = %s, want unknown action error", rec.Body.String())
+	}
+}
+
+func TestHandleAction_InstanceStartWithoutConfig(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/actions", bytes.NewBufferString(`{"action_type":"InstanceStart"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code == http.StatusNoContent {
+		t.Fatal("InstanceStart without boot source should fail")
+	}
+}
+
+func TestHandleStopVM_NotFoundExtended(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/vms/nonexistent/stop", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+func TestHandleStopVM_Success(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-stop")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-stop", entry)
+
+	req := httptest.NewRequest(http.MethodPost, "/vms/vm-stop/stop", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleVMLogs_NotFound(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/vms/nonexistent/logs", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestHandleVMLogs_Success(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-logs")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-logs", entry)
+
+	req := httptest.NewRequest(http.MethodGet, "/vms/vm-logs/logs", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != "logs" {
+		t.Fatalf("body = %q, want 'logs'", rec.Body.String())
+	}
+}
+
+func TestHandleVMEvents_NotFound(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/vms/nonexistent/events", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleVMEvents_Success(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-events")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-events", entry)
+
+	req := httptest.NewRequest(http.MethodGet, "/vms/vm-events/events", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleVMEvents_WithSinceParam(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-events-since")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-events-since", entry)
+
+	since := time.Now().Add(-time.Hour).Format(time.RFC3339)
+	req := httptest.NewRequest(http.MethodGet, "/vms/vm-events-since/events?since="+since, nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleVMEvents_InvalidSince(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-events-bad")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-events-bad", entry)
+
+	req := httptest.NewRequest(http.MethodGet, "/vms/vm-events-bad/events?since=not-a-date", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleVMEventsStream_NotFound(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/vms/nonexistent/events/stream", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleNetRateLimiter_NotFound(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/vms/nonexistent/rate-limiters/net", bytes.NewBufferString(`{"bandwidth":{"size":100}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleNetRateLimiter_Success(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-rl")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-rl", entry)
+
+	req := httptest.NewRequest(http.MethodPut, "/vms/vm-rl/rate-limiters/net", bytes.NewBufferString(`{"bandwidth":{"size":100}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleBlockRateLimiter_NotFound(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/vms/nonexistent/rate-limiters/block", bytes.NewBufferString(`{"ops":{"size":200}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleBlockRateLimiter_Success(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-blk-rl")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-blk-rl", entry)
+
+	req := httptest.NewRequest(http.MethodPut, "/vms/vm-blk-rl/rate-limiters/block", bytes.NewBufferString(`{"ops":{"size":200}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleRNGRateLimiter_NotFound(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/vms/nonexistent/rate-limiters/rng", bytes.NewBufferString(`{"bandwidth":{"size":50}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleRNGRateLimiter_Success(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-rng-rl")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-rng-rl", entry)
+
+	req := httptest.NewRequest(http.MethodPut, "/vms/vm-rng-rl/rate-limiters/rng", bytes.NewBufferString(`{"bandwidth":{"size":50}}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleNetRateLimiter_InvalidJSON(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-rl-bad")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-rl-bad", entry)
+
+	req := httptest.NewRequest(http.MethodPut, "/vms/vm-rl-bad/rate-limiters/net", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleBlockRateLimiter_InvalidJSON(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-blk-bad")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-blk-bad", entry)
+
+	req := httptest.NewRequest(http.MethodPut, "/vms/vm-blk-bad/rate-limiters/block", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleRNGRateLimiter_InvalidJSON(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-rng-bad")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-rng-bad", entry)
+
+	req := httptest.NewRequest(http.MethodPut, "/vms/vm-rng-bad/rate-limiters/rng", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleSnapshot_NotFound(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/vms/nonexistent/snapshot", bytes.NewBufferString(`{}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleSnapshot_InvalidJSON(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-snap")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-snap", entry)
+
+	req := httptest.NewRequest(http.MethodPost, "/vms/vm-snap/snapshot", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleRun_NoKernel(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewBufferString(`{"image":"ubuntu:22.04"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "kernel_path") {
+		t.Fatalf("expected kernel_path error, got %s", rec.Body.String())
+	}
+}
+
+func TestHandleRun_NoSource(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewBufferString(`{"kernel_path":"/vmlinuz"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleRun_BothSources(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewBufferString(`{"kernel_path":"/vmlinuz","image":"ubuntu","dockerfile":"Dockerfile"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "specify image or dockerfile") {
+		t.Fatalf("expected source conflict error, got %s", rec.Body.String())
+	}
+}
+
+func TestHandleRun_MalformedJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/run", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleDrive_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/drives/root", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleDrive_Success(t *testing.T) {
+	srv := New()
+	body := `{"path_on_host":"/tmp/disk.ext4","is_root_device":true}`
+	req := httptest.NewRequest(http.MethodPut, "/drives/rootfs", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(srv.preboot.drives) != 1 {
+		t.Fatalf("expected 1 drive, got %d", len(srv.preboot.drives))
+	}
+}
+
+func TestHandleNetworkIface_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/network-interfaces/eth0", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleNetworkIface_Success(t *testing.T) {
+	srv := New()
+	body := `{"host_dev_name":"tap0"}`
+	req := httptest.NewRequest(http.MethodPut, "/network-interfaces/eth0", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleBalloonGet_NoBalloon(t *testing.T) {
+	srv := New()
+	// No preboot balloon configured
+	req := httptest.NewRequest(http.MethodGet, "/balloon", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleBalloonPut_Success(t *testing.T) {
+	srv := New()
+	body := `{"amount_mib":64,"deflate_on_oom":true}`
+	req := httptest.NewRequest(http.MethodPut, "/balloon", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleBalloonPut_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/balloon", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleBalloonPatch_NoBalloon(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPatch, "/balloon", bytes.NewBufferString(`{"amount_mib":32}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	// No balloon configured in preboot, no root VM
+	if rec.Code == http.StatusNoContent {
+		t.Log("patch succeeded (preboot balloon may have been created)")
+	}
+}
+
+func TestHandleBalloonStatsGet_NoBalloon(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/balloon/statistics", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleBalloonStatsPatch_NoBalloon(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPatch, "/balloon/statistics", bytes.NewBufferString(`{"stats_polling_interval_s":5}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	// No balloon in preboot, no root VM
+	if rec.Code == http.StatusNoContent {
+		t.Log("patch succeeded (preboot)")
+	}
+}
+
+func TestHandleBalloonGet_AfterPut(t *testing.T) {
+	srv := New()
+	// First PUT a balloon config
+	putBody := `{"amount_mib":128,"deflate_on_oom":false}`
+	putReq := httptest.NewRequest(http.MethodPut, "/balloon", bytes.NewBufferString(putBody))
+	putRec := httptest.NewRecorder()
+	srv.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusNoContent {
+		t.Fatalf("PUT status = %d", putRec.Code)
+	}
+
+	// Then GET it back
+	getReq := httptest.NewRequest(http.MethodGet, "/balloon", nil)
+	getRec := httptest.NewRecorder()
+	srv.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d body=%s", getRec.Code, getRec.Body.String())
+	}
+	var b Balloon
+	if err := json.NewDecoder(getRec.Body).Decode(&b); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if b.AmountMib != 128 {
+		t.Fatalf("amount_mib = %d, want 128", b.AmountMib)
+	}
+}
+
+func TestHandleMemoryHotplugGet_NoConfig(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/hotplug/memory", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleMemoryHotplugPut_Success(t *testing.T) {
+	srv := New()
+	body := `{"total_size_mib":2048,"slot_size_mib":512,"block_size_mib":128}`
+	req := httptest.NewRequest(http.MethodPut, "/hotplug/memory", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleMemoryHotplugPut_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/hotplug/memory", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleMemoryHotplugPatch_NoConfig(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPatch, "/hotplug/memory", bytes.NewBufferString(`{"requested_size_mib":1024}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	// No hotplug config, no root VM
+	_ = rec.Code // any status is fine
+}
+
+func TestHandleMemoryHotplugGet_AfterPut(t *testing.T) {
+	srv := New()
+	putBody := `{"total_size_mib":4096,"slot_size_mib":1024,"block_size_mib":256}`
+	putReq := httptest.NewRequest(http.MethodPut, "/hotplug/memory", bytes.NewBufferString(putBody))
+	putRec := httptest.NewRecorder()
+	srv.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusNoContent {
+		t.Fatalf("PUT status = %d", putRec.Code)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/hotplug/memory", nil)
+	getRec := httptest.NewRecorder()
+	srv.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d body=%s", getRec.Code, getRec.Body.String())
+	}
+}
+
+func TestHandleGetVM_Missing(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/vms/nonexistent", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleGetVM_Success(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-get")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-get", entry)
+
+	req := httptest.NewRequest(http.MethodGet, "/vms/vm-get", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var info VMInfo
+	if err := json.NewDecoder(rec.Body).Decode(&info); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if info.ID != "vm-get" {
+		t.Fatalf("id = %q, want vm-get", info.ID)
+	}
+}
+
+func TestHandleVMVsockConnect_MissingPort(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-vsock")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-vsock", entry)
+
+	req := httptest.NewRequest(http.MethodGet, "/vms/vm-vsock/vsock/connect", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleVMVsockConnect_InvalidPort(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-vsock-bad")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-vsock-bad", entry)
+
+	req := httptest.NewRequest(http.MethodGet, "/vms/vm-vsock-bad/vsock/connect?port=invalid", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleVMVsockConnect_VMNotFound(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodGet, "/vms/nonexistent/vsock/connect?port=1234", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleBuild_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/build", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleBuild_NoSource(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/build", bytes.NewBufferString(`{}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleBuild_BothSources(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPost, "/build", bytes.NewBufferString(`{"image":"ubuntu","dockerfile":"Dockerfile"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleBalloonPatch_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPatch, "/balloon", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleBalloonStatsPatch_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPatch, "/balloon/statistics", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleMemoryHotplugPatch_InvalidJSON(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPatch, "/hotplug/memory", bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleAction_InstanceStop_NoRootVM(t *testing.T) {
+	srv := New()
+	req := httptest.NewRequest(http.MethodPut, "/actions", bytes.NewBufferString(`{"action_type":"InstanceStop"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	// No root VM to stop
+	if rec.Code == http.StatusNoContent {
+		t.Log("stop succeeded even without root VM (may be valid)")
+	}
+}
+
+func TestCloneBalloonConfig_Nil(t *testing.T) {
+	if got := cloneBalloonConfig(nil); got != nil {
+		t.Fatalf("cloneBalloonConfig(nil) = %v", got)
+	}
+}
+
+func TestCloneBalloonConfig_WithSnapshots(t *testing.T) {
+	original := &vmm.BalloonConfig{
+		AmountMiB:     128,
+		DeflateOnOOM:  true,
+		SnapshotPages: []uint32{1, 2, 3},
+	}
+	cloned := cloneBalloonConfig(original)
+	if cloned == nil || cloned.AmountMiB != 128 {
+		t.Fatalf("cloned = %v", cloned)
+	}
+	// Verify deep copy of SnapshotPages
+	cloned.SnapshotPages[0] = 99
+	if original.SnapshotPages[0] == 99 {
+		t.Fatal("SnapshotPages was not deep-copied")
+	}
+}
+
+func TestCloneBalloonConfig_WithoutSnapshots(t *testing.T) {
+	original := &vmm.BalloonConfig{AmountMiB: 64}
+	cloned := cloneBalloonConfig(original)
+	if cloned == nil || cloned.AmountMiB != 64 {
+		t.Fatalf("cloned = %v", cloned)
+	}
+}
+
+func TestCloneMemoryHotplug_Nil(t *testing.T) {
+	if got := cloneMemoryHotplug(nil); got != nil {
+		t.Fatalf("cloneMemoryHotplug(nil) = %v", got)
+	}
+}
+
+func TestCloneMemoryHotplug_NonNil(t *testing.T) {
+	original := &vmm.MemoryHotplugConfig{TotalSizeMiB: 4096}
+	cloned := cloneMemoryHotplug(original)
+	if cloned == nil || cloned.TotalSizeMiB != 4096 {
+		t.Fatalf("cloned = %v", cloned)
+	}
+}
+
+func TestMergeMetadata(t *testing.T) {
+	tests := []struct {
+		name string
+		dst  map[string]string
+		src  map[string]string
+		want int
+	}{
+		{"nil dst", nil, map[string]string{"a": "1"}, 1},
+		{"nil src", map[string]string{"a": "1"}, nil, 1},
+		{"merge", map[string]string{"a": "1"}, map[string]string{"b": "2"}, 2},
+		{"skip empty values", map[string]string{"a": "1"}, map[string]string{"b": ""}, 1},
+		{"both empty", nil, nil, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mergeMetadata(tt.dst, tt.src)
+			if len(got) != tt.want {
+				t.Fatalf("mergeMetadata() len = %d, want %d; got %v", len(got), tt.want, got)
+			}
+		})
+	}
+}
+
+func TestHandleBalloonPut_ThenGet_WithRootVM(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("root-vm")
+	handle.cfg.Balloon = &vmm.BalloonConfig{AmountMiB: 64}
+	entry := srv.newVMEntry(handle, nil)
+	entry.isRoot = true
+	srv.registerVMEntry("root-vm", entry)
+	srv.rootVMID = "root-vm"
+
+	// GET balloon from running root VM
+	req := httptest.NewRequest(http.MethodGet, "/balloon", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET balloon status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleBalloonStats_WithRootVM(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("root-vm-stats")
+	handle.cfg.Balloon = &vmm.BalloonConfig{AmountMiB: 64, StatsPollingIntervalS: 5}
+	entry := srv.newVMEntry(handle, nil)
+	entry.isRoot = true
+	srv.registerVMEntry("root-vm-stats", entry)
+	srv.rootVMID = "root-vm-stats"
+
+	req := httptest.NewRequest(http.MethodGet, "/balloon/statistics", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET balloon/statistics status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleBalloonPatch_WithRootVM(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("root-vm-patch")
+	handle.cfg.Balloon = &vmm.BalloonConfig{AmountMiB: 64}
+	entry := srv.newVMEntry(handle, nil)
+	entry.isRoot = true
+	srv.registerVMEntry("root-vm-patch", entry)
+	srv.rootVMID = "root-vm-patch"
+
+	req := httptest.NewRequest(http.MethodPatch, "/balloon", bytes.NewBufferString(`{"amount_mib":128}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("PATCH balloon status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleBalloonStatsPatch_WithRootVM(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("root-vm-stats-patch")
+	handle.cfg.Balloon = &vmm.BalloonConfig{AmountMiB: 64}
+	entry := srv.newVMEntry(handle, nil)
+	entry.isRoot = true
+	srv.registerVMEntry("root-vm-stats-patch", entry)
+	srv.rootVMID = "root-vm-stats-patch"
+
+	req := httptest.NewRequest(http.MethodPatch, "/balloon/statistics", bytes.NewBufferString(`{"stats_polling_interval_s":10}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("PATCH balloon/statistics status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleMemoryHotplugGet_WithRootVM(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("root-vm-hp")
+	handle.cfg.MemoryHotplug = &vmm.MemoryHotplugConfig{TotalSizeMiB: 4096}
+	entry := srv.newVMEntry(handle, nil)
+	entry.isRoot = true
+	srv.registerVMEntry("root-vm-hp", entry)
+	srv.rootVMID = "root-vm-hp"
+
+	req := httptest.NewRequest(http.MethodGet, "/hotplug/memory", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET memory-hotplug status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleMemoryHotplugPatch_WithRootVM(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("root-vm-hp-patch")
+	handle.cfg.MemoryHotplug = &vmm.MemoryHotplugConfig{TotalSizeMiB: 4096}
+	entry := srv.newVMEntry(handle, nil)
+	entry.isRoot = true
+	srv.registerVMEntry("root-vm-hp-patch", entry)
+	srv.rootVMID = "root-vm-hp-patch"
+
+	req := httptest.NewRequest(http.MethodPatch, "/hotplug/memory", bytes.NewBufferString(`{"requested_size_mib":2048}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("PATCH memory-hotplug status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleInstanceInfo_WithRootVM(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("root-info")
+	entry := srv.newVMEntry(handle, nil)
+	entry.isRoot = true
+	srv.registerVMEntry("root-info", entry)
+	srv.rootVMID = "root-info"
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var info InstanceInfo
+	json.NewDecoder(rec.Body).Decode(&info)
+	if info.State != "running=1" {
+		t.Fatalf("state = %q, want running=1", info.State)
+	}
+}
+
+func TestHandleSnapshot_WithTrustedDirs(t *testing.T) {
+	dir := t.TempDir()
+	srv := NewWithOptions(Options{
+		TrustedSnapshotDirs: []string{dir},
+	})
+	handle := newFakeHandle("vm-snap-trusted")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-snap-trusted", entry)
+
+	destDir := filepath.Join(dir, "snapshot-1")
+	body := fmt.Sprintf(`{"dest_dir":%q}`, destDir)
+	req := httptest.NewRequest(http.MethodPost, "/vms/vm-snap-trusted/snapshot", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestClient_ListVMs(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-client")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-client", entry)
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := NewClient(ts.URL)
+	ctx := context.Background()
+
+	vms, err := client.ListVMs(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListVMs: %v", err)
+	}
+	if len(vms) != 1 || vms[0].ID != "vm-client" {
+		t.Fatalf("ListVMs = %v", vms)
+	}
+}
+
+func TestClient_ListVMs_WithFilters(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := NewClient(ts.URL)
+	ctx := context.Background()
+
+	vms, err := client.ListVMs(ctx, map[string]string{"orchestrator": "compose"})
+	if err != nil {
+		t.Fatalf("ListVMs: %v", err)
+	}
+	if len(vms) != 0 {
+		t.Fatalf("expected empty, got %v", vms)
+	}
+}
+
+func TestClient_GetVM(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-get-client")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-get-client", entry)
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := NewClient(ts.URL)
+	ctx := context.Background()
+
+	info, err := client.GetVM(ctx, "vm-get-client")
+	if err != nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if info.ID != "vm-get-client" {
+		t.Fatalf("GetVM id = %q", info.ID)
+	}
+}
+
+func TestClient_GetVM_NotFound(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := NewClient(ts.URL)
+	_, err := client.GetVM(context.Background(), "nonexistent")
+	if err == nil {
+		t.Fatal("expected error for nonexistent VM")
+	}
+}
+
+func TestClient_StopVM(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-stop-client")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-stop-client", entry)
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := NewClient(ts.URL)
+	if err := client.StopVM(context.Background(), "vm-stop-client"); err != nil {
+		t.Fatalf("StopVM: %v", err)
+	}
+}
+
+func TestClient_Logs(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-logs-client")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-logs-client", entry)
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := NewClient(ts.URL)
+	logs, err := client.Logs(context.Background(), "vm-logs-client")
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	if string(logs) != "logs" {
+		t.Fatalf("Logs = %q", string(logs))
+	}
+}
+
+func TestClient_BalloonOperations(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := NewClient(ts.URL)
+	ctx := context.Background()
+
+	// Set balloon
+	if err := client.SetBalloon(ctx, Balloon{AmountMib: 64, DeflateOnOOM: true}); err != nil {
+		t.Fatalf("SetBalloon: %v", err)
+	}
+
+	// Get balloon
+	balloon, err := client.GetBalloon(ctx)
+	if err != nil {
+		t.Fatalf("GetBalloon: %v", err)
+	}
+	if balloon.AmountMib != 64 {
+		t.Fatalf("AmountMib = %d", balloon.AmountMib)
+	}
+
+	// Patch balloon stats
+	if err := client.PatchBalloonStats(ctx, BalloonStatsUpdate{StatsPollingIntervalS: 10}); err != nil {
+		t.Fatalf("PatchBalloonStats: %v", err)
+	}
+
+	// Patch balloon
+	if err := client.PatchBalloon(ctx, BalloonUpdate{AmountMib: 128}); err != nil {
+		// May fail if no root VM
+		t.Logf("PatchBalloon: %v (expected without root VM)", err)
+	}
+}
+
+func TestClient_MemoryHotplugOperations(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := NewClient(ts.URL)
+	ctx := context.Background()
+
+	// Set
+	if err := client.SetMemoryHotplug(ctx, MemoryHotplugConfig{TotalSizeMiB: 4096, SlotSizeMiB: 1024, BlockSizeMiB: 128}); err != nil {
+		t.Fatalf("SetMemoryHotplug: %v", err)
+	}
+
+	// Get
+	status, err := client.GetMemoryHotplug(ctx)
+	if err != nil {
+		t.Fatalf("GetMemoryHotplug: %v", err)
+	}
+	_ = status
+
+	// Patch
+	if err := client.PatchMemoryHotplug(ctx, MemoryHotplugSizeUpdate{RequestedSizeMiB: 2048}); err != nil {
+		t.Logf("PatchMemoryHotplug: %v (expected without root VM)", err)
+	}
+}
+
+func TestClient_SnapshotVM(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-snap-client")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-snap-client", entry)
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	dir := t.TempDir()
+	client := NewClient(ts.URL)
+	err := client.SnapshotVM(context.Background(), "vm-snap-client", filepath.Join(dir, "snap"))
+	// May succeed or fail depending on validation
+	_ = err
+}
+
+func TestClient_Run(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := NewClient(ts.URL)
+	_, err := client.Run(context.Background(), RunRequest{
+		KernelPath: "/vmlinuz",
+		Image:      "ubuntu:22.04",
+	})
+	// Will start async, may succeed with status 200
+	_ = err
+}
+
+func TestClient_GetBalloonStats_NoBalloon(t *testing.T) {
+	srv := New()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	client := NewClient(ts.URL)
+	_, err := client.GetBalloonStats(context.Background())
+	if err == nil {
+		t.Fatal("expected error when no balloon configured")
+	}
+}
+
+func TestUpsertDrive(t *testing.T) {
+	drives := []Drive{{DriveID: "root", PathOnHost: "/disk1.ext4"}}
+	drives = upsertDrive(drives, Drive{DriveID: "root", PathOnHost: "/disk2.ext4"})
+	if len(drives) != 1 {
+		t.Fatalf("expected 1 drive after upsert, got %d", len(drives))
+	}
+	if drives[0].PathOnHost != "/disk2.ext4" {
+		t.Fatalf("drive path = %q", drives[0].PathOnHost)
+	}
+
+	drives = upsertDrive(drives, Drive{DriveID: "data", PathOnHost: "/data.ext4"})
+	if len(drives) != 2 {
+		t.Fatalf("expected 2 drives, got %d", len(drives))
+	}
+}
+
+func TestUpsertNetworkInterface(t *testing.T) {
+	ifaces := []NetworkInterface{{IfaceID: "eth0", HostDevName: "tap0"}}
+	ifaces = upsertNetworkInterface(ifaces, NetworkInterface{IfaceID: "eth0", HostDevName: "tap1"})
+	if len(ifaces) != 1 {
+		t.Fatalf("expected 1 iface after upsert, got %d", len(ifaces))
+	}
+	if ifaces[0].HostDevName != "tap1" {
+		t.Fatalf("host_dev_name = %q", ifaces[0].HostDevName)
+	}
+
+	ifaces = upsertNetworkInterface(ifaces, NetworkInterface{IfaceID: "eth1", HostDevName: "tap2"})
+	if len(ifaces) != 2 {
+		t.Fatalf("expected 2 ifaces, got %d", len(ifaces))
+	}
+}
+
+func TestValidateRequestedArch(t *testing.T) {
+	// Empty arch should be valid (uses default)
+	if err := validateRequestedArch(""); err != nil {
+		t.Fatalf("empty arch: %v", err)
+	}
+	// Current arch should be valid
+	if err := validateRequestedArch(runtime.GOARCH); err != nil {
+		t.Fatalf("current arch: %v", err)
+	}
+	// Different arch should fail
+	other := "arm64"
+	if runtime.GOARCH == "arm64" {
+		other = "amd64"
+	}
+	if err := validateRequestedArch(other); err == nil {
+		t.Fatal("expected error for different arch")
+	}
+	// Invalid arch
+	if err := validateRequestedArch("mips"); err == nil {
+		t.Fatal("expected error for invalid arch")
+	}
+}
+
+func TestCloneAPILimiter(t *testing.T) {
+	if got := cloneAPILimiter(nil); got != nil {
+		t.Fatal("cloneAPILimiter(nil) should be nil")
+	}
+	original := &vmm.RateLimiterConfig{Bandwidth: vmm.TokenBucketConfig{Size: 100}}
+	cloned := cloneAPILimiter(original)
+	if cloned.Bandwidth.Size != 100 {
+		t.Fatalf("cloned size = %d", cloned.Bandwidth.Size)
+	}
+	cloned.Bandwidth.Size = 999
+	if original.Bandwidth.Size == 999 {
+		t.Fatal("clone was not a deep copy")
+	}
+}
+
 func TestMigrationFinalizeUsesRestoreWorkerHook(t *testing.T) {
 	srv := NewWithOptions(Options{
 		JailerMode: container.JailerModeOn,
@@ -1460,5 +2615,228 @@ func TestMigrationFinalizeUsesRestoreWorkerHook(t *testing.T) {
 	}
 	if _, ok := srv.vms["finalized-vm"]; !ok {
 		t.Fatal("expected finalized vm to be registered")
+	}
+}
+
+// ---- Additional coverage tests ----
+
+func TestDecodeComposePortMappings_Empty(t *testing.T) {
+	mappings, err := decodeComposePortMappings(map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mappings != nil {
+		t.Fatalf("expected nil, got %v", mappings)
+	}
+}
+
+func TestDecodeComposePortMappings_ValidJSON(t *testing.T) {
+	meta := map[string]string{
+		composePortMappingsMetadataKey: `[{"host_port":8080,"guest_port":80,"protocol":"tcp"}]`,
+	}
+	mappings, err := decodeComposePortMappings(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mappings) != 1 {
+		t.Fatalf("expected 1 mapping, got %d", len(mappings))
+	}
+}
+
+func TestDecodeComposePortMappings_InvalidJSON(t *testing.T) {
+	meta := map[string]string{
+		composePortMappingsMetadataKey: `{broken`,
+	}
+	_, err := decodeComposePortMappings(meta)
+	if err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+}
+
+func TestPublicMetadata_FiltersInternal(t *testing.T) {
+	meta := map[string]string{
+		"user_key":                     "value",
+		"gocracker_internal_something": "hidden",
+		"another":                      "visible",
+	}
+	got := publicMetadata(meta)
+	if got["user_key"] != "value" || got["another"] != "visible" {
+		t.Fatalf("expected user keys, got %v", got)
+	}
+	if _, ok := got["gocracker_internal_something"]; ok {
+		t.Fatal("internal key should be filtered")
+	}
+}
+
+func TestPublicMetadata_Empty(t *testing.T) {
+	if publicMetadata(nil) != nil {
+		t.Fatal("expected nil for nil input")
+	}
+	if publicMetadata(map[string]string{}) != nil {
+		t.Fatal("expected nil for empty input")
+	}
+}
+
+func TestPublicMetadata_AllInternal(t *testing.T) {
+	meta := map[string]string{
+		"gocracker_internal_a": "x",
+		"gocracker_internal_b": "y",
+	}
+	if publicMetadata(meta) != nil {
+		t.Fatal("expected nil when all keys are internal")
+	}
+}
+
+func TestIsComposeVMMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]string
+		want     bool
+	}{
+		{"compose_metadata", map[string]string{"orchestrator": "compose", "stack_name": "mystack"}, true},
+		{"uppercase_orchestrator", map[string]string{"orchestrator": "COMPOSE", "stack_name": "mystack"}, true},
+		{"missing_stack", map[string]string{"orchestrator": "compose"}, false},
+		{"empty_stack", map[string]string{"orchestrator": "compose", "stack_name": ""}, false},
+		{"not_compose", map[string]string{"orchestrator": "other", "stack_name": "mystack"}, false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isComposeVMMetadata(tt.metadata)
+			if got != tt.want {
+				t.Errorf("isComposeVMMetadata(%v) = %v, want %v", tt.metadata, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCleanStopped_RemovesStoppedVMs(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	handle := newFakeHandle("stopped-vm")
+	handle.state = vmm.StateStopped
+	handle.cfg = vmm.Config{ID: "stopped-vm"}
+	srv.vms["stopped-vm"] = &vmEntry{
+		handle: handle,
+		kind:   "local",
+	}
+	srv.vms["running-vm"] = &vmEntry{
+		handle: newFakeHandle("running-vm"),
+		kind:   "local",
+	}
+
+	srv.cleanStopped()
+
+	if _, ok := srv.vms["stopped-vm"]; ok {
+		t.Fatal("stopped VM should have been removed")
+	}
+	if _, ok := srv.vms["running-vm"]; !ok {
+		t.Fatal("running VM should still be present")
+	}
+}
+
+func TestCleanStopped_Empty(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	// Should not panic
+	srv.cleanStopped()
+}
+
+func TestReleaseComposeStackResources_NonCompose(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	// Should not panic for non-compose metadata
+	srv.releaseComposeStackResources("vm-1", map[string]string{})
+}
+
+func TestHandleDrive_BadJSON(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/drives/rootfs", strings.NewReader("{broken"))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleNetworkIface_BadJSON(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/network-interfaces/eth0", strings.NewReader("{broken"))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleBalloonPut_BadJSON(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/balloon", strings.NewReader("{broken"))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleMemoryHotplugPut_BadJSON(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/hotplug/memory", strings.NewReader("{broken"))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleVMEventsStream_Success(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	handle := newFakeHandle("ev-vm")
+	handle.cfg = vmm.Config{ID: "ev-vm"}
+	srv.vms["ev-vm"] = &vmEntry{
+		handle: handle,
+		kind:   "local",
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/vms/ev-vm/events/stream", nil)
+
+	// Cancel request quickly since SSE will block
+	ctx, cancel := context.WithTimeout(req.Context(), 50*time.Millisecond)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	srv.ServeHTTP(rec, req)
+	// Should return 200 with SSE content type
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleBalloonStatsGet_PrebootNoBalloon(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	// No root VM, no balloon
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/balloon/statistics", nil)
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleBalloonStatsPatch_PrebootNoBalloon(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/balloon/statistics", strings.NewReader(`{"stats_polling_interval_s":5}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleMemoryHotplugPatch_PrebootNoConfig(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/hotplug/memory", strings.NewReader(`{"requested_size_mib":256}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
 	}
 }

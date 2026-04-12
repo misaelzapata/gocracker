@@ -10,7 +10,7 @@ import (
 func setupMockQueue(b *testing.B) (*Queue, []byte) {
 	mem := make([]byte, 1024*1024)
 	q := NewQueue(mem, 256, nil)
-	
+
 	q.DescAddr = 0x0
 	q.DriverAddr = 0x1000
 	q.DeviceAddr = 0x2000
@@ -18,7 +18,7 @@ func setupMockQueue(b *testing.B) (*Queue, []byte) {
 
 	// Set Avail.Idx = 256 effectively meaning 256 completed requests
 	binary.LittleEndian.PutUint16(mem[0x1002:0x1004], 256)
-	
+
 	// Fill Avail.Ring
 	for i := 0; i < 256; i++ {
 		binary.LittleEndian.PutUint16(mem[0x1004+2*i:0x1004+2*i+2], uint16(i))
@@ -29,7 +29,7 @@ func setupMockQueue(b *testing.B) (*Queue, []byte) {
 
 func BenchmarkQueueConsumeAndPush(b *testing.B) {
 	q, mem := setupMockQueue(b)
-	
+
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {

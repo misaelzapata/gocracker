@@ -428,6 +428,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	var timings vmm.BootTimings
 
 	tPreNew := time.Now()
+	timings.Orchestration = tPreNew.Sub(t0)
 	vm, err := vmm.New(vmm.Config{
 		ID:         opts.ID,
 		MemMB:      opts.MemMB,

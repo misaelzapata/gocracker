@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"sync"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -87,6 +87,13 @@ var (
 	terminalOutput      io.Writer = os.Stdout
 	terminalInputReader           = os.Stdin
 )
+
+var ioCopyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 4096)
+		return &buf
+	},
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -484,30 +491,35 @@ func runInteractiveConnWithIO(conn net.Conn, stdin *os.File, stdout io.Writer) e
 	defer restore()
 	copyInputDone := make(chan error, 1)
 	go func() {
-		buf := console.BufferPool.Get().(*[]byte)
-		defer console.BufferPool.Put(buf)
+		buf := ioCopyBufPool.Get().(*[]byte)
+		defer ioCopyBufPool.Put(buf)
 		_, err := io.CopyBuffer(conn, stdin, *buf)
 		closeNetWriter(conn)
 		copyInputDone <- err
 	}()
 	copyOutputDone := make(chan error, 1)
 	go func() {
-		buf := console.BufferPool.Get().(*[]byte)
-		defer console.BufferPool.Put(buf)
+		buf := ioCopyBufPool.Get().(*[]byte)
+		defer ioCopyBufPool.Put(buf)
 		_, err := io.CopyBuffer(stdout, conn, *buf)
 		copyOutputDone <- err
 	}()
 
 	select {
 	case inputErr := <-copyInputDone:
-		if err := normalizeCopyError(inputErr); err != nil {
-			return err
+		// Input copy finished first. If it returned a real error (e.g.
+		// write to a closed vsock pipe), the remote has already gone away
+		// — force-close the conn so the output copy's Read() unblocks
+		// immediately. If input ended cleanly (EOF from stdin), the
+		// remote may still have data in flight, so wait for the output
+		// copy to drain naturally.
+		if normalizeCopyError(inputErr) != nil {
+			conn.Close()
 		}
 		return normalizeCopyError(<-copyOutputDone)
 	case outputErr := <-copyOutputDone:
 		if stdin != nil && stdin == os.Stdin {
 			restore() // Restore state before returning
-			_ = stdin.Close()
 		}
 		return normalizeCopyError(outputErr)
 	}
@@ -898,12 +910,12 @@ func printResult(r *container.RunResult) {
 	if state == vmm.StateCreated && r.WorkerSocket != "" {
 		state = vmm.StateRunning
 	}
-	uptime := r.VM.Uptime().Round(time.Millisecond)
-	if uptime == 0 {
-		uptime = r.Duration
+	bootTime := r.Timings.Total.Round(time.Millisecond)
+	if bootTime == 0 {
+		bootTime = r.Duration
 	}
-	if uptime > 0 {
-		fmt.Printf("\n✓ VM %s is %s (%s)\n", r.ID, state, uptime)
+	if bootTime > 0 {
+		fmt.Printf("\n✓ VM %s is %s (%s)\n", r.ID, state, bootTime)
 	} else {
 		fmt.Printf("\n✓ VM %s is %s\n", r.ID, state)
 	}
@@ -1098,7 +1110,7 @@ func closeNetWriter(conn net.Conn) {
 }
 
 func normalizeCopyError(err error) error {
-	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
 		return nil
 	}
 	if opErr, ok := err.(*net.OpError); ok && opErr.Err != nil {
@@ -1185,9 +1197,14 @@ func resolveRequiredExistingPath(label, raw string) string {
 	return abs
 }
 
-func fatal(msg string) {
+// fatalFunc can be overridden in tests to avoid os.Exit.
+var fatalFunc = func(msg string) {
 	fmt.Fprintln(os.Stderr, "error:", msg)
 	os.Exit(1)
+}
+
+func fatal(msg string) {
+	fatalFunc(msg)
 }
 
 func splitComma(s string) []string {

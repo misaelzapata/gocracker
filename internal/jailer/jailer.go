@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -143,7 +144,15 @@ func Run(cfg Config) error {
 	if err := dropPrivileges(cfg.UID, cfg.GID); err != nil {
 		return err
 	}
-	return syscall.Exec(execPathInJail, append([]string{execName}, cfg.ExtraArgs...), cfg.execEnv())
+	// Verify the binary exists before exec — syscall.Exec returns a raw
+	// errno ("no such file or directory") without any path context.
+	if _, err := os.Stat(execPathInJail); err != nil {
+		return fmt.Errorf("exec binary not found in jail: stat %s: %w", execPathInJail, err)
+	}
+	if err := syscall.Exec(execPathInJail, append([]string{execName}, cfg.ExtraArgs...), cfg.execEnv()); err != nil {
+		return fmt.Errorf("exec %s: %w", execPathInJail, err)
+	}
+	return nil // unreachable after successful exec
 }
 
 func (cfg Config) validate() error {
@@ -662,9 +671,14 @@ func cleanStaleMounts(dir string) {
 			targets = append(targets, mountpoint)
 		}
 	}
-	// Unmount deepest first with MNT_DETACH so we don't block.
-	for i := len(targets) - 1; i >= 0; i-- {
-		_ = unix.Unmount(targets[i], unix.MNT_DETACH)
+	// Unmount deepest first with MNT_DETACH so children are released
+	// before parents. Sort by path length descending (deeper paths are
+	// longer) to ensure correct order regardless of mountinfo ordering.
+	sort.Slice(targets, func(i, j int) bool {
+		return len(targets[i]) > len(targets[j])
+	})
+	for _, t := range targets {
+		_ = unix.Unmount(t, unix.MNT_DETACH)
 	}
 }
 

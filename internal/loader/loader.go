@@ -9,12 +9,16 @@ import (
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"math"
+	"os"
+	"sort"
+	"sync"
+
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 	"github.com/ulikunitz/xz"
 	"github.com/ulikunitz/xz/lzma"
-	"io"
-	"os"
 )
 
 // bzImage setup header offsets (Documentation/x86/boot.rst)
@@ -241,7 +245,15 @@ func loadELF(mem, data []byte) (*KernelInfo, error) {
 	}
 	defer ef.Close()
 
-	var kernEnd uint64
+	// Collect loadable segments, validate bounds, and check for overlap
+	// before parallelizing I/O (concurrent writes to overlapping mem
+	// regions would be a data race).
+	type loadSeg struct {
+		prog  *elf.Prog
+		start uint64
+		end   uint64 // paddr + memsz
+	}
+	var segs []loadSeg
 	for _, ph := range ef.Progs {
 		if ph.Type != elf.PT_LOAD {
 			continue
@@ -250,15 +262,47 @@ func loadELF(mem, data []byte) (*KernelInfo, error) {
 			return nil, fmt.Errorf("ELF segment [%#x,%#x) exceeds guest RAM",
 				ph.Paddr, ph.Paddr+ph.Memsz)
 		}
-		seg := make([]byte, ph.Filesz)
-		if _, err := ph.ReadAt(seg, 0); err != nil {
-			return nil, fmt.Errorf("read ELF segment: %w", err)
+		if ph.Filesz > uint64(math.MaxInt) {
+			return nil, fmt.Errorf("ELF segment filesz %#x exceeds addressable range", ph.Filesz)
 		}
-		copy(mem[ph.Paddr:], seg)
-		end := ph.Paddr + ph.Memsz
-		if end > kernEnd {
-			kernEnd = end
+		if ph.Paddr+ph.Filesz > uint64(len(mem)) {
+			return nil, fmt.Errorf("ELF segment [%#x,%#x) filesz exceeds guest RAM",
+				ph.Paddr, ph.Paddr+ph.Filesz)
 		}
+		segs = append(segs, loadSeg{prog: ph, start: ph.Paddr, end: ph.Paddr + ph.Memsz})
+	}
+	// Check for overlapping segments (sort by start address).
+	sort.Slice(segs, func(i, j int) bool { return segs[i].start < segs[j].start })
+	for i := 1; i < len(segs); i++ {
+		if segs[i].start < segs[i-1].end {
+			return nil, fmt.Errorf("ELF segments overlap: [%#x,%#x) and [%#x,%#x)",
+				segs[i-1].start, segs[i-1].end, segs[i].start, segs[i].end)
+		}
+	}
+
+	var kernEnd uint64
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(segs))
+
+	for _, s := range segs {
+		wg.Add(1)
+		go func(s loadSeg) {
+			defer wg.Done()
+			seg := make([]byte, int(s.prog.Filesz))
+			if _, err := s.prog.ReadAt(seg, 0); err != nil {
+				errCh <- fmt.Errorf("read ELF segment: %w", err)
+				return
+			}
+			copy(mem[s.start:], seg)
+		}(s)
+		if s.end > kernEnd {
+			kernEnd = s.end
+		}
+	}
+	wg.Wait()
+	close(errCh)
+	if err := <-errCh; err != nil {
+		return nil, err
 	}
 
 	return &KernelInfo{

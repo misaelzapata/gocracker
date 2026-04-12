@@ -2,13 +2,26 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 )
 
 func main() {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	if err := run(":8080", os.Stdout); err != nil {
+		panic(err)
+	}
+}
+
+func newMux() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "Hello from gocracker!")
 	})
-	fmt.Println("Listening on :8080")
-	http.ListenAndServe(":8080", nil)
+	return mux
+}
+
+func run(addr string, stdout io.Writer) error {
+	fmt.Fprintln(stdout, "Listening on", addr)
+	return http.ListenAndServe(addr, newMux())
 }

@@ -241,6 +241,9 @@ func (d *Device) handleDisconnect(hdr *pktHdr) {
 	d.mu.Unlock()
 	if c != nil {
 		c.conn.Close()
+		// Send RST back so the guest's close() completes promptly
+		// instead of timing out waiting for the peer to acknowledge.
+		d.sendPkt(hdr.DstCID, hdr.SrcCID, hdr.DstPort, hdr.SrcPort, opReset, nil)
 	}
 	if pending != nil {
 		pending.conn.conn.Close()

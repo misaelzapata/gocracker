@@ -1,12 +1,14 @@
 package container
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gocracker/gocracker/internal/guest"
 	"github.com/gocracker/gocracker/internal/oci"
@@ -1786,5 +1788,538 @@ func TestAppendVirtioFSKernelModule_WithSharedFS(t *testing.T) {
 	}
 	if mods[0].Name != "virtiofs" {
 		t.Fatalf("module name = %q, want virtiofs", mods[0].Name)
+	}
+}
+
+// --- waitFirstOutput ---
+
+type mockHandle struct {
+	firstOutputAt time.Time
+}
+
+func (m *mockHandle) Start() error                                    { return nil }
+func (m *mockHandle) Stop()                                           {}
+func (m *mockHandle) TakeSnapshot(string) (*vmm.Snapshot, error)      { return nil, nil }
+func (m *mockHandle) State() vmm.State                                { return vmm.StateRunning }
+func (m *mockHandle) ID() string                                      { return "mock" }
+func (m *mockHandle) Uptime() time.Duration                           { return 0 }
+func (m *mockHandle) Events() vmm.EventSource                        { return nil }
+func (m *mockHandle) VMConfig() vmm.Config                            { return vmm.Config{} }
+func (m *mockHandle) DeviceList() []vmm.DeviceInfo                    { return nil }
+func (m *mockHandle) ConsoleOutput() []byte                           { return nil }
+func (m *mockHandle) WaitStopped(ctx context.Context) error           { return nil }
+func (m *mockHandle) FirstOutputAt() time.Time                        { return m.firstOutputAt }
+
+func TestWaitFirstOutput_NilHandle(t *testing.T) {
+	d := waitFirstOutput(nil, time.Now(), time.Second)
+	if d != 0 {
+		t.Fatalf("waitFirstOutput(nil) = %v, want 0", d)
+	}
+}
+
+func TestWaitFirstOutput_ImmediateOutput(t *testing.T) {
+	startedAt := time.Now()
+	h := &mockHandle{firstOutputAt: startedAt.Add(50 * time.Millisecond)}
+	d := waitFirstOutput(h, startedAt, time.Second)
+	if d < 40*time.Millisecond || d > 200*time.Millisecond {
+		t.Fatalf("waitFirstOutput = %v, expected ~50ms", d)
+	}
+}
+
+func TestWaitFirstOutput_Timeout(t *testing.T) {
+	h := &mockHandle{} // firstOutputAt stays zero
+	d := waitFirstOutput(h, time.Now(), 20*time.Millisecond)
+	if d != 0 {
+		t.Fatalf("waitFirstOutput on timeout = %v, want 0", d)
+	}
+}
+
+func TestWaitFirstOutput_NegativeDuration(t *testing.T) {
+	startedAt := time.Now()
+	// firstOutputAt is before startedAt
+	h := &mockHandle{firstOutputAt: startedAt.Add(-100 * time.Millisecond)}
+	d := waitFirstOutput(h, startedAt, time.Second)
+	if d != 0 {
+		t.Fatalf("waitFirstOutput with negative duration = %v, want 0", d)
+	}
+}
+
+// --- writeGuestSpecCache / cachedGuestSpecMatches ---
+
+func TestWriteGuestSpecCache(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runtime.json")
+	spec := runtimecfg.GuestSpec{
+		Process: runtimecfg.Process{Exec: "/bin/sh"},
+	}
+	if err := writeGuestSpecCache(path, spec); err != nil {
+		t.Fatalf("writeGuestSpecCache: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("expected non-empty cache file")
+	}
+	if !strings.Contains(string(data), "/bin/sh") {
+		t.Fatalf("cache file does not contain exec path:\n%s", data)
+	}
+}
+
+func TestCachedGuestSpecMatches_MissingFile(t *testing.T) {
+	match, reason, err := cachedGuestSpecMatches("/nonexistent/path", runtimecfg.GuestSpec{})
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if match {
+		t.Fatal("should not match for missing file")
+	}
+	if reason != "runtime spec missing" {
+		t.Fatalf("reason = %q", reason)
+	}
+}
+
+func TestCachedGuestSpecMatches_InvalidJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spec.json")
+	os.WriteFile(path, []byte("{bad json"), 0644)
+	match, reason, err := cachedGuestSpecMatches(path, runtimecfg.GuestSpec{})
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if match {
+		t.Fatal("should not match for invalid json")
+	}
+	if !strings.Contains(reason, "unreadable") {
+		t.Fatalf("reason = %q", reason)
+	}
+}
+
+func TestCachedGuestSpecMatches_MatchingSpec(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spec.json")
+	spec := runtimecfg.GuestSpec{
+		Process: runtimecfg.Process{Exec: "/bin/sh"},
+	}
+	if err := writeGuestSpecCache(path, spec); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	match, reason, err := cachedGuestSpecMatches(path, spec)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if !match {
+		t.Fatalf("should match, reason = %q", reason)
+	}
+}
+
+func TestCachedGuestSpecMatches_ChangedSpec(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "spec.json")
+	spec := runtimecfg.GuestSpec{
+		Process: runtimecfg.Process{Exec: "/bin/sh"},
+	}
+	if err := writeGuestSpecCache(path, spec); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	newSpec := runtimecfg.GuestSpec{
+		Process: runtimecfg.Process{Exec: "/bin/bash"},
+	}
+	match, reason, err := cachedGuestSpecMatches(path, newSpec)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if match {
+		t.Fatal("should not match for changed spec")
+	}
+	if reason != "runtime spec changed" {
+		t.Fatalf("reason = %q", reason)
+	}
+}
+
+// --- shouldReuseCachedInitrd ---
+
+func TestShouldReuseCachedInitrd_MissingInitrd(t *testing.T) {
+	dir := t.TempDir()
+	reuse, reason, err := shouldReuseCachedInitrd(
+		filepath.Join(dir, "nonexistent-initrd"),
+		filepath.Join(dir, "spec.json"),
+		runtimecfg.GuestSpec{},
+	)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if reuse {
+		t.Fatal("should not reuse when initrd missing")
+	}
+	if reason != "initrd missing" {
+		t.Fatalf("reason = %q", reason)
+	}
+}
+
+func TestShouldReuseCachedInitrd_InitrdExistsSpecMatches(t *testing.T) {
+	dir := t.TempDir()
+	initrdPath := filepath.Join(dir, "initrd")
+	specPath := filepath.Join(dir, "spec.json")
+	os.WriteFile(initrdPath, []byte("initrd-data"), 0644)
+	spec := runtimecfg.GuestSpec{
+		Process: runtimecfg.Process{Exec: "/bin/sh"},
+	}
+	if err := writeGuestSpecCache(specPath, spec); err != nil {
+		t.Fatalf("write spec: %v", err)
+	}
+	reuse, _, err := shouldReuseCachedInitrd(initrdPath, specPath, spec)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if !reuse {
+		t.Fatal("should reuse when spec matches")
+	}
+}
+
+func TestShouldReuseCachedInitrd_SpecChanged(t *testing.T) {
+	dir := t.TempDir()
+	initrdPath := filepath.Join(dir, "initrd")
+	specPath := filepath.Join(dir, "spec.json")
+	os.WriteFile(initrdPath, []byte("initrd-data"), 0644)
+	oldSpec := runtimecfg.GuestSpec{Process: runtimecfg.Process{Exec: "/bin/sh"}}
+	writeGuestSpecCache(specPath, oldSpec)
+	newSpec := runtimecfg.GuestSpec{Process: runtimecfg.Process{Exec: "/bin/bash"}}
+	reuse, _, err := shouldReuseCachedInitrd(initrdPath, specPath, newSpec)
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if reuse {
+		t.Fatal("should not reuse when spec changed")
+	}
+	// initrd should be removed
+	if _, err := os.Stat(initrdPath); !os.IsNotExist(err) {
+		t.Fatal("expected initrd to be removed after spec change")
+	}
+}
+
+// --- copyDiskImage ---
+
+func TestCopyDiskImage(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.ext4")
+	dst := filepath.Join(dir, "dst.ext4")
+	os.WriteFile(src, []byte("disk-data"), 0644)
+
+	if err := copyDiskImage(src, dst); err != nil {
+		t.Fatalf("copyDiskImage: %v", err)
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != "disk-data" {
+		t.Fatalf("content = %q", data)
+	}
+}
+
+func TestCopyDiskImage_NonexistentSource(t *testing.T) {
+	dir := t.TempDir()
+	err := copyDiskImage(filepath.Join(dir, "nonexistent"), filepath.Join(dir, "dst"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+// --- delayedRemoveAll ---
+
+func TestDelayedRemoveAll_EmptyPath(t *testing.T) {
+	fn := delayedRemoveAll("", time.Second)
+	fn() // should not panic
+}
+
+func TestDelayedRemoveAll_ImmediateRemoval(t *testing.T) {
+	dir := t.TempDir()
+	testFile := filepath.Join(dir, "test.txt")
+	os.WriteFile(testFile, []byte("data"), 0644)
+
+	fn := delayedRemoveAll(dir, 0)
+	fn()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := os.Stat(testFile); !os.IsNotExist(err) {
+		t.Fatal("expected file to be removed immediately")
+	}
+}
+
+func TestDelayedRemoveAll_Idempotent(t *testing.T) {
+	dir := t.TempDir()
+	fn := delayedRemoveAll(dir, 0)
+	fn()
+	fn() // second call should be no-op
+}
+
+// --- removeCachedRunArtifacts ---
+
+func TestRemoveCachedRunArtifacts_EmptyPaths(t *testing.T) {
+	err := removeCachedRunArtifacts("", "  ", "")
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRemoveCachedRunArtifacts_RemovesFiles(t *testing.T) {
+	dir := t.TempDir()
+	f1 := filepath.Join(dir, "a.txt")
+	f2 := filepath.Join(dir, "b.txt")
+	os.WriteFile(f1, []byte("a"), 0644)
+	os.WriteFile(f2, []byte("b"), 0644)
+
+	if err := removeCachedRunArtifacts(f1, f2); err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	for _, f := range []string{f1, f2} {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be removed", f)
+		}
+	}
+}
+
+func TestRemoveCachedRunArtifacts_NonexistentOK(t *testing.T) {
+	err := removeCachedRunArtifacts("/nonexistent/file.txt")
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+// --- rootfsPath ---
+
+func TestRootfsPath(t *testing.T) {
+	tests := []struct {
+		rootfs string
+		path   string
+		want   string
+	}{
+		{"/rootfs", "/etc/hosts", "/rootfs/etc/hosts"},
+		{"/rootfs", "etc/hosts", "/rootfs/etc/hosts"},
+		{"/rootfs", "/", "/rootfs"},
+		{"/rootfs", ".", "/rootfs"},
+		{"/rootfs", "/a/../b", "/rootfs/b"},
+	}
+	for _, tt := range tests {
+		got := rootfsPath(tt.rootfs, tt.path)
+		if got != tt.want {
+			t.Errorf("rootfsPath(%q, %q) = %q, want %q", tt.rootfs, tt.path, got, tt.want)
+		}
+	}
+}
+
+// --- applyMounts ---
+
+func TestApplyMounts_EmptyList(t *testing.T) {
+	if err := applyMounts(t.TempDir(), nil); err != nil {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestApplyMounts_MissingSource(t *testing.T) {
+	err := applyMounts(t.TempDir(), []Mount{{Source: "", Target: "/data"}})
+	if err == nil {
+		t.Fatal("expected error for empty source")
+	}
+}
+
+func TestApplyMounts_MissingTarget(t *testing.T) {
+	err := applyMounts(t.TempDir(), []Mount{{Source: "/tmp", Target: ""}})
+	if err == nil {
+		t.Fatal("expected error for empty target")
+	}
+}
+
+func TestApplyMounts_DirMount(t *testing.T) {
+	srcDir := t.TempDir()
+	os.WriteFile(filepath.Join(srcDir, "config.yaml"), []byte("key: val"), 0644)
+
+	rootfs := t.TempDir()
+	err := applyMounts(rootfs, []Mount{{Source: srcDir, Target: "/etc/app"}})
+	if err != nil {
+		t.Fatalf("applyMounts: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(rootfs, "etc", "app", "config.yaml"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != "key: val" {
+		t.Fatalf("content = %q", data)
+	}
+}
+
+func TestApplyMounts_FileMount(t *testing.T) {
+	dir := t.TempDir()
+	srcFile := filepath.Join(dir, "hosts")
+	os.WriteFile(srcFile, []byte("127.0.0.1 localhost"), 0644)
+
+	rootfs := t.TempDir()
+	err := applyMounts(rootfs, []Mount{{Source: srcFile, Target: "/etc/hosts"}})
+	if err != nil {
+		t.Fatalf("applyMounts: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(rootfs, "etc", "hosts"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != "127.0.0.1 localhost" {
+		t.Fatalf("content = %q", data)
+	}
+}
+
+func TestApplyMounts_VirtioFSSkipsCopy(t *testing.T) {
+	srcDir := t.TempDir()
+	os.WriteFile(filepath.Join(srcDir, "data"), []byte("test"), 0644)
+
+	rootfs := t.TempDir()
+	err := applyMounts(rootfs, []Mount{
+		{Source: srcDir, Target: "/data", Backend: MountBackendVirtioFS},
+	})
+	if err != nil {
+		t.Fatalf("applyMounts: %v", err)
+	}
+	// Should not have copied the dir to rootfs
+	if _, err := os.Stat(filepath.Join(rootfs, "data")); !os.IsNotExist(err) {
+		t.Fatal("virtiofs mount should not copy to rootfs")
+	}
+}
+
+func TestApplyMounts_NonexistentSource(t *testing.T) {
+	err := applyMounts(t.TempDir(), []Mount{{Source: "/nonexistent/dir", Target: "/data"}})
+	if err == nil {
+		t.Fatal("expected error for nonexistent source")
+	}
+}
+
+// --- copyDirContents ---
+
+func TestCopyDirContents(t *testing.T) {
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("a"), 0644)
+	os.MkdirAll(filepath.Join(src, "sub"), 0755)
+	os.WriteFile(filepath.Join(src, "sub", "b.txt"), []byte("b"), 0644)
+
+	dst := t.TempDir()
+	if err := copyDirContents(src, dst); err != nil {
+		t.Fatalf("copyDirContents: %v", err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dst, "a.txt"))
+	if string(data) != "a" {
+		t.Fatalf("a.txt = %q", data)
+	}
+	data, _ = os.ReadFile(filepath.Join(dst, "sub", "b.txt"))
+	if string(data) != "b" {
+		t.Fatalf("sub/b.txt = %q", data)
+	}
+}
+
+// --- copyFileOrSymlink ---
+
+func TestCopyFileOrSymlink_RegularFile(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.txt")
+	dst := filepath.Join(dir, "dst.txt")
+	os.WriteFile(src, []byte("content"), 0644)
+
+	if err := copyFileOrSymlink(src, dst); err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	data, _ := os.ReadFile(dst)
+	if string(data) != "content" {
+		t.Fatalf("content = %q", data)
+	}
+}
+
+func TestCopyFileOrSymlink_Symlink(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "target.txt"), []byte("target"), 0644)
+	src := filepath.Join(dir, "link.txt")
+	os.Symlink("target.txt", src)
+
+	dst := filepath.Join(dir, "copied-link.txt")
+	if err := copyFileOrSymlink(src, dst); err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	link, err := os.Readlink(dst)
+	if err != nil {
+		t.Fatalf("readlink: %v", err)
+	}
+	if link != "target.txt" {
+		t.Fatalf("link target = %q", link)
+	}
+}
+
+func TestCopyFileOrSymlink_Nonexistent(t *testing.T) {
+	err := copyFileOrSymlink("/nonexistent", filepath.Join(t.TempDir(), "dst"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+// --- writeImageConfig ---
+
+func TestWriteImageConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := oci.ImageConfig{
+		Entrypoint: []string{"/bin/sh"},
+		Cmd:        []string{"-c", "echo hello"},
+	}
+	if err := writeImageConfig(path, cfg); err != nil {
+		t.Fatalf("writeImageConfig: %v", err)
+	}
+	restored, err := readImageConfig(path)
+	if err != nil {
+		t.Fatalf("readImageConfig: %v", err)
+	}
+	if !reflect.DeepEqual(restored, cfg) {
+		t.Fatalf("roundtrip mismatch: %+v", restored)
+	}
+}
+
+// --- BootTimings.Sum (from container perspective) ---
+
+func TestBootTimings_Sum_Container(t *testing.T) {
+	bt := vmm.BootTimings{
+		Orchestration:    100 * time.Millisecond,
+		VMMSetup:         200 * time.Millisecond,
+		Start:            5 * time.Millisecond,
+		GuestFirstOutput: 50 * time.Millisecond,
+	}
+	result := bt.Sum()
+	if result.Total != 355*time.Millisecond {
+		t.Fatalf("Total = %v, want 355ms", result.Total)
+	}
+}
+
+// --- buildWorkDirForCache edge cases ---
+
+func TestBuildWorkDirForCache_EmptyCacheDir(t *testing.T) {
+	// When CacheDir is empty, still returns a valid path
+	opts := BuildOptions{Image: "alpine:3.18"}
+	dir := buildWorkDirForCache(opts, "fallback")
+	if dir == "" {
+		t.Fatal("expected non-empty dir")
+	}
+}
+
+// --- writeRuntimeSpecToRootfs ---
+
+func TestWriteRuntimeSpecToRootfs(t *testing.T) {
+	rootfs := t.TempDir()
+	spec := runtimecfg.GuestSpec{
+		Process: runtimecfg.Process{Exec: "/bin/sh"},
+	}
+	if err := writeRuntimeSpecToRootfs(rootfs, spec); err != nil {
+		t.Fatalf("writeRuntimeSpecToRootfs: %v", err)
+	}
+	// Verify the file was written
+	data, err := os.ReadFile(filepath.Join(rootfs, runtimecfg.GuestSpecPath))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(data), "/bin/sh") {
+		t.Fatalf("spec file missing exec: %s", data)
 	}
 }

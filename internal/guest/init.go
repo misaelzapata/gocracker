@@ -245,6 +245,16 @@ func newVsockConn(fd int, peer unix.Sockaddr) (net.Conn, error) {
 func (c *vsockConn) Read(p []byte) (int, error)  { return c.file.Read(p) }
 func (c *vsockConn) Write(p []byte) (int, error) { return c.file.Write(p) }
 func (c *vsockConn) Close() error                { return c.file.Close() }
+
+// Shutdown signals the vsock socket to stop accepting reads and writes,
+// waking any goroutine blocked on Read/Write and triggering the kernel's
+// VIRTIO_VSOCK_OP_SHUTDOWN to the host. This MUST be called before Close
+// when another goroutine may still hold a reference to the FD (e.g. a
+// blocked io.Copy), because Close only releases one FD reference and the
+// kernel won't send the SHUTDOWN until ALL references are dropped.
+func (c *vsockConn) Shutdown() error {
+	return unix.Shutdown(int(c.file.Fd()), unix.SHUT_RDWR)
+}
 func (c *vsockConn) LocalAddr() net.Addr         { return c.local }
 func (c *vsockConn) RemoteAddr() net.Addr        { return c.peer }
 func (c *vsockConn) SetDeadline(t time.Time) error {
@@ -692,6 +702,16 @@ func runExecStream(conn net.Conn, req guestexec.Request, spec runtimecfg.GuestSp
 	}()
 	waitErr := cmd.Wait()
 	_ = ptmx.Close()
+	// Shutdown the vsock connection to wake the blocked io.Copy(ptmx, conn)
+	// goroutine and trigger the kernel's VIRTIO_VSOCK_OP_SHUTDOWN immediately.
+	// Without this, conn.Close() (in the caller's defer) only decrements the
+	// FD refcount while the blocked read goroutine still holds a reference,
+	// so the kernel never sends the shutdown packet and the host-side reader
+	// blocks indefinitely — causing the console to hang after "exit".
+	type shutdowner interface{ Shutdown() error }
+	if sc, ok := conn.(shutdowner); ok {
+		_ = sc.Shutdown()
+	}
 	select {
 	case <-stdoutDone:
 	case <-time.After(2 * time.Second):

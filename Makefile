@@ -4,7 +4,7 @@ CMD      := ./cmd/gocracker
 TARGET_GOOS ?= linux
 TARGET_GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: all build build-amd64 build-arm64 generate tidy test clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs hostcheck
+.PHONY: all build build-amd64 build-arm64 generate tidy test coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs hostcheck
 
 all: build
 
@@ -12,14 +12,18 @@ all: build
 generate:
 	go generate ./internal/guest/
 
-## Download dependencies, generate, and build all binaries
+## Download dependencies, generate, and build all binaries.
+## gocracker-vmm and gocracker-jailer are linux-only (they use KVM, mount
+## namespaces, seccomp, etc.) so we skip them when TARGET_GOOS != linux.
 build: tidy generate
 	CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
 	  go build -trimpath -ldflags="-s -w" -o $(BIN) $(CMD)
+ifeq ($(TARGET_GOOS),linux)
 	CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
 	  go build -trimpath -ldflags="-s -w" -o gocracker-vmm ./cmd/gocracker-vmm
 	CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
 	  go build -trimpath -ldflags="-s -w" -o gocracker-jailer ./cmd/gocracker-jailer
+endif
 
 build-amd64:
 	$(MAKE) build TARGET_GOARCH=amd64
@@ -32,6 +36,9 @@ tidy:
 
 test:
 	go test ./...
+
+coverage:
+	./tools/coverage-repo.sh
 
 kernel-host:
 	./tools/prepare-kernel.sh --profile standard

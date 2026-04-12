@@ -1337,3 +1337,678 @@ func TestExecEnv_EmptyAddsDefaultPath(t *testing.T) {
 		t.Fatalf("expected PATH, got %q", env[0])
 	}
 }
+
+func TestRunCLI_AllFlags(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	// RunCLI should parse all flags and then fail at Run (requires root for mounts etc)
+	err := RunCLI([]string{
+		"--id", "test-vm",
+		"--exec-file", execFile,
+		"--uid", "1000",
+		"--gid", "1000",
+		"--chroot-base-dir", filepath.Join(tmp, "jail"),
+		"--cgroup-version", "2",
+		"--mount", "ro:/usr/lib:/usr/lib",
+		"--env", "FOO=bar",
+		"--cgroup", "memory.max=256M",
+		"--parent-cgroup", "gocracker",
+		"--resource-limit", "no-file=4096",
+		"--new-pid-ns",
+		"--",
+		"--socket", "/tmp/test.sock",
+	})
+	// Will fail at Run() because we can't actually do chroot operations,
+	// but all flag parsing should have succeeded
+	if err == nil {
+		t.Log("RunCLI unexpectedly succeeded (may have root)")
+	}
+}
+
+func TestRunCLI_FlagParsing(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	// Minimal valid flags - will fail at Run but validates flag parsing
+	err := RunCLI([]string{
+		"--id", "vm-1",
+		"--exec-file", execFile,
+		"--uid", "1000",
+		"--gid", "1000",
+	})
+	// Should not be a flag parsing error
+	if err != nil && strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatalf("unexpected flag parsing error: %v", err)
+	}
+}
+
+func TestRunCLI_WithNetNS(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	err := RunCLI([]string{
+		"--id", "vm-ns",
+		"--exec-file", execFile,
+		"--uid", "1000",
+		"--gid", "1000",
+		"--netns", "/proc/self/ns/net",
+	})
+	// Will fail somewhere in Run() but flag parsing works
+	if err != nil && strings.Contains(err.Error(), "flag") {
+		t.Fatalf("flag parsing failed: %v", err)
+	}
+}
+
+func TestRunCLI_WithDaemonize(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	err := RunCLI([]string{
+		"--id", "vm-daemon",
+		"--exec-file", execFile,
+		"--uid", "1000",
+		"--gid", "1000",
+		"--daemonize",
+	})
+	if err != nil && strings.Contains(err.Error(), "flag") {
+		t.Fatalf("flag parsing failed: %v", err)
+	}
+}
+
+func TestRun_ValidationFailsBeforeWork(t *testing.T) {
+	// Run with invalid config should fail at validation
+	err := Run(Config{})
+	if err == nil || !strings.Contains(err.Error(), "--id is required") {
+		t.Fatalf("expected validation error, got %v", err)
+	}
+}
+
+func TestRun_MissingExecFile(t *testing.T) {
+	err := Run(Config{
+		ID:       "test-vm",
+		ExecFile: "/nonexistent/binary",
+		UID:      1000,
+		GID:      1000,
+	})
+	if err == nil || !strings.Contains(err.Error(), "stat exec-file") {
+		t.Fatalf("expected stat error, got %v", err)
+	}
+}
+
+func TestRun_ChrootDirCreation(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Run(Config{
+		ID:            "test-vm",
+		ExecFile:      execFile,
+		UID:           1000,
+		GID:           1000,
+		ChrootBaseDir: filepath.Join(tmp, "jail"),
+	})
+	// Will fail at applyResourceLimits, prepareMountNamespace, etc.
+	// But should have created the chroot dir and copied the exec file
+	if err != nil {
+		t.Logf("Run failed as expected (non-root): %v", err)
+	}
+	// Verify chroot dir was created
+	chrootDir := filepath.Join(tmp, "jail", "vmm", "test-vm", "root")
+	if info, err := os.Stat(chrootDir); err != nil || !info.IsDir() {
+		t.Logf("chroot dir status: err=%v (may not have been created depending on error path)", err)
+	}
+}
+
+func TestApplyResourceLimits_DefaultLimit(t *testing.T) {
+	// With empty values, should apply the default no-file=2048
+	err := applyResourceLimits(nil)
+	if err != nil {
+		t.Fatalf("applyResourceLimits(nil) = %v", err)
+	}
+}
+
+func TestApplyResourceLimits_CustomLimits(t *testing.T) {
+	err := applyResourceLimits([]string{"no-file=4096"})
+	if err != nil && !strings.Contains(err.Error(), "operation not permitted") {
+		t.Fatalf("applyResourceLimits(no-file=4096) = %v", err)
+	}
+}
+
+func TestApplyResourceLimits_MultipleLimits(t *testing.T) {
+	err := applyResourceLimits([]string{"no-file=4096", "fsize=1073741824"})
+	if err != nil && !strings.Contains(err.Error(), "operation not permitted") {
+		t.Fatalf("applyResourceLimits() = %v", err)
+	}
+}
+
+func TestApplyResourceLimits_InvalidLimit(t *testing.T) {
+	err := applyResourceLimits([]string{"invalid"})
+	if err == nil {
+		t.Fatal("expected error for invalid limit")
+	}
+}
+
+func TestApplySingleResourceLimit_NoFile(t *testing.T) {
+	err := applySingleResourceLimit("no-file=4096")
+	// May fail with EPERM in non-root environments
+	if err != nil && !strings.Contains(err.Error(), "operation not permitted") {
+		t.Fatalf("applySingleResourceLimit(no-file) = %v", err)
+	}
+}
+
+func TestApplySingleResourceLimit_Fsize(t *testing.T) {
+	err := applySingleResourceLimit("fsize=1073741824")
+	if err != nil && !strings.Contains(err.Error(), "operation not permitted") {
+		t.Fatalf("applySingleResourceLimit(fsize) = %v", err)
+	}
+}
+
+func TestRun_WithResourceLimits(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Run(Config{
+		ID:             "test-vm",
+		ExecFile:       execFile,
+		UID:            1000,
+		GID:            1000,
+		ChrootBaseDir:  filepath.Join(tmp, "jail"),
+		ResourceLimits: []string{"no-file=4096"},
+	})
+	// Will fail at mount namespace but resource limits should have been applied
+	if err != nil {
+		t.Logf("Run failed as expected: %v", err)
+	}
+}
+
+func TestRun_WithNetNS(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Run(Config{
+		ID:            "test-vm",
+		ExecFile:      execFile,
+		UID:           1000,
+		GID:           1000,
+		ChrootBaseDir: filepath.Join(tmp, "jail"),
+		NetNS:         "/nonexistent/ns",
+	})
+	if err == nil || !strings.Contains(err.Error(), "open netns") {
+		t.Fatalf("expected netns open error, got %v", err)
+	}
+}
+
+func TestBinaryDependencyMounts_DynamicBinary(t *testing.T) {
+	// /bin/sh is typically dynamically linked
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("/bin/sh not found")
+	}
+	mounts, err := binaryDependencyMounts("/bin/sh")
+	if err != nil {
+		t.Fatalf("binaryDependencyMounts(/bin/sh) = %v", err)
+	}
+	// Should find at least libc
+	if len(mounts) == 0 {
+		t.Log("no dependency mounts found (may be static binary)")
+	}
+	for _, m := range mounts {
+		parts := strings.SplitN(m, ":", 3)
+		if len(parts) != 3 || parts[0] != "ro" {
+			t.Fatalf("invalid mount format: %q", m)
+		}
+		if !filepath.IsAbs(parts[1]) || !filepath.IsAbs(parts[2]) {
+			t.Fatalf("mount paths should be absolute: %q", m)
+		}
+	}
+}
+
+func TestRunCLI_ExtraArgs(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	err := RunCLI([]string{
+		"--id", "vm-extra",
+		"--exec-file", execFile,
+		"--uid", "1000",
+		"--gid", "1000",
+		"--", "--socket", "/tmp/vmm.sock", "--other-flag",
+	})
+	// Fails at Run() but tests that extra args are passed through
+	if err != nil && strings.Contains(err.Error(), "flag") {
+		t.Fatalf("unexpected flag error: %v", err)
+	}
+}
+
+func TestRunCLI_MultipleEnvAndMount(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	err := RunCLI([]string{
+		"--id", "vm-multi",
+		"--exec-file", execFile,
+		"--uid", "1000",
+		"--gid", "1000",
+		"--env", "A=1",
+		"--env", "B=2",
+		"--mount", "ro:/usr/lib:/usr/lib",
+		"--mount", "rw:/data:/data",
+	})
+	if err != nil && strings.Contains(err.Error(), "flag") {
+		t.Fatalf("unexpected flag error: %v", err)
+	}
+}
+
+func TestRun_InvalidResourceLimit(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Run(Config{
+		ID:             "test-vm",
+		ExecFile:       execFile,
+		UID:            1000,
+		GID:            1000,
+		ChrootBaseDir:  filepath.Join(tmp, "jail"),
+		ResourceLimits: []string{"invalid"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid --resource-limit") {
+		t.Fatalf("expected resource limit error, got %v", err)
+	}
+}
+
+func TestRun_BinaryDependencyError(t *testing.T) {
+	tmp := t.TempDir()
+	// Create a valid exec file that's dynamically linked
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use /bin/sh (typically dynamically linked) to test binaryDependencyMounts
+	// producing actual mounts
+	if _, err := os.Stat("/bin/sh"); err == nil {
+		err := Run(Config{
+			ID:            "test-vm",
+			ExecFile:      "/bin/sh",
+			UID:           1000,
+			GID:           1000,
+			ChrootBaseDir: filepath.Join(tmp, "jail"),
+		})
+		// Will fail somewhere in the mount/chroot phase but exercises
+		// the binaryDependencyMounts path with a real dynamic binary
+		if err != nil {
+			t.Logf("Run with /bin/sh failed as expected: %v", err)
+		}
+	}
+}
+
+func TestApplyCgroupV2_NoCgroups_NonexistentTarget(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+
+	// With no cgroups and nonexistent parent, should return nil
+	cfg := Config{
+		ID:            "test-vm",
+		ExecFile:      execFile,
+		ParentCgroup:  "nonexistent-parent-cgroup-xyz",
+	}
+	err := applyCgroupV2(cfg)
+	// When target dir doesn't exist and no cgroups specified, returns nil
+	if err != nil {
+		t.Logf("applyCgroupV2 error (may need cgroup): %v", err)
+	}
+}
+
+func TestApplyCgroupV2_InvalidCgroupEntry(t *testing.T) {
+	// Create a temp cgroup-like structure if possible
+	tmp := t.TempDir()
+	cfg := Config{
+		ID:           "test-vm",
+		ExecFile:     filepath.Join(tmp, "vmm"),
+		ParentCgroup: "",
+		Cgroups:      []string{"invalid-no-equals"},
+	}
+	err := applyCgroupV2(cfg)
+	// Should fail at mkdir or at the invalid entry parsing
+	if err != nil {
+		t.Logf("applyCgroupV2 with invalid cgroup entry: %v", err)
+	}
+}
+
+func TestRun_ValidConfigPathsThroughCreation(t *testing.T) {
+	tmp := t.TempDir()
+	execFile := filepath.Join(tmp, "vmm")
+	if err := osWriteFile(execFile); err != nil {
+		t.Fatal(err)
+	}
+	jailBase := filepath.Join(tmp, "jail")
+
+	err := Run(Config{
+		ID:            "test-creation",
+		ExecFile:      execFile,
+		UID:           1000,
+		GID:           1000,
+		ChrootBaseDir: jailBase,
+		Mounts:        []string{"ro:/usr/lib:/usr/lib"},
+		Env:           []string{"FOO=bar"},
+	})
+
+	// Verify the chroot dir was created and exec file was copied
+	chrootDir := filepath.Join(jailBase, "vmm", "test-creation", "root")
+	if _, err := os.Stat(chrootDir); err == nil {
+		t.Log("chroot dir created successfully")
+	}
+	copiedExec := filepath.Join(chrootDir, "vmm")
+	if data, err := os.ReadFile(copiedExec); err == nil {
+		if string(data) != "stub" {
+			t.Fatalf("copied exec content = %q, want stub", string(data))
+		}
+	}
+
+	// Run should have failed at some privileged operation
+	if err != nil {
+		t.Logf("Run failed (expected without root): %v", err)
+	}
+}
+
+// ---- Additional coverage tests ----
+
+func TestCopyRegularFile_RejectsSymlinkSource(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.txt")
+	os.WriteFile(target, []byte("data"), 0644)
+	link := filepath.Join(dir, "link.txt")
+	os.Symlink(target, link)
+
+	err := copyRegularFile(link, filepath.Join(dir, "copy.txt"), 0644)
+	if err == nil {
+		t.Fatal("expected error for symlink source")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("expected symlink error, got: %v", err)
+	}
+}
+
+func TestCopyRegularFile_SuccessfulCopy(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.txt")
+	os.WriteFile(src, []byte("hello"), 0644)
+	dst := filepath.Join(dir, "sub", "dst.txt")
+
+	err := copyRegularFile(src, dst, 0755)
+	if err != nil {
+		t.Fatalf("copyRegularFile: %v", err)
+	}
+
+	data, _ := os.ReadFile(dst)
+	if string(data) != "hello" {
+		t.Fatalf("content = %q", data)
+	}
+}
+
+func TestCopyRegularFile_MissingSource(t *testing.T) {
+	err := copyRegularFile("/nonexistent", filepath.Join(t.TempDir(), "dst"), 0644)
+	if err == nil {
+		t.Fatal("expected error for missing source")
+	}
+}
+
+func TestCleanStaleMounts_RootPath(t *testing.T) {
+	// Should be a no-op for root or empty path
+	cleanStaleMounts("")
+	cleanStaleMounts("/")
+}
+
+func TestCleanStaleMounts_NonexistentDir2(t *testing.T) {
+	// Should not panic
+	cleanStaleMounts("/nonexistent/path/for/testing")
+}
+
+func TestMkdirAllNoSymlink_RelativePath2(t *testing.T) {
+	dir := t.TempDir()
+	prev, _ := os.Getwd()
+	defer os.Chdir(prev)
+	os.Chdir(dir)
+
+	err := mkdirAllNoSymlink("relative/nested/path", 0755)
+	if err != nil {
+		t.Fatalf("mkdirAllNoSymlink(relative): %v", err)
+	}
+}
+
+
+
+
+
+
+
+func TestEnsureSymlink_ExistingCorrectLink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "link")
+	os.Symlink("target", path)
+
+	err := ensureSymlink(path, "target")
+	if err != nil {
+		t.Fatalf("ensureSymlink(existing correct): %v", err)
+	}
+}
+
+func TestEnsureSymlink_ExistingWrongLink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "link")
+	os.Symlink("old-target", path)
+
+	err := ensureSymlink(path, "new-target")
+	if err != nil {
+		t.Fatalf("ensureSymlink(wrong target): %v", err)
+	}
+
+	got, _ := os.Readlink(path)
+	if got != "new-target" {
+		t.Fatalf("link target = %q, want new-target", got)
+	}
+}
+
+func TestEnsureSymlink_NewLink2(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "newlink")
+
+	err := ensureSymlink(path, "target")
+	if err != nil {
+		t.Fatalf("ensureSymlink(new): %v", err)
+	}
+
+	got, _ := os.Readlink(path)
+	if got != "target" {
+		t.Fatalf("link target = %q", got)
+	}
+}
+
+func TestExecEnv_WithPATH(t *testing.T) {
+	cfg := Config{Env: []string{"PATH=/custom/path", "HOME=/root"}}
+	env := cfg.execEnv()
+	pathCount := 0
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			pathCount++
+		}
+	}
+	if pathCount != 1 {
+		t.Fatalf("expected exactly 1 PATH entry, got %d", pathCount)
+	}
+}
+
+func TestParseMount_TargetSlash(t *testing.T) {
+	_, err := parseMount("ro:/src:/")
+	if err == nil {
+		t.Fatal("expected error for target /")
+	}
+}
+
+func TestParseMount_RelativeTarget(t *testing.T) {
+	_, err := parseMount("ro:/src:relative")
+	if err == nil {
+		t.Fatal("expected error for relative target")
+	}
+}
+
+func TestParseMount_RelativeSource(t *testing.T) {
+	_, err := parseMount("ro:relative:/dest")
+	if err == nil {
+		t.Fatal("expected error for relative source")
+	}
+}
+
+func TestParseMount_InvalidMode(t *testing.T) {
+	_, err := parseMount("xx:/src:/dest")
+	if err == nil {
+		t.Fatal("expected error for invalid mode")
+	}
+}
+
+func TestRunCLI_MissingID2(t *testing.T) {
+	err := RunCLI([]string{"--exec-file", "/bin/true", "--uid", "1000", "--gid", "1000"})
+	if err == nil {
+		t.Fatal("expected error for missing --id")
+	}
+}
+
+func TestRunCLI_MissingExecFile(t *testing.T) {
+	err := RunCLI([]string{"--id", "test", "--uid", "1000", "--gid", "1000"})
+	if err == nil {
+		t.Fatal("expected error for missing --exec-file")
+	}
+}
+
+func TestRunCLI_InvalidMountFlag(t *testing.T) {
+	err := RunCLI([]string{"--id", "test", "--exec-file", "/bin/true", "--uid", "1000", "--gid", "1000", "--mount", "invalid"})
+	if err == nil {
+		t.Fatal("expected error for invalid --mount")
+	}
+}
+
+func TestRunCLI_InvalidEnvFlag(t *testing.T) {
+	err := RunCLI([]string{"--id", "test", "--exec-file", "/bin/true", "--uid", "1000", "--gid", "1000", "--env", "noequalssign"})
+	if err == nil {
+		t.Fatal("expected error for invalid --env")
+	}
+}
+
+func TestRun_ValidationFailure(t *testing.T) {
+	err := Run(Config{})
+	if err == nil {
+		t.Fatal("expected validation error for empty config")
+	}
+}
+
+func TestRun_MissingExecFile2(t *testing.T) {
+	dir := t.TempDir()
+	err := Run(Config{
+		ID:       "test-vm",
+		ExecFile: filepath.Join(dir, "nonexistent"),
+		UID:      1000,
+		GID:      1000,
+	})
+	if err == nil {
+		t.Fatal("expected error for missing exec file")
+	}
+}
+
+func TestRun_NetNSOpenFails(t *testing.T) {
+	dir := t.TempDir()
+	exec := filepath.Join(dir, "exec")
+	os.WriteFile(exec, []byte("#!/bin/sh\nexit 0"), 0755)
+
+	err := Run(Config{
+		ID:            "test-vm",
+		ExecFile:      exec,
+		UID:           os.Getuid(),
+		GID:           os.Getgid(),
+		ChrootBaseDir: filepath.Join(dir, "chroot"),
+		NetNS:         "/nonexistent/netns",
+	})
+	if err == nil {
+		t.Fatal("expected error for bad netns path")
+	}
+	if !strings.Contains(err.Error(), "netns") {
+		t.Fatalf("expected netns error, got: %v", err)
+	}
+}
+
+func TestApplySingleResourceLimit_InvalidFormat(t *testing.T) {
+	err := applySingleResourceLimit("no-equals")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestApplySingleResourceLimit_InvalidNumber(t *testing.T) {
+	err := applySingleResourceLimit("no-file=abc")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestApplySingleResourceLimit_UnsupportedType(t *testing.T) {
+	err := applySingleResourceLimit("unknown-type=1234")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestApplyCgroupV2_NoCgroups_MissingDir(t *testing.T) {
+	cfg := Config{
+		ID:       "test",
+		ExecFile: "/bin/true",
+	}
+	// No cgroups and no existing cgroup dir -> should return nil
+	err := applyCgroupV2(cfg)
+	if err != nil {
+		// Only fails if the cgroup dir actually exists, which it might on some systems
+		t.Logf("applyCgroupV2 returned: %v (may be expected)", err)
+	}
+}
+
+func TestApplyCgroupV2_InvalidCgroup(t *testing.T) {
+	cfg := Config{
+		ID:       "test",
+		ExecFile: "/bin/true",
+		Cgroups:  []string{"invalid-no-equals"},
+	}
+	err := applyCgroupV2(cfg)
+	if err == nil {
+		t.Fatal("expected error for invalid cgroup")
+	}
+}

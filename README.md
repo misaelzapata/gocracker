@@ -262,7 +262,7 @@ I measured gocracker against Firecracker v1.10.1 on the same host, kernel and ro
 - **Guest**: 1 vCPU, 128 MiB RAM
 - **Kernel cmdline**: `console=ttyS0 reboot=t panic=-1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda rw init=/init 8250.nr_uarts=1`
 
-Both runtimes are driven by the same bash script ([boot_one.sh](/tmp/gocracker-bench/boot_one.sh)) which does:
+Both runtimes are driven by the same bash script which does:
 
 1. `fork-exec` of the VMM binary (`firecracker` or `gocracker-vmm`)
 2. Wait for the Unix socket to appear
@@ -358,29 +358,6 @@ Context from authoritative sources:
 - Guest rootfs runs `alpine init` with a full mount sequence, not a static-linked noop init.
 
 The **ratio between runtimes** on the same host is the useful number, and there gocracker is neck-and-neck with Firecracker. No single-VM public Firecracker figure supports a 2× jailer penalty — the 2× in their docs is specifically about parallel jail creation at scale.
-
-### Reproducing the benchmark
-
-Scripts and raw data live in `/tmp/gocracker-bench/`:
-
-- `boot_one.sh` — single-boot driver (used for the direct matrix)
-- `boot_jailer.sh` — same, but invokes the runtime under `firecracker-jailer` or `gocracker-jailer` (must be run as root)
-- `bench.sh` — runs the 4-phase matrix (A: direct, B: jailer, C: TAP, D: CLI)
-- `bench_cli.sh` — Phase D: `gocracker run` CLI comparison
-- `aggregate.py` — computes medians / p95 from `results.tsv`
-- `results.tsv` — 240 rows of raw data
-- `summary.md` — full writeup with the discussion
-
-```bash
-# Phases A + B (no sudo needed for A; B requires sudo)
-PHASES=AB RUNS=15 /tmp/gocracker-bench/bench.sh
-
-# Phase C (requires sudo and TAP setup)
-PHASES=C TAP_NAME=tap-gb0 /tmp/gocracker-bench/bench.sh
-
-# Aggregate
-python3 /tmp/gocracker-bench/aggregate.py
-```
 
 ## Documentation
 

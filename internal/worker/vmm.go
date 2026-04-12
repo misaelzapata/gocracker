@@ -20,7 +20,7 @@ import (
 
 const (
 	pollInterval   = 250 * time.Millisecond
-	socketWaitStep = 5 * time.Millisecond
+	socketWaitStep = 25 * time.Millisecond
 	socketWaitMax  = 10 * time.Second
 )
 
@@ -98,13 +98,13 @@ type remoteVM struct {
 	jailRoot string
 	created  time.Time
 
-	mu             sync.RWMutex
-	state          vmm.State
-	started        time.Time
-	uptime         time.Duration
-	devices        []vmm.DeviceInfo
-	logs           []byte
-	firstOutputAt  time.Time
+	mu            sync.RWMutex
+	state         vmm.State
+	started       time.Time
+	uptime        time.Duration
+	devices       []vmm.DeviceInfo
+	logs          []byte
+	firstOutputAt time.Time
 }
 
 // LaunchVMM is a thin wrapper over LaunchVMMWithTimings for callers that
@@ -651,28 +651,15 @@ func (r *remoteVM) DeviceList() []vmm.DeviceInfo {
 	return out
 }
 
-// FirstOutputAt returns the timestamp at which the guest first wrote
-// to the UART, as reported by the remote VMM's /vm endpoint. Returns
-// the zero time if the guest has not yet printed anything or the
-// remote call fails.
+// FirstOutputAt returns the cached timestamp at which the guest first
+// wrote to the UART. The value is updated by the poll() loop which
+// already refreshes VM info periodically — this method is a pure
+// accessor with no I/O to avoid HTTP polling storms when called in a
+// tight loop (e.g. the 2ms waitFirstOutput poller in container.go).
 func (r *remoteVM) FirstOutputAt() time.Time {
 	r.mu.RLock()
-	cached := r.firstOutputAt
-	r.mu.RUnlock()
-	if !cached.IsZero() {
-		return cached
-	}
-	// Poll the remote VMM for the latest value.
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	info, err := r.client.GetInfo(ctx)
-	if err != nil || info.FirstOutputAt.IsZero() {
-		return time.Time{}
-	}
-	r.mu.Lock()
-	r.firstOutputAt = info.FirstOutputAt
-	r.mu.Unlock()
-	return info.FirstOutputAt
+	defer r.mu.RUnlock()
+	return r.firstOutputAt
 }
 
 func (r *remoteVM) ConsoleOutput() []byte {
@@ -917,6 +904,9 @@ func (r *remoteVM) poll() {
 			r.state = state
 			r.uptime = up
 			r.devices = append(r.devices[:0], info.Devices...)
+			if r.firstOutputAt.IsZero() && !info.FirstOutputAt.IsZero() {
+				r.firstOutputAt = info.FirstOutputAt
+			}
 			r.mu.Unlock()
 			if state == vmm.StateStopped {
 				cancel()

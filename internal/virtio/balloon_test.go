@@ -115,3 +115,217 @@ func TestBalloonDevicePollStats(t *testing.T) {
 		t.Fatalf("target_mib = %d, want 64", stats.TargetMiB)
 	}
 }
+
+func TestBalloonDeviceFeatures_WithStats(t *testing.T) {
+	mem := make([]byte, 4<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{StatsPollingInterval: time.Second, DeflateOnOOM: true}, nil, nil)
+	defer dev.Close()
+
+	features := dev.DeviceFeatures()
+	if features == 0 {
+		t.Fatal("expected non-zero features")
+	}
+}
+
+func TestBalloonDeviceID(t *testing.T) {
+	mem := make([]byte, 4<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{}, nil, nil)
+	defer dev.Close()
+
+	if dev.DeviceID() != 5 {
+		t.Fatalf("DeviceID = %d, want 5", dev.DeviceID())
+	}
+}
+
+func TestBalloonDeviceConfigBytes(t *testing.T) {
+	mem := make([]byte, 4<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{}, nil, nil)
+	defer dev.Close()
+
+	cfg := dev.ConfigBytes()
+	if len(cfg) != 16 {
+		t.Fatalf("ConfigBytes len = %d, want 16", len(cfg))
+	}
+}
+
+func TestBalloonDeviceSetTargetMiB(t *testing.T) {
+	mem := make([]byte, 4<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{}, nil, nil)
+	defer dev.Close()
+
+	if err := dev.SetTargetMiB(2); err != nil {
+		t.Fatalf("SetTargetMiB: %v", err)
+	}
+	if balloonPagesToMiB(uint64(dev.targetPages)) != 2 {
+		t.Fatalf("TargetMiB = %d, want 128", balloonPagesToMiB(uint64(dev.targetPages)))
+	}
+}
+
+func TestBalloonDeviceDeflateOnOOM(t *testing.T) {
+	mem := make([]byte, 4<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{DeflateOnOOM: true}, nil, nil)
+	defer dev.Close()
+
+	if !dev.deflateOnOOM {
+		t.Fatal("deflateOnOOM should be true")
+	}
+	dev2 := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{DeflateOnOOM: false}, nil, nil)
+	defer dev2.Close()
+	if dev2.deflateOnOOM {
+		t.Fatal("deflateOnOOM should be false")
+	}
+}
+
+func TestBalloonDeviceSetStatsPollingInterval(t *testing.T) {
+	mem := make([]byte, 4<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{}, nil, nil)
+	defer dev.Close()
+
+	dev.SetStatsPollingInterval(5 * time.Second)
+	if dev.StatsPollingInterval() != 5*time.Second {
+		t.Fatalf("StatsPollingInterval = %v, want 5s", dev.StatsPollingInterval())
+	}
+}
+
+func TestBalloonDeviceAutoConservativeConfig(t *testing.T) {
+	mem := make([]byte, 4<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{AutoConservative: true}, nil, nil)
+	defer dev.Close()
+
+	if !dev.autoConservative {
+		t.Fatal("autoConservative should be true")
+	}
+}
+
+func TestBalloonDeviceActualPages(t *testing.T) {
+	mem := make([]byte, 4<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{}, nil, nil)
+	defer dev.Close()
+
+	if dev.actualPages != 0 {
+		t.Fatalf("initial ActualPages = %d, want 0", dev.actualPages)
+	}
+}
+
+func TestBalloonHelpers(t *testing.T) {
+	if mibToBalloonPages(1) != 256 {
+		t.Fatalf("mibToBalloonPages(1) = %d, want 256", mibToBalloonPages(1))
+	}
+	if balloonPagesToMiB(256) != 1 {
+		t.Fatalf("balloonPagesToMiB(256) = %d, want 1", balloonPagesToMiB(256))
+	}
+	if minUint64(10, 20) != 10 {
+		t.Fatal("minUint64(10, 20) should be 10")
+	}
+	if minUint64(20, 10) != 10 {
+		t.Fatal("minUint64(20, 10) should be 10")
+	}
+}
+
+func TestBalloonDeviceNextPollInterval(t *testing.T) {
+	mem := make([]byte, 4<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{
+		StatsPollingInterval: 3 * time.Second,
+	}, nil, nil)
+	defer dev.Close()
+
+	interval := dev.nextPollInterval()
+	if interval != 3*time.Second {
+		t.Fatalf("nextPollInterval = %v, want 3s", interval)
+	}
+}
+
+func TestBalloonDeviceNextPollInterval_AutoConservative(t *testing.T) {
+	mem := make([]byte, 4<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{
+		AutoConservative: true,
+	}, nil, nil)
+	defer dev.Close()
+
+	interval := dev.nextPollInterval()
+	if interval != balloonAutoInterval {
+		t.Fatalf("nextPollInterval = %v, want %v", interval, balloonAutoInterval)
+	}
+}
+
+func TestBalloonDeviceNextPollInterval_NoPoll(t *testing.T) {
+	mem := make([]byte, 4<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{}, nil, nil)
+	defer dev.Close()
+
+	interval := dev.nextPollInterval()
+	if interval != 0 {
+		t.Fatalf("nextPollInterval = %v, want 0", interval)
+	}
+}
+
+func TestBalloonConservativePolicy_NoPressureNoHighWater(t *testing.T) {
+	mem := make([]byte, 256<<20) // 256 MiB
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{
+		AutoConservative: true,
+	}, nil, nil)
+	defer dev.Close()
+
+	// No pressure, available within normal range
+	stats := BalloonStats{
+		TotalMemory:     200 << 20,
+		AvailableMemory: 100 << 20, // 100 MiB available
+	}
+	dev.applyConservativePolicy(stats)
+}
+
+func TestBalloonConservativePolicy_Pressure(t *testing.T) {
+	mem := make([]byte, 256<<20) // 256 MiB
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{
+		AutoConservative: true,
+	}, nil, nil)
+	defer dev.Close()
+
+	// Set a target first
+	dev.SetTargetMiB(64)
+
+	// Simulate pressure via low available memory
+	stats := BalloonStats{
+		TotalMemory:     200 << 20,
+		AvailableMemory: 10 << 20, // 10 MiB - below reserve
+	}
+	dev.applyConservativePolicy(stats)
+}
+
+func TestBalloonConservativePolicy_ZeroStats(t *testing.T) {
+	mem := make([]byte, 256<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{
+		AutoConservative: true,
+	}, nil, nil)
+	defer dev.Close()
+
+	// Zero stats should be a no-op
+	stats := BalloonStats{}
+	dev.applyConservativePolicy(stats)
+}
+
+func TestBalloonConservativePolicy_NotAutoConservative(t *testing.T) {
+	mem := make([]byte, 256<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{}, nil, nil)
+	defer dev.Close()
+
+	// Should return early when not in auto-conservative mode
+	stats := BalloonStats{
+		TotalMemory:     200 << 20,
+		AvailableMemory: 10 << 20,
+	}
+	dev.applyConservativePolicy(stats)
+}
+
+func TestBalloonSnapshotPagesLocked(t *testing.T) {
+	mem := make([]byte, 4<<20)
+	dev := NewBalloonDevice(mem, 0x1000, 5, BalloonDeviceConfig{}, nil, nil)
+	defer dev.Close()
+
+	dev.mu.Lock()
+	pages := dev.snapshotPagesLocked()
+	dev.mu.Unlock()
+	if len(pages) != 0 {
+		t.Fatalf("expected empty snapshot pages, got %d", len(pages))
+	}
+}
