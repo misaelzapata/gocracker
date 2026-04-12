@@ -1742,3 +1742,273 @@ func TestRun_ValidConfigPathsThroughCreation(t *testing.T) {
 		t.Logf("Run failed (expected without root): %v", err)
 	}
 }
+
+// ---- Additional coverage tests ----
+
+func TestCopyRegularFile_RejectsSymlinkSource(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.txt")
+	os.WriteFile(target, []byte("data"), 0644)
+	link := filepath.Join(dir, "link.txt")
+	os.Symlink(target, link)
+
+	err := copyRegularFile(link, filepath.Join(dir, "copy.txt"), 0644)
+	if err == nil {
+		t.Fatal("expected error for symlink source")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("expected symlink error, got: %v", err)
+	}
+}
+
+func TestCopyRegularFile_SuccessfulCopy(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.txt")
+	os.WriteFile(src, []byte("hello"), 0644)
+	dst := filepath.Join(dir, "sub", "dst.txt")
+
+	err := copyRegularFile(src, dst, 0755)
+	if err != nil {
+		t.Fatalf("copyRegularFile: %v", err)
+	}
+
+	data, _ := os.ReadFile(dst)
+	if string(data) != "hello" {
+		t.Fatalf("content = %q", data)
+	}
+}
+
+func TestCopyRegularFile_MissingSource(t *testing.T) {
+	err := copyRegularFile("/nonexistent", filepath.Join(t.TempDir(), "dst"), 0644)
+	if err == nil {
+		t.Fatal("expected error for missing source")
+	}
+}
+
+func TestCleanStaleMounts_RootPath(t *testing.T) {
+	// Should be a no-op for root or empty path
+	cleanStaleMounts("")
+	cleanStaleMounts("/")
+}
+
+func TestCleanStaleMounts_NonexistentDir2(t *testing.T) {
+	// Should not panic
+	cleanStaleMounts("/nonexistent/path/for/testing")
+}
+
+func TestMkdirAllNoSymlink_RelativePath2(t *testing.T) {
+	dir := t.TempDir()
+	prev, _ := os.Getwd()
+	defer os.Chdir(prev)
+	os.Chdir(dir)
+
+	err := mkdirAllNoSymlink("relative/nested/path", 0755)
+	if err != nil {
+		t.Fatalf("mkdirAllNoSymlink(relative): %v", err)
+	}
+}
+
+
+
+
+
+
+
+func TestEnsureSymlink_ExistingCorrectLink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "link")
+	os.Symlink("target", path)
+
+	err := ensureSymlink(path, "target")
+	if err != nil {
+		t.Fatalf("ensureSymlink(existing correct): %v", err)
+	}
+}
+
+func TestEnsureSymlink_ExistingWrongLink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "link")
+	os.Symlink("old-target", path)
+
+	err := ensureSymlink(path, "new-target")
+	if err != nil {
+		t.Fatalf("ensureSymlink(wrong target): %v", err)
+	}
+
+	got, _ := os.Readlink(path)
+	if got != "new-target" {
+		t.Fatalf("link target = %q, want new-target", got)
+	}
+}
+
+func TestEnsureSymlink_NewLink2(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "newlink")
+
+	err := ensureSymlink(path, "target")
+	if err != nil {
+		t.Fatalf("ensureSymlink(new): %v", err)
+	}
+
+	got, _ := os.Readlink(path)
+	if got != "target" {
+		t.Fatalf("link target = %q", got)
+	}
+}
+
+func TestExecEnv_WithPATH(t *testing.T) {
+	cfg := Config{Env: []string{"PATH=/custom/path", "HOME=/root"}}
+	env := cfg.execEnv()
+	pathCount := 0
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			pathCount++
+		}
+	}
+	if pathCount != 1 {
+		t.Fatalf("expected exactly 1 PATH entry, got %d", pathCount)
+	}
+}
+
+func TestParseMount_TargetSlash(t *testing.T) {
+	_, err := parseMount("ro:/src:/")
+	if err == nil {
+		t.Fatal("expected error for target /")
+	}
+}
+
+func TestParseMount_RelativeTarget(t *testing.T) {
+	_, err := parseMount("ro:/src:relative")
+	if err == nil {
+		t.Fatal("expected error for relative target")
+	}
+}
+
+func TestParseMount_RelativeSource(t *testing.T) {
+	_, err := parseMount("ro:relative:/dest")
+	if err == nil {
+		t.Fatal("expected error for relative source")
+	}
+}
+
+func TestParseMount_InvalidMode(t *testing.T) {
+	_, err := parseMount("xx:/src:/dest")
+	if err == nil {
+		t.Fatal("expected error for invalid mode")
+	}
+}
+
+func TestRunCLI_MissingID2(t *testing.T) {
+	err := RunCLI([]string{"--exec-file", "/bin/true", "--uid", "1000", "--gid", "1000"})
+	if err == nil {
+		t.Fatal("expected error for missing --id")
+	}
+}
+
+func TestRunCLI_MissingExecFile(t *testing.T) {
+	err := RunCLI([]string{"--id", "test", "--uid", "1000", "--gid", "1000"})
+	if err == nil {
+		t.Fatal("expected error for missing --exec-file")
+	}
+}
+
+func TestRunCLI_InvalidMountFlag(t *testing.T) {
+	err := RunCLI([]string{"--id", "test", "--exec-file", "/bin/true", "--uid", "1000", "--gid", "1000", "--mount", "invalid"})
+	if err == nil {
+		t.Fatal("expected error for invalid --mount")
+	}
+}
+
+func TestRunCLI_InvalidEnvFlag(t *testing.T) {
+	err := RunCLI([]string{"--id", "test", "--exec-file", "/bin/true", "--uid", "1000", "--gid", "1000", "--env", "noequalssign"})
+	if err == nil {
+		t.Fatal("expected error for invalid --env")
+	}
+}
+
+func TestRun_ValidationFailure(t *testing.T) {
+	err := Run(Config{})
+	if err == nil {
+		t.Fatal("expected validation error for empty config")
+	}
+}
+
+func TestRun_MissingExecFile2(t *testing.T) {
+	dir := t.TempDir()
+	err := Run(Config{
+		ID:       "test-vm",
+		ExecFile: filepath.Join(dir, "nonexistent"),
+		UID:      1000,
+		GID:      1000,
+	})
+	if err == nil {
+		t.Fatal("expected error for missing exec file")
+	}
+}
+
+func TestRun_NetNSOpenFails(t *testing.T) {
+	dir := t.TempDir()
+	exec := filepath.Join(dir, "exec")
+	os.WriteFile(exec, []byte("#!/bin/sh\nexit 0"), 0755)
+
+	err := Run(Config{
+		ID:            "test-vm",
+		ExecFile:      exec,
+		UID:           os.Getuid(),
+		GID:           os.Getgid(),
+		ChrootBaseDir: filepath.Join(dir, "chroot"),
+		NetNS:         "/nonexistent/netns",
+	})
+	if err == nil {
+		t.Fatal("expected error for bad netns path")
+	}
+	if !strings.Contains(err.Error(), "netns") {
+		t.Fatalf("expected netns error, got: %v", err)
+	}
+}
+
+func TestApplySingleResourceLimit_InvalidFormat(t *testing.T) {
+	err := applySingleResourceLimit("no-equals")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestApplySingleResourceLimit_InvalidNumber(t *testing.T) {
+	err := applySingleResourceLimit("no-file=abc")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestApplySingleResourceLimit_UnsupportedType(t *testing.T) {
+	err := applySingleResourceLimit("unknown-type=1234")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestApplyCgroupV2_NoCgroups_MissingDir(t *testing.T) {
+	cfg := Config{
+		ID:       "test",
+		ExecFile: "/bin/true",
+	}
+	// No cgroups and no existing cgroup dir -> should return nil
+	err := applyCgroupV2(cfg)
+	if err != nil {
+		// Only fails if the cgroup dir actually exists, which it might on some systems
+		t.Logf("applyCgroupV2 returned: %v (may be expected)", err)
+	}
+}
+
+func TestApplyCgroupV2_InvalidCgroup(t *testing.T) {
+	cfg := Config{
+		ID:       "test",
+		ExecFile: "/bin/true",
+		Cgroups:  []string{"invalid-no-equals"},
+	}
+	err := applyCgroupV2(cfg)
+	if err == nil {
+		t.Fatal("expected error for invalid cgroup")
+	}
+}

@@ -2071,3 +2071,309 @@ func TestCmdCompose_WithWaitAndSnapshotFlags(t *testing.T) {
 		t.Fatalf("expected compose up error, got: %s", msg)
 	}
 }
+
+// ---- Additional coverage tests ----
+
+func TestCmdComposeExec_WithDashDash(t *testing.T) {
+	dir := t.TempDir()
+	composeFile := filepath.Join(dir, "docker-compose.yml")
+	writeTestFile(t, composeFile, []byte("services:\n  web:\n    image: nginx\n"))
+
+	msg := catchFatal(t, func() {
+		cmdComposeExec([]string{
+			"--file", composeFile,
+			"--server", "http://127.0.0.1:1",
+			"web", "--", "echo", "hello",
+		})
+	})
+	if msg == "" {
+		t.Fatal("expected fatal to be called")
+	}
+}
+
+func TestCmdComposeExec_NoArgs(t *testing.T) {
+	msg := catchFatal(t, func() {
+		cmdComposeExec([]string{})
+	})
+	if !strings.Contains(msg, "service name") {
+		t.Fatalf("expected service name error, got: %s", msg)
+	}
+}
+
+func TestCmdCompose_DispatchesDown(t *testing.T) {
+	msg := catchFatal(t, func() {
+		cmdCompose([]string{"down"})
+	})
+	if !strings.Contains(msg, "server") {
+		t.Fatalf("expected server error from compose down, got: %s", msg)
+	}
+}
+
+func TestCmdCompose_DispatchesExec(t *testing.T) {
+	msg := catchFatal(t, func() {
+		cmdCompose([]string{"exec"})
+	})
+	if !strings.Contains(msg, "service name") {
+		t.Fatalf("expected service name error from compose exec, got: %s", msg)
+	}
+}
+
+func TestOpenLocalExecStream_DialError(t *testing.T) {
+	handle := &testHandle{
+		cfg: vmm.Config{
+			ID:   "vm-dial-err",
+			Exec: &vmm.ExecConfig{Enabled: true, VsockPort: 9999},
+		},
+		state: vmm.StateRunning,
+	}
+	handle.dial = func(port uint32) (net.Conn, error) {
+		return nil, errors.New("vsock dial failed")
+	}
+
+	_, err := openLocalExecStream(handle, internalapi.ExecRequest{Command: []string{"sh"}})
+	if err == nil {
+		t.Fatal("expected error from dial failure")
+	}
+	if !strings.Contains(err.Error(), "vsock dial failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestFormatConsoleTail_NegativeMaxLines(t *testing.T) {
+	got := formatConsoleTail([]byte("a\nb\nc\n"), -1)
+	if got != "a\nb\nc" {
+		t.Fatalf("formatConsoleTail with negative maxLines = %q", got)
+	}
+}
+
+func TestNormalizeCopyError_OpErrorWithOtherErr(t *testing.T) {
+	opErr := &net.OpError{Op: "read", Err: errors.New("connection reset")}
+	got := normalizeCopyError(opErr)
+	if got == nil {
+		t.Fatal("expected non-nil error for OpError with non-ErrClosed inner error")
+	}
+}
+
+func TestMultiKVFlag_SetAndMapMultiple(t *testing.T) {
+	var kv multiKVFlag
+	_ = kv.Set("FOO=bar")
+	_ = kv.Set("BAZ=qux=extra")
+	m := kv.Map()
+	if m["FOO"] != "bar" {
+		t.Fatalf("Map[FOO] = %q", m["FOO"])
+	}
+	if m["BAZ"] != "qux=extra" {
+		t.Fatalf("Map[BAZ] = %q", m["BAZ"])
+	}
+}
+
+func TestIsLoopbackTCPAddr_ExtendedCases(t *testing.T) {
+	tests := []struct {
+		addr string
+		want bool
+	}{
+		{"LOCALHOST:80", true},
+		{"Localhost:443", true},
+		{"127.0.0.1", true},
+		{"[::1]", true},
+		{"[127.0.0.1]:80", true},
+		{"10.0.0.1:80", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.addr, func(t *testing.T) {
+			got := isLoopbackTCPAddr(tt.addr)
+			if got != tt.want {
+				t.Errorf("isLoopbackTCPAddr(%q) = %v, want %v", tt.addr, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCmdRun_WithAllBalloonAndHotplug(t *testing.T) {
+	dir := t.TempDir()
+	kernel := filepath.Join(dir, "kernel")
+	writeTestFile(t, kernel, []byte("fake"))
+
+	msg := catchFatal(t, func() {
+		cmdRun([]string{
+			"--image", "alpine:latest",
+			"--kernel", kernel,
+			"--balloon-target-mib", "64",
+			"--balloon-deflate-on-oom",
+			"--balloon-stats-interval-s", "5",
+			"--balloon-auto", "conservative",
+			"--hotplug-total-mib", "512",
+			"--hotplug-slot-mib", "128",
+			"--hotplug-block-mib", "64",
+			"--mem", "256",
+			"--cpus", "2",
+			"--jailer", "off",
+		})
+	})
+	if msg == "" {
+		t.Fatal("expected fatal from container.Run")
+	}
+}
+
+func TestDefaultTrustedSnapshotDirs_DuplicateStateDir(t *testing.T) {
+	dirs := defaultTrustedSnapshotDirs("/tmp/gocracker-snapshots")
+	seen := map[string]bool{}
+	for _, d := range dirs {
+		if seen[d] {
+			t.Fatalf("duplicate entry in snapshot dirs: %s", d)
+		}
+		seen[d] = true
+	}
+}
+
+func TestRunLocalInteractiveVM_ExecDisabled(t *testing.T) {
+	handle := &testHandle{
+		cfg:   vmm.Config{ID: "vm-no-exec"},
+		state: vmm.StateRunning,
+	}
+	result := &container.RunResult{VM: handle, ID: "vm-no-exec"}
+	err := runLocalInteractiveVM(result, []string{"sh"})
+	if err == nil {
+		t.Fatal("expected error when exec is not enabled")
+	}
+	if !strings.Contains(err.Error(), "exec") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCmdServe_JailerOff_FailsAtListen(t *testing.T) {
+	msg := catchFatal(t, func() {
+		cmdServe([]string{
+			"--jailer", "off",
+			"--sock", "/nonexistent-dir-xxxx/gocracker-test.sock",
+		})
+	})
+	if strings.Contains(msg, "resolve") {
+		t.Fatalf("jailer=off should skip binary resolution, got: %s", msg)
+	}
+}
+
+func TestCmdComposeDown_WithServerAndFile(t *testing.T) {
+	dir := t.TempDir()
+	composeFile := filepath.Join(dir, "docker-compose.yml")
+	writeTestFile(t, composeFile, []byte("services:\n  web:\n    image: nginx\n"))
+
+	msg := catchFatal(t, func() {
+		cmdComposeDown([]string{
+			"--server", "http://127.0.0.1:1",
+			"--file", composeFile,
+		})
+	})
+	if msg == "" {
+		t.Fatal("expected fatal from compose down")
+	}
+}
+
+func TestCmdComposeExec_InteractiveModeFallsBack(t *testing.T) {
+	dir := t.TempDir()
+	composeFile := filepath.Join(dir, "docker-compose.yml")
+	writeTestFile(t, composeFile, []byte("services:\n  web:\n    image: nginx\n"))
+
+	// With no extra args (interactive mode), should still fail at LookupRemoteService
+	msg := catchFatal(t, func() {
+		cmdComposeExec([]string{
+			"--file", composeFile,
+			"--server", "http://127.0.0.1:1",
+			"web",
+		})
+	})
+	if msg == "" {
+		t.Fatal("expected fatal to be called")
+	}
+}
+
+func TestCmdCompose_WithServerFlag(t *testing.T) {
+	dir := t.TempDir()
+	kernel := filepath.Join(dir, "kernel")
+	writeTestFile(t, kernel, []byte("fake"))
+	composeFile := filepath.Join(dir, "docker-compose.yml")
+	writeTestFile(t, composeFile, []byte("services:\n  web:\n    image: nginx\n"))
+
+	msg := catchFatal(t, func() {
+		cmdCompose([]string{
+			"--kernel", kernel,
+			"--file", composeFile,
+			"--server", "http://127.0.0.1:1",
+			"--jailer", "off",
+		})
+	})
+	if msg == "" {
+		t.Fatal("expected fatal from compose up with unreachable server")
+	}
+}
+
+func TestOpenLocalExecStream_AckReturnsError(t *testing.T) {
+	handle := &testHandle{
+		cfg: vmm.Config{
+			ID:   "vm-ack-err",
+			Exec: &vmm.ExecConfig{Enabled: true, VsockPort: 1234},
+		},
+		state: vmm.StateRunning,
+	}
+	handle.dial = func(port uint32) (net.Conn, error) {
+		serverConn, clientConn := net.Pipe()
+		go func() {
+			defer serverConn.Close()
+			var req guestexec.Request
+			_ = guestexec.Decode(serverConn, &req)
+			_ = guestexec.Encode(serverConn, guestexec.Response{Error: "permission denied"})
+		}()
+		return clientConn, nil
+	}
+
+	_, err := openLocalExecStream(handle, internalapi.ExecRequest{Command: []string{"sh"}})
+	if err == nil {
+		t.Fatal("expected error from ack error response")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestCmdRestore_JailerOff_ValidSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	snapDir := filepath.Join(dir, "snap")
+	_ = os.MkdirAll(snapDir, 0755)
+	// Create a minimal snapshot with invalid data to trigger error after parsing
+	writeTestFile(t, filepath.Join(snapDir, "snapshot.json"), []byte("{}"))
+
+	msg := catchFatal(t, func() {
+		cmdRestore([]string{
+			"--snapshot", snapDir,
+			"--jailer", "off",
+			"--tty", "off",
+		})
+	})
+	if msg == "" {
+		t.Fatal("expected fatal from restore")
+	}
+}
+
+func TestResolveInteractiveRunCommand_EmptyOverrides(t *testing.T) {
+	// Both empty => nil
+	got := resolveInteractiveRunCommand(oci.ImageConfig{}, container.RunOptions{})
+	if got != nil {
+		t.Fatalf("expected nil for empty overrides, got %v", got)
+	}
+}
+
+func TestCmdServe_TCPAddr_WithAuth(t *testing.T) {
+	// TCP addr with auth token should pass validation but fail at listen
+	msg := catchFatal(t, func() {
+		cmdServe([]string{
+			"--addr", "10.0.0.1:8080",
+			"--auth-token", "secret123",
+			"--jailer", "off",
+		})
+	})
+	// Should fail at listen, not at auth validation
+	if strings.Contains(msg, "auth-token") {
+		t.Fatalf("expected listen error, not auth error: %s", msg)
+	}
+}

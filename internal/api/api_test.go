@@ -2617,3 +2617,226 @@ func TestMigrationFinalizeUsesRestoreWorkerHook(t *testing.T) {
 		t.Fatal("expected finalized vm to be registered")
 	}
 }
+
+// ---- Additional coverage tests ----
+
+func TestDecodeComposePortMappings_Empty(t *testing.T) {
+	mappings, err := decodeComposePortMappings(map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mappings != nil {
+		t.Fatalf("expected nil, got %v", mappings)
+	}
+}
+
+func TestDecodeComposePortMappings_ValidJSON(t *testing.T) {
+	meta := map[string]string{
+		composePortMappingsMetadataKey: `[{"host_port":8080,"guest_port":80,"protocol":"tcp"}]`,
+	}
+	mappings, err := decodeComposePortMappings(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mappings) != 1 {
+		t.Fatalf("expected 1 mapping, got %d", len(mappings))
+	}
+}
+
+func TestDecodeComposePortMappings_InvalidJSON(t *testing.T) {
+	meta := map[string]string{
+		composePortMappingsMetadataKey: `{broken`,
+	}
+	_, err := decodeComposePortMappings(meta)
+	if err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+}
+
+func TestPublicMetadata_FiltersInternal(t *testing.T) {
+	meta := map[string]string{
+		"user_key":                     "value",
+		"gocracker_internal_something": "hidden",
+		"another":                      "visible",
+	}
+	got := publicMetadata(meta)
+	if got["user_key"] != "value" || got["another"] != "visible" {
+		t.Fatalf("expected user keys, got %v", got)
+	}
+	if _, ok := got["gocracker_internal_something"]; ok {
+		t.Fatal("internal key should be filtered")
+	}
+}
+
+func TestPublicMetadata_Empty(t *testing.T) {
+	if publicMetadata(nil) != nil {
+		t.Fatal("expected nil for nil input")
+	}
+	if publicMetadata(map[string]string{}) != nil {
+		t.Fatal("expected nil for empty input")
+	}
+}
+
+func TestPublicMetadata_AllInternal(t *testing.T) {
+	meta := map[string]string{
+		"gocracker_internal_a": "x",
+		"gocracker_internal_b": "y",
+	}
+	if publicMetadata(meta) != nil {
+		t.Fatal("expected nil when all keys are internal")
+	}
+}
+
+func TestIsComposeVMMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]string
+		want     bool
+	}{
+		{"compose_metadata", map[string]string{"orchestrator": "compose", "stack_name": "mystack"}, true},
+		{"uppercase_orchestrator", map[string]string{"orchestrator": "COMPOSE", "stack_name": "mystack"}, true},
+		{"missing_stack", map[string]string{"orchestrator": "compose"}, false},
+		{"empty_stack", map[string]string{"orchestrator": "compose", "stack_name": ""}, false},
+		{"not_compose", map[string]string{"orchestrator": "other", "stack_name": "mystack"}, false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isComposeVMMetadata(tt.metadata)
+			if got != tt.want {
+				t.Errorf("isComposeVMMetadata(%v) = %v, want %v", tt.metadata, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCleanStopped_RemovesStoppedVMs(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	handle := newFakeHandle("stopped-vm")
+	handle.state = vmm.StateStopped
+	handle.cfg = vmm.Config{ID: "stopped-vm"}
+	srv.vms["stopped-vm"] = &vmEntry{
+		handle: handle,
+		kind:   "local",
+	}
+	srv.vms["running-vm"] = &vmEntry{
+		handle: newFakeHandle("running-vm"),
+		kind:   "local",
+	}
+
+	srv.cleanStopped()
+
+	if _, ok := srv.vms["stopped-vm"]; ok {
+		t.Fatal("stopped VM should have been removed")
+	}
+	if _, ok := srv.vms["running-vm"]; !ok {
+		t.Fatal("running VM should still be present")
+	}
+}
+
+func TestCleanStopped_Empty(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	// Should not panic
+	srv.cleanStopped()
+}
+
+func TestReleaseComposeStackResources_NonCompose(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	// Should not panic for non-compose metadata
+	srv.releaseComposeStackResources("vm-1", map[string]string{})
+}
+
+func TestHandleDrive_BadJSON(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/drives/rootfs", strings.NewReader("{broken"))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleNetworkIface_BadJSON(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/network-interfaces/eth0", strings.NewReader("{broken"))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleBalloonPut_BadJSON(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/balloon", strings.NewReader("{broken"))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleMemoryHotplugPut_BadJSON(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/hotplug/memory", strings.NewReader("{broken"))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleVMEventsStream_Success(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	handle := newFakeHandle("ev-vm")
+	handle.cfg = vmm.Config{ID: "ev-vm"}
+	srv.vms["ev-vm"] = &vmEntry{
+		handle: handle,
+		kind:   "local",
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/vms/ev-vm/events/stream", nil)
+
+	// Cancel request quickly since SSE will block
+	ctx, cancel := context.WithTimeout(req.Context(), 50*time.Millisecond)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	srv.ServeHTTP(rec, req)
+	// Should return 200 with SSE content type
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleBalloonStatsGet_PrebootNoBalloon(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	// No root VM, no balloon
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/balloon/statistics", nil)
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleBalloonStatsPatch_PrebootNoBalloon(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/balloon/statistics", strings.NewReader(`{"stats_polling_interval_s":5}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
+
+func TestHandleMemoryHotplugPatch_PrebootNoConfig(t *testing.T) {
+	srv := NewWithOptions(Options{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/hotplug/memory", strings.NewReader(`{"requested_size_mib":256}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+}
