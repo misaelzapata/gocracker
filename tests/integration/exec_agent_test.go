@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -38,6 +39,7 @@ func TestAPIServeRunExec(t *testing.T) {
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
+	serveCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := serveCmd.Start(); err != nil {
 		t.Fatalf("start serve command: %v", err)
 	}
@@ -117,6 +119,7 @@ func TestCLIComposeServeExec(t *testing.T) {
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
+	serveCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := serveCmd.Start(); err != nil {
 		t.Fatalf("start serve command: %v", err)
 	}
@@ -212,6 +215,7 @@ func TestCLIComposeExecInteractive(t *testing.T) {
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
+	serveCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := serveCmd.Start(); err != nil {
 		t.Fatalf("start serve command: %v", err)
 	}
@@ -393,13 +397,20 @@ func stopCommand(t *testing.T, cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	_ = cmd.Process.Signal(os.Interrupt)
+	// Kill the entire process group (parent + children like gocracker-vmm,
+	// virtiofsd) so inherited stdout pipes get closed and cmd.Wait returns.
+	pgid := cmd.Process.Pid
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	select {
-	case <-time.After(10 * time.Second):
-		_ = cmd.Process.Kill()
-		<-done
+	case <-time.After(5 * time.Second):
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			// Give up — don't block test cleanup forever.
+		}
 	case <-done:
 	}
 }
