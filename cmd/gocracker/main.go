@@ -903,12 +903,12 @@ func printResult(r *container.RunResult) {
 	if state == vmm.StateCreated && r.WorkerSocket != "" {
 		state = vmm.StateRunning
 	}
-	uptime := r.VM.Uptime().Round(time.Millisecond)
-	if uptime == 0 {
-		uptime = r.Duration
+	bootTime := r.Timings.Total.Round(time.Millisecond)
+	if bootTime == 0 {
+		bootTime = r.Duration
 	}
-	if uptime > 0 {
-		fmt.Printf("\n✓ VM %s is %s (%s)\n", r.ID, state, uptime)
+	if bootTime > 0 {
+		fmt.Printf("\n✓ VM %s is %s (%s)\n", r.ID, state, bootTime)
 	} else {
 		fmt.Printf("\n✓ VM %s is %s\n", r.ID, state)
 	}
