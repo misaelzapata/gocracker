@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -912,5 +913,236 @@ func TestInsertForwardedWorkerEnvFlags_AtStart(t *testing.T) {
 	result := insertForwardedWorkerEnvFlags(args, 0)
 	if result[0] != "--env" || result[1] != "GOCRACKER_SECCOMP=off" {
 		t.Fatalf("expected env flags at start, got %v", result)
+	}
+}
+
+// --- remoteVM unit tests (no real subprocess/client) ---
+
+func TestRemoteVM_State(t *testing.T) {
+	rvm := &remoteVM{state: vmm.StateRunning}
+	if rvm.State() != vmm.StateRunning {
+		t.Fatalf("State() = %v, want Running", rvm.State())
+	}
+}
+
+func TestRemoteVM_ID(t *testing.T) {
+	rvm := &remoteVM{cfg: vmm.Config{ID: "test-vm"}}
+	if rvm.ID() != "test-vm" {
+		t.Fatalf("ID() = %q", rvm.ID())
+	}
+}
+
+func TestRemoteVM_Uptime_NotStarted(t *testing.T) {
+	rvm := &remoteVM{state: vmm.StateCreated}
+	if rvm.Uptime() != 0 {
+		t.Fatalf("Uptime before start = %v", rvm.Uptime())
+	}
+}
+
+func TestRemoteVM_Uptime_Running(t *testing.T) {
+	rvm := &remoteVM{
+		state:   vmm.StateRunning,
+		started: time.Now().Add(-5 * time.Second),
+	}
+	up := rvm.Uptime()
+	if up < 4*time.Second || up > 10*time.Second {
+		t.Fatalf("Uptime() = %v, expected ~5s", up)
+	}
+}
+
+func TestRemoteVM_Uptime_Paused(t *testing.T) {
+	rvm := &remoteVM{
+		state:  vmm.StatePaused,
+		uptime: 10 * time.Second,
+	}
+	if rvm.Uptime() != 10*time.Second {
+		t.Fatalf("Uptime() = %v, want 10s", rvm.Uptime())
+	}
+}
+
+func TestRemoteVM_Events(t *testing.T) {
+	el := vmm.NewEventLog()
+	rvm := &remoteVM{events: el}
+	if rvm.Events() != el {
+		t.Fatal("Events() should return event log")
+	}
+}
+
+func TestRemoteVM_VMConfig(t *testing.T) {
+	rvm := &remoteVM{cfg: vmm.Config{MemMB: 512}}
+	if rvm.VMConfig().MemMB != 512 {
+		t.Fatalf("VMConfig().MemMB = %d", rvm.VMConfig().MemMB)
+	}
+}
+
+func TestRemoteVM_WorkerMetadata(t *testing.T) {
+	created := time.Now()
+	rvm := &remoteVM{
+		socket:   "/tmp/vmm.sock",
+		pid:      1234,
+		jailRoot: "/srv/jailer/root",
+		runDir:   "/tmp/run",
+		created:  created,
+	}
+	meta := rvm.WorkerMetadata()
+	if meta.Kind != "worker" {
+		t.Fatalf("Kind = %q", meta.Kind)
+	}
+	if meta.SocketPath != "/tmp/vmm.sock" {
+		t.Fatalf("SocketPath = %q", meta.SocketPath)
+	}
+	if meta.WorkerPID != 1234 {
+		t.Fatalf("WorkerPID = %d", meta.WorkerPID)
+	}
+	if meta.JailRoot != "/srv/jailer/root" {
+		t.Fatalf("JailRoot = %q", meta.JailRoot)
+	}
+	if meta.RunDir != "/tmp/run" {
+		t.Fatalf("RunDir = %q", meta.RunDir)
+	}
+	if meta.CreatedAt != created {
+		t.Fatalf("CreatedAt mismatch")
+	}
+}
+
+func TestRemoteVM_DeviceList_Empty(t *testing.T) {
+	rvm := &remoteVM{}
+	devices := rvm.DeviceList()
+	if len(devices) != 0 {
+		t.Fatalf("DeviceList() = %v, want empty", devices)
+	}
+}
+
+func TestRemoteVM_DeviceList_ReturnsCopy(t *testing.T) {
+	rvm := &remoteVM{
+		devices: []vmm.DeviceInfo{{Type: "virtio-net", IRQ: 5}},
+	}
+	devices := rvm.DeviceList()
+	if len(devices) != 1 || devices[0].Type != "virtio-net" {
+		t.Fatalf("DeviceList() = %v", devices)
+	}
+	// Ensure it's a copy
+	devices[0].Type = "modified"
+	if rvm.devices[0].Type != "virtio-net" {
+		t.Fatal("DeviceList() returned reference instead of copy")
+	}
+}
+
+func TestRemoteVM_Start(t *testing.T) {
+	rvm := &remoteVM{}
+	if err := rvm.Start(); err != nil {
+		t.Fatalf("Start() = %v", err)
+	}
+}
+
+func TestRemoteVM_WaitStopped_AlreadyDone(t *testing.T) {
+	rvm := &remoteVM{doneCh: make(chan struct{})}
+	close(rvm.doneCh)
+	if err := rvm.WaitStopped(context.Background()); err != nil {
+		t.Fatalf("WaitStopped = %v", err)
+	}
+}
+
+func TestRemoteVM_WaitStopped_ContextCanceled(t *testing.T) {
+	rvm := &remoteVM{doneCh: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := rvm.WaitStopped(ctx); err == nil {
+		t.Fatal("expected context error")
+	}
+}
+
+func TestRemoteVM_Finish(t *testing.T) {
+	called := false
+	rvm := &remoteVM{
+		doneCh:  make(chan struct{}),
+		events:  vmm.NewEventLog(),
+		cleanup: func() { called = true },
+	}
+	rvm.finish()
+
+	if rvm.State() != vmm.StateStopped {
+		t.Fatalf("state after finish = %v", rvm.State())
+	}
+	select {
+	case <-rvm.doneCh:
+	default:
+		t.Fatal("doneCh not closed")
+	}
+	if !called {
+		t.Fatal("cleanup not called")
+	}
+
+	// Idempotent
+	rvm.finish()
+}
+
+func TestRemoteVM_Finish_NoCleanup(t *testing.T) {
+	rvm := &remoteVM{
+		doneCh: make(chan struct{}),
+		events: vmm.NewEventLog(),
+	}
+	// Should not panic
+	rvm.finish()
+}
+
+func TestCopyTree_WithSymlink(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "dest")
+
+	// Create a regular file
+	os.WriteFile(filepath.Join(src, "file.txt"), []byte("content"), 0644)
+
+	// Create a symlink
+	os.Symlink("file.txt", filepath.Join(src, "link.txt"))
+
+	if err := copyTree(src, dst); err != nil {
+		t.Fatalf("copyTree: %v", err)
+	}
+
+	// Verify symlink is preserved
+	target, err := os.Readlink(filepath.Join(dst, "link.txt"))
+	if err != nil {
+		t.Fatalf("readlink: %v", err)
+	}
+	if target != "file.txt" {
+		t.Fatalf("symlink target = %q, want file.txt", target)
+	}
+}
+
+func TestCopyTree_NonexistentSource(t *testing.T) {
+	err := copyTree("/nonexistent/path", t.TempDir())
+	if err == nil {
+		t.Fatal("expected error for nonexistent source")
+	}
+}
+
+func TestJailerInstanceID_EdgeCases(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", "gocracker-vmm"},
+		{".", "gocracker-vmm"},
+		{"/", "gocracker-vmm"},
+		{"  ", "gocracker-vmm"},
+		{"/tmp/gocracker-vmm-worker-123", "gocracker-vmm-worker-123"},
+		{"/a/b/c", "c"},
+	}
+	for _, tt := range tests {
+		got := jailerInstanceID(tt.input)
+		if got != tt.want {
+			t.Errorf("jailerInstanceID(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestParseState_Coverage(t *testing.T) {
+	// Ensure "created" maps to StateCreated
+	if got := parseState("created"); got != vmm.StateCreated {
+		t.Fatalf("parseState(created) = %d", got)
+	}
+	if got := parseState("Created"); got != vmm.StateCreated {
+		t.Fatalf("parseState(Created) = %d", got)
 	}
 }

@@ -1190,9 +1190,14 @@ func resolveRequiredExistingPath(label, raw string) string {
 	return abs
 }
 
-func fatal(msg string) {
+// fatalFunc can be overridden in tests to avoid os.Exit.
+var fatalFunc = func(msg string) {
 	fmt.Fprintln(os.Stderr, "error:", msg)
 	os.Exit(1)
+}
+
+func fatal(msg string) {
+	fatalFunc(msg)
 }
 
 func splitComma(s string) []string {
