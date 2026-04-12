@@ -51,6 +51,13 @@ type Session struct {
 	stopOnce   sync.Once
 }
 
+var BufferPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 4096)
+		return &buf
+	},
+}
+
 func NewSession(mode Mode, wait bool, stdin, stdout *os.File) (*Session, error) {
 	if !wait {
 		if mode == ModeForce {
@@ -177,6 +184,10 @@ func (s *Session) Close() {
 		if s.master != nil {
 			_ = s.master.Close()
 		}
+		if s.stdin != nil {
+			// Force unblock any pending Read() on standard input.
+			_ = s.stdin.Close()
+		}
 		drainInput(s.stdin)
 		if s.rawState != nil {
 			_ = term.Restore(int(s.stdin.Fd()), s.rawState)
@@ -227,7 +238,9 @@ func (s *Session) pumpInput() {
 	// `exit` arriving as `xt`, etc.
 	const detachByte = 0x1d
 	filter := newInputReplyFilter()
-	buf := make([]byte, 1024)
+	bufPtr := BufferPool.Get().(*[]byte)
+	defer BufferPool.Put(bufPtr)
+	buf := *bufPtr
 	for {
 		n, err := s.stdin.Read(buf)
 		if n > 0 {
@@ -346,7 +359,9 @@ func isHostTerminalReply(seq []byte) bool {
 
 func (s *Session) pumpOutput() {
 	filter := terminalOutputFilter{}
-	buf := make([]byte, 1024)
+	bufPtr := BufferPool.Get().(*[]byte)
+	defer BufferPool.Put(bufPtr)
+	buf := *bufPtr
 	for {
 		n, err := s.master.Read(buf)
 		if n > 0 {
