@@ -143,7 +143,15 @@ func Run(cfg Config) error {
 	if err := dropPrivileges(cfg.UID, cfg.GID); err != nil {
 		return err
 	}
-	return syscall.Exec(execPathInJail, append([]string{execName}, cfg.ExtraArgs...), cfg.execEnv())
+	// Verify the binary exists before exec — syscall.Exec returns a raw
+	// errno ("no such file or directory") without any path context.
+	if _, err := os.Stat(execPathInJail); err != nil {
+		return fmt.Errorf("exec binary not found in jail: stat %s: %w", execPathInJail, err)
+	}
+	if err := syscall.Exec(execPathInJail, append([]string{execName}, cfg.ExtraArgs...), cfg.execEnv()); err != nil {
+		return fmt.Errorf("exec %s: %w", execPathInJail, err)
+	}
+	return nil // unreachable after successful exec
 }
 
 func (cfg Config) validate() error {
