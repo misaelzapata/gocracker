@@ -500,13 +500,16 @@ func runInteractiveConnWithIO(conn net.Conn, stdin *os.File, stdout io.Writer) e
 
 	select {
 	case inputErr := <-copyInputDone:
-		// Input copy finished first (user pressed a key after the guest
-		// closed the vsock, or stdin reached EOF). Close the conn to
-		// unblock the output copy's Read() — without this, net.Pipe's
-		// Read blocks forever because nobody closes the host end.
-		conn.Close()
-		<-copyOutputDone
-		return normalizeCopyError(inputErr)
+		// Input copy finished first. If it returned a real error (e.g.
+		// write to a closed vsock pipe), the remote has already gone away
+		// — force-close the conn so the output copy's Read() unblocks
+		// immediately. If input ended cleanly (EOF from stdin), the
+		// remote may still have data in flight, so wait for the output
+		// copy to drain naturally.
+		if normalizeCopyError(inputErr) != nil {
+			conn.Close()
+		}
+		return normalizeCopyError(<-copyOutputDone)
 	case outputErr := <-copyOutputDone:
 		if stdin != nil && stdin == os.Stdin {
 			restore() // Restore state before returning
