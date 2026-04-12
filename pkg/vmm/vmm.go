@@ -1367,7 +1367,7 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 	if err := seccomp.InstallThreadProfile(seccomp.ProfileVCPU); err != nil {
 		gclog.VMM.Error("install vcpu seccomp profile failed", "id", m.cfg.ID, "vcpu", vcpu.ID, "error", err)
 		m.events.Emit(EventError, fmt.Sprintf("install vcpu seccomp profile: %v", err))
-		runtime.UnlockOSThread()
+		// runtime.UnlockOSThread()
 		m.Stop()
 		m.runWG.Done()
 		return
@@ -1376,7 +1376,8 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 	defer m.runWG.Done()
 	defer func() {
 		m.unregisterVCPUThread(vcpu.ID)
-		runtime.UnlockOSThread()
+		// DO NOT unlock! The thread is tainted with strict seccomp.
+		// // runtime.UnlockOSThread()
 	}()
 	for {
 		if m.waitIfPaused(vcpu.ID) {

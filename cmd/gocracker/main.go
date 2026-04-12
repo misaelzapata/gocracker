@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"sync"
 	"io"
 	"net"
 	"net/http"
@@ -80,11 +81,11 @@ type interactiveMode struct {
 }
 
 var (
-	terminalGetFdInfo   = mobyterm.GetFdInfo
-	terminalSetRaw      = mobyterm.SetRawTerminal
-	terminalRestore     = mobyterm.RestoreTerminal
+	terminalGetFdInfo             = mobyterm.GetFdInfo
+	terminalSetRaw                = mobyterm.SetRawTerminal
+	terminalRestore               = mobyterm.RestoreTerminal
 	terminalOutput      io.Writer = os.Stdout
-	terminalInputReader          = os.Stdin
+	terminalInputReader           = os.Stdin
 )
 
 func main() {
@@ -311,6 +312,8 @@ func cmdRepo(args []string) {
 			fatal(err.Error())
 		}
 		stopVMAndWait(result.VM, 15*time.Second)
+		// Final newline to ensure the shell prompt redraws after VM stop messages.
+		fmt.Println()
 		return
 	}
 	if *wait {
@@ -477,16 +480,21 @@ func runInteractiveConn(conn net.Conn) error {
 
 func runInteractiveConnWithIO(conn net.Conn, stdin *os.File, stdout io.Writer) error {
 	defer conn.Close()
-	defer prepareInteractiveTerminal(stdin, stdout)()
+	restore := prepareInteractiveTerminal(stdin, stdout)
+	defer restore()
 	copyInputDone := make(chan error, 1)
 	go func() {
-		_, err := io.Copy(conn, stdin)
+		buf := console.BufferPool.Get().(*[]byte)
+		defer console.BufferPool.Put(buf)
+		_, err := io.CopyBuffer(conn, stdin, *buf)
 		closeNetWriter(conn)
 		copyInputDone <- err
 	}()
 	copyOutputDone := make(chan error, 1)
 	go func() {
-		_, err := io.Copy(stdout, conn)
+		buf := console.BufferPool.Get().(*[]byte)
+		defer console.BufferPool.Put(buf)
+		_, err := io.CopyBuffer(stdout, conn, *buf)
 		copyOutputDone <- err
 	}()
 
@@ -497,6 +505,10 @@ func runInteractiveConnWithIO(conn net.Conn, stdin *os.File, stdout io.Writer) e
 		}
 		return normalizeCopyError(<-copyOutputDone)
 	case outputErr := <-copyOutputDone:
+		if stdin != nil && stdin == os.Stdin {
+			restore() // Restore state before returning
+			_ = stdin.Close()
+		}
 		return normalizeCopyError(outputErr)
 	}
 }
@@ -513,13 +525,16 @@ func prepareInteractiveTerminal(stdin *os.File, stdout io.Writer) func() {
 	if err != nil {
 		return func() {}
 	}
+	var once sync.Once
 	return func() {
-		_ = terminalRestore(stdinFD, oldState)
-		if stdout != nil {
-			// Reset cursor visibility and print carriage return + newline
-			// so the shell prompt reappears cleanly after raw mode.
-			fmt.Fprint(stdout, "\033[?25h\r\n")
-		}
+		once.Do(func() {
+			_ = terminalRestore(stdinFD, oldState)
+			if stdout != nil {
+				// Reset cursor visibility and print carriage return + newline
+				// so the shell prompt reappears cleanly after raw mode.
+				fmt.Fprint(stdout, "\033[?25h\r\n")
+			}
+		})
 	}
 }
 
@@ -712,18 +727,18 @@ func cmdServe(args []string) {
 	}
 
 	srv := api.NewWithOptions(api.Options{
-		DefaultX86Boot: vmm.X86BootMode(*x86Boot),
-		JailerMode:     *jailerMode,
-		JailerBinary:   resolvedJailer,
-		VMMBinary:      resolvedVMM,
-		StateDir:       *stateDir,
-		CacheDir:       *cacheDir,
-		ChrootBaseDir:  *chrootBaseDir,
-		UID:            *uid,
-		GID:            *gid,
-		AuthToken:      strings.TrimSpace(*authToken),
-		TrustedKernelDirs: kernelDirs,
-		TrustedWorkDirs:   workDirs,
+		DefaultX86Boot:      vmm.X86BootMode(*x86Boot),
+		JailerMode:          *jailerMode,
+		JailerBinary:        resolvedJailer,
+		VMMBinary:           resolvedVMM,
+		StateDir:            *stateDir,
+		CacheDir:            *cacheDir,
+		ChrootBaseDir:       *chrootBaseDir,
+		UID:                 *uid,
+		GID:                 *gid,
+		AuthToken:           strings.TrimSpace(*authToken),
+		TrustedKernelDirs:   kernelDirs,
+		TrustedWorkDirs:     workDirs,
 		TrustedSnapshotDirs: snapshotDirs,
 	})
 	if *addr != "" {
@@ -883,8 +898,12 @@ func printResult(r *container.RunResult) {
 	if state == vmm.StateCreated && r.WorkerSocket != "" {
 		state = vmm.StateRunning
 	}
-	if r.Duration > 0 {
-		fmt.Printf("\n✓ VM %s is %s (%s)\n", r.ID, state, r.Duration)
+	uptime := r.VM.Uptime().Round(time.Millisecond)
+	if uptime == 0 {
+		uptime = r.Duration
+	}
+	if uptime > 0 {
+		fmt.Printf("\n✓ VM %s is %s (%s)\n", r.ID, state, uptime)
 	} else {
 		fmt.Printf("\n✓ VM %s is %s\n", r.ID, state)
 	}
@@ -899,9 +918,6 @@ func printResult(r *container.RunResult) {
 	}
 	if r.Gateway != "" {
 		fmt.Printf("  gw:     %s\n", r.Gateway)
-	}
-	if r.WorkerSocket != "" {
-		fmt.Printf("  worker: %s\n", r.WorkerSocket)
 	}
 }
 
