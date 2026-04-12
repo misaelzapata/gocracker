@@ -500,14 +500,16 @@ func runInteractiveConnWithIO(conn net.Conn, stdin *os.File, stdout io.Writer) e
 
 	select {
 	case inputErr := <-copyInputDone:
-		if err := normalizeCopyError(inputErr); err != nil {
-			return err
-		}
-		return normalizeCopyError(<-copyOutputDone)
+		// Input copy finished first (user pressed a key after the guest
+		// closed the vsock, or stdin reached EOF). Close the conn to
+		// unblock the output copy's Read() — without this, net.Pipe's
+		// Read blocks forever because nobody closes the host end.
+		conn.Close()
+		<-copyOutputDone
+		return normalizeCopyError(inputErr)
 	case outputErr := <-copyOutputDone:
 		if stdin != nil && stdin == os.Stdin {
 			restore() // Restore state before returning
-			_ = stdin.Close()
 		}
 		return normalizeCopyError(outputErr)
 	}
@@ -1098,7 +1100,7 @@ func closeNetWriter(conn net.Conn) {
 }
 
 func normalizeCopyError(err error) error {
-	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
 		return nil
 	}
 	if opErr, ok := err.(*net.OpError); ok && opErr.Err != nil {
