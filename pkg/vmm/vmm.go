@@ -254,12 +254,12 @@ type VM struct {
 
 	archBackend machineArchBackend
 
-	uart0      *uart.UART
-	i8042      *i8042.Device
-	pl011dev   any // reserved for future PL011 device, currently unused
-	gicDev      any   // *kvm.GICDevice on ARM64, nil on x86
-	irqEventFds []int // eventfds for irqfd-based interrupt delivery (ARM64)
-	transports  []*virtio.Transport
+	uart0         *uart.UART
+	i8042         *i8042.Device
+	pl011dev      any   // reserved for future PL011 device, currently unused
+	gicDev        any   // *kvm.GICDevice on ARM64, nil on x86
+	irqEventFds   []int // eventfds for irqfd-based interrupt delivery (ARM64)
+	transports    []*virtio.Transport
 	rngDev        *virtio.RNGDevice
 	balloonDev    *virtio.BalloonDevice
 	memoryHotplug *memoryHotplugState
@@ -1378,7 +1378,9 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 	if err := seccomp.InstallThreadProfile(seccomp.ProfileVCPU); err != nil {
 		gclog.VMM.Error("install vcpu seccomp profile failed", "id", m.cfg.ID, "vcpu", vcpu.ID, "error", err)
 		m.events.Emit(EventError, fmt.Sprintf("install vcpu seccomp profile: %v", err))
-		// runtime.UnlockOSThread()
+		// Seccomp was NOT installed, so the thread is clean — unlock it
+		// to avoid leaking a locked OS thread.
+		runtime.UnlockOSThread()
 		m.Stop()
 		m.runWG.Done()
 		return
@@ -1387,8 +1389,8 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 	defer m.runWG.Done()
 	defer func() {
 		m.unregisterVCPUThread(vcpu.ID)
-		// DO NOT unlock! The thread is tainted with strict seccomp.
-		// // runtime.UnlockOSThread()
+		// DO NOT unlock after successful seccomp install — the thread
+		// is tainted with a strict filter and must not be reused.
 	}()
 	for {
 		if m.waitIfPaused(vcpu.ID) {

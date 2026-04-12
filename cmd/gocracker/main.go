@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"sync"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -87,6 +87,13 @@ var (
 	terminalOutput      io.Writer = os.Stdout
 	terminalInputReader           = os.Stdin
 )
+
+var ioCopyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 4096)
+		return &buf
+	},
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -484,16 +491,16 @@ func runInteractiveConnWithIO(conn net.Conn, stdin *os.File, stdout io.Writer) e
 	defer restore()
 	copyInputDone := make(chan error, 1)
 	go func() {
-		buf := console.BufferPool.Get().(*[]byte)
-		defer console.BufferPool.Put(buf)
+		buf := ioCopyBufPool.Get().(*[]byte)
+		defer ioCopyBufPool.Put(buf)
 		_, err := io.CopyBuffer(conn, stdin, *buf)
 		closeNetWriter(conn)
 		copyInputDone <- err
 	}()
 	copyOutputDone := make(chan error, 1)
 	go func() {
-		buf := console.BufferPool.Get().(*[]byte)
-		defer console.BufferPool.Put(buf)
+		buf := ioCopyBufPool.Get().(*[]byte)
+		defer ioCopyBufPool.Put(buf)
 		_, err := io.CopyBuffer(stdout, conn, *buf)
 		copyOutputDone <- err
 	}()

@@ -51,7 +51,7 @@ type Session struct {
 	stopOnce   sync.Once
 }
 
-var BufferPool = sync.Pool{
+var bufferPool = sync.Pool{
 	New: func() interface{} {
 		buf := make([]byte, 4096)
 		return &buf
@@ -178,25 +178,24 @@ func (s *Session) Close() {
 			signal.Stop(s.sigCh)
 			close(s.sigCh)
 		}
+		// Restore terminal state BEFORE closing anything — term.Restore
+		// needs a valid FD on stdin. Closing stdin first would make the
+		// Fd() call return an invalid descriptor.
+		if s.rawState != nil {
+			_ = term.Restore(int(s.stdin.Fd()), s.rawState)
+			// Show cursor and print newline so the shell prompt
+			// reappears cleanly after raw mode.
+			fmt.Fprint(s.stdout, "\033[?25h\r\n")
+		}
 		if s.slave != nil {
 			_ = s.slave.Close()
 		}
+		// Close the master PTY to unblock pumpInput (blocked on
+		// master.Write) and pumpOutput (blocked on master.Read).
 		if s.master != nil {
 			_ = s.master.Close()
 		}
-		if s.stdin != nil {
-			// Force unblock any pending Read() on standard input.
-			_ = s.stdin.Close()
-		}
 		drainInput(s.stdin)
-		if s.rawState != nil {
-			_ = term.Restore(int(s.stdin.Fd()), s.rawState)
-			// Reset terminal to sane state and print newline so the
-			// shell prompt reappears without requiring Enter.
-			// \033c = RIS (Reset to Initial State)
-			// \033[?25h = show cursor (in case it was hidden)
-			fmt.Fprint(s.stdout, "\033[?25h\r\n")
-		}
 	})
 }
 
@@ -238,8 +237,8 @@ func (s *Session) pumpInput() {
 	// `exit` arriving as `xt`, etc.
 	const detachByte = 0x1d
 	filter := newInputReplyFilter()
-	bufPtr := BufferPool.Get().(*[]byte)
-	defer BufferPool.Put(bufPtr)
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
 	buf := *bufPtr
 	for {
 		n, err := s.stdin.Read(buf)
@@ -359,8 +358,8 @@ func isHostTerminalReply(seq []byte) bool {
 
 func (s *Session) pumpOutput() {
 	filter := terminalOutputFilter{}
-	bufPtr := BufferPool.Get().(*[]byte)
-	defer BufferPool.Put(bufPtr)
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
 	buf := *bufPtr
 	for {
 		n, err := s.master.Read(buf)
