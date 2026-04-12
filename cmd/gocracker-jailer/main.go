@@ -4,14 +4,22 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/gocracker/gocracker/internal/jailer"
 )
 
+var runJailerCLI = jailer.RunCLI
+
 func main() {
-	if err := jailer.RunCLI(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+	os.Exit(run(os.Args[1:], os.Stderr))
+}
+
+func run(args []string, stderr io.Writer) int {
+	if err := runJailerCLI(args); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
 	}
+	return 0
 }

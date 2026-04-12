@@ -83,6 +83,19 @@ func TestDefaultChrootBaseDir(t *testing.T) {
 	}
 }
 
+func TestJailerInstanceIDUsesRunDirBasename(t *testing.T) {
+	runDir := "/tmp/gocracker-vmm-worker-293311611"
+	if got := jailerInstanceID(runDir); got != "gocracker-vmm-worker-293311611" {
+		t.Fatalf("jailerInstanceID(%q) = %q", runDir, got)
+	}
+}
+
+func TestJailerInstanceIDFallsBackForInvalidPath(t *testing.T) {
+	if got := jailerInstanceID(""); got != "gocracker-vmm" {
+		t.Fatalf("jailerInstanceID(\"\") = %q", got)
+	}
+}
+
 func TestParseState(t *testing.T) {
 	tests := []struct {
 		input string

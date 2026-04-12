@@ -4,7 +4,7 @@ CMD      := ./cmd/gocracker
 TARGET_GOOS ?= linux
 TARGET_GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: all build build-amd64 build-arm64 generate tidy test clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs hostcheck
+.PHONY: all build build-amd64 build-arm64 generate tidy test coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs hostcheck
 
 all: build
 
@@ -32,6 +32,9 @@ tidy:
 
 test:
 	go test ./...
+
+coverage:
+	./tools/coverage-repo.sh
 
 kernel-host:
 	./tools/prepare-kernel.sh --profile standard

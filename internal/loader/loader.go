@@ -9,12 +9,14 @@ import (
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"os"
+	"sync"
+
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 	"github.com/ulikunitz/xz"
 	"github.com/ulikunitz/xz/lzma"
-	"io"
-	"os"
 )
 
 // bzImage setup header offsets (Documentation/x86/boot.rst)
@@ -242,6 +244,10 @@ func loadELF(mem, data []byte) (*KernelInfo, error) {
 	defer ef.Close()
 
 	var kernEnd uint64
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(ef.Progs))
+	var mu sync.Mutex
+
 	for _, ph := range ef.Progs {
 		if ph.Type != elf.PT_LOAD {
 			continue
@@ -250,15 +256,27 @@ func loadELF(mem, data []byte) (*KernelInfo, error) {
 			return nil, fmt.Errorf("ELF segment [%#x,%#x) exceeds guest RAM",
 				ph.Paddr, ph.Paddr+ph.Memsz)
 		}
-		seg := make([]byte, ph.Filesz)
-		if _, err := ph.ReadAt(seg, 0); err != nil {
-			return nil, fmt.Errorf("read ELF segment: %w", err)
-		}
-		copy(mem[ph.Paddr:], seg)
-		end := ph.Paddr + ph.Memsz
-		if end > kernEnd {
-			kernEnd = end
-		}
+		wg.Add(1)
+		go func(ph *elf.Prog) {
+			defer wg.Done()
+			seg := make([]byte, ph.Filesz)
+			if _, err := ph.ReadAt(seg, 0); err != nil {
+				errCh <- fmt.Errorf("read ELF segment: %w", err)
+				return
+			}
+			copy(mem[ph.Paddr:], seg)
+			end := ph.Paddr + ph.Memsz
+			mu.Lock()
+			if end > kernEnd {
+				kernEnd = end
+			}
+			mu.Unlock()
+		}(ph)
+	}
+	wg.Wait()
+	close(errCh)
+	if err := <-errCh; err != nil {
+		return nil, err
 	}
 
 	return &KernelInfo{

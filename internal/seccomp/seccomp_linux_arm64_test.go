@@ -22,56 +22,32 @@ func TestProfileProgramIncludesArchGuardAndAllowsSyscalls(t *testing.T) {
 	if prog[len(prog)-1].K != unix.SECCOMP_RET_KILL_PROCESS {
 		t.Fatalf("final action = %#x, want kill", prog[len(prog)-1].K)
 	}
-	allowFound := false
-	for _, insn := range prog {
-		if insn.K == uint32(unix.SYS_IOCTL) {
-			allowFound = true
-			break
+	for _, nr := range []uint32{
+		uint32(unix.SYS_IOCTL),
+		uint32(unix.SYS_RSEQ),
+		uint32(unix.SYS_CLONE3),
+		uint32(unix.SYS_FSYNC),
+		uint32(unix.SYS_FCNTL),
+		uint32(unix.SYS_KILL),
+		uint32(unix.SYS_SETITIMER),
+		uint32(unix.SYS_TIMER_CREATE),
+		uint32(unix.SYS_TIMER_SETTIME),
+		uint32(unix.SYS_TIMER_DELETE),
+		uint32(unix.SYS_FACCESSAT),
+	} {
+		if !profileProgramIncludesSyscall(prog, nr) {
+			t.Fatalf("expected syscall %d in vcpu profile", nr)
 		}
 	}
-	if !allowFound {
-		t.Fatal("expected ioctl syscall in vcpu profile")
-	}
-	rseqFound := false
+}
+
+func profileProgramIncludesSyscall(prog []unix.SockFilter, nr uint32) bool {
 	for _, insn := range prog {
-		if insn.K == uint32(unix.SYS_RSEQ) {
-			rseqFound = true
-			break
+		if insn.K == nr {
+			return true
 		}
 	}
-	if !rseqFound {
-		t.Fatal("expected rseq syscall in vcpu profile")
-	}
-	clone3Found := false
-	for _, insn := range prog {
-		if insn.K == uint32(unix.SYS_CLONE3) {
-			clone3Found = true
-			break
-		}
-	}
-	if !clone3Found {
-		t.Fatal("expected clone3 syscall in vcpu profile")
-	}
-	fsyncFound := false
-	for _, insn := range prog {
-		if insn.K == uint32(unix.SYS_FSYNC) {
-			fsyncFound = true
-			break
-		}
-	}
-	if !fsyncFound {
-		t.Fatal("expected fsync syscall in vcpu profile")
-	}
-	fcntlFound := false
-	for _, insn := range prog {
-		if insn.K == uint32(unix.SYS_FCNTL) {
-			fcntlFound = true
-			break
-		}
-	}
-	if !fcntlFound {
-		t.Fatal("expected fcntl syscall in vcpu profile")
-	}
+	return false
 }
 
 func TestDisabledEnvSwitch(t *testing.T) {

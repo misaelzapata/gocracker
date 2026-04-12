@@ -15,6 +15,23 @@ jobs:
       - name: Unit and package tests
         run: go test $(go list ./... | grep -v /tests/integration)
 
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Repo-wide coverage summary
+        run: |
+          chmod +x ./tools/coverage-repo.sh
+          ./tools/coverage-repo.sh --threshold 90 --warn-only --summary-file coverage-summary.txt
+      - name: Upload coverage summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: coverage-summary.txt
+
   privileged-integration:
     runs-on: ubuntu-latest
     steps:

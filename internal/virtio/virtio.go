@@ -9,10 +9,10 @@ import (
 )
 
 const (
-	MaxQueueSize              = 256
-	MaxDescriptorChainLength  = MaxQueueSize
-	MaxDescriptorSizeBytes    = 16 << 20
-	MaxDescriptorChainBytes   = 64 << 20
+	MaxQueueSize             = 256
+	MaxDescriptorChainLength = MaxQueueSize
+	MaxDescriptorSizeBytes   = 16 << 20
+	MaxDescriptorChainBytes  = 64 << 20
 )
 
 // ---- Virtio MMIO register offsets (virtio spec 4.2.2) ----
@@ -148,7 +148,7 @@ func (q *Queue) IterAvail(fn func(head uint16)) error {
 		q.mu.Unlock()
 		return err
 	}
-	
+
 	// Collect available heads
 	var heads []uint16
 	for q.LastAvail != avail.Idx {
@@ -180,7 +180,7 @@ func (q *Queue) ConsumeAvail(fn func(head uint16)) (bool, error) {
 	head := avail.Ring[q.LastAvail%uint16(q.Size)]
 	q.LastAvail++
 	q.mu.Unlock()
-	
+
 	fn(head)
 	return true, nil
 }

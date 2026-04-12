@@ -15,6 +15,12 @@ import (
 	"github.com/gocracker/gocracker/internal/oci"
 )
 
+var (
+	pullImage       = oci.Pull
+	extractToDir    = func(img *oci.PulledImage, dir string) error { return img.ExtractToDir(dir) }
+	buildDockerfile = dockerfile.Build
+)
+
 type BuildRequest struct {
 	Image      string            `json:"image,omitempty"`
 	Dockerfile string            `json:"dockerfile,omitempty"`
@@ -112,18 +118,18 @@ func buildFromImage(outputDir, ref, cacheDir string) (oci.ImageConfig, error) {
 	if base == "" {
 		base = filepath.Join(os.TempDir(), "gocracker", "cache")
 	}
-	pulled, err := oci.Pull(oci.PullOptions{
+	pulled, err := pullImage(oci.PullOptions{
 		Ref:      ref,
 		CacheDir: filepath.Join(base, "layers"),
 	})
 	if err != nil {
 		return oci.ImageConfig{}, err
 	}
-	return pulled.Config, pulled.ExtractToDir(outputDir)
+	return pulled.Config, extractToDir(pulled, outputDir)
 }
 
 func buildFromDockerfile(outputDir string, req BuildRequest) (oci.ImageConfig, error) {
-	result, err := dockerfile.Build(dockerfile.BuildOptions{
+	result, err := buildDockerfile(dockerfile.BuildOptions{
 		DockerfilePath: req.Dockerfile,
 		ContextDir:     req.Context,
 		BuildArgs:      req.BuildArgs,
