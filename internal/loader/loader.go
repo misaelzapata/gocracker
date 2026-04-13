@@ -265,7 +265,7 @@ func loadELF(mem, data []byte) (*KernelInfo, error) {
 		if ph.Filesz > uint64(math.MaxInt) {
 			return nil, fmt.Errorf("ELF segment filesz %#x exceeds addressable range", ph.Filesz)
 		}
-		if ph.Paddr+ph.Filesz > uint64(len(mem)) {
+		if ph.Filesz > math.MaxUint64-ph.Paddr || ph.Paddr+ph.Filesz > uint64(len(mem)) {
 			return nil, fmt.Errorf("ELF segment [%#x,%#x) filesz exceeds guest RAM",
 				ph.Paddr, ph.Paddr+ph.Filesz)
 		}

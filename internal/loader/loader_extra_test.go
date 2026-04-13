@@ -391,10 +391,12 @@ func TestMatchCompressionXZ(t *testing.T) {
 }
 
 func TestMatchCompressionLZMA(t *testing.T) {
-	// LZMA magic: 0x5D 0x00
+	// LZMA magic: 0x5D 0x00 — matchCompression checks a prefix.
 	data := []byte{0x5D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	_, found := matchCompression(data)
-	_ = found // may or may not match depending on data validity
+	reader, found := matchCompression(data)
+	if found && reader == nil {
+		t.Fatal("found=true but reader is nil")
+	}
 }
 
 func TestLoadELFSegmentTooLarge(t *testing.T) {
