@@ -167,7 +167,9 @@ func TestPackCpioGzWithSymlink(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "target.txt"), []byte("hello"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	os.Symlink("target.txt", filepath.Join(dir, "link.txt"))
+	if err := os.Symlink("target.txt", filepath.Join(dir, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
 
 	output := filepath.Join(t.TempDir(), "test.cpio.gz")
 	if err := packCpioGz(dir, output); err != nil {
