@@ -169,7 +169,7 @@ func TestQueueReset(t *testing.T) {
 
 	if q.Size != MaxQueueSize || q.Ready || q.LastAvail != 0 ||
 		q.DescAddr != 0 || q.DriverAddr != 0 || q.DeviceAddr != 0 {
-		t.Fatalf("queue not properly reset: %+v", *q)
+		t.Fatalf("queue not properly reset: size=%d ready=%v lastAvail=%d", q.Size, q.Ready, q.LastAvail)
 	}
 }
 

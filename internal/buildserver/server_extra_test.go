@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"time"
 	"strings"
 	"testing"
 
@@ -220,11 +221,15 @@ func TestListenUnixCreatesSocket(t *testing.T) {
 	}()
 
 	// Wait for socket to appear
-	for i := 0; i < 100; i++ {
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
 		if _, err := os.Stat(sockPath); err == nil {
 			break
 		}
-		// Give it a moment
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(sockPath); err != nil {
+		t.Fatalf("socket %s did not appear within 3s", sockPath)
 	}
 
 	// Verify we can connect

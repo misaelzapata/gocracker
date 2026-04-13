@@ -49,7 +49,6 @@ func run(args []string, stderr io.Writer) int {
 	go func() {
 		<-sigCh
 		srv.Close()
-		os.Exit(0)
 	}()
 
 	if err := srv.ListenUnix(*socketPath); err != nil {

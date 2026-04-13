@@ -49,7 +49,9 @@ func TestAccessLogMiddlewareError(t *testing.T) {
 func TestLogHTTPAccessLevels(t *testing.T) {
 	var buf bytes.Buffer
 	h := &cliHandler{w: &buf, level: slog.LevelDebug}
+	prev := slog.Default()
 	slog.SetDefault(slog.New(h))
+	defer slog.SetDefault(prev)
 	logger := WithComponent("test-http")
 
 	// 200 - Info
