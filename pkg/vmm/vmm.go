@@ -379,8 +379,18 @@ func New(cfg Config) (*VM, error) {
 		}
 		m.vcpus = append(m.vcpus, vcpu)
 	}
+	vcpuErrs := make([]error, len(m.vcpus))
+	var vcpuWG sync.WaitGroup
 	for i, vcpu := range m.vcpus {
-		if err := m.archBackend.setupVCPU(m, vcpu, i, kernelInfo); err != nil {
+		vcpuWG.Add(1)
+		go func(i int, vcpu *kvm.VCPU) {
+			defer vcpuWG.Done()
+			vcpuErrs[i] = m.archBackend.setupVCPU(m, vcpu, i, kernelInfo)
+		}(i, vcpu)
+	}
+	vcpuWG.Wait()
+	for _, err := range vcpuErrs {
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -1156,24 +1166,34 @@ func (m *VM) loadKernel() (*loader.KernelInfo, error) {
 	}
 	copy(mem[CmdlineAddr:], cmdline+"\x00")
 
-	// Load initrd — place after kernel to avoid overlap with ELF segments
 	var initrdAddr, initrdSize uint64
 	if m.cfg.InitrdPath != "" {
-		initrd, err := os.ReadFile(m.cfg.InitrdPath)
+		f, err := os.Open(m.cfg.InitrdPath)
 		if err != nil {
-			return nil, fmt.Errorf("read initrd: %w", err)
+			return nil, fmt.Errorf("open initrd: %w", err)
 		}
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("stat initrd: %w", err)
+		}
+		size := uint64(fi.Size())
 		// Place initrd at max(InitrdAddr, kernelEnd rounded up to 2MiB)
 		iAddr := uint64(InitrdAddr)
 		if info.KernelEnd > iAddr {
 			iAddr = (info.KernelEnd + 0x1FFFFF) &^ 0x1FFFFF // align 2MiB
 		}
-		if iAddr+uint64(len(initrd)) > uint64(len(mem)) {
-			return nil, fmt.Errorf("initrd at %#x (%d bytes) exceeds guest RAM", iAddr, len(initrd))
+		if iAddr+size > uint64(len(mem)) {
+			f.Close()
+			return nil, fmt.Errorf("initrd at %#x (%d bytes) exceeds guest RAM", iAddr, size)
 		}
-		copy(mem[iAddr:], initrd)
+		if _, err := io.ReadFull(f, mem[iAddr:iAddr+size]); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("read initrd: %w", err)
+		}
+		f.Close()
 		initrdAddr = iAddr
-		initrdSize = uint64(len(initrd))
+		initrdSize = size
 	}
 
 	loader.WriteBootParams(mem, info, loader.BootConfig{

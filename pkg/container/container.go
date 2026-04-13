@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gocracker/gocracker/internal/buildserver"
@@ -137,19 +138,12 @@ const (
 	runtimeDiskRetention    = time.Minute
 	runArtifactCacheVersion = 2
 
-	// firstOutputWaitMax is how long we'll block in the boot path waiting
-	// for the guest kernel to print its first byte to the UART. Sized to
-	// cover a worst-case generic kernel boot on consumer hardware (~2 s
-	// in practice). If the guest doesn't print in this window we give up
-	// and return a zero value — the caller can still use the other phases.
+	// firstOutputWaitMax is how long to wait for the guest's first UART byte.
 	firstOutputWaitMax = 3 * time.Second
 )
 
-// waitFirstOutput blocks up to maxWait for vm.FirstOutputAt() to become
-// non-zero and returns the elapsed time from startedAt. If the VM handle
-// is nil or nothing arrives in the window it returns 0. The poll loop is
-// intentionally simple and cheap (sub-millisecond busy waits) because we
-// only run this on the boot critical path for a few hundred ms at most.
+// waitFirstOutput polls for the guest's first UART output, returning the
+// elapsed time from startedAt. Returns 0 if h is nil or nothing arrives.
 func waitFirstOutput(h vmm.Handle, startedAt time.Time, maxWait time.Duration) time.Duration {
 	if h == nil {
 		return 0
@@ -417,11 +411,6 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prepare boot disk: %w", err)
 	}
-	if err := writeRuntimeSpecToDiskImage(bootDiskPath, guestSpec); err != nil {
-		cleanupRuntimeDisk()
-		return nil, fmt.Errorf("write runtime spec to boot disk: %w", err)
-	}
-
 	// ---- Boot ----
 	gclog.Container.Info("booting", "id", opts.ID)
 	t0 := time.Now()
@@ -731,11 +720,6 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prepare boot disk: %w", err)
 	}
-	if err := writeRuntimeSpecToDiskImage(bootDiskPath, guestSpec); err != nil {
-		cleanupRuntimeDisk()
-		return nil, fmt.Errorf("write runtime spec to boot disk: %w", err)
-	}
-
 	t0 := time.Now()
 	handle, timings, cleanup, err := worker.LaunchVMMWithTimings(vmm.Config{
 		ID:         opts.ID,
@@ -1258,41 +1242,6 @@ func prepareBootDisk(workDir, templateDiskPath, id string) (string, func(), erro
 	return runtimeDiskPath, delayedRemoveAll(runtimeDir, runtimeDiskRetention), nil
 }
 
-func writeRuntimeSpecToDiskImage(diskPath string, spec runtimecfg.GuestSpec) error {
-	if !spec.HasStructuredFields() {
-		return nil
-	}
-	data, err := spec.MarshalJSONBytes()
-	if err != nil {
-		return err
-	}
-	tempFile, err := os.CreateTemp("", "gocracker-runtime-spec-*.json")
-	if err != nil {
-		return err
-	}
-	tempPath := tempFile.Name()
-	defer os.Remove(tempPath)
-	if _, err := tempFile.Write(data); err != nil {
-		tempFile.Close()
-		return err
-	}
-	if err := tempFile.Close(); err != nil {
-		return err
-	}
-	if err := runDebugFSCommand(diskPath, "rm "+runtimecfg.GuestSpecPath); err != nil && !strings.Contains(err.Error(), "File not found by ext2_lookup") {
-		return err
-	}
-	return runDebugFSCommand(diskPath, fmt.Sprintf("write %s %s", tempPath, runtimecfg.GuestSpecPath))
-}
-
-func runDebugFSCommand(diskPath, command string) error {
-	cmd := exec.Command("debugfs", "-w", "-R", command, diskPath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("debugfs %q on %s: %w: %s", command, diskPath, err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
 
 func sanitizeRuntimePathComponent(value string) string {
 	value = strings.TrimSpace(value)
@@ -1319,7 +1268,50 @@ func sanitizeRuntimePathComponent(value string) string {
 	return sanitized
 }
 
+// copyDiskImage copies src to dst: hardlink → reflink → full copy.
 func copyDiskImage(src, dst string) error {
+	// Try hardlink first (same filesystem, instant).
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+
+	// Try reflink (CoW clone). FICLONE = 0x40049409 on Linux.
+	if err := tryReflink(src, dst); err == nil {
+		return nil
+	}
+
+	// Fallback: full copy.
+	return copyDiskImageFull(src, dst)
+}
+
+// ficlone is the Linux ioctl number for FICLONE (copy-on-write clone).
+const ficlone = 0x40049409
+
+func tryReflink(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, out.Fd(), ficlone, in.Fd())
+	if errno != 0 {
+		out.Close()
+		os.Remove(dst)
+		return errno
+	}
+	return out.Close()
+}
+
+func copyDiskImageFull(src, dst string) error {
 	info, err := os.Stat(src)
 	if err != nil {
 		return err
@@ -1691,20 +1683,28 @@ func hasKernelModule(modules []guest.KernelModule, name string) bool {
 	return false
 }
 
+var (
+	hostVirtioFSModuleOnce sync.Once
+	hostVirtioFSModuleVal  string
+)
+
 func hostVirtioFSModulePath() string {
-	release, err := os.ReadFile("/proc/sys/kernel/osrelease")
-	if err != nil {
-		return ""
-	}
-	base := strings.TrimSpace(string(release))
-	if base == "" {
-		return ""
-	}
-	matches, err := filepath.Glob(filepath.Join("/lib/modules", base, "kernel", "fs", "fuse", "virtiofs.ko*"))
-	if err != nil || len(matches) == 0 {
-		return ""
-	}
-	return matches[0]
+	hostVirtioFSModuleOnce.Do(func() {
+		release, err := os.ReadFile("/proc/sys/kernel/osrelease")
+		if err != nil {
+			return
+		}
+		base := strings.TrimSpace(string(release))
+		if base == "" {
+			return
+		}
+		matches, err := filepath.Glob(filepath.Join("/lib/modules", base, "kernel", "fs", "fuse", "virtiofs.ko*"))
+		if err != nil || len(matches) == 0 {
+			return
+		}
+		hostVirtioFSModuleVal = matches[0]
+	})
+	return hostVirtioFSModuleVal
 }
 
 func firstNonNegative(values ...int) int {

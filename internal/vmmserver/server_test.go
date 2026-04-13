@@ -2207,3 +2207,88 @@ func TestMemoryHotplugPut_InvalidValidation(t *testing.T) {
 		t.Fatalf("status = %d", rec.Code)
 	}
 }
+
+func TestConfigureAndStart(t *testing.T) {
+	srv := NewWithOptions(Options{Factory: func(cfg vmm.Config) (VM, error) {
+		return newFakeVM(cfg), nil
+	}})
+
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	body := `{
+		"boot_source": {"kernel_image_path":"/vmlinuz","boot_args":"console=ttyS0"},
+		"machine_config": {"vcpu_count":2,"mem_size_mib":512},
+		"drives": [{"drive_id":"root","path_on_host":"/disk.ext4","is_root_device":true}],
+		"network_interfaces": [{"iface_id":"eth0","host_dev_name":"tap0"}]
+	}`
+
+	rec := mustDo(http.MethodPut, "/configure-and-start", body)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("configure-and-start status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify VM is running via info endpoint.
+	rec = mustDo(http.MethodGet, "/", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("info status = %d", rec.Code)
+	}
+	var info InstanceInfo
+	if err := json.NewDecoder(rec.Body).Decode(&info); err != nil {
+		t.Fatalf("decode info: %v", err)
+	}
+	if info.State != "running=1" {
+		t.Fatalf("state = %q, want running=1", info.State)
+	}
+}
+
+func TestConfigureAndStart_RejectsAfterStart(t *testing.T) {
+	srv := NewWithOptions(Options{Factory: func(cfg vmm.Config) (VM, error) {
+		return newFakeVM(cfg), nil
+	}})
+
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	body := `{
+		"boot_source": {"kernel_image_path":"/vmlinuz","boot_args":"console=ttyS0"},
+		"machine_config": {"vcpu_count":2,"mem_size_mib":256}
+	}`
+
+	// First call should succeed.
+	rec := mustDo(http.MethodPut, "/configure-and-start", body)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("first call status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	// Second call should be rejected (already started).
+	rec = mustDo(http.MethodPut, "/configure-and-start", body)
+	if rec.Code == http.StatusNoContent {
+		t.Fatal("expected rejection after start, got 204")
+	}
+}
+
+func TestConfigureAndStart_BadRequest(t *testing.T) {
+	srv := New()
+
+	mustDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Missing kernel_image_path should fail validation.
+	rec := mustDo(http.MethodPut, "/configure-and-start", `{"boot_source":{}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}

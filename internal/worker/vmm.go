@@ -12,6 +12,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/gocracker/gocracker/internal/sharedfs"
 	"github.com/gocracker/gocracker/internal/vmmserver"
@@ -269,65 +272,48 @@ func LaunchVMMWithTimings(cfg vmm.Config, opts VMMOptions) (vmm.Handle, vmm.Boot
 	client := vmmserver.NewClient(socketHostPath)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := client.SetBootSource(ctx, vmmserver.BootSource{
-		KernelImagePath: jailedCfg.KernelPath,
-		BootArgs:        jailedCfg.Cmdline,
-		InitrdPath:      jailedCfg.InitrdPath,
-		X86Boot:         string(jailedCfg.X86Boot),
-	}); err != nil {
-		_ = cmd.Process.Kill()
-		cleanup()
-		return nil, timings, nil, wrapSubprocessError(err, logBuf)
-	}
-	if err := client.SetMachineConfig(ctx, vmmserver.MachineConfig{
-		VcpuCount:      jailedCfg.VCPUs,
-		MemSizeMib:     int(jailedCfg.MemMB),
-		RNGRateLimiter: jailedCfg.RNGRateLimiter,
-		VsockEnabled:   jailedCfg.Vsock != nil && jailedCfg.Vsock.Enabled,
-		VsockGuestCID:  vsockGuestCID(jailedCfg.Vsock),
-		ExecEnabled:    jailedCfg.Exec != nil && jailedCfg.Exec.Enabled,
-		ExecVsockPort:  execVsockPort(jailedCfg.Exec),
-	}); err != nil {
-		_ = cmd.Process.Kill()
-		cleanup()
-		return nil, timings, nil, wrapSubprocessError(err, logBuf)
+
+	casReq := vmmserver.ConfigureAndStartRequest{
+		BootSource: vmmserver.BootSource{
+			KernelImagePath: jailedCfg.KernelPath,
+			BootArgs:        jailedCfg.Cmdline,
+			InitrdPath:      jailedCfg.InitrdPath,
+			X86Boot:         string(jailedCfg.X86Boot),
+		},
+		MachineConfig: &vmmserver.MachineConfig{
+			VcpuCount:      jailedCfg.VCPUs,
+			MemSizeMib:     int(jailedCfg.MemMB),
+			RNGRateLimiter: jailedCfg.RNGRateLimiter,
+			VsockEnabled:   jailedCfg.Vsock != nil && jailedCfg.Vsock.Enabled,
+			VsockGuestCID:  vsockGuestCID(jailedCfg.Vsock),
+			ExecEnabled:    jailedCfg.Exec != nil && jailedCfg.Exec.Enabled,
+			ExecVsockPort:  execVsockPort(jailedCfg.Exec),
+		},
 	}
 	if jailedCfg.Balloon != nil {
-		if err := client.SetBalloon(ctx, vmmserver.Balloon{
+		casReq.Balloon = &vmmserver.Balloon{
 			AmountMib:             jailedCfg.Balloon.AmountMiB,
 			DeflateOnOOM:          jailedCfg.Balloon.DeflateOnOOM,
 			StatsPollingIntervalS: jailedCfg.Balloon.StatsPollingIntervalS,
 			FreePageHinting:       jailedCfg.Balloon.FreePageHinting,
 			FreePageReporting:     jailedCfg.Balloon.FreePageReporting,
-		}); err != nil {
-			_ = cmd.Process.Kill()
-			cleanup()
-			return nil, timings, nil, wrapSubprocessError(err, logBuf)
 		}
 	}
 	if jailedCfg.MemoryHotplug != nil {
-		if err := client.SetMemoryHotplug(ctx, vmmserver.MemoryHotplugConfig{
+		casReq.MemoryHotplug = &vmmserver.MemoryHotplugConfig{
 			TotalSizeMiB: jailedCfg.MemoryHotplug.TotalSizeMiB,
 			SlotSizeMiB:  jailedCfg.MemoryHotplug.SlotSizeMiB,
 			BlockSizeMiB: jailedCfg.MemoryHotplug.BlockSizeMiB,
-		}); err != nil {
-			_ = cmd.Process.Kill()
-			cleanup()
-			return nil, timings, nil, wrapSubprocessError(err, logBuf)
 		}
 	}
 	for _, drive := range jailedCfg.DriveList() {
-		if err := client.SetDrive(ctx, drive.ID, vmmserver.Drive{
+		casReq.Drives = append(casReq.Drives, vmmserver.Drive{
 			DriveID:      drive.ID,
 			PathOnHost:   drive.Path,
 			IsRootDevice: drive.Root,
 			IsReadOnly:   drive.ReadOnly,
 			RateLimiter:  cloneRateLimiter(drive.RateLimiter),
-		}); err != nil {
-			_ = cmd.Process.Kill()
-			cleanup()
-			return nil, timings, nil, wrapSubprocessError(err, logBuf)
-		}
+		})
 	}
 	if jailedCfg.TapName != "" {
 		iface := vmmserver.NetworkInterface{
@@ -338,30 +324,19 @@ func LaunchVMMWithTimings(cfg vmm.Config, opts VMMOptions) (vmm.Handle, vmm.Boot
 		if len(jailedCfg.MACAddr) > 0 {
 			iface.GuestMAC = jailedCfg.MACAddr.String()
 		}
-		if err := client.SetNetworkInterface(ctx, "eth0", iface); err != nil {
-			_ = cmd.Process.Kill()
-			cleanup()
-			return nil, timings, nil, wrapSubprocessError(err, logBuf)
-		}
+		casReq.NetworkInterfaces = append(casReq.NetworkInterfaces, iface)
 	}
 	for _, fs := range jailedCfg.SharedFS {
-		if err := client.SetSharedFS(ctx, fs.Tag, vmmserver.SharedFS{
+		casReq.SharedFS = append(casReq.SharedFS, vmmserver.SharedFS{
 			Tag:        fs.Tag,
 			Source:     fs.Source,
 			SocketPath: fs.SocketPath,
-		}); err != nil {
-			_ = cmd.Process.Kill()
-			cleanup()
-			return nil, timings, nil, wrapSubprocessError(err, logBuf)
-		}
+		})
 	}
-	// Boundary: everything before here is host-side orchestration (fork-exec
-	// of jailer, chroot setup, socket wait, config PUTs). The InstanceStart
-	// RPC round trip triggers the remote vmm.New + vm.Start and is the
-	// equivalent of runLocal's "VMMSetup" phase.
+
 	tPreStart := time.Now()
 	timings.Orchestration = tPreStart.Sub(t0)
-	if err := client.Start(ctx); err != nil {
+	if err := client.ConfigureAndStart(ctx, casReq); err != nil {
 		_ = cmd.Process.Kill()
 		cleanup()
 		return nil, timings, nil, wrapSubprocessError(err, logBuf)
@@ -957,6 +932,116 @@ func waitForSocket(path string, timeout time.Duration) error {
 }
 
 func waitForSocketOrExit(path string, timeout time.Duration, waitErrCh <-chan error) (bool, error) {
+	// Try inotify first; fall back to polling on any setup error.
+	exited, err, ok := waitForSocketInotify(path, timeout, waitErrCh)
+	if ok {
+		return exited, err
+	}
+	return waitForSocketPoll(path, timeout, waitErrCh)
+}
+
+// waitForSocketInotify uses inotify to watch for socket creation, then
+// confirms it is connectable. Returns (exited, err, true) on success or
+// (_, _, false) if inotify setup failed and the caller should fall back.
+func waitForSocketInotify(path string, timeout time.Duration, waitErrCh <-chan error) (bool, error, bool) {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+
+	// Ensure the parent directory exists before adding a watch.
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return false, nil, false
+	}
+
+	ifd, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
+	if err != nil {
+		return false, nil, false
+	}
+
+	// os.File owns the fd; do not also unix.Close(ifd) (double-close).
+	inotifyFile := os.NewFile(uintptr(ifd), "inotify")
+	defer inotifyFile.Close()
+
+	_, err = unix.InotifyAddWatch(ifd, dir, unix.IN_CREATE)
+	if err != nil {
+		return false, nil, false
+	}
+
+	eventCh := make(chan string, 16)
+	go func() {
+		defer close(eventCh)
+		buf := make([]byte, 4096)
+		for {
+			n, err := inotifyFile.Read(buf)
+			if err != nil {
+				return
+			}
+			offset := 0
+			for offset+unix.SizeofInotifyEvent <= n {
+				event := (*unix.InotifyEvent)(unsafe.Pointer(&buf[offset]))
+				nameLen := int(event.Len)
+				if nameLen > 0 && offset+unix.SizeofInotifyEvent+nameLen <= n {
+					nameBytes := buf[offset+unix.SizeofInotifyEvent : offset+unix.SizeofInotifyEvent+nameLen]
+					// Name is null-terminated.
+					if idx := bytes.IndexByte(nameBytes, 0); idx >= 0 {
+						nameBytes = nameBytes[:idx]
+					}
+					eventCh <- string(nameBytes)
+				}
+				offset += unix.SizeofInotifyEvent + nameLen
+			}
+		}
+	}()
+
+	// Check if the socket already exists (race: it may have been created
+	// before the watch was established).
+	if conn, err := net.DialTimeout("unix", path, 100*time.Millisecond); err == nil {
+		_ = conn.Close()
+		return false, nil, true
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case name, ok := <-eventCh:
+			if !ok {
+				// inotify reader closed unexpectedly; fall back.
+				return false, nil, false
+			}
+			if name != base {
+				continue
+			}
+			// File appeared — try to connect (the process may not be
+			// listening yet). Use exponential backoff starting at 1ms.
+			backoff := time.Millisecond
+			for i := 0; i < 15; i++ {
+				conn, err := net.DialTimeout("unix", path, 50*time.Millisecond)
+				if err == nil {
+					_ = conn.Close()
+					return false, nil, true
+				}
+				time.Sleep(backoff)
+				if backoff < 20*time.Millisecond {
+					backoff *= 2
+				}
+			}
+			return false, fmt.Errorf("socket %s appeared but is not connectable", path), true
+
+		case waitErr := <-waitErrCh:
+			if waitErr == nil {
+				return true, fmt.Errorf("worker exited before opening socket %s", path), true
+			}
+			return true, fmt.Errorf("worker exited before opening socket %s: %w", path, waitErr), true
+
+		case <-timer.C:
+			return false, fmt.Errorf("timed out waiting for worker socket %s", path), true
+		}
+	}
+}
+
+// waitForSocketPoll is the legacy polling fallback.
+func waitForSocketPoll(path string, timeout time.Duration, waitErrCh <-chan error) (bool, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("unix", path, 100*time.Millisecond)

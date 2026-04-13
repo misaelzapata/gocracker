@@ -4,6 +4,7 @@ package jailer
 
 import (
 	"bufio"
+	"debug/elf"
 	"errors"
 	"flag"
 	"fmt"
@@ -119,8 +120,13 @@ func Run(cfg Config) error {
 	if err := mkdirAllNoSymlink(chrootDir, 0755); err != nil {
 		return fmt.Errorf("create chroot dir %s: %w", chrootDir, err)
 	}
-	if err := copyRegularFile(cfg.ExecFile, filepath.Join(chrootDir, execName), 0755); err != nil {
-		return fmt.Errorf("copy exec-file into jail: %w", err)
+	// Try hardlink first (instant, same filesystem). Fall back to full copy
+	// if it fails (e.g. cross-device link, permission denied).
+	jailExec := filepath.Join(chrootDir, execName)
+	if err := os.Link(cfg.ExecFile, jailExec); err != nil {
+		if err := copyRegularFile(cfg.ExecFile, jailExec, 0755); err != nil {
+			return fmt.Errorf("copy exec-file into jail: %w", err)
+		}
 	}
 	if err := applyResourceLimits(cfg.ResourceLimits); err != nil {
 		return err
@@ -399,11 +405,30 @@ func prepareMountTarget(path string, isDir bool) error {
 	return unix.Close(fd)
 }
 
+// isStaticBinary returns true if the given ELF binary has no PT_INTERP
+// program header, meaning it does not require a dynamic linker.
+func isStaticBinary(path string) bool {
+	f, err := elf.Open(path)
+	if err != nil {
+		return false // assume dynamic if we can't read
+	}
+	defer f.Close()
+	for _, p := range f.Progs {
+		if p.Type == elf.PT_INTERP {
+			return false // has dynamic linker
+		}
+	}
+	return true // no interpreter = static
+}
+
 func binaryDependencyMounts(execFile string) ([]string, error) {
+	if isStaticBinary(execFile) {
+		return nil, nil
+	}
 	cmd := exec.Command("ldd", execFile)
 	output, err := cmd.Output()
 	if err != nil {
-		// Static binaries are fine; if ldd cannot inspect the file we do not fail hard.
+		// If ldd cannot inspect the file we do not fail hard.
 		return nil, nil
 	}
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
