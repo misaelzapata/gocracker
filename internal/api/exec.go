@@ -152,6 +152,9 @@ func newExecAgentConn(entry *vmEntry) (net.Conn, error) {
 	if entry == nil {
 		return nil, fmt.Errorf("VM not found")
 	}
+	if entry.handle == nil {
+		return nil, fmt.Errorf("VM is not running")
+	}
 	cfg := entry.handle.VMConfig()
 	if cfg.Exec == nil || !cfg.Exec.Enabled {
 		return nil, fmt.Errorf("exec is not enabled for this VM")
