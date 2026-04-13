@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
+
 	"debug/elf"
 	"encoding/binary"
 	"fmt"

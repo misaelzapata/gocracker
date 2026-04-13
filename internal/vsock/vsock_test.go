@@ -600,8 +600,8 @@ func TestDeviceIDAndFeatures_OnDevice(t *testing.T) {
 	if d.DeviceID() != 19 {
 		t.Errorf("DeviceID() = %d, want 19", d.DeviceID())
 	}
-	if d.DeviceFeatures() != 0 {
-		t.Errorf("DeviceFeatures() = %d, want 0", d.DeviceFeatures())
+	if d.DeviceFeatures() != vsockFeatureInOrder {
+		t.Errorf("DeviceFeatures() = %d, want %d", d.DeviceFeatures(), vsockFeatureInOrder)
 	}
 }
 
@@ -986,8 +986,8 @@ func TestDevice_DeviceID(t *testing.T) {
 
 func TestDevice_DeviceFeatures(t *testing.T) {
 	d := &Device{}
-	if f := d.DeviceFeatures(); f != 0 {
-		t.Fatalf("DeviceFeatures() = %d, want 0", f)
+	if f := d.DeviceFeatures(); f != vsockFeatureInOrder {
+		t.Fatalf("DeviceFeatures() = %d, want %d", f, vsockFeatureInOrder)
 	}
 }
 

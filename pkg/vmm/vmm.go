@@ -23,6 +23,7 @@ import (
 	"unsafe"
 
 	"github.com/gocracker/gocracker/internal/acpi"
+	"github.com/gocracker/gocracker/internal/arm64layout"
 	"github.com/gocracker/gocracker/internal/i8042"
 	"github.com/gocracker/gocracker/internal/kvm"
 	"github.com/gocracker/gocracker/internal/loader"
@@ -254,22 +255,23 @@ type VM struct {
 
 	archBackend machineArchBackend
 
-	uart0         *uart.UART
-	i8042         *i8042.Device
-	pl011dev      any   // reserved for future PL011 device, currently unused
-	gicDev        any   // *kvm.GICDevice on ARM64, nil on x86
-	irqEventFds   []int // eventfds for irqfd-based interrupt delivery (ARM64)
-	transports    []*virtio.Transport
-	rngDev        *virtio.RNGDevice
-	balloonDev    *virtio.BalloonDevice
-	memoryHotplug *memoryHotplugState
-	netDev        *virtio.NetDevice
-	blkDev        *virtio.BlockDevice
-	blkDevs       []*virtio.BlockDevice
-	fsDevs        []*virtio.FSDevice
-	vsockDev      *vsock.Device
-	execBroker    *execAgentBroker
-	memDirty      *virtio.DirtyTracker
+	uart0          *uart.UART
+	i8042          *i8042.Device
+	pl011dev       any // reserved for future PL011 device, currently unused
+	gicDev         any // *kvm.GICDevice on ARM64, nil on x86
+	arm64GICLayout arm64layout.GICLayout
+	irqEventFds    []int // eventfds for irqfd-based interrupt delivery (ARM64)
+	transports     []*virtio.Transport
+	rngDev         *virtio.RNGDevice
+	balloonDev     *virtio.BalloonDevice
+	memoryHotplug  *memoryHotplugState
+	netDev         *virtio.NetDevice
+	blkDev         *virtio.BlockDevice
+	blkDevs        []*virtio.BlockDevice
+	fsDevs         []*virtio.FSDevice
+	vsockDev       *vsock.Device
+	execBroker     *execAgentBroker
+	memDirty       *virtio.DirtyTracker
 
 	startTime   time.Time
 	cleanupOnce sync.Once
@@ -379,19 +381,31 @@ func New(cfg Config) (*VM, error) {
 		}
 		m.vcpus = append(m.vcpus, vcpu)
 	}
-	vcpuErrs := make([]error, len(m.vcpus))
-	var vcpuWG sync.WaitGroup
-	for i, vcpu := range m.vcpus {
-		vcpuWG.Add(1)
-		go func(i int, vcpu *kvm.VCPU) {
-			defer vcpuWG.Done()
-			vcpuErrs[i] = m.archBackend.setupVCPU(m, vcpu, i, kernelInfo)
-		}(i, vcpu)
+	if err := m.archBackend.postCreateVCPUs(m); err != nil {
+		return nil, err
 	}
-	vcpuWG.Wait()
-	for _, err := range vcpuErrs {
-		if err != nil {
-			return nil, err
+
+	if m.archBackend.setupVCPUsInParallel() {
+		vcpuErrs := make([]error, len(m.vcpus))
+		var vcpuWG sync.WaitGroup
+		for i, vcpu := range m.vcpus {
+			vcpuWG.Add(1)
+			go func(i int, vcpu *kvm.VCPU) {
+				defer vcpuWG.Done()
+				vcpuErrs[i] = m.archBackend.setupVCPU(m, vcpu, i, kernelInfo)
+			}(i, vcpu)
+		}
+		vcpuWG.Wait()
+		for _, err := range vcpuErrs {
+			if err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		for i, vcpu := range m.vcpus {
+			if err := m.archBackend.setupVCPU(m, vcpu, i, kernelInfo); err != nil {
+				return nil, err
+			}
 		}
 	}
 	m.events.Emit(EventCPUConfigured, fmt.Sprintf("%d vCPU(s) configured", len(m.vcpus)))

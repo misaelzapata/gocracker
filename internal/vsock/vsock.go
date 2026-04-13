@@ -25,6 +25,11 @@ const (
 	HostCID     = 2
 	dialTimeout = 15 * time.Second
 
+	// Firecracker's virtio-vsock advertises VIRTIO_F_IN_ORDER in addition to
+	// VIRTIO_F_VERSION_1. Our device also returns used buffers in order, so
+	// expose the same hint to keep the guest driver path aligned.
+	vsockFeatureInOrder = 1 << 35
+
 	// Packet opcodes
 	opRequest       = 1
 	opResponse      = 2
@@ -96,7 +101,7 @@ func NewDevice(mem []byte, basePA uint64, irq uint8, listenFn func(uint32) (net.
 }
 
 func (d *Device) DeviceID() uint32       { return 19 } // VIRTIO_ID_VSOCK
-func (d *Device) DeviceFeatures() uint64 { return 0 }
+func (d *Device) DeviceFeatures() uint64 { return vsockFeatureInOrder }
 func (d *Device) ConfigBytes() []byte {
 	b := make([]byte, 8)
 	binary.LittleEndian.PutUint64(b, GuestCID)

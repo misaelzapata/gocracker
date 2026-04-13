@@ -3,9 +3,11 @@
 package kvm
 
 import (
+	"errors"
 	"fmt"
 	"unsafe"
 
+	"github.com/gocracker/gocracker/internal/arm64layout"
 	"golang.org/x/sys/unix"
 )
 
@@ -25,14 +27,6 @@ const (
 	kvmDevArmVGICGrpAddr   = 0
 	kvmDevArmVGICGrpNrIRQs = 3
 	kvmDevArmVGICGrpCtrl   = 4
-
-	// GICv3 address type attributes
-	kvmVGICv3AddrTypeDist   = 0
-	kvmVGICv3AddrTypeRedist = 1
-
-	// GICv2 address type attributes
-	kvmVGICv2AddrTypeDist = 0
-	kvmVGICv2AddrTypeCPU  = 1
 
 	// Control attributes
 	kvmDevArmVGICCtrlInit = 0
@@ -57,53 +51,79 @@ type GICDevice struct {
 	version int // 2 or 3
 }
 
-// CreateGIC creates an in-kernel GIC. It probes GICv3 first and falls back to
-// GICv2 if the host doesn't support v3, matching Firecracker's behavior.
-//
-// gicdBase is the distributor MMIO base (same for v2 and v3).
-// gicrBase is the redistributor base (v3) — for the v2 fallback the CPU
-// interface is placed at gicdBase + 0x10000 (QEMU virt convention).
-func (vm *VM) CreateGIC(gicdBase, gicrBase uint64, nrIRQs uint32) (*GICDevice, error) {
-	// KVM allows only one GIC per VM — a failed create still registers
-	// the device, blocking fallback. Use probeDevice (TEST flag) to pick
-	// the right version before creating for real.
-	//
-	// Prefer GICv3 when available (Graviton 2+). Fall back to GICv2
-	// (Graviton 1 / Cortex-A72). Matches Firecracker's gic/mod.rs.
-	//
-	// Note: some hosts (Graviton 1) report GICv3 as known but fail to
-	// init it. We detect this by trying v3 creation first on hosts that
-	// DON'T support v2 (pure v3), and preferring v2 when both probe OK.
-	v2ok := vm.probeDevice(kvmDevTypeArmVGICv2)
-	v3ok := vm.probeDevice(kvmDevTypeArmVGICv3)
-
-	if v2ok {
-		// GICv2 available — use it. Safe on Graviton 1 and QEMU.
-		// CPU interface is BELOW the distributor (Firecracker: GICD - CPU_SIZE).
-		const gicv2CPUSize uint64 = 0x2000
-		gicv2CPUBase := gicdBase - gicv2CPUSize
-		gic, err := vm.tryCreateGICv2(gicdBase, gicv2CPUBase, nrIRQs)
-		if err == nil {
-			return gic, nil
-		}
-		return nil, fmt.Errorf("GICv2: %w", err)
+// ProbeGICLayout selects a concrete GIC device/layout pair that can be fully
+// configured on this host. KVM only allows one GIC per VM, so probing uses a
+// short-lived scratch VM instead of the real guest.
+func (vm *VM) ProbeGICLayout(vcpuCount int, nrIRQs uint32) (arm64layout.GICLayout, error) {
+	candidates := []arm64layout.GICLayout{
+		arm64layout.GICv3(vcpuCount),
+		arm64layout.GICv2(),
 	}
-	if v3ok {
-		// Only GICv3 available (Graviton 2+, no v2 fallback).
-		gic, err := vm.tryCreateGICv3(gicdBase, gicrBase, nrIRQs)
-		if err == nil {
-			return gic, nil
+	var errs []error
+	for _, layout := range candidates {
+		if err := vm.probeGICLayout(layout, vcpuCount, nrIRQs); err == nil {
+			return layout, nil
+		} else {
+			errs = append(errs, fmt.Errorf("GICv%d: %w", layout.Version, err))
 		}
-		return nil, fmt.Errorf("GICv3: %w", err)
 	}
-	return nil, fmt.Errorf("neither GICv2 nor GICv3 supported by host KVM")
+	return arm64layout.GICLayout{}, fmt.Errorf("GIC init failed (tried v3 and v2): %w", errors.Join(errs...))
 }
 
-// probeDevice tests if a KVM device type is supported without creating it.
-func (vm *VM) probeDevice(devType uint32) bool {
-	data := kvmCreateDeviceData{Type: devType, Flags: 1} // flags=1 = KVM_CREATE_DEVICE_TEST
-	_, err := vmIoctl(vm.fd, kvmCreateDevice, uintptr(unsafe.Pointer(&data)))
-	return err == nil
+// CreateGIC creates the selected in-kernel GIC.
+func (vm *VM) CreateGIC(layout arm64layout.GICLayout, nrIRQs uint32) (*GICDevice, error) {
+	switch layout.Version {
+	case arm64layout.GICVersionV3:
+		return vm.tryCreateGICv3(layout.Properties[0], layout.Properties[2], nrIRQs)
+	case arm64layout.GICVersionV2:
+		return vm.tryCreateGICv2(layout.Properties[0], layout.Properties[2], nrIRQs)
+	default:
+		return nil, fmt.Errorf("unsupported GIC layout version %d", layout.Version)
+	}
+}
+
+func (vm *VM) probeGICLayout(layout arm64layout.GICLayout, vcpuCount int, nrIRQs uint32) error {
+	if vcpuCount <= 0 {
+		vcpuCount = 1
+	}
+	sys, err := Open()
+	if err != nil {
+		return err
+	}
+	defer sys.Close()
+
+	memMB := vm.memSize / (1024 * 1024)
+	if memMB == 0 {
+		memMB = 64
+	}
+	probeVM, err := sys.CreateVMWithBase(memMB, vm.guestPhysBase)
+	if err != nil {
+		return err
+	}
+	defer probeVM.Close()
+
+	probeVCPUs := make([]*VCPU, 0, vcpuCount)
+	for i := 0; i < vcpuCount; i++ {
+		vcpu, err := probeVM.CreateVCPU(i)
+		if err != nil {
+			for _, created := range probeVCPUs {
+				_ = created.Close()
+			}
+			return err
+		}
+		probeVCPUs = append(probeVCPUs, vcpu)
+	}
+	defer func() {
+		for _, vcpu := range probeVCPUs {
+			_ = vcpu.Close()
+		}
+	}()
+
+	gic, err := probeVM.CreateGIC(layout, nrIRQs)
+	if err != nil {
+		return err
+	}
+	return gic.Close()
 }
 
 func (vm *VM) tryCreateGICv3(gicdBase, gicrBase uint64, nrIRQs uint32) (*GICDevice, error) {

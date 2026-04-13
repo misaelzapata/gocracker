@@ -25,6 +25,14 @@ func (x86MachineBackend) loadKernel(vm *VM) (*loader.KernelInfo, error) {
 	return vm.loadKernel()
 }
 
+func (x86MachineBackend) postCreateVCPUs(_ *VM) error {
+	return nil
+}
+
+func (x86MachineBackend) setupVCPUsInParallel() bool {
+	return true
+}
+
 func (x86MachineBackend) setupVCPU(vm *VM, vcpu *kvm.VCPU, index int, kernelInfo *loader.KernelInfo) error {
 	if err := kvm.SetupCPUID(vm.kvmSys, vcpu); err != nil {
 		return fmt.Errorf("cpuid setup vcpu %d: %w", index, err)
