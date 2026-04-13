@@ -52,6 +52,10 @@ func run(args []string, stderr io.Writer) int {
 	}()
 
 	if err := srv.ListenUnix(*socketPath); err != nil {
+		// Stop the signal goroutine so it doesn't leak when ListenUnix
+		// fails immediately (e.g., in unit tests).
+		signal.Stop(sigCh)
+		close(sigCh)
 		fmt.Fprintln(stderr, fmt.Errorf("listen unix socket %s: %w", *socketPath, err))
 		return 1
 	}

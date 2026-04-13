@@ -671,6 +671,9 @@ func cleanStaleMounts(dir string) {
 			targets = append(targets, mountpoint)
 		}
 	}
+	if scanner.Err() != nil {
+		return // partial read — don't unmount based on incomplete data
+	}
 	// Unmount deepest first with MNT_DETACH so children are released
 	// before parents. Sort by path length descending (deeper paths are
 	// longer) to ensure correct order regardless of mountinfo ordering.

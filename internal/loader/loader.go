@@ -258,7 +258,7 @@ func loadELF(mem, data []byte) (*KernelInfo, error) {
 		if ph.Type != elf.PT_LOAD {
 			continue
 		}
-		if ph.Paddr+ph.Memsz > uint64(len(mem)) {
+		if ph.Memsz > math.MaxUint64-ph.Paddr || ph.Paddr+ph.Memsz > uint64(len(mem)) {
 			return nil, fmt.Errorf("ELF segment [%#x,%#x) exceeds guest RAM",
 				ph.Paddr, ph.Paddr+ph.Memsz)
 		}
