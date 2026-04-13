@@ -67,6 +67,9 @@ func main() {
 `
 
 func TestVirtioBalloonLocalStatsAndExec(t *testing.T) {
+	if os.Getenv("GOCRACKER_SKIP_LARGE_MEM") == "1" {
+		t.Skip("GOCRACKER_SKIP_LARGE_MEM=1: skipping 1024MB VM test")
+	}
 	requirePrivilegedExecIntegration(t)
 	kernel := requireIntegrationKernel(t)
 
@@ -130,6 +133,9 @@ func TestVirtioBalloonLocalStatsAndExec(t *testing.T) {
 }
 
 func TestVirtioBalloonWorkerReclaimsRSS(t *testing.T) {
+	if os.Getenv("GOCRACKER_SKIP_LARGE_MEM") == "1" {
+		t.Skip("GOCRACKER_SKIP_LARGE_MEM=1: skipping 1024MB VM test")
+	}
 	requirePrivilegedExecIntegration(t)
 	kernel := requireIntegrationKernel(t)
 	bins := repoWorkerBinaries(t)
@@ -193,6 +199,9 @@ func TestVirtioBalloonWorkerReclaimsRSS(t *testing.T) {
 }
 
 func TestMemoryHotplugLocalGrowShrink(t *testing.T) {
+	if os.Getenv("GOCRACKER_SKIP_LARGE_MEM") == "1" {
+		t.Skip("GOCRACKER_SKIP_LARGE_MEM=1: skipping 512MB+ VM test on this host")
+	}
 	requirePrivilegedExecIntegration(t)
 	kernel := requireIntegrationKernel(t)
 
@@ -269,6 +278,9 @@ func TestMemoryHotplugLocalGrowShrink(t *testing.T) {
 }
 
 func TestMemoryHotplugWorkerGrowShrink(t *testing.T) {
+	if os.Getenv("GOCRACKER_SKIP_LARGE_MEM") == "1" {
+		t.Skip("GOCRACKER_SKIP_LARGE_MEM=1: skipping 512MB VM test")
+	}
 	requirePrivilegedExecIntegration(t)
 	kernel := requireIntegrationKernel(t)
 	bins := repoWorkerBinaries(t)
