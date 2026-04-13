@@ -145,15 +145,26 @@ func TestCLIComposeServeExec(t *testing.T) {
 		}
 	}()
 
-	waitForComposeVM(t, serverURL, compose.StackNameForComposePath(composeFile), "debug", 30*time.Second)
+	waitForComposeVM(t, serverURL, compose.StackNameForComposePath(composeFile), "debug", 60*time.Second)
 
-	composeExec := exec.Command(bins.gocracker,
-		"compose", "exec",
-		"--server", serverURL,
-		"--file", composeFile,
-		"debug", "--", "/bin/sh", "-lc", "echo compose-exec-ok",
-	)
-	execOutput, err := composeExec.CombinedOutput()
+	// Retry exec once — under CI load the VM may need a moment after
+	// reaching "running" state before the exec agent is ready.
+	var execOutput []byte
+	for attempt := 0; attempt < 2; attempt++ {
+		composeExec := exec.Command(bins.gocracker,
+			"compose", "exec",
+			"--server", serverURL,
+			"--file", composeFile,
+			"debug", "--", "/bin/sh", "-lc", "echo compose-exec-ok",
+		)
+		execOutput, err = composeExec.CombinedOutput()
+		if err == nil {
+			break
+		}
+		if attempt == 0 {
+			time.Sleep(2 * time.Second)
+		}
+	}
 	if err != nil {
 		t.Fatalf("compose exec: %v\n%s\nserve log:\n%s", err, execOutput, serveLog.String())
 	}

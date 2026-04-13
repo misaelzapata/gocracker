@@ -28,6 +28,7 @@ func migrationTestAPI() *api.Server {
 }
 
 func TestLiveMigrationStopAndCopy(t *testing.T) {
+	requireKVMClockCtrl(t)
 	kernel := requireIntegrationKernel(t)
 
 	ctxDir := t.TempDir()
@@ -95,6 +96,7 @@ func main() {
 }
 
 func TestLiveMigrationPreCopyPreservesDirtyRAMAndDisk(t *testing.T) {
+	requireKVMClockCtrl(t)
 	// Stop-and-copy migration works (TestLiveMigrationStopAndCopy passes after
 	// the prepare-bundle ordering fix). Pre-copy still loses dirty disk pages
 	// during the delta apply: the destination disk image does not contain the

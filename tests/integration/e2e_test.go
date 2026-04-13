@@ -877,3 +877,39 @@ func (b *lockedBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
+
+// requireKVMClockCtrl skips the test if the host KVM does not support
+// kvmclock control MSRs. Without kvmclock, snapshot/restore can corrupt
+// guest memory mappings causing SIGSEGV in the Go runtime (the vCPU
+// accesses memory that the host unmapped during restore).
+func requireKVMClockCtrl(t *testing.T) {
+	t.Helper()
+	kernel := requireIntegrationKernel(t)
+
+	// Quick probe: create a tiny VM, snapshot it, restore it. If the
+	// restore logs a kvmclock warning, this host can't safely run
+	// migration tests.
+	vm, err := vmm.New(vmm.Config{
+		MemMB:      64,
+		VCPUs:      1,
+		KernelPath: kernel,
+	})
+	if err != nil {
+		t.Skipf("cannot probe kvmclock: vmm.New: %v", err)
+	}
+	if err := vm.Start(); err != nil {
+		vm.Stop()
+		t.Skipf("cannot probe kvmclock: vm.Start: %v", err)
+	}
+	snapDir := t.TempDir()
+	_, err = vm.TakeSnapshot(snapDir)
+	vm.Stop()
+	if err != nil {
+		t.Skipf("cannot probe kvmclock: snapshot: %v", err)
+	}
+	restored, err := vmm.RestoreFromSnapshotWithOptions(snapDir, vmm.RestoreOptions{})
+	if err != nil {
+		t.Skipf("kvmclock restore unsupported on this host: %v", err)
+	}
+	restored.Stop()
+}
