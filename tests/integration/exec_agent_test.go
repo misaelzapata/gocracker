@@ -28,14 +28,7 @@ func TestAPIServeRunExec(t *testing.T) {
 
 	addr := freeLocalAddr(t)
 	serverURL := "http://" + addr
-	serveCmd := exec.Command(
-		bins.gocracker,
-		"serve",
-		"--addr", addr,
-		"--cache-dir", cacheDir,
-		"--jailer-binary", bins.jailer,
-		"--vmm-binary", bins.vmm,
-	)
+	serveCmd := exec.Command(bins.gocracker, buildServeArgs(addr, cacheDir, bins)...)
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
@@ -81,6 +74,9 @@ func TestAPIServeRunExec(t *testing.T) {
 		t.Fatalf("exec stream: %v\nserve log:\n%s", err, serveLog.String())
 	}
 	defer conn.Close()
+	// Give the shell a moment to initialize before sending commands —
+	// under suite-wide load the PTY may not be ready for input yet.
+	time.Sleep(500 * time.Millisecond)
 	if _, err := io.WriteString(conn, "echo api-run-stream-ok\nexit\n"); err != nil {
 		t.Fatalf("write exec stream commands: %v", err)
 	}
@@ -109,14 +105,7 @@ func TestCLIComposeServeExec(t *testing.T) {
 
 	addr := freeLocalAddr(t)
 	serverURL := "http://" + addr
-	serveCmd := exec.Command(
-		bins.gocracker,
-		"serve",
-		"--addr", addr,
-		"--cache-dir", cacheDir,
-		"--jailer-binary", bins.jailer,
-		"--vmm-binary", bins.vmm,
-	)
+	serveCmd := exec.Command(bins.gocracker, buildServeArgs(addr, cacheDir, bins)...)
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
@@ -216,14 +205,7 @@ func TestCLIComposeExecInteractive(t *testing.T) {
 
 	addr := freeLocalAddr(t)
 	serverURL := "http://" + addr
-	serveCmd := exec.Command(
-		bins.gocracker,
-		"serve",
-		"--addr", addr,
-		"--cache-dir", cacheDir,
-		"--jailer-binary", bins.jailer,
-		"--vmm-binary", bins.vmm,
-	)
+	serveCmd := exec.Command(bins.gocracker, buildServeArgs(addr, cacheDir, bins)...)
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
@@ -402,6 +384,25 @@ func buildComposeExecFixture(t *testing.T) string {
 		t.Fatalf("write compose file: %v", err)
 	}
 	return dir
+}
+
+// buildServeArgs returns the common arguments for `gocracker serve`.
+// On hosts where pivot_root is not available (e.g., GitHub Actions runners
+// using overlay filesystems), it disables the jailer to avoid
+// "pivot_root: invalid argument" failures.
+func buildServeArgs(addr, cacheDir string, bins builtBinaries) []string {
+	args := []string{
+		"serve",
+		"--addr", addr,
+		"--cache-dir", cacheDir,
+		"--vmm-binary", bins.vmm,
+	}
+	if os.Getenv("GOCRACKER_JAILER_OFF") == "1" {
+		args = append(args, "--jailer", "off")
+	} else {
+		args = append(args, "--jailer-binary", bins.jailer)
+	}
+	return args
 }
 
 func stopCommand(t *testing.T, cmd *exec.Cmd) {

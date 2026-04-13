@@ -65,6 +65,7 @@ jobs:
           sudo -n env GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
             GOCRACKER_SECCOMP=off \
             GOCRACKER_SKIP_MIGRATION=1 \
+            GOCRACKER_JAILER_OFF=1 \
             go test -tags integration ./tests/integration/... \
             -count=1 -v -timeout 600s \
           || sudo -n env GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \

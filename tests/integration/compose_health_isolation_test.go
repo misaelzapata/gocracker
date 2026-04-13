@@ -29,14 +29,7 @@ func TestCLIComposeServeHealthcheckExecBinary(t *testing.T) {
 
 	addr := freeLocalAddr(t)
 	serverURL := "http://" + addr
-	serveCmd := exec.Command(
-		bins.gocracker,
-		"serve",
-		"--addr", addr,
-		"--cache-dir", cacheDir,
-		"--jailer-binary", bins.jailer,
-		"--vmm-binary", bins.vmm,
-	)
+	serveCmd := exec.Command(bins.gocracker, buildServeArgs(addr, cacheDir, bins)...)
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
@@ -79,14 +72,7 @@ func TestComposeStackIsolationAndCleanup(t *testing.T) {
 
 	addr := freeLocalAddr(t)
 	serverURL := "http://" + addr
-	serveCmd := exec.Command(
-		bins.gocracker,
-		"serve",
-		"--addr", addr,
-		"--cache-dir", cacheDir,
-		"--jailer-binary", bins.jailer,
-		"--vmm-binary", bins.vmm,
-	)
+	serveCmd := exec.Command(bins.gocracker, buildServeArgs(addr, cacheDir, bins)...)
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
