@@ -181,11 +181,11 @@ func (s *Session) Close() {
 		// Restore terminal state BEFORE closing anything — term.Restore
 		// needs a valid FD on stdin. Closing stdin first would make the
 		// Fd() call return an invalid descriptor.
-		if s.rawState != nil {
+		if s.rawState != nil && s.stdin != nil {
 			_ = term.Restore(int(s.stdin.Fd()), s.rawState)
-			// Show cursor and print newline so the shell prompt
-			// reappears cleanly after raw mode.
-			fmt.Fprint(s.stdout, "\033[?25h\r\n")
+			if s.stdout != nil {
+				fmt.Fprint(s.stdout, "\033[?25h\r\n")
+			}
 		}
 		if s.slave != nil {
 			_ = s.slave.Close()

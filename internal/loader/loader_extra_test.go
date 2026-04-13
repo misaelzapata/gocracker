@@ -384,10 +384,10 @@ func TestLoadArm64KernelBytes_TooLargeForRAM(t *testing.T) {
 func TestMatchCompressionXZ(t *testing.T) {
 	// XZ magic: 0xFD 0x37 0x7A 0x58 0x5A 0x00
 	data := []byte{0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x00}
-	_, found := matchCompression(data)
-	// XZ needs valid stream, so NewReader may fail, but matchCompression
-	// should handle this gracefully
-	_ = found
+	reader, found := matchCompression(data)
+	if found && reader == nil {
+		t.Fatal("found=true but reader is nil")
+	}
 }
 
 func TestMatchCompressionLZMA(t *testing.T) {

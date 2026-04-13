@@ -40,7 +40,9 @@ func TestBuildInitrd(t *testing.T) {
 func TestBuildInitrdWithExtraFiles(t *testing.T) {
 	dir := t.TempDir()
 	extraFile := filepath.Join(dir, "extra.bin")
-	os.WriteFile(extraFile, []byte("extra"), 0644)
+	if err := os.WriteFile(extraFile, []byte("extra"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	initrdPath := filepath.Join(dir, "initrd.img")
 	if err := BuildInitrd(initrdPath, map[string]string{"/opt/extra.bin": extraFile}); err != nil {
@@ -106,9 +108,13 @@ func TestStageKernelModulesMissingHostPath(t *testing.T) {
 func TestStageKernelModulesPlainKo(t *testing.T) {
 	dir := t.TempDir()
 	modPath := filepath.Join(dir, "test.ko")
-	os.WriteFile(modPath, []byte("module"), 0644)
+	if err := os.WriteFile(modPath, []byte("module"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	root := filepath.Join(dir, "root")
-	os.MkdirAll(root, 0755)
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
 	if err := stageKernelModules(root, []KernelModule{{HostPath: modPath}}); err != nil {
 		t.Fatalf("stageKernelModules: %v", err)
 	}
@@ -128,7 +134,9 @@ func TestStageRuntimeSpecNil(t *testing.T) {
 func TestCopyKernelModulePlainKo(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "mod.ko")
-	os.WriteFile(src, []byte("payload"), 0644)
+	if err := os.WriteFile(src, []byte("payload"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	dst := filepath.Join(dir, "mod_copy.ko")
 	if err := copyKernelModule(src, dst); err != nil {
 		t.Fatalf("copyKernelModule: %v", err)
@@ -156,7 +164,9 @@ func TestBuildInitrdContainsExpectedFiles(t *testing.T) {
 
 func TestPackCpioGzWithSymlink(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "target.txt"), []byte("hello"), 0644)
+	if err := os.WriteFile(filepath.Join(dir, "target.txt"), []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	os.Symlink("target.txt", filepath.Join(dir, "link.txt"))
 
 	output := filepath.Join(t.TempDir(), "test.cpio.gz")

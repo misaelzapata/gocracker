@@ -112,6 +112,9 @@ func Run(cfg Config) error {
 	// chroot path. Without this, leftover bind mounts accumulate and
 	// cause ENOENT on subsequent runs.
 	cleanStaleMounts(chrootDir)
+	if chrootDir == "" || chrootDir == "/" || chrootDir == "/tmp" {
+		return fmt.Errorf("refusing to remove dangerous chroot path: %q", chrootDir)
+	}
 	_ = os.RemoveAll(chrootDir)
 
 	if err := mkdirAllNoSymlink(chrootDir, 0755); err != nil {
