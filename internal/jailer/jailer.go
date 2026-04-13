@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -670,9 +671,14 @@ func cleanStaleMounts(dir string) {
 			targets = append(targets, mountpoint)
 		}
 	}
-	// Unmount deepest first with MNT_DETACH so we don't block.
-	for i := len(targets) - 1; i >= 0; i-- {
-		_ = unix.Unmount(targets[i], unix.MNT_DETACH)
+	// Unmount deepest first with MNT_DETACH so children are released
+	// before parents. Sort by path length descending (deeper paths are
+	// longer) to ensure correct order regardless of mountinfo ordering.
+	sort.Slice(targets, func(i, j int) bool {
+		return len(targets[i]) > len(targets[j])
+	})
+	for _, t := range targets {
+		_ = unix.Unmount(t, unix.MNT_DETACH)
 	}
 }
 

@@ -8,9 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"time"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gocracker/gocracker/internal/dockerfile"
 	"github.com/gocracker/gocracker/internal/oci"

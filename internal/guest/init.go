@@ -708,7 +708,8 @@ func runExecStream(conn net.Conn, req guestexec.Request, spec runtimecfg.GuestSp
 	// FD refcount while the blocked read goroutine still holds a reference,
 	// so the kernel never sends the shutdown packet and the host-side reader
 	// blocks indefinitely — causing the console to hang after "exit".
-	if sc, ok := conn.(*vsockConn); ok {
+	type shutdowner interface{ Shutdown() error }
+	if sc, ok := conn.(shutdowner); ok {
 		_ = sc.Shutdown()
 	}
 	select {

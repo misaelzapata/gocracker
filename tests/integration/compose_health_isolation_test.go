@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -39,6 +40,7 @@ func TestCLIComposeServeHealthcheckExecBinary(t *testing.T) {
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
+	serveCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := serveCmd.Start(); err != nil {
 		t.Fatalf("start serve command: %v", err)
 	}
@@ -88,6 +90,7 @@ func TestComposeStackIsolationAndCleanup(t *testing.T) {
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
+	serveCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := serveCmd.Start(); err != nil {
 		t.Fatalf("start serve command: %v", err)
 	}
@@ -161,7 +164,7 @@ func TestComposeStackIsolationAndCleanup(t *testing.T) {
 		Context:     filepath.Join(fixtureA, "app"),
 		KernelPath:  kernel,
 		MemMB:       256,
-		DiskSizeMB:  256,
+		DiskSizeMB:  512,
 		CacheDir:    cacheDir,
 		ExecEnabled: true,
 	})
