@@ -215,13 +215,15 @@ func TestListenUnixCreatesSocket(t *testing.T) {
 	go func() {
 		errCh <- srv.ListenUnix(sockPath)
 	}()
-	// Ensure the server goroutine is cleaned up when the test ends.
+	// Ensure the server goroutine is cleaned up when the test ends by
+	// closing the listener directly — removing the socket file does not
+	// stop http.Serve.
 	t.Cleanup(func() {
-		// Closing the socket file forces ListenUnix's http.Serve to return.
-		_ = os.Remove(sockPath)
+		_ = srv.Close()
 		select {
 		case <-errCh:
 		case <-time.After(2 * time.Second):
+			t.Error("ListenUnix goroutine did not exit within 2s")
 		}
 	})
 

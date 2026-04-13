@@ -36,7 +36,19 @@ type GICLayout struct {
 }
 
 func (g GICLayout) Valid() bool {
-	return g.Version == GICVersionV2 || g.Version == GICVersionV3
+	if g.Version != GICVersionV2 && g.Version != GICVersionV3 {
+		return false
+	}
+	if g.Compat == "" || g.MaintIRQ == 0 {
+		return false
+	}
+	if g.Properties[0] == 0 || g.Properties[1] == 0 {
+		return false
+	}
+	if g.Properties[2] == 0 || g.Properties[3] == 0 {
+		return false
+	}
+	return true
 }
 
 func GICv2() GICLayout {

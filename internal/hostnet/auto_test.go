@@ -22,8 +22,23 @@ func TestAutoNetworkGetters(t *testing.T) {
 		guest:          net.ParseIP("198.18.0.2"),
 		upstreamIfName: "eth0",
 	}
-	if n.TapName() != "tap0" || n.GuestCIDR() != "198.18.0.2/30" || n.GuestIP() != "198.18.0.2" || n.GatewayIP() != "198.18.0.1" || n.UpstreamInterface() != "eth0" {
-		t.Fatalf("unexpected getters: %+v", n)
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"TapName", n.TapName(), "tap0"},
+		{"GuestCIDR", n.GuestCIDR(), "198.18.0.2/30"},
+		{"GuestIP", n.GuestIP(), "198.18.0.2"},
+		{"GatewayIP", n.GatewayIP(), "198.18.0.1"},
+		{"UpstreamInterface", n.UpstreamInterface(), "eth0"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Fatalf("%s() = %q, want %q", tc.name, tc.got, tc.want)
+			}
+		})
 	}
 }
 

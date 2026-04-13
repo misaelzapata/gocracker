@@ -84,6 +84,8 @@ type Device struct {
 	nextHostPort uint32
 	listenFn     func(port uint32) (net.Conn, error)
 	mem          []byte
+	closed       bool
+	rxWG         sync.WaitGroup
 }
 
 // NewDevice creates a vsock device. listenFn is called when the guest
@@ -186,14 +188,23 @@ func (d *Device) handleConnect(hdr *pktHdr, q *virtio.Queue) {
 		device:    d,
 	}
 	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		conn.Close()
+		return
+	}
 	d.conns[connKey{guestPort: hdr.SrcPort, hostPort: hdr.DstPort}] = c
+	d.rxWG.Add(1)
 	d.mu.Unlock()
 
 	// Send RESPONSE
 	d.sendPkt(hdr.DstCID, hdr.SrcCID, hdr.DstPort, hdr.SrcPort, opResponse, nil)
 
 	// Pump data from host connection → guest
-	go c.rxPump(q)
+	go func() {
+		defer d.rxWG.Done()
+		c.rxPump(q)
+	}()
 }
 
 func (d *Device) handleResponse(hdr *pktHdr, q *virtio.Queue) {
@@ -207,8 +218,20 @@ func (d *Device) handleResponse(hdr *pktHdr, q *virtio.Queue) {
 	if pending == nil {
 		return
 	}
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		pending.conn.conn.Close()
+		pending.ready <- fmt.Errorf("vsock device closed")
+		return
+	}
+	d.rxWG.Add(1)
+	d.mu.Unlock()
 	pending.ready <- nil
-	go pending.conn.rxPump(q)
+	go func() {
+		defer d.rxWG.Done()
+		pending.conn.rxPump(q)
+	}()
 }
 
 func (d *Device) handleData(hdr *pktHdr, chain []virtio.Desc, q *virtio.Queue) {
@@ -329,11 +352,16 @@ func (c *Connection) rxPump(q *virtio.Queue) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := c.conn.Read(buf)
+		if c.device.isClosed() {
+			return
+		}
 		if n > 0 {
 			c.device.sendPkt(HostCID, GuestCID, c.hostPort, c.guestPort, opRW, buf[:n])
 		}
 		if err == io.EOF || err != nil {
-			c.device.sendPkt(HostCID, GuestCID, c.hostPort, c.guestPort, opShutdown, nil)
+			if !c.device.isClosed() {
+				c.device.sendPkt(HostCID, GuestCID, c.hostPort, c.guestPort, opShutdown, nil)
+			}
 			return
 		}
 	}
@@ -372,6 +400,48 @@ func (d *Device) Dial(port uint32) (net.Conn, error) {
 		deviceConn.Close()
 		return nil, fmt.Errorf("vsock dial timeout for guest port %d", port)
 	}
+}
+
+// Close shuts down the vsock device: it marks the device closed, terminates
+// all active guest↔host connections, and waits for in-flight rxPump goroutines
+// to exit. Must be called before guest memory is unmapped, otherwise rxPump
+// goroutines may sigpanic writing into freed guest RAM.
+func (d *Device) Close() {
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return
+	}
+	d.closed = true
+	conns := make([]*Connection, 0, len(d.conns))
+	for _, c := range d.conns {
+		conns = append(conns, c)
+	}
+	pending := make([]*pendingConn, 0, len(d.pending))
+	for _, p := range d.pending {
+		pending = append(pending, p)
+	}
+	d.conns = map[connKey]*Connection{}
+	d.pending = map[uint32]*pendingConn{}
+	d.mu.Unlock()
+
+	for _, c := range conns {
+		c.conn.Close()
+	}
+	for _, p := range pending {
+		p.conn.conn.Close()
+		select {
+		case p.ready <- fmt.Errorf("vsock device closed"):
+		default:
+		}
+	}
+	d.rxWG.Wait()
+}
+
+func (d *Device) isClosed() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.closed
 }
 
 func (d *Device) allocateHostPort() uint32 {

@@ -1552,6 +1552,9 @@ func (m *VM) cleanup() {
 		if m.execBroker != nil {
 			m.execBroker.close()
 		}
+		if m.vsockDev != nil {
+			m.vsockDev.Close()
+		}
 		if m.balloonDev != nil {
 			_ = m.balloonDev.Close()
 		}

@@ -177,9 +177,15 @@ func TestPackCpioGzWithSymlink(t *testing.T) {
 	}
 	
 	// Read it back
-	f, _ := os.Open(output)
+	f, err := os.Open(output)
+	if err != nil {
+		t.Fatalf("os.Open(%q): %v", output, err)
+	}
 	defer f.Close()
-	gr, _ := gzip.NewReader(f)
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("gzip.NewReader(%q): %v", output, err)
+	}
 	defer gr.Close()
 	cr := cpiolib.NewReader(gr)
 	found := false

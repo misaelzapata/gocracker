@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/gocracker/gocracker/internal/dockerfile"
 	"github.com/gocracker/gocracker/internal/oci"
@@ -38,6 +39,9 @@ type Server struct {
 	pullImage       func(oci.PullOptions) (*oci.PulledImage, error)
 	extractToDir    func(img *oci.PulledImage, dir string) error
 	buildDockerfile func(dockerfile.BuildOptions) (*dockerfile.BuildResult, error)
+
+	mu sync.Mutex
+	ln net.Listener
 }
 
 func New() *Server {
@@ -63,8 +67,32 @@ func (s *Server) ListenUnix(path string) error {
 	if err != nil {
 		return err
 	}
-	defer ln.Close()
-	return http.Serve(ln, s)
+	s.mu.Lock()
+	s.ln = ln
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.ln = nil
+		s.mu.Unlock()
+		ln.Close()
+	}()
+	if err := http.Serve(ln, s); err != nil && !errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	return nil
+}
+
+// Close stops a running ListenUnix server, unblocking its http.Serve call.
+// Safe to call when no server is running.
+func (s *Server) Close() error {
+	s.mu.Lock()
+	ln := s.ln
+	s.ln = nil
+	s.mu.Unlock()
+	if ln == nil {
+		return nil
+	}
+	return ln.Close()
 }
 
 func (s *Server) handleBuild(w http.ResponseWriter, r *http.Request) {

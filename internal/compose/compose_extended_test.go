@@ -3,16 +3,14 @@ package compose
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
-	
-	"time"
-
-	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 	api "github.com/gocracker/gocracker/internal/api"
@@ -398,7 +396,6 @@ func TestHealthcheckExecRequestNilReturnsError(t *testing.T) {
 	}
 }
 
-
 func TestWaitForRemoteVMRunning_Timeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -492,7 +489,6 @@ func TestParseMemLimit_Units(t *testing.T) {
 		})
 	}
 }
-
 
 func TestMappingWithEqualsToSlice_Coverage(t *testing.T) {
 	nilVal := composetypes.MappingWithEquals(nil)
