@@ -365,6 +365,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 			return nil, fmt.Errorf("write runtime spec: %w", err)
 		}
 
+		injectHostCACerts(rootfsDir)
 		if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 			return nil, fmt.Errorf("ext4: %w", err)
 		}
@@ -678,6 +679,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		if err := writeRuntimeSpecToRootfs(rootfsDir, guestSpec); err != nil {
 			return nil, fmt.Errorf("write runtime spec: %w", err)
 		}
+		injectHostCACerts(rootfsDir)
 		if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 			return nil, fmt.Errorf("ext4: %w", err)
 		}
@@ -899,6 +901,7 @@ func buildLocal(opts BuildOptions) (*BuildResult, error) {
 		return nil, err
 	}
 
+	injectHostCACerts(rootfsDir)
 	if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 		return nil, fmt.Errorf("ext4: %w", err)
 	}
@@ -968,6 +971,7 @@ func buildViaWorker(opts BuildOptions) (*BuildResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	injectHostCACerts(rootfsDir)
 	if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 		return nil, fmt.Errorf("ext4: %w", err)
 	}
@@ -1120,6 +1124,26 @@ func writeRuntimeSpecToRootfs(rootfsDir string, spec runtimecfg.GuestSpec) error
 		return err
 	}
 	return os.WriteFile(hostPath, data, 0644)
+}
+
+// injectHostCACerts copies the host's CA certificate bundle into the guest
+// rootfs so that TLS-dependent tools (apk, curl, wget) work out of the box.
+func injectHostCACerts(rootfsDir string) {
+	// Only inject if the rootfs doesn't already have CA certs (e.g. alpine:latest has them).
+	guestCerts := filepath.Join(rootfsDir, "etc/ssl/certs/ca-certificates.crt")
+	if info, err := os.Stat(guestCerts); err == nil && info.Size() > 0 {
+		// rootfs already has certs, don't overwrite
+	} else {
+		const hostBundle = "/etc/ssl/certs/ca-certificates.crt"
+		data, err := os.ReadFile(hostBundle)
+		if err == nil {
+			_ = os.MkdirAll(filepath.Dir(guestCerts), 0755)
+			_ = os.WriteFile(guestCerts, data, 0644)
+		}
+	}
+	// Ensure working DNS inside the guest.
+	resolvPath := filepath.Join(rootfsDir, "etc/resolv.conf")
+	_ = os.WriteFile(resolvPath, []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644)
 }
 
 func readImageConfig(path string) (oci.ImageConfig, error) {

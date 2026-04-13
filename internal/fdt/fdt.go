@@ -54,6 +54,10 @@ const (
 
 	DefaultARM64MMIO32Start = 0x40000000 // MMIO32 region start
 
+	// RTC PL031 at Firecracker's RTC_MEM_START (MMIO32 + 0x1000).
+	DefaultARM64RTCBase = 0x40001000
+	DefaultARM64RTCSize = 0x00001000
+
 	// Firecracker reserves the serial MMIO slot at 0x40002000. gocracker
 	// currently exposes an ns16550a UART at that address, while Firecracker's
 	// own AArch64 guests use PL011/ttyAMA0 there.
@@ -386,8 +390,14 @@ func GenerateARM64(cfg ARM64Config) ([]byte, error) {
 	b.propU32("phandle", clockPhandle)
 	b.endNode()
 
-	// gocracker currently uses an ns16550a UART in Firecracker's serial MMIO
-	// slot so the guest console stays on ttyS0.
+	// PL031 RTC — the kernel reads RTCDR at boot to set the wall clock.
+	b.beginNode(fmt.Sprintf("rtc@%x", DefaultARM64RTCBase))
+	b.propStrList("compatible", "arm,pl031", "arm,primecell")
+	b.propReg(DefaultARM64RTCBase, DefaultARM64RTCSize)
+	b.propU32("clocks", clockPhandle)
+	b.propStr("clock-names", "apb_pclk")
+	b.endNode()
+
 	b.beginNode(fmt.Sprintf("uart@%x", DefaultARM64PL011Base))
 	b.propStr("compatible", "ns16550a")
 	b.propReg(DefaultARM64PL011Base, DefaultARM64PL011Size)

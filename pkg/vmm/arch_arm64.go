@@ -14,6 +14,7 @@ import (
 	"github.com/gocracker/gocracker/internal/fdt"
 	"github.com/gocracker/gocracker/internal/kvm"
 	"github.com/gocracker/gocracker/internal/loader"
+	"github.com/gocracker/gocracker/internal/rtc"
 	gclog "github.com/gocracker/gocracker/internal/log"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
 	"github.com/gocracker/gocracker/internal/uart"
@@ -139,6 +140,9 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 		return fmt.Errorf("serial eventfd: %w", err)
 	}
 	vm.uart0 = uart.New(consoleOut, consoleIn, serialIRQFn)
+
+	// PL031 RTC — provides wall clock to the guest kernel at boot.
+	vm.rtcDev = rtc.New()
 
 	// virtio-rng
 	{

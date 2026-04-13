@@ -270,6 +270,7 @@ type VM struct {
 	blkDevs        []*virtio.BlockDevice
 	fsDevs         []*virtio.FSDevice
 	vsockDev       *vsock.Device
+	rtcDev         interface{ ReadBytes(uint16, []byte); WriteBytes(uint16, []byte) }
 	execBroker     *execAgentBroker
 	memDirty       *virtio.DirtyTracker
 
@@ -1700,6 +1701,23 @@ func (m *VM) handleMMIO(vcpu *kvm.VCPU) {
 	mmio := vcpu.GetMMIOData()
 	// ARM64 UART dispatch via MMIO (Firecracker uses ns16550a at 0x40002000).
 	// On x86, uart0 is accessed via I/O ports in handleIO; on ARM64 it's MMIO.
+	// PL031 RTC at 0x40001000 (Firecracker: RTC_MEM_START).
+	if m.rtcDev != nil {
+		const rtcBase = 0x40001000
+		const rtcSize = 0x1000
+		if mmio.PhysAddr >= rtcBase && mmio.PhysAddr < rtcBase+rtcSize {
+			offset := uint16(mmio.PhysAddr - rtcBase)
+			if mmio.IsWrite == 1 {
+				m.rtcDev.WriteBytes(offset, mmio.Data[:mmio.Len])
+			} else {
+				for i := range mmio.Data {
+					mmio.Data[i] = 0
+				}
+				m.rtcDev.ReadBytes(offset, mmio.Data[:mmio.Len])
+			}
+			return
+		}
+	}
 	if m.uart0 != nil {
 		const serialBase = 0x40002000
 		const serialSize = 0x1000

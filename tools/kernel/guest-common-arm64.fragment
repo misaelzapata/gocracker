@@ -53,6 +53,10 @@ CONFIG_ARCH_VIRT=y
 # PSCI for power management (shutdown/reboot from guest)
 CONFIG_ARM_PSCI_FW=y
 
+# PL031 RTC — provides wall clock to the guest (required for TLS)
+CONFIG_RTC_CLASS=y
+CONFIG_RTC_DRV_PL031=y
+
 # Disable debug bloat for minimal kernel size
 CONFIG_DEBUG_INFO_NONE=y
 # CONFIG_DEBUG_INFO is not set
