@@ -57,6 +57,7 @@ func main() {
 		Context:    ctxDir,
 		KernelPath: kernel,
 		MemMB:      128,
+		DiskSizeMB: 256,
 	}
 	var runResp api.RunResponse
 	postJSON(t, src.URL+"/run", runReq, &runResp)

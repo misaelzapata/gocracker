@@ -55,6 +55,7 @@ func TestAPIServeRunExec(t *testing.T) {
 		Context:     contextDir,
 		KernelPath:  kernel,
 		MemMB:       256,
+		DiskSizeMB:  256,
 		ExecEnabled: true,
 	})
 	if err != nil {

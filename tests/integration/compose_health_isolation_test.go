@@ -161,6 +161,7 @@ func TestComposeStackIsolationAndCleanup(t *testing.T) {
 		Context:     filepath.Join(fixtureA, "app"),
 		KernelPath:  kernel,
 		MemMB:       256,
+		DiskSizeMB:  256,
 		CacheDir:    cacheDir,
 		ExecEnabled: true,
 	})

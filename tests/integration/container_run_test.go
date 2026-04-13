@@ -36,6 +36,8 @@ func main() { fmt.Println("oci-container-ok") }
 		Context:    contextDir,
 		KernelPath: kernel,
 		MemMB:      256,
+		DiskSizeMB: 256,
+		CacheDir:   filepath.Join(t.TempDir(), "cache"),
 		ConsoleOut: &serial,
 		JailerMode: container.JailerModeOff,
 	})
@@ -79,6 +81,8 @@ ENTRYPOINT ["/app"]
 		Context:    contextDir,
 		KernelPath: kernel,
 		MemMB:      256,
+		DiskSizeMB: 256,
+		CacheDir:   filepath.Join(t.TempDir(), "cache"),
 		ConsoleOut: &serial,
 		JailerMode: container.JailerModeOff,
 	})
@@ -138,6 +142,8 @@ func main() {
 		Context:    contextDir,
 		KernelPath: kernel,
 		MemMB:      256,
+		DiskSizeMB: 256,
+		CacheDir:   filepath.Join(t.TempDir(), "cache"),
 		ConsoleOut: &serial,
 		JailerMode: container.JailerModeOff,
 	})

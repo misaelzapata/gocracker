@@ -78,6 +78,8 @@ func TestVirtioBalloonLocalStatsAndExec(t *testing.T) {
 		Context:     contextDir,
 		KernelPath:  kernel,
 		MemMB:       1024,
+		DiskSizeMB:  256,
+		CacheDir:    filepath.Join(t.TempDir(), "cache"),
 		ExecEnabled: true,
 		Balloon: &vmm.BalloonConfig{
 			AmountMiB:             0,
@@ -141,6 +143,7 @@ func TestVirtioBalloonWorkerReclaimsRSS(t *testing.T) {
 		Context:      contextDir,
 		KernelPath:   kernel,
 		MemMB:        1024,
+		DiskSizeMB:   256,
 		ExecEnabled:  true,
 		CacheDir:     cacheDir,
 		JailerMode:   container.JailerModeOn,
@@ -201,6 +204,8 @@ func TestMemoryHotplugLocalGrowShrink(t *testing.T) {
 		Context:     contextDir,
 		KernelPath:  kernel,
 		MemMB:       512,
+		DiskSizeMB:  256,
+		CacheDir:    filepath.Join(t.TempDir(), "cache"),
 		ExecEnabled: true,
 		MemoryHotplug: &vmm.MemoryHotplugConfig{
 			TotalSizeMiB: 256,
@@ -277,6 +282,7 @@ func TestMemoryHotplugWorkerGrowShrink(t *testing.T) {
 		Context:      contextDir,
 		KernelPath:   kernel,
 		MemMB:        512,
+		DiskSizeMB:   256,
 		ExecEnabled:  true,
 		CacheDir:     cacheDir,
 		JailerMode:   container.JailerModeOn,

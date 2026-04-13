@@ -58,6 +58,8 @@ func main() {
 		Context:    contextDir,
 		KernelPath: kernel,
 		MemMB:      256,
+		DiskSizeMB: 256,
+		CacheDir:   filepath.Join(t.TempDir(), "cache"),
 		X86Boot:    vmm.X86BootACPI,
 		ConsoleOut: testConsoleWriter(t),
 		// Use in-process VMM so stdio inherited by jailer subprocesses
@@ -184,6 +186,8 @@ func main() {
 		ContextDir:  baseDir,
 		KernelPath:  kernel,
 		DefaultMem:  256,
+		DefaultDisk: 256,
+		CacheDir:    filepath.Join(t.TempDir(), "cache"),
 		X86Boot:     vmm.X86BootACPI,
 		JailerMode:  container.JailerModeOff,
 	})
