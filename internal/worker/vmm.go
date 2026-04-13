@@ -12,6 +12,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/gocracker/gocracker/internal/sharedfs"
 	"github.com/gocracker/gocracker/internal/vmmserver"
@@ -20,7 +23,7 @@ import (
 
 const (
 	pollInterval   = 250 * time.Millisecond
-	socketWaitStep = 50 * time.Millisecond
+	socketWaitStep = 25 * time.Millisecond
 	socketWaitMax  = 10 * time.Second
 )
 
@@ -32,7 +35,6 @@ type subprocessLogBuffer struct {
 func (b *subprocessLogBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	os.Stdout.Write(p) // FOR DEBUGGING
 	return b.buf.Write(p)
 }
 
@@ -99,36 +101,63 @@ type remoteVM struct {
 	jailRoot string
 	created  time.Time
 
-	mu      sync.RWMutex
-	state   vmm.State
-	uptime  time.Duration
-	devices []vmm.DeviceInfo
-	logs    []byte
+	mu            sync.RWMutex
+	state         vmm.State
+	started       time.Time
+	uptime        time.Duration
+	devices       []vmm.DeviceInfo
+	logs          []byte
+	firstOutputAt time.Time
 }
 
+// LaunchVMM is a thin wrapper over LaunchVMMWithTimings for callers that
+// don't need the phase breakdown. New code should prefer the timed variant.
 func LaunchVMM(cfg vmm.Config, opts VMMOptions) (vmm.Handle, func(), error) {
+	h, _, cleanup, err := LaunchVMMWithTimings(cfg, opts)
+	return h, cleanup, err
+}
+
+// LaunchVMMWithTimings starts a jailed gocracker-vmm subprocess, drives it
+// through the Firecracker REST API to boot the guest, and returns a Handle
+// plus a vmm.BootTimings populated with the host-side phase split:
+//
+//   - Orchestration = fork-exec(jailer) + chroot setup + socket wait +
+//     the SET* setup RPCs (everything BEFORE InstanceStart).
+//   - VMMSetup      = InstanceStart RPC round trip (which triggers the
+//     remote vmm.New + vm.Start inside gocracker-vmm).
+//   - Start and GuestFirstOutput are left zero here; the caller (container
+//     package) fills GuestFirstOutput once the guest has printed a byte.
+func LaunchVMMWithTimings(cfg vmm.Config, opts VMMOptions) (vmm.Handle, vmm.BootTimings, func(), error) {
+	var timings vmm.BootTimings
+	t0 := time.Now()
 	if opts.ChrootBase == "" {
 		opts.ChrootBase = DefaultChrootBaseDir()
 	}
+	if err := os.MkdirAll(opts.ChrootBase, 0755); err != nil {
+		return nil, timings, nil, fmt.Errorf("create chroot base %s: %w", opts.ChrootBase, err)
+	}
 	jailerExec, jailerPrefix, err := resolveLauncher(opts.JailerBinary, "jailer")
 	if err != nil {
-		return nil, nil, err
+		return nil, timings, nil, err
 	}
 	vmmExec, vmmArgsPrefix, err := resolveLauncher(opts.VMMBinary, "vmm")
 	if err != nil {
-		return nil, nil, err
+		return nil, timings, nil, err
 	}
 	runDir, err := os.MkdirTemp("", "gocracker-vmm-worker-*")
 	if err != nil {
-		return nil, nil, err
+		return nil, timings, nil, err
 	}
 	socketHostPath := filepath.Join(runDir, "vmm.sock")
+	jailerID := jailerInstanceID(runDir)
 
 	jailedCfg := cfg
 	mounts := []string{
 		"rw:" + runDir + ":/worker",
 	}
-	jailRoot := filepath.Join(opts.ChrootBase, filepath.Base(vmmExec), jailedCfg.ID, "root")
+	// The jail root must derive from the same unique identifier that we pass
+	// to the jailer, otherwise we silently fall back to the shared vm-id path.
+	jailRoot := filepath.Join(opts.ChrootBase, filepath.Base(vmmExec), jailerID, "root")
 	jailedCfg.KernelPath = "/worker/kernel"
 	mounts = append(mounts, "ro:"+cfg.KernelPath+":"+jailedCfg.KernelPath)
 	if cfg.InitrdPath != "" {
@@ -176,7 +205,7 @@ func LaunchVMM(cfg vmm.Config, opts VMMOptions) (vmm.Handle, func(), error) {
 					_ = b.Close()
 				}
 				_ = os.RemoveAll(runDir)
-				return nil, nil, fmt.Errorf("start host virtiofsd for tag %s: %w", fs.Tag, err)
+				return nil, timings, nil, fmt.Errorf("start host virtiofsd for tag %s: %w", fs.Tag, err)
 			}
 			virtiofsdBackends = append(virtiofsdBackends, backend)
 			shared = append(shared, vmm.SharedFSConfig{
@@ -189,7 +218,7 @@ func LaunchVMM(cfg vmm.Config, opts VMMOptions) (vmm.Handle, func(), error) {
 	}
 
 	jailerArgs := []string{
-		"--id", jailedCfg.ID,
+		"--id", jailerID,
 		"--uid", fmt.Sprintf("%d", firstNonNegative(opts.UID, os.Getuid())),
 		"--gid", fmt.Sprintf("%d", firstNonNegative(opts.GID, os.Getgid())),
 		"--exec-file", vmmExec,
@@ -219,7 +248,7 @@ func LaunchVMM(cfg vmm.Config, opts VMMOptions) (vmm.Handle, func(), error) {
 			_ = b.Close()
 		}
 		_ = os.RemoveAll(runDir)
-		return nil, nil, fmt.Errorf("start jailer: %w", err)
+		return nil, timings, nil, fmt.Errorf("start jailer: %w", err)
 	}
 
 	cleanup := func() {
@@ -237,71 +266,54 @@ func LaunchVMM(cfg vmm.Config, opts VMMOptions) (vmm.Handle, func(), error) {
 			<-waitErrCh
 		}
 		cleanup()
-		return nil, nil, wrapSubprocessError(err, logBuf)
+		return nil, timings, nil, wrapSubprocessError(err, logBuf)
 	}
 
 	client := vmmserver.NewClient(socketHostPath)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := client.SetBootSource(ctx, vmmserver.BootSource{
-		KernelImagePath: jailedCfg.KernelPath,
-		BootArgs:        jailedCfg.Cmdline,
-		InitrdPath:      jailedCfg.InitrdPath,
-		X86Boot:         string(jailedCfg.X86Boot),
-	}); err != nil {
-		_ = cmd.Process.Kill()
-		cleanup()
-		return nil, nil, wrapSubprocessError(err, logBuf)
-	}
-	if err := client.SetMachineConfig(ctx, vmmserver.MachineConfig{
-		VcpuCount:      jailedCfg.VCPUs,
-		MemSizeMib:     int(jailedCfg.MemMB),
-		RNGRateLimiter: jailedCfg.RNGRateLimiter,
-		VsockEnabled:   jailedCfg.Vsock != nil && jailedCfg.Vsock.Enabled,
-		VsockGuestCID:  vsockGuestCID(jailedCfg.Vsock),
-		ExecEnabled:    jailedCfg.Exec != nil && jailedCfg.Exec.Enabled,
-		ExecVsockPort:  execVsockPort(jailedCfg.Exec),
-	}); err != nil {
-		_ = cmd.Process.Kill()
-		cleanup()
-		return nil, nil, wrapSubprocessError(err, logBuf)
+
+	casReq := vmmserver.ConfigureAndStartRequest{
+		BootSource: vmmserver.BootSource{
+			KernelImagePath: jailedCfg.KernelPath,
+			BootArgs:        jailedCfg.Cmdline,
+			InitrdPath:      jailedCfg.InitrdPath,
+			X86Boot:         string(jailedCfg.X86Boot),
+		},
+		MachineConfig: &vmmserver.MachineConfig{
+			VcpuCount:      jailedCfg.VCPUs,
+			MemSizeMib:     int(jailedCfg.MemMB),
+			RNGRateLimiter: jailedCfg.RNGRateLimiter,
+			VsockEnabled:   jailedCfg.Vsock != nil && jailedCfg.Vsock.Enabled,
+			VsockGuestCID:  vsockGuestCID(jailedCfg.Vsock),
+			ExecEnabled:    jailedCfg.Exec != nil && jailedCfg.Exec.Enabled,
+			ExecVsockPort:  execVsockPort(jailedCfg.Exec),
+		},
 	}
 	if jailedCfg.Balloon != nil {
-		if err := client.SetBalloon(ctx, vmmserver.Balloon{
+		casReq.Balloon = &vmmserver.Balloon{
 			AmountMib:             jailedCfg.Balloon.AmountMiB,
 			DeflateOnOOM:          jailedCfg.Balloon.DeflateOnOOM,
 			StatsPollingIntervalS: jailedCfg.Balloon.StatsPollingIntervalS,
 			FreePageHinting:       jailedCfg.Balloon.FreePageHinting,
 			FreePageReporting:     jailedCfg.Balloon.FreePageReporting,
-		}); err != nil {
-			_ = cmd.Process.Kill()
-			cleanup()
-			return nil, nil, wrapSubprocessError(err, logBuf)
 		}
 	}
 	if jailedCfg.MemoryHotplug != nil {
-		if err := client.SetMemoryHotplug(ctx, vmmserver.MemoryHotplugConfig{
+		casReq.MemoryHotplug = &vmmserver.MemoryHotplugConfig{
 			TotalSizeMiB: jailedCfg.MemoryHotplug.TotalSizeMiB,
 			SlotSizeMiB:  jailedCfg.MemoryHotplug.SlotSizeMiB,
 			BlockSizeMiB: jailedCfg.MemoryHotplug.BlockSizeMiB,
-		}); err != nil {
-			_ = cmd.Process.Kill()
-			cleanup()
-			return nil, nil, wrapSubprocessError(err, logBuf)
 		}
 	}
 	for _, drive := range jailedCfg.DriveList() {
-		if err := client.SetDrive(ctx, drive.ID, vmmserver.Drive{
+		casReq.Drives = append(casReq.Drives, vmmserver.Drive{
 			DriveID:      drive.ID,
 			PathOnHost:   drive.Path,
 			IsRootDevice: drive.Root,
 			IsReadOnly:   drive.ReadOnly,
 			RateLimiter:  cloneRateLimiter(drive.RateLimiter),
-		}); err != nil {
-			_ = cmd.Process.Kill()
-			cleanup()
-			return nil, nil, wrapSubprocessError(err, logBuf)
-		}
+		})
 	}
 	if jailedCfg.TapName != "" {
 		iface := vmmserver.NetworkInterface{
@@ -312,28 +324,25 @@ func LaunchVMM(cfg vmm.Config, opts VMMOptions) (vmm.Handle, func(), error) {
 		if len(jailedCfg.MACAddr) > 0 {
 			iface.GuestMAC = jailedCfg.MACAddr.String()
 		}
-		if err := client.SetNetworkInterface(ctx, "eth0", iface); err != nil {
-			_ = cmd.Process.Kill()
-			cleanup()
-			return nil, nil, wrapSubprocessError(err, logBuf)
-		}
+		casReq.NetworkInterfaces = append(casReq.NetworkInterfaces, iface)
 	}
 	for _, fs := range jailedCfg.SharedFS {
-		if err := client.SetSharedFS(ctx, fs.Tag, vmmserver.SharedFS{
+		casReq.SharedFS = append(casReq.SharedFS, vmmserver.SharedFS{
 			Tag:        fs.Tag,
 			Source:     fs.Source,
 			SocketPath: fs.SocketPath,
-		}); err != nil {
-			_ = cmd.Process.Kill()
-			cleanup()
-			return nil, nil, wrapSubprocessError(err, logBuf)
-		}
+		})
 	}
-	if err := client.Start(ctx); err != nil {
+
+	tPreStart := time.Now()
+	timings.Orchestration = tPreStart.Sub(t0)
+	if err := client.ConfigureAndStart(ctx, casReq); err != nil {
 		_ = cmd.Process.Kill()
 		cleanup()
-		return nil, nil, wrapSubprocessError(err, logBuf)
+		return nil, timings, nil, wrapSubprocessError(err, logBuf)
 	}
+	timings.VMMSetup = time.Since(tPreStart)
+	timings = timings.Sum()
 
 	rvm := &remoteVM{
 		client:   client,
@@ -355,7 +364,7 @@ func LaunchVMM(cfg vmm.Config, opts VMMOptions) (vmm.Handle, func(), error) {
 		}
 		rvm.finish()
 	}()
-	return rvm, cleanup, nil
+	return rvm, timings, cleanup, nil
 }
 
 func LaunchRestoredVMM(snapshotDir string, opts vmm.RestoreOptions, workerOpts VMMOptions) (vmm.Handle, func(), error) {
@@ -365,6 +374,9 @@ func LaunchRestoredVMM(snapshotDir string, opts vmm.RestoreOptions, workerOpts V
 func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, resume bool, workerOpts VMMOptions) (vmm.Handle, func(), error) {
 	if workerOpts.ChrootBase == "" {
 		workerOpts.ChrootBase = DefaultChrootBaseDir()
+	}
+	if err := os.MkdirAll(workerOpts.ChrootBase, 0755); err != nil {
+		return nil, nil, fmt.Errorf("create chroot base %s: %w", workerOpts.ChrootBase, err)
 	}
 	jailerExec, jailerPrefix, err := resolveLauncher(workerOpts.JailerBinary, "jailer")
 	if err != nil {
@@ -379,8 +391,9 @@ func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, re
 		return nil, nil, err
 	}
 	socketHostPath := filepath.Join(runDir, "vmm.sock")
+	jailerID := jailerInstanceID(runDir)
 	jailerArgs := []string{
-		"--id", filepath.Base(snapshotDir),
+		"--id", jailerID,
 		"--uid", fmt.Sprintf("%d", firstNonNegative(workerOpts.UID, os.Getuid())),
 		"--gid", fmt.Sprintf("%d", firstNonNegative(workerOpts.GID, os.Getgid())),
 		"--exec-file", vmmExec,
@@ -444,7 +457,7 @@ func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, re
 		runDir:   runDir,
 		socket:   socketHostPath,
 		pid:      cmd.Process.Pid,
-		jailRoot: filepath.Join(workerOpts.ChrootBase, filepath.Base(vmmExec), filepath.Base(snapshotDir), "root"),
+		jailRoot: filepath.Join(workerOpts.ChrootBase, filepath.Base(vmmExec), jailerID, "root"),
 		created:  time.Now(),
 		state:    parseState(info.State),
 	}
@@ -584,6 +597,9 @@ func (r *remoteVM) ID() string { return r.cfg.ID }
 func (r *remoteVM) Uptime() time.Duration {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if !r.started.IsZero() && r.state == vmm.StateRunning {
+		return time.Since(r.started) + r.uptime
+	}
 	return r.uptime
 }
 
@@ -608,6 +624,17 @@ func (r *remoteVM) DeviceList() []vmm.DeviceInfo {
 	out := make([]vmm.DeviceInfo, len(r.devices))
 	copy(out, r.devices)
 	return out
+}
+
+// FirstOutputAt returns the cached timestamp at which the guest first
+// wrote to the UART. The value is updated by the poll() loop which
+// already refreshes VM info periodically — this method is a pure
+// accessor with no I/O to avoid HTTP polling storms when called in a
+// tight loop (e.g. the 2ms waitFirstOutput poller in container.go).
+func (r *remoteVM) FirstOutputAt() time.Time {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.firstOutputAt
 }
 
 func (r *remoteVM) ConsoleOutput() []byte {
@@ -843,9 +870,18 @@ func (r *remoteVM) poll() {
 			if info.Kernel != "" {
 				r.cfg.KernelPath = info.Kernel
 			}
+			if r.state != vmm.StateRunning && state == vmm.StateRunning {
+				r.started = time.Now()
+			}
+			if state != vmm.StateRunning {
+				r.started = time.Time{}
+			}
 			r.state = state
 			r.uptime = up
 			r.devices = append(r.devices[:0], info.Devices...)
+			if r.firstOutputAt.IsZero() && !info.FirstOutputAt.IsZero() {
+				r.firstOutputAt = info.FirstOutputAt
+			}
 			r.mu.Unlock()
 			if state == vmm.StateStopped {
 				cancel()
@@ -896,6 +932,116 @@ func waitForSocket(path string, timeout time.Duration) error {
 }
 
 func waitForSocketOrExit(path string, timeout time.Duration, waitErrCh <-chan error) (bool, error) {
+	// Try inotify first; fall back to polling on any setup error.
+	exited, err, ok := waitForSocketInotify(path, timeout, waitErrCh)
+	if ok {
+		return exited, err
+	}
+	return waitForSocketPoll(path, timeout, waitErrCh)
+}
+
+// waitForSocketInotify uses inotify to watch for socket creation, then
+// confirms it is connectable. Returns (exited, err, true) on success or
+// (_, _, false) if inotify setup failed and the caller should fall back.
+func waitForSocketInotify(path string, timeout time.Duration, waitErrCh <-chan error) (bool, error, bool) {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+
+	// Ensure the parent directory exists before adding a watch.
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return false, nil, false
+	}
+
+	ifd, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
+	if err != nil {
+		return false, nil, false
+	}
+
+	// os.File owns the fd; do not also unix.Close(ifd) (double-close).
+	inotifyFile := os.NewFile(uintptr(ifd), "inotify")
+	defer inotifyFile.Close()
+
+	_, err = unix.InotifyAddWatch(ifd, dir, unix.IN_CREATE)
+	if err != nil {
+		return false, nil, false
+	}
+
+	eventCh := make(chan string, 16)
+	go func() {
+		defer close(eventCh)
+		buf := make([]byte, 4096)
+		for {
+			n, err := inotifyFile.Read(buf)
+			if err != nil {
+				return
+			}
+			offset := 0
+			for offset+unix.SizeofInotifyEvent <= n {
+				event := (*unix.InotifyEvent)(unsafe.Pointer(&buf[offset]))
+				nameLen := int(event.Len)
+				if nameLen > 0 && offset+unix.SizeofInotifyEvent+nameLen <= n {
+					nameBytes := buf[offset+unix.SizeofInotifyEvent : offset+unix.SizeofInotifyEvent+nameLen]
+					// Name is null-terminated.
+					if idx := bytes.IndexByte(nameBytes, 0); idx >= 0 {
+						nameBytes = nameBytes[:idx]
+					}
+					eventCh <- string(nameBytes)
+				}
+				offset += unix.SizeofInotifyEvent + nameLen
+			}
+		}
+	}()
+
+	// Check if the socket already exists (race: it may have been created
+	// before the watch was established).
+	if conn, err := net.DialTimeout("unix", path, 100*time.Millisecond); err == nil {
+		_ = conn.Close()
+		return false, nil, true
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case name, ok := <-eventCh:
+			if !ok {
+				// inotify reader closed unexpectedly; fall back.
+				return false, nil, false
+			}
+			if name != base {
+				continue
+			}
+			// File appeared — try to connect (the process may not be
+			// listening yet). Use exponential backoff starting at 1ms.
+			backoff := time.Millisecond
+			for i := 0; i < 15; i++ {
+				conn, err := net.DialTimeout("unix", path, 50*time.Millisecond)
+				if err == nil {
+					_ = conn.Close()
+					return false, nil, true
+				}
+				time.Sleep(backoff)
+				if backoff < 20*time.Millisecond {
+					backoff *= 2
+				}
+			}
+			return false, fmt.Errorf("socket %s appeared but is not connectable", path), true
+
+		case waitErr := <-waitErrCh:
+			if waitErr == nil {
+				return true, fmt.Errorf("worker exited before opening socket %s", path), true
+			}
+			return true, fmt.Errorf("worker exited before opening socket %s: %w", path, waitErr), true
+
+		case <-timer.C:
+			return false, fmt.Errorf("timed out waiting for worker socket %s", path), true
+		}
+	}
+}
+
+// waitForSocketPoll is the legacy polling fallback.
+func waitForSocketPoll(path string, timeout time.Duration, waitErrCh <-chan error) (bool, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("unix", path, 100*time.Millisecond)
@@ -914,6 +1060,14 @@ func waitForSocketOrExit(path string, timeout time.Duration, waitErrCh <-chan er
 		time.Sleep(socketWaitStep)
 	}
 	return false, fmt.Errorf("timed out waiting for worker socket %s", path)
+}
+
+func jailerInstanceID(runDir string) string {
+	base := strings.TrimSpace(filepath.Base(runDir))
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return "gocracker-vmm"
+	}
+	return base
 }
 
 func DefaultChrootBaseDir() string {

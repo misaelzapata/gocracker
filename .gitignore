@@ -1,8 +1,8 @@
-gocracker
-gocracker-vmm
-gocracker-jailer
-gocracker.test
-ptyrun
+/gocracker
+/gocracker-vmm
+/gocracker-jailer
+/gocracker.test
+/ptyrun
 artifacts/kernel-build/
 artifacts/linux-src/
 artifacts/linux-archives/
@@ -17,3 +17,4 @@ artifacts/kernels/host-*
 .vscode/
 __pycache__/
 2026-*.txt
+gocracker-bottleneck.md

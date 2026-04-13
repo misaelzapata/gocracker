@@ -11,6 +11,8 @@ type machineArchBackend interface {
 	setupDevices(*VM) error
 	setupIRQs(*VM) error
 	loadKernel(*VM) (*loader.KernelInfo, error)
+	postCreateVCPUs(*VM) error
+	setupVCPUsInParallel() bool
 	setupVCPU(*VM, *kvm.VCPU, int, *loader.KernelInfo) error
 	captureVCPU(*kvm.VCPU) (VCPUState, error)
 	restoreVCPU(*kvm.System, *kvm.VM, *kvm.VCPU, VCPUState) error

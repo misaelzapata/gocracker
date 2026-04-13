@@ -8,18 +8,35 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Unit and package tests
         run: go test $(go list ./... | grep -v /tests/integration)
 
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Repo-wide coverage summary
+        run: |
+          chmod +x ./tools/coverage-repo.sh
+          ./tools/coverage-repo.sh --threshold 90 --warn-only --summary-file coverage-summary.txt
+      - name: Upload coverage summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: coverage-summary.txt
+
   privileged-integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Check privileged prerequisites
@@ -30,19 +47,33 @@ jobs:
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
+      - name: Free disk space
+        if: steps.prereq.outputs.run == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
       - name: Decompress guest kernel
         if: steps.prereq.outputs.run == 'true'
         run: gunzip -k artifacts/kernels/gocracker-guest-standard-vmlinux.gz || true
       - name: Build gocracker binary
         if: steps.prereq.outputs.run == 'true'
         run: make build
-      - name: Privileged integration subset
+      - name: Privileged integration tests
         if: steps.prereq.outputs.run == 'true'
         run: |
           sudo -n env GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
-            go test -tags integration ./tests/integration \
-            -run 'TestAPIServeRunExec|TestCLIComposeServeExec|TestCLIRunInteractiveExec|TestCLIComposeExecInteractive|TestVirtioBalloon(LocalStatsAndExec|WorkerReclaimsRSS)' \
-            -count=1 -v -timeout 300s
+            GOCRACKER_SECCOMP=off \
+            GOCRACKER_SKIP_MIGRATION=1 \
+            GOCRACKER_JAILER_OFF=1 \
+            GOCRACKER_SKIP_LARGE_MEM=1 \
+            go test -tags integration ./tests/integration/... \
+            -count=1 -v -timeout 600s \
+          || sudo -n env GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
+            GOCRACKER_SECCOMP=off \
+            GOCRACKER_SKIP_MIGRATION=1 \
+            go test -tags integration ./tests/integration/... \
+            -count=1 -v -timeout 600s
       - name: Skip note
         if: steps.prereq.outputs.run != 'true'
         run: echo "Skipping privileged integration subset because /dev/kvm or /dev/net/tun is unavailable on this runner."

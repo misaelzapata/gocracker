@@ -241,3 +241,13 @@ sudo gocracker serve --sock /tmp/gocracker.sock
 | `--trusted-kernel-dir` | string | (auto) | Trusted kernel directory (repeatable) |
 | `--trusted-work-dir` | string | (auto) | Trusted workspace directory (repeatable) |
 | `--trusted-snapshot-dir` | string | (auto) | Trusted snapshot directory (repeatable) |
+
+---
+
+## More Documentation
+
+- [Getting Started](GETTING_STARTED.md) | [Networking](NETWORKING.md) | [Architecture](ARCHITECTURE.md) | [Compose](COMPOSE.md)
+- [API Reference](API.md) | [CLI Reference](CLI_REFERENCE.md) | [Snapshots](SNAPSHOTS.md)
+- [Examples](EXAMPLES.md) | [Validated Projects](VALIDATED_PROJECTS.md) | [Troubleshooting](TROUBLESHOOTING.md)
+- [How gocracker Fits In](COMPETITIVE_ANALYSIS.md) | [Security Policy](../SECURITY.md)
+

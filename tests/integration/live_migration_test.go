@@ -28,6 +28,7 @@ func migrationTestAPI() *api.Server {
 }
 
 func TestLiveMigrationStopAndCopy(t *testing.T) {
+	requireKVMClockCtrl(t)
 	kernel := requireIntegrationKernel(t)
 
 	ctxDir := t.TempDir()
@@ -57,6 +58,7 @@ func main() {
 		Context:    ctxDir,
 		KernelPath: kernel,
 		MemMB:      128,
+		DiskSizeMB: 256,
 	}
 	var runResp api.RunResponse
 	postJSON(t, src.URL+"/run", runReq, &runResp)
@@ -64,10 +66,7 @@ func main() {
 		t.Fatal("run response did not include a VM id")
 	}
 
-	srcVM := waitForVM(t, src.URL, runResp.ID, 45*time.Second)
-	if srcVM.State != "running" {
-		t.Fatalf("source VM state = %s, want running", srcVM.State)
-	}
+	_ = waitForVMRunning(t, src.URL, runResp.ID, 45*time.Second)
 
 	migrateReq := api.MigrateRequest{DestinationURL: dst.URL}
 	var migrateResp api.MigrationResponse
@@ -97,6 +96,7 @@ func main() {
 }
 
 func TestLiveMigrationPreCopyPreservesDirtyRAMAndDisk(t *testing.T) {
+	requireKVMClockCtrl(t)
 	// Stop-and-copy migration works (TestLiveMigrationStopAndCopy passes after
 	// the prepare-bundle ordering fix). Pre-copy still loses dirty disk pages
 	// during the delta apply: the destination disk image does not contain the
@@ -292,6 +292,22 @@ func waitForVM(t *testing.T, baseURL, vmID string, timeout time.Duration) api.VM
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("vm %s did not appear at %s within %s", vmID, baseURL, timeout)
+	return api.VMInfo{}
+}
+
+func waitForVMRunning(t *testing.T, baseURL, vmID string, timeout time.Duration) api.VMInfo {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		vms := listVMs(t, baseURL)
+		for _, vm := range vms {
+			if vm.ID == vmID && vm.State == "running" {
+				return vm
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("vm %s did not reach running state at %s within %s", vmID, baseURL, timeout)
 	return api.VMInfo{}
 }
 

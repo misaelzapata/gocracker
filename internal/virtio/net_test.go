@@ -91,3 +91,260 @@ func TestTapTransientReadErrorClassification(t *testing.T) {
 		t.Fatal("EBADF should not be classified as transient")
 	}
 }
+
+func TestNetDeviceConfigBytes(t *testing.T) {
+	mem := make([]byte, 64*1024)
+	dev := &NetDevice{tapName: "tap-test"}
+	dev.cfg.MAC = [6]byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}
+	dev.cfg.Status = 0
+	dev.Transport = NewTransport(dev, mem, 0x1000, 5, nil, nil)
+
+	cfg := dev.ConfigBytes()
+	if len(cfg) != 8 {
+		t.Fatalf("ConfigBytes len = %d, want 8", len(cfg))
+	}
+	// Check MAC bytes
+	if cfg[0] != 0xAA || cfg[1] != 0xBB || cfg[5] != 0xFF {
+		t.Fatalf("MAC bytes mismatch: %x", cfg[:6])
+	}
+	// Status should be 0 (link down)
+	status := binary.LittleEndian.Uint16(cfg[6:])
+	if status != 0 {
+		t.Fatalf("status = %d, want 0", status)
+	}
+}
+
+func TestNetDeviceActivateLink(t *testing.T) {
+	mem := make([]byte, 64*1024)
+	dev := &NetDevice{tapName: "tap-test"}
+	dev.Transport = NewTransport(dev, mem, 0x1000, 5, nil, nil)
+
+	if dev.cfg.Status != 0 {
+		t.Fatalf("initial status = %d, want 0", dev.cfg.Status)
+	}
+	dev.ActivateLink()
+	if dev.cfg.Status != 1 {
+		t.Fatalf("status after ActivateLink = %d, want 1", dev.cfg.Status)
+	}
+}
+
+func TestNetDeviceID(t *testing.T) {
+	mem := make([]byte, 64*1024)
+	dev := &NetDevice{tapName: "tap-test"}
+	dev.Transport = NewTransport(dev, mem, 0x1000, 5, nil, nil)
+
+	if dev.DeviceID() != DeviceIDNet {
+		t.Fatalf("DeviceID = %d, want %d", dev.DeviceID(), DeviceIDNet)
+	}
+}
+
+func TestNetDeviceFeatures(t *testing.T) {
+	mem := make([]byte, 64*1024)
+	dev := &NetDevice{tapName: "tap-test"}
+	dev.Transport = NewTransport(dev, mem, 0x1000, 5, nil, nil)
+
+	features := dev.DeviceFeatures()
+	if features&NetFeatureMac == 0 {
+		t.Fatal("missing NetFeatureMac")
+	}
+	if features&NetFeatureMrgRxBuf == 0 {
+		t.Fatal("missing NetFeatureMrgRxBuf")
+	}
+	if features&NetFeatureStatus == 0 {
+		t.Fatal("missing NetFeatureStatus")
+	}
+}
+
+func TestNetDeviceHandleQueue_TXQueue(t *testing.T) {
+	prevRead := tapReadFrameFn
+	tapReadFrameFn = func(fd int, buf []byte) (int, error) {
+		return 0, syscall.EBADF
+	}
+	t.Cleanup(func() { tapReadFrameFn = prevRead })
+
+	mem := make([]byte, 64*1024)
+	dev := &NetDevice{tapName: "tap-test"}
+	dev.Transport = NewTransport(dev, mem, 0x1000, 5, nil, nil)
+	r, w, _ := os.Pipe()
+	defer r.Close()
+	defer w.Close()
+	dev.tapFd = r
+
+	// HandleQueue with idx=0 (RX) should be a no-op
+	dev.HandleQueue(0, dev.Queue(0))
+
+	// HandleQueue with idx=1 (TX) should try to transmit
+	txQ := dev.Queue(1)
+	txQ.Ready = true
+	txQ.Size = 256
+	txQ.DescAddr = 0x1000
+	txQ.DriverAddr = 0x2000
+	txQ.DeviceAddr = 0x3000
+	dev.HandleQueue(1, txQ)
+}
+
+func TestNetDeviceSetRateLimiter(t *testing.T) {
+	mem := make([]byte, 64*1024)
+	dev := &NetDevice{tapName: "tap-test"}
+	dev.Transport = NewTransport(dev, mem, 0x1000, 5, nil, nil)
+
+	rl := NewRateLimiter(RateLimiterConfig{Bandwidth: TokenBucket{Size: 1000, RefillTime: 1000}})
+	dev.SetRateLimiter(rl)
+	if dev.rl != rl {
+		t.Fatal("rate limiter not set")
+	}
+}
+
+func TestNetDeviceClose_NilFd(t *testing.T) {
+	mem := make([]byte, 64*1024)
+	dev := &NetDevice{tapName: ""}
+	dev.Transport = NewTransport(dev, mem, 0x1000, 5, nil, nil)
+
+	// Close with nil tapFd and empty tapName should succeed
+	if err := dev.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+}
+
+func TestIsTapShutdownError(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{syscall.EBADF, true},
+		{syscall.EIO, true},
+		{syscall.EINVAL, true},
+		{syscall.ENODEV, true},
+		{syscall.EFAULT, true},
+		{syscall.EAGAIN, false},
+		{syscall.EINTR, false},
+		{nil, false},
+	}
+	for _, tt := range tests {
+		got := isTapShutdownError(tt.err)
+		if got != tt.want {
+			t.Errorf("isTapShutdownError(%v) = %v, want %v", tt.err, got, tt.want)
+		}
+	}
+}
+
+func TestWriteTapFrame_Success(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	pkt := []byte{0x01, 0x02, 0x03, 0x04}
+	if err := writeTapFrame(int(w.Fd()), pkt); err != nil {
+		t.Fatalf("writeTapFrame: %v", err)
+	}
+
+	buf := make([]byte, 16)
+	n, _ := r.Read(buf)
+	if n != 4 || buf[0] != 1 || buf[3] != 4 {
+		t.Fatalf("read back %d bytes: %x", n, buf[:n])
+	}
+}
+
+func TestWriteTapFrame_Empty(t *testing.T) {
+	if err := writeTapFrame(0, nil); err != nil {
+		t.Fatalf("writeTapFrame(nil): %v", err)
+	}
+}
+
+func TestNetDeviceTransmit_EmptyQueue(t *testing.T) {
+	prevRead := tapReadFrameFn
+	tapReadFrameFn = func(fd int, buf []byte) (int, error) {
+		return 0, syscall.EBADF
+	}
+	t.Cleanup(func() { tapReadFrameFn = prevRead })
+
+	mem := make([]byte, 64*1024)
+	dev := &NetDevice{tapName: "tap-test"}
+	dev.Transport = NewTransport(dev, mem, 0x1000, 5, nil, nil)
+	r, w, _ := os.Pipe()
+	defer r.Close()
+	defer w.Close()
+	dev.tapFd = r
+
+	txQ := dev.Queue(1)
+	txQ.Ready = true
+	txQ.Size = 256
+	txQ.DescAddr = 0x1000
+	txQ.DriverAddr = 0x2000
+	txQ.DeviceAddr = 0x3000
+
+	// Transmit on empty queue should be fine
+	dev.transmit(txQ)
+}
+
+func TestNetDeviceTransmit_WithPacket(t *testing.T) {
+	prevRead := tapReadFrameFn
+	tapReadFrameFn = func(fd int, buf []byte) (int, error) {
+		return 0, syscall.EBADF
+	}
+	t.Cleanup(func() { tapReadFrameFn = prevRead })
+
+	mem := make([]byte, 64*1024)
+	dev := &NetDevice{tapName: "tap-test"}
+	r, w, _ := os.Pipe()
+	defer r.Close()
+	defer w.Close()
+	dev.tapFd = w
+	dev.Transport = NewTransport(dev, mem, 0x1000, 5, nil, nil)
+
+	txQ := dev.Queue(1)
+	txQ.Ready = true
+	txQ.Size = 256
+	txQ.DescAddr = 0x1000
+	txQ.DriverAddr = 0x2000
+	txQ.DeviceAddr = 0x3000
+
+	// Write a packet into guest memory and set up descriptor
+	pktAddr := uint64(0x5000)
+	pkt := make([]byte, 20)
+	copy(pkt, []byte{0xDE, 0xAD, 0xBE, 0xEF})
+	copy(mem[pktAddr:], pkt)
+
+	writeDesc(mem, txQ.DescAddr, 0, pktAddr, uint32(len(pkt)), 0, 0)
+	writeAvailEntry(mem, txQ.DriverAddr, 0, 0)
+
+	dev.transmit(txQ)
+
+	// Verify used ring was updated
+	usedIdx := binary.LittleEndian.Uint16(mem[txQ.DeviceAddr+2:])
+	if usedIdx != 1 {
+		t.Fatalf("used idx = %d, want 1", usedIdx)
+	}
+}
+
+func TestDeliverRXPacket_ShortPacket(t *testing.T) {
+	mem := make([]byte, 64*1024)
+	dev := &NetDevice{tapName: "tap-test"}
+	dev.Transport = NewTransport(dev, mem, 0x1000, 5, nil, nil)
+
+	rxQ := dev.Queue(0)
+	rxQ.Ready = true
+
+	// Packet shorter than header should be rejected
+	_, ok := dev.deliverRXPacket(make([]byte, netHeaderLen-1))
+	if ok {
+		t.Fatal("expected false for short packet")
+	}
+}
+
+func TestDeliverRXPacket_QueueNotReady(t *testing.T) {
+	mem := make([]byte, 64*1024)
+	dev := &NetDevice{tapName: "tap-test"}
+	dev.Transport = NewTransport(dev, mem, 0x1000, 5, nil, nil)
+
+	rxQ := dev.Queue(0)
+	rxQ.Ready = false
+
+	_, ok := dev.deliverRXPacket(make([]byte, netHeaderLen+10))
+	if ok {
+		t.Fatal("expected false for non-ready queue")
+	}
+}

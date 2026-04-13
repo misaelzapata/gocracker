@@ -34,6 +34,7 @@ type VM interface {
 	VMConfig() vmm.Config
 	DeviceList() []vmm.DeviceInfo
 	ConsoleOutput() []byte
+	FirstOutputAt() time.Time
 }
 
 // VMFactory creates a VM for the worker.
@@ -155,13 +156,28 @@ type APIError struct {
 }
 
 type VMInfo struct {
-	ID      string           `json:"id"`
-	State   string           `json:"state"`
-	Uptime  string           `json:"uptime"`
-	MemMB   uint64           `json:"mem_mb"`
-	Kernel  string           `json:"kernel"`
-	Events  []vmm.Event      `json:"events"`
-	Devices []vmm.DeviceInfo `json:"devices,omitempty"`
+	ID             string           `json:"id"`
+	State          string           `json:"state"`
+	Uptime         string           `json:"uptime"`
+	MemMB          uint64           `json:"mem_mb"`
+	Kernel         string           `json:"kernel"`
+	Events         []vmm.Event      `json:"events"`
+	Devices        []vmm.DeviceInfo `json:"devices,omitempty"`
+	// FirstOutputAt is the wall-clock time at which the guest first
+	// transmitted a byte on the serial console. Populated from the VMM's
+	// UART as soon as the guest prints anything; zero until then.
+	FirstOutputAt time.Time `json:"first_output_at,omitempty"`
+}
+
+// ConfigureAndStartRequest bundles all pre-boot configuration with InstanceStart.
+type ConfigureAndStartRequest struct {
+	BootSource        BootSource          `json:"boot_source"`
+	MachineConfig     *MachineConfig      `json:"machine_config,omitempty"`
+	Balloon           *Balloon            `json:"balloon,omitempty"`
+	MemoryHotplug     *MemoryHotplugConfig `json:"memory_hotplug,omitempty"`
+	Drives            []Drive             `json:"drives,omitempty"`
+	NetworkInterfaces []NetworkInterface  `json:"network_interfaces,omitempty"`
+	SharedFS          []SharedFS          `json:"shared_fs,omitempty"`
 }
 
 type SnapshotRequest struct {
@@ -234,6 +250,7 @@ func NewWithOptions(opts Options) *Server {
 	r.Post("/migrations/prepare", s.handleMigrationPrepare)
 	r.Post("/migrations/finalize", s.handleMigrationFinalize)
 	r.Post("/migrations/reset", s.handleMigrationReset)
+	r.Put("/configure-and-start", s.handleConfigureAndStart)
 
 	s.router = r
 	return s
@@ -779,6 +796,130 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleConfigureAndStart applies all pre-boot configuration and starts the VM.
+func (s *Server) handleConfigureAndStart(w http.ResponseWriter, r *http.Request) {
+	if err := s.rejectIfStarted(); err != nil {
+		apiErr(w, firecrackerapi.StatusCode(err, http.StatusConflict), err.Error())
+		return
+	}
+	var req ConfigureAndStartRequest
+	if err := decodeJSONStrict(r, &req); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Validate boot source (required).
+	if err := firecrackerapi.ValidateBootSource(firecrackerapi.BootSource{
+		KernelImagePath: req.BootSource.KernelImagePath,
+		BootArgs:        req.BootSource.BootArgs,
+		InitrdPath:      req.BootSource.InitrdPath,
+		X86Boot:         req.BootSource.X86Boot,
+	}); err != nil {
+		apiErr(w, firecrackerapi.StatusCode(err, http.StatusBadRequest), err.Error())
+		return
+	}
+
+	// Validate machine config (optional but usually present).
+	if req.MachineConfig != nil {
+		if err := firecrackerapi.ValidateMachineConfig(firecrackerapi.MachineConfig{
+			VcpuCount:  req.MachineConfig.VcpuCount,
+			MemSizeMib: req.MachineConfig.MemSizeMib,
+		}); err != nil {
+			apiErr(w, firecrackerapi.StatusCode(err, http.StatusBadRequest), err.Error())
+			return
+		}
+	}
+
+	// Validate balloon (optional).
+	if req.Balloon != nil {
+		if err := firecrackerapi.ValidateBalloon(firecrackerapi.Balloon{
+			AmountMib:             req.Balloon.AmountMib,
+			DeflateOnOOM:          req.Balloon.DeflateOnOOM,
+			StatsPollingIntervalS: req.Balloon.StatsPollingIntervalS,
+			FreePageHinting:       req.Balloon.FreePageHinting,
+			FreePageReporting:     req.Balloon.FreePageReporting,
+		}); err != nil {
+			apiErr(w, firecrackerapi.StatusCode(err, http.StatusBadRequest), err.Error())
+			return
+		}
+	}
+
+	// Validate memory hotplug (optional).
+	if req.MemoryHotplug != nil {
+		if err := firecrackerapi.ValidateMemoryHotplugConfig(firecrackerapi.MemoryHotplugConfig{
+			TotalSizeMib: req.MemoryHotplug.TotalSizeMiB,
+			SlotSizeMib:  req.MemoryHotplug.SlotSizeMiB,
+			BlockSizeMib: req.MemoryHotplug.BlockSizeMiB,
+		}); err != nil {
+			apiErr(w, firecrackerapi.StatusCode(err, http.StatusBadRequest), err.Error())
+			return
+		}
+	}
+
+	// Validate drives.
+	for i := range req.Drives {
+		if err := firecrackerapi.ValidateDrive(firecrackerapi.Drive{
+			DriveID:      req.Drives[i].DriveID,
+			PathOnHost:   req.Drives[i].PathOnHost,
+			IsRootDevice: req.Drives[i].IsRootDevice,
+		}); err != nil {
+			apiErr(w, firecrackerapi.StatusCode(err, http.StatusBadRequest), err.Error())
+			return
+		}
+	}
+
+	// Validate network interfaces.
+	for i := range req.NetworkInterfaces {
+		if err := firecrackerapi.ValidateNetworkInterface(firecrackerapi.NetworkInterface{
+			IfaceID:     req.NetworkInterfaces[i].IfaceID,
+			HostDevName: req.NetworkInterfaces[i].HostDevName,
+			GuestMAC:    req.NetworkInterfaces[i].GuestMAC,
+		}); err != nil {
+			apiErr(w, firecrackerapi.StatusCode(err, http.StatusBadRequest), err.Error())
+			return
+		}
+	}
+
+	// Validate shared FS entries.
+	for i := range req.SharedFS {
+		if strings.TrimSpace(req.SharedFS[i].Source) == "" {
+			apiErr(w, http.StatusBadRequest, "source is required for shared_fs entry")
+			return
+		}
+	}
+
+	// All validation passed — apply config under a single lock.
+	s.mu.Lock()
+	s.preboot.bootSource = &req.BootSource
+	if req.MachineConfig != nil {
+		s.preboot.machineCfg = req.MachineConfig
+	}
+	if req.Balloon != nil {
+		s.preboot.balloon = req.Balloon
+	}
+	if req.MemoryHotplug != nil {
+		s.preboot.memoryHotplug = cloneMemoryHotplug(req.MemoryHotplug)
+		s.preboot.memoryHotplugRequestedMiB = 0
+	}
+	for _, d := range req.Drives {
+		s.preboot.drives = upsertDrive(s.preboot.drives, d)
+	}
+	for _, ni := range req.NetworkInterfaces {
+		s.preboot.netIfaces = upsertNetworkInterface(s.preboot.netIfaces, ni)
+	}
+	for _, fs := range req.SharedFS {
+		s.preboot.sharedFS = upsertSharedFS(s.preboot.sharedFS, fs)
+	}
+	s.mu.Unlock()
+
+	// Start the VM.
+	if err := s.startPrebootVM(); err != nil {
+		apiErr(w, firecrackerapi.StatusCode(err, http.StatusBadRequest), err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	vm, err := s.currentVM()
 	if err != nil {
@@ -805,13 +946,14 @@ func (s *Server) handleVMInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := vm.VMConfig()
 	_ = json.NewEncoder(w).Encode(VMInfo{
-		ID:      vm.ID(),
-		State:   vm.State().String(),
-		Uptime:  vm.Uptime().String(),
-		MemMB:   cfg.MemMB,
-		Kernel:  cfg.KernelPath,
-		Events:  vm.Events().Events(time.Time{}),
-		Devices: vm.DeviceList(),
+		ID:            vm.ID(),
+		State:         vm.State().String(),
+		Uptime:        vm.Uptime().String(),
+		MemMB:         cfg.MemMB,
+		Kernel:        cfg.KernelPath,
+		Events:        vm.Events().Events(time.Time{}),
+		Devices:       vm.DeviceList(),
+		FirstOutputAt: vm.FirstOutputAt(),
 	})
 }
 
@@ -1438,6 +1580,11 @@ func (c *Client) SetRNGRateLimiter(ctx context.Context, body vmm.RateLimiterConf
 
 func (c *Client) Start(ctx context.Context) error {
 	return c.putJSON(ctx, http.MethodPut, "/actions", Action{ActionType: "InstanceStart"})
+}
+
+// ConfigureAndStart configures and starts the VM in a single RPC.
+func (c *Client) ConfigureAndStart(ctx context.Context, req ConfigureAndStartRequest) error {
+	return c.putJSON(ctx, http.MethodPut, "/configure-and-start", req)
 }
 
 func (c *Client) GetInfo(ctx context.Context) (VMInfo, error) {

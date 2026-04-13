@@ -4,11 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/gocracker/gocracker/internal/guestexec"
 	"github.com/gocracker/gocracker/internal/kvm"
+	"github.com/gocracker/gocracker/internal/virtio"
+	"golang.org/x/sys/unix"
 )
 
 func TestStateString(t *testing.T) {
@@ -848,5 +855,2127 @@ func TestNewARM64SnapshotArchState(t *testing.T) {
 	s := newARM64SnapshotArchState()
 	if s == nil || s.ARM64 == nil {
 		t.Fatal("newARM64SnapshotArchState() returned nil")
+	}
+}
+
+// --- Coverage-boosting tests ---
+
+func TestSnapshotOptionsDefault(t *testing.T) {
+	opts := SnapshotOptions{}
+	if opts.Resume {
+		t.Fatal("default SnapshotOptions.Resume should be false")
+	}
+	opts.Resume = true
+	if !opts.Resume {
+		t.Fatal("SnapshotOptions.Resume should be settable")
+	}
+}
+
+func TestRestoreOptionsFields(t *testing.T) {
+	opts := RestoreOptions{
+		OverrideVCPUs:   4,
+		OverrideID:      "restored-vm",
+		OverrideTap:     "tap1",
+		OverrideX86Boot: X86BootACPI,
+	}
+	if opts.OverrideVCPUs != 4 {
+		t.Fatalf("OverrideVCPUs = %d, want 4", opts.OverrideVCPUs)
+	}
+	if opts.OverrideID != "restored-vm" {
+		t.Fatalf("OverrideID = %q, want restored-vm", opts.OverrideID)
+	}
+	if opts.OverrideTap != "tap1" {
+		t.Fatalf("OverrideTap = %q, want tap1", opts.OverrideTap)
+	}
+	if opts.OverrideX86Boot != X86BootACPI {
+		t.Fatalf("OverrideX86Boot = %q, want acpi", opts.OverrideX86Boot)
+	}
+}
+
+func TestBuildRateLimiter_Nil(t *testing.T) {
+	if got := buildRateLimiter(nil); got != nil {
+		t.Fatalf("buildRateLimiter(nil) = %v, want nil", got)
+	}
+}
+
+func TestBuildRateLimiter_Valid(t *testing.T) {
+	cfg := &RateLimiterConfig{
+		Bandwidth: TokenBucketConfig{Size: 1024, RefillTimeMs: 500},
+		Ops:       TokenBucketConfig{Size: 100, OneTimeBurst: 50, RefillTimeMs: 1000},
+	}
+	rl := buildRateLimiter(cfg)
+	if rl == nil {
+		t.Fatal("buildRateLimiter() returned nil for valid config")
+	}
+}
+
+func TestUniqueIRQs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []uint32
+		want []uint32
+	}{
+		{"empty", nil, []uint32{}},
+		{"no dups", []uint32{4, 5, 6}, []uint32{4, 5, 6}},
+		{"with dups", []uint32{4, 5, 4, 6, 5}, []uint32{4, 5, 6}},
+		{"all same", []uint32{7, 7, 7}, []uint32{7}},
+		{"single", []uint32{1}, []uint32{1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := uniqueIRQs(tt.in)
+			if len(got) != len(tt.want) {
+				t.Fatalf("uniqueIRQs(%v) = %v, want %v", tt.in, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("uniqueIRQs(%v) = %v, want %v", tt.in, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestConfigJSON_FullRoundTrip(t *testing.T) {
+	cfg := Config{
+		MemMB:      1024,
+		Arch:       "amd64",
+		KernelPath: "/boot/vmlinuz",
+		InitrdPath: "/boot/initrd.img",
+		Cmdline:    "console=ttyS0 root=/dev/vda rw",
+		DiskImage:  "/tmp/rootfs.ext4",
+		DiskRO:     false,
+		TapName:    "tap0",
+		VCPUs:      4,
+		ID:         "full-test-vm",
+		X86Boot:    X86BootACPI,
+		Drives: []DriveConfig{
+			{ID: "root", Path: "/a.ext4", Root: true, ReadOnly: false},
+			{ID: "data", Path: "/b.ext4", Root: false, ReadOnly: true},
+		},
+		Vsock:   &VsockConfig{Enabled: true, GuestCID: 5},
+		Exec:    &ExecConfig{Enabled: true, VsockPort: 52},
+		Balloon: &BalloonConfig{
+			AmountMiB:             128,
+			DeflateOnOOM:          true,
+			StatsPollingIntervalS: 10,
+			FreePageHinting:       true,
+			FreePageReporting:     true,
+			Auto:                  BalloonAutoConservative,
+			SnapshotPages:         []uint32{1, 2, 3},
+		},
+		MemoryHotplug: &MemoryHotplugConfig{
+			TotalSizeMiB: 4096,
+			SlotSizeMiB:  1024,
+			BlockSizeMiB: 128,
+		},
+		NetRateLimiter:   &RateLimiterConfig{Bandwidth: TokenBucketConfig{Size: 500}},
+		BlockRateLimiter: &RateLimiterConfig{Ops: TokenBucketConfig{Size: 200}},
+		RNGRateLimiter:   &RateLimiterConfig{Bandwidth: TokenBucketConfig{Size: 100}},
+		Metadata:         map[string]string{"env": "test", "version": "1.0"},
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored Config
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.MemMB != 1024 {
+		t.Errorf("MemMB = %d", restored.MemMB)
+	}
+	if restored.VCPUs != 4 {
+		t.Errorf("VCPUs = %d", restored.VCPUs)
+	}
+	if len(restored.Drives) != 2 {
+		t.Errorf("Drives = %d", len(restored.Drives))
+	}
+	if restored.Balloon == nil || len(restored.Balloon.SnapshotPages) != 3 {
+		t.Errorf("Balloon.SnapshotPages mismatch")
+	}
+	if restored.MemoryHotplug == nil || restored.MemoryHotplug.TotalSizeMiB != 4096 {
+		t.Errorf("MemoryHotplug mismatch")
+	}
+	if restored.NetRateLimiter == nil || restored.NetRateLimiter.Bandwidth.Size != 500 {
+		t.Errorf("NetRateLimiter mismatch")
+	}
+	if restored.Metadata["env"] != "test" || restored.Metadata["version"] != "1.0" {
+		t.Errorf("Metadata mismatch")
+	}
+}
+
+func TestSnapshotJSON_FullRoundTrip(t *testing.T) {
+	snap := Snapshot{
+		Version:   2,
+		Timestamp: time.Now().Truncate(time.Millisecond),
+		ID:        "snap-test",
+		Config: Config{
+			MemMB:      512,
+			Arch:       "amd64",
+			KernelPath: "/boot/vmlinuz",
+			VCPUs:      2,
+			ID:         "snap-test",
+			Vsock:      &VsockConfig{Enabled: true, GuestCID: 3},
+		},
+		MemFile: "mem.bin",
+		VCPUs: []VCPUState{
+			{ID: 0, X86: &X86VCPUState{Regs: kvm.Regs{RAX: 100}, MPState: kvm.MPState{State: 1}}},
+			{ID: 1, ARM64: &ARM64VCPUState{CoreRegs: map[uint64]uint64{1: 42}}},
+		},
+		Arch: &SnapshotArchState{
+			X86: &X86MachineState{Clock: kvm.ClockData{Clock: 999}},
+		},
+	}
+	data, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored Snapshot
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.Version != 2 || restored.ID != "snap-test" {
+		t.Errorf("basic fields mismatch")
+	}
+	if len(restored.VCPUs) != 2 {
+		t.Fatalf("VCPUs = %d", len(restored.VCPUs))
+	}
+	if restored.VCPUs[0].X86 == nil || restored.VCPUs[0].X86.Regs.RAX != 100 {
+		t.Errorf("VCPUs[0].X86.Regs.RAX mismatch")
+	}
+	if restored.VCPUs[1].ARM64 == nil || restored.VCPUs[1].ARM64.CoreRegs[1] != 42 {
+		t.Errorf("VCPUs[1].ARM64.CoreRegs mismatch")
+	}
+	if restored.Arch == nil || restored.Arch.X86 == nil || restored.Arch.X86.Clock.Clock != 999 {
+		t.Errorf("Arch.X86 mismatch")
+	}
+}
+
+func TestEventLog_SubscribeMultiple(t *testing.T) {
+	el := NewEventLog()
+	ch1, unsub1 := el.Subscribe()
+	ch2, unsub2 := el.Subscribe()
+	defer unsub1()
+	defer unsub2()
+
+	el.Emit(EventRunning, "test")
+
+	got1 := <-ch1
+	got2 := <-ch2
+	if got1.Type != EventRunning || got2.Type != EventRunning {
+		t.Fatalf("expected both subscribers to get EventRunning, got %q and %q", got1.Type, got2.Type)
+	}
+}
+
+func TestEventLog_SlowSubscriber(t *testing.T) {
+	el := NewEventLog()
+	ch, unsub := el.Subscribe()
+	defer unsub()
+
+	// Fill the subscriber's channel buffer (64 capacity)
+	for i := 0; i < 100; i++ {
+		el.Emit(EventRunning, "flood")
+	}
+
+	// Should not panic and some events should arrive
+	count := 0
+	for {
+		select {
+		case <-ch:
+			count++
+		default:
+			goto done
+		}
+	}
+done:
+	if count == 0 {
+		t.Fatal("expected at least some events to be delivered")
+	}
+	if count > 64 {
+		t.Fatalf("subscriber channel buffer is 64, got %d events", count)
+	}
+}
+
+func TestEventJSON_RoundTrip(t *testing.T) {
+	ev := Event{
+		Time:    time.Now().Truncate(time.Millisecond),
+		Type:    EventCreated,
+		Message: "test message",
+	}
+	data, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored Event
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.Type != EventCreated || restored.Message != "test message" {
+		t.Fatalf("Event mismatch: %#v", restored)
+	}
+}
+
+func TestVCPUState_NormalizedX86_WithLAPIC(t *testing.T) {
+	lapic := &kvm.LAPICState{}
+	state := VCPUState{
+		ID:    0,
+		LAPIC: lapic,
+	}
+	normalized := state.normalizedX86()
+	if normalized.LAPIC != lapic {
+		t.Fatal("expected LAPIC to be set from legacy field")
+	}
+}
+
+func TestVCPUState_NormalizedX86_X86LAPICTakesPrecedence(t *testing.T) {
+	lapic1 := &kvm.LAPICState{}
+	lapic2 := &kvm.LAPICState{}
+	state := VCPUState{
+		ID:    0,
+		X86:   &X86VCPUState{LAPIC: lapic1},
+		LAPIC: lapic2,
+	}
+	normalized := state.normalizedX86()
+	if normalized.LAPIC != lapic1 {
+		t.Fatal("expected X86 LAPIC to take precedence over legacy LAPIC")
+	}
+}
+
+func TestVCPUStateJSON(t *testing.T) {
+	state := VCPUState{
+		ID:  3,
+		X86: &X86VCPUState{Regs: kvm.Regs{RAX: 42}, MPState: kvm.MPState{State: 1}},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored VCPUState
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.ID != 3 {
+		t.Errorf("ID = %d", restored.ID)
+	}
+	if restored.X86 == nil || restored.X86.Regs.RAX != 42 {
+		t.Errorf("X86.Regs.RAX mismatch")
+	}
+}
+
+func TestNewX86VCPUState_WithLAPIC(t *testing.T) {
+	lapic := &kvm.LAPICState{}
+	state := newX86VCPUState(0, kvm.Regs{}, kvm.Sregs{}, kvm.MPState{}, lapic)
+	if state.X86.LAPIC != lapic {
+		t.Fatal("expected LAPIC in X86 field")
+	}
+	if state.LAPIC != lapic {
+		t.Fatal("expected LAPIC in legacy field")
+	}
+}
+
+func TestDefaultGuestMAC_DifferentInputs(t *testing.T) {
+	// defaultGuestMAC uses only id as seed (tapName is fallback when id is empty)
+	tests := []struct {
+		vmID    string
+		tapName string
+	}{
+		{"vm-1", "tap0"},
+		{"vm-2", "tap0"},
+		{"vm-3", "tap1"},
+		{"a-very-long-vm-identifier-for-testing", "a-very-long-tap-name"},
+	}
+	macs := make(map[string]struct{})
+	for _, tt := range tests {
+		mac := defaultGuestMAC(tt.vmID, tt.tapName)
+		s := mac.String()
+		if _, exists := macs[s]; exists {
+			t.Errorf("duplicate MAC for (%q, %q): %s", tt.vmID, tt.tapName, s)
+		}
+		macs[s] = struct{}{}
+		// All should be unicast + locally administered
+		if mac[0]&0x01 != 0 {
+			t.Errorf("MAC should be unicast: %s", mac)
+		}
+		if mac[0]&0x02 == 0 {
+			t.Errorf("MAC should be locally administered: %s", mac)
+		}
+	}
+}
+
+func TestDefaultGuestMAC_TapFallback(t *testing.T) {
+	// When id is empty, tapName is used as seed
+	mac1 := defaultGuestMAC("", "tap0")
+	mac2 := defaultGuestMAC("", "tap1")
+	if bytes.Equal(mac1, mac2) {
+		t.Fatalf("different tap names should produce different MACs: %s == %s", mac1, mac2)
+	}
+}
+
+func TestTokenBucketConfig_ZeroValues(t *testing.T) {
+	cfg := TokenBucketConfig{}
+	bucket := cfg.toVirtio()
+	if bucket.Size != 0 || bucket.OneTimeBurst != 0 || bucket.RefillTime != 0 {
+		t.Errorf("zero TokenBucketConfig should produce zero virtio bucket: %+v", bucket)
+	}
+}
+
+func TestBalloonStatsFields(t *testing.T) {
+	stats := BalloonStats{
+		TargetPages:     100,
+		ActualPages:     50,
+		TargetMiB:       400,
+		ActualMiB:       200,
+		SwapIn:          1,
+		SwapOut:         2,
+		MajorFaults:     3,
+		MinorFaults:     4,
+		FreeMemory:      5,
+		TotalMemory:     6,
+		AvailableMemory: 7,
+		DiskCaches:      8,
+		HugetlbAllocs:   9,
+		HugetlbFailures: 10,
+		OOMKill:         11,
+		AllocStall:      12,
+		AsyncScan:       13,
+		DirectScan:      14,
+		AsyncReclaim:    15,
+		DirectReclaim:   16,
+	}
+	data, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored BalloonStats
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.TargetPages != 100 || restored.ActualMiB != 200 || restored.OOMKill != 11 {
+		t.Errorf("BalloonStats roundtrip mismatch: %+v", restored)
+	}
+}
+
+func TestBalloonUpdateJSON(t *testing.T) {
+	update := BalloonUpdate{AmountMiB: 256}
+	data, err := json.Marshal(update)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored BalloonUpdate
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.AmountMiB != 256 {
+		t.Fatalf("AmountMiB = %d, want 256", restored.AmountMiB)
+	}
+}
+
+func TestBalloonStatsUpdateJSON(t *testing.T) {
+	update := BalloonStatsUpdate{StatsPollingIntervalS: 5}
+	data, err := json.Marshal(update)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored BalloonStatsUpdate
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.StatsPollingIntervalS != 5 {
+		t.Fatalf("StatsPollingIntervalS = %d, want 5", restored.StatsPollingIntervalS)
+	}
+}
+
+func TestMemoryHotplugConfigJSON(t *testing.T) {
+	cfg := MemoryHotplugConfig{
+		TotalSizeMiB: 2048,
+		SlotSizeMiB:  512,
+		BlockSizeMiB: 128,
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored MemoryHotplugConfig
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.TotalSizeMiB != 2048 || restored.SlotSizeMiB != 512 || restored.BlockSizeMiB != 128 {
+		t.Errorf("MemoryHotplugConfig roundtrip: %+v", restored)
+	}
+}
+
+func TestMemoryHotplugSizeUpdateJSON(t *testing.T) {
+	update := MemoryHotplugSizeUpdate{RequestedSizeMiB: 512}
+	data, err := json.Marshal(update)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored MemoryHotplugSizeUpdate
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.RequestedSizeMiB != 512 {
+		t.Fatalf("RequestedSizeMiB = %d, want 512", restored.RequestedSizeMiB)
+	}
+}
+
+func TestMemoryHotplugStatusJSON(t *testing.T) {
+	status := MemoryHotplugStatus{
+		TotalSizeMiB:     2048,
+		SlotSizeMiB:      512,
+		BlockSizeMiB:     128,
+		PluggedSizeMiB:   256,
+		RequestedSizeMiB: 256,
+	}
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored MemoryHotplugStatus
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.PluggedSizeMiB != 256 {
+		t.Fatalf("PluggedSizeMiB = %d, want 256", restored.PluggedSizeMiB)
+	}
+}
+
+func TestWorkerMetadataJSON(t *testing.T) {
+	meta := WorkerMetadata{
+		Kind:       "worker",
+		SocketPath: "/tmp/vmm.sock",
+		WorkerPID:  1234,
+		JailRoot:   "/jail/root",
+		RunDir:     "/run/dir",
+		CreatedAt:  time.Now().Truncate(time.Millisecond),
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored WorkerMetadata
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.Kind != "worker" || restored.SocketPath != "/tmp/vmm.sock" {
+		t.Fatalf("WorkerMetadata mismatch: %+v", restored)
+	}
+}
+
+func TestVsockConfigJSON(t *testing.T) {
+	cfg := VsockConfig{Enabled: true, GuestCID: 5}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored VsockConfig
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if !restored.Enabled || restored.GuestCID != 5 {
+		t.Fatalf("VsockConfig mismatch: %+v", restored)
+	}
+}
+
+func TestExecConfigJSON(t *testing.T) {
+	cfg := ExecConfig{Enabled: true, VsockPort: 52}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored ExecConfig
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if !restored.Enabled || restored.VsockPort != 52 {
+		t.Fatalf("ExecConfig mismatch: %+v", restored)
+	}
+}
+
+func TestSharedFSConfigJSON(t *testing.T) {
+	cfg := SharedFSConfig{
+		Source:     "/host/data",
+		Tag:        "myfs",
+		SocketPath: "/tmp/virtiofsd.sock",
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored SharedFSConfig
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.Source != "/host/data" || restored.Tag != "myfs" || restored.SocketPath != "/tmp/virtiofsd.sock" {
+		t.Fatalf("SharedFSConfig mismatch: %+v", restored)
+	}
+}
+
+func TestDriveConfigJSON(t *testing.T) {
+	drive := DriveConfig{
+		ID:       "data",
+		Path:     "/dev/sdb",
+		Root:     false,
+		ReadOnly: true,
+		RateLimiter: &RateLimiterConfig{
+			Bandwidth: TokenBucketConfig{Size: 500, RefillTimeMs: 1000},
+		},
+	}
+	data, err := json.Marshal(drive)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var restored DriveConfig
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if restored.ID != "data" || restored.ReadOnly != true || restored.RateLimiter == nil {
+		t.Fatalf("DriveConfig mismatch: %+v", restored)
+	}
+	if restored.RateLimiter.Bandwidth.Size != 500 {
+		t.Fatalf("RateLimiter.Bandwidth.Size = %d", restored.RateLimiter.Bandwidth.Size)
+	}
+}
+
+func TestCloneDriveConfigs_EmptySlice(t *testing.T) {
+	if got := cloneDriveConfigs([]DriveConfig{}); got != nil {
+		t.Fatalf("cloneDriveConfigs(empty) = %v, want nil", got)
+	}
+}
+
+func TestDriveList_FromDiskImage_NoRateLimiter(t *testing.T) {
+	cfg := Config{DiskImage: "/tmp/disk.ext4", DiskRO: false}
+	drives := cfg.DriveList()
+	if len(drives) != 1 {
+		t.Fatalf("DriveList() returned %d drives, want 1", len(drives))
+	}
+	if drives[0].RateLimiter != nil {
+		t.Fatal("expected nil rate limiter")
+	}
+	if drives[0].ReadOnly {
+		t.Fatal("expected ReadOnly = false")
+	}
+}
+
+func TestHasAdditionalDrives_MultipleRoots(t *testing.T) {
+	cfg := Config{
+		Drives: []DriveConfig{
+			{Root: true},
+			{Root: true},
+		},
+	}
+	if !cfg.HasAdditionalDrives() {
+		t.Fatal("expected true for multiple root drives")
+	}
+}
+
+func TestRootDrive_FromDiskImage(t *testing.T) {
+	cfg := Config{DiskImage: "/tmp/rootfs.ext4"}
+	root, ok := cfg.RootDrive()
+	if !ok {
+		t.Fatal("RootDrive() should find root from DiskImage")
+	}
+	if root.ID != "root" || root.Path != "/tmp/rootfs.ext4" {
+		t.Fatalf("unexpected root drive: %+v", root)
+	}
+}
+
+func TestNewARM64VCPUState_NilMaps(t *testing.T) {
+	state := newARM64VCPUState(0, nil, nil)
+	if state.ARM64 == nil {
+		t.Fatal("ARM64 should not be nil")
+	}
+	if state.ARM64.CoreRegs != nil {
+		t.Fatal("CoreRegs should be nil when nil passed")
+	}
+}
+
+func TestSnapshotArchState_NormalizedX86_FromLegacyWithIRQChips(t *testing.T) {
+	var chipData [512]byte
+	chipData[0] = 0xCD
+	s := &SnapshotArchState{
+		Clock:    kvm.ClockData{Clock: 55},
+		IRQChips: []kvm.IRQChip{{ChipID: 1, Chip: chipData}},
+	}
+	got := s.normalizedX86()
+	if got.Clock.Clock != 55 {
+		t.Fatalf("Clock = %d, want 55", got.Clock.Clock)
+	}
+	if len(got.IRQChips) != 1 || got.IRQChips[0].ChipID != 1 {
+		t.Fatalf("IRQChips mismatch")
+	}
+	// Verify IRQChips are cloned
+	got.IRQChips[0].Chip[0] = 0xFF
+	if s.IRQChips[0].Chip[0] != 0xCD {
+		t.Fatal("normalizedX86 should clone IRQChips")
+	}
+}
+
+func TestNewX86SnapshotArchState_WithMultipleIRQChips(t *testing.T) {
+	var chip1, chip2 [512]byte
+	chip1[0] = 0xAA
+	chip2[0] = 0xBB
+	ms := &X86MachineState{
+		Clock: kvm.ClockData{Clock: 200},
+		IRQChips: []kvm.IRQChip{
+			{ChipID: 0, Chip: chip1},
+			{ChipID: 1, Chip: chip2},
+		},
+	}
+	s := newX86SnapshotArchState(ms)
+	if len(s.IRQChips) != 2 {
+		t.Fatalf("IRQChips = %d, want 2", len(s.IRQChips))
+	}
+	if s.X86.Clock.Clock != 200 {
+		t.Fatalf("X86.Clock = %d, want 200", s.X86.Clock.Clock)
+	}
+}
+
+func TestValidateMachineArch_InvalidArch(t *testing.T) {
+	err := validateMachineArch("mips")
+	if err == nil {
+		t.Fatal("expected error for invalid arch")
+	}
+}
+
+func TestNormalizeMachineArch_AllVariants(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    MachineArch
+		wantErr bool
+	}{
+		{"amd64", ArchAMD64, false},
+		{"arm64", ArchARM64, false},
+		{"  amd64  ", ArchAMD64, false},
+		{"  arm64  ", ArchARM64, false},
+		{"", HostArch(), false},
+		{"   ", HostArch(), false},
+		{"x86", "", true},
+		{"riscv64", "", true},
+	}
+	for _, tt := range tests {
+		got, err := normalizeMachineArch(tt.input)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("normalizeMachineArch(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("normalizeMachineArch(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestNormalizeSnapshotMachineArch_AllCases(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    MachineArch
+		wantErr bool
+	}{
+		{"", ArchAMD64, false},
+		{"  ", ArchAMD64, false},
+		{"amd64", ArchAMD64, false},
+		{"arm64", ArchARM64, false},
+		{"bad", "", true},
+	}
+	for _, tt := range tests {
+		got, err := normalizeSnapshotMachineArch(tt.input)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("normalizeSnapshotMachineArch(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("normalizeSnapshotMachineArch(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestNextConservativeBalloonTarget(t *testing.T) {
+	tests := []struct {
+		name     string
+		stats    BalloonStats
+		last     BalloonStats
+		baseMemMiB uint64
+		wantMiB  uint64
+		wantOK   bool
+	}{
+		{
+			name:     "no stats available",
+			stats:    BalloonStats{},
+			last:     BalloonStats{},
+			baseMemMiB: 1024,
+			wantMiB:  0,
+			wantOK:   false,
+		},
+		{
+			name: "oom pressure, deflate",
+			stats: BalloonStats{
+				TotalMemory:     1 << 30,
+				AvailableMemory: 50 << 20,
+				TargetMiB:       256,
+				OOMKill:         1,
+			},
+			last:       BalloonStats{OOMKill: 0},
+			baseMemMiB: 1024,
+			wantMiB:    192,
+			wantOK:     true,
+		},
+		{
+			name: "plenty of headroom, inflate",
+			stats: BalloonStats{
+				TotalMemory:     1 << 30,
+				AvailableMemory: 500 << 20,
+				TargetMiB:       0,
+			},
+			last:       BalloonStats{},
+			baseMemMiB: 1024,
+			wantMiB:    64,
+			wantOK:     true,
+		},
+		{
+			name: "no change needed",
+			stats: BalloonStats{
+				TotalMemory:     1 << 30,
+				AvailableMemory: 300 << 20,
+				TargetMiB:       100,
+			},
+			last:       BalloonStats{},
+			baseMemMiB: 1024,
+			wantMiB:    0,
+			wantOK:     false,
+		},
+		{
+			name: "pressure but target already zero",
+			stats: BalloonStats{
+				TotalMemory:     1 << 30,
+				AvailableMemory: 10 << 20,
+				TargetMiB:       0,
+				AllocStall:      5,
+			},
+			last:       BalloonStats{AllocStall: 0},
+			baseMemMiB: 1024,
+			wantMiB:    0,
+			wantOK:     false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotMiB, gotOK := nextConservativeBalloonTarget(tt.stats, tt.last, tt.baseMemMiB)
+			if gotOK != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", gotOK, tt.wantOK)
+			}
+			if gotOK && gotMiB != tt.wantMiB {
+				t.Fatalf("mib = %d, want %d", gotMiB, tt.wantMiB)
+			}
+		})
+	}
+}
+
+func TestValidateMemoryHotplugConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     MemoryHotplugConfig
+		wantErr bool
+	}{
+		{"valid", MemoryHotplugConfig{TotalSizeMiB: 1024, SlotSizeMiB: 256, BlockSizeMiB: 128}, false},
+		{"zero total", MemoryHotplugConfig{SlotSizeMiB: 256, BlockSizeMiB: 128}, true},
+		{"zero slot", MemoryHotplugConfig{TotalSizeMiB: 1024, BlockSizeMiB: 128}, true},
+		{"zero block", MemoryHotplugConfig{TotalSizeMiB: 1024, SlotSizeMiB: 256}, true},
+		{"total < slot", MemoryHotplugConfig{TotalSizeMiB: 128, SlotSizeMiB: 256, BlockSizeMiB: 128}, true},
+		{"slot < block", MemoryHotplugConfig{TotalSizeMiB: 1024, SlotSizeMiB: 64, BlockSizeMiB: 128}, true},
+		{"total not multiple of slot", MemoryHotplugConfig{TotalSizeMiB: 1000, SlotSizeMiB: 300, BlockSizeMiB: 100}, true},
+		{"slot not multiple of block", MemoryHotplugConfig{TotalSizeMiB: 1024, SlotSizeMiB: 256, BlockSizeMiB: 100}, true},
+		{"too many slots", MemoryHotplugConfig{TotalSizeMiB: 65536, SlotSizeMiB: 1, BlockSizeMiB: 1}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateMemoryHotplugConfig(tt.cfg)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateMemoryHotplugConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateMemoryHotplugUpdate(t *testing.T) {
+	state := &memoryHotplugState{
+		totalBytes: 1 << 30, // 1 GiB
+		blockBytes: 128 << 20, // 128 MiB
+	}
+	tests := []struct {
+		name    string
+		update  MemoryHotplugSizeUpdate
+		wantErr bool
+	}{
+		{"valid", MemoryHotplugSizeUpdate{RequestedSizeMiB: 256}, false},
+		{"exceeds total", MemoryHotplugSizeUpdate{RequestedSizeMiB: 2048}, true},
+		{"not aligned", MemoryHotplugSizeUpdate{RequestedSizeMiB: 100}, true},
+		{"zero", MemoryHotplugSizeUpdate{RequestedSizeMiB: 0}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateMemoryHotplugUpdate(state, tt.update)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateMemoryHotplugUpdate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestHotplugConversions(t *testing.T) {
+	if got := hotplugMiBToBytes(1); got != 1<<20 {
+		t.Fatalf("hotplugMiBToBytes(1) = %d", got)
+	}
+	if got := hotplugBytesToMiB(1 << 20); got != 1 {
+		t.Fatalf("hotplugBytesToMiB(1MiB) = %d", got)
+	}
+	if got := hotplugMiBToBytes(0); got != 0 {
+		t.Fatalf("hotplugMiBToBytes(0) = %d", got)
+	}
+	if got := hotplugBytesToMiB(0); got != 0 {
+		t.Fatalf("hotplugBytesToMiB(0) = %d", got)
+	}
+}
+
+// --- Coverage-boosting tests: rate limiters, balloon, migration, etc. ---
+
+func TestUpdateNetRateLimiter_NilDevice(t *testing.T) {
+	vm := &VM{netDev: nil}
+	err := vm.UpdateNetRateLimiter(&RateLimiterConfig{})
+	if err == nil {
+		t.Fatal("expected error when netDev is nil")
+	}
+	if err.Error() != "virtio-net is not configured" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestUpdateBlockRateLimiter_NilDevice(t *testing.T) {
+	vm := &VM{blkDev: nil}
+	err := vm.UpdateBlockRateLimiter(&RateLimiterConfig{})
+	if err == nil {
+		t.Fatal("expected error when blkDev is nil")
+	}
+	if err.Error() != "virtio-blk is not configured" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestUpdateRNGRateLimiter_NilDevice(t *testing.T) {
+	vm := &VM{rngDev: nil}
+	err := vm.UpdateRNGRateLimiter(&RateLimiterConfig{})
+	if err == nil {
+		t.Fatal("expected error when rngDev is nil")
+	}
+	if err.Error() != "virtio-rng is not configured" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestGetBalloonConfig_NilDevice(t *testing.T) {
+	vm := &VM{balloonDev: nil, cfg: Config{}}
+	_, err := vm.GetBalloonConfig()
+	if err == nil {
+		t.Fatal("expected error when balloon not configured")
+	}
+}
+
+func TestUpdateBalloon_NilDevice(t *testing.T) {
+	vm := &VM{balloonDev: nil, cfg: Config{}}
+	err := vm.UpdateBalloon(BalloonUpdate{AmountMiB: 64})
+	if err == nil {
+		t.Fatal("expected error when balloon not configured")
+	}
+}
+
+func TestGetBalloonStats_NilDevice(t *testing.T) {
+	vm := &VM{balloonDev: nil}
+	_, err := vm.GetBalloonStats()
+	if err == nil {
+		t.Fatal("expected error when balloon not configured")
+	}
+}
+
+func TestUpdateBalloonStats_NilDevice(t *testing.T) {
+	vm := &VM{balloonDev: nil, cfg: Config{}}
+	err := vm.UpdateBalloonStats(BalloonStatsUpdate{StatsPollingIntervalS: 5})
+	if err == nil {
+		t.Fatal("expected error when balloon not configured")
+	}
+}
+
+func TestDialVsock_NilDevice(t *testing.T) {
+	vm := &VM{vsockDev: nil}
+	_, err := vm.DialVsock(10022)
+	if err == nil {
+		t.Fatal("expected error when vsock not configured")
+	}
+}
+
+func TestNextConservativeBalloonTarget_NoStats(t *testing.T) {
+	stats := BalloonStats{TotalMemory: 0, AvailableMemory: 0}
+	_, ok := nextConservativeBalloonTarget(stats, BalloonStats{}, 1024)
+	if ok {
+		t.Fatal("expected ok=false when no stats available")
+	}
+}
+
+func TestNextConservativeBalloonTarget_OOMPressureDeflates(t *testing.T) {
+	stats := BalloonStats{
+		TotalMemory:     1 << 30,
+		AvailableMemory: 10 << 20, // very low
+		TargetMiB:       200,
+		OOMKill:         5,
+	}
+	last := BalloonStats{OOMKill: 3} // OOM increased
+	gotMiB, gotOK := nextConservativeBalloonTarget(stats, last, 1024)
+	if !gotOK {
+		t.Fatal("expected ok=true for OOM pressure")
+	}
+	if gotMiB >= 200 {
+		t.Fatalf("expected deflation below 200, got %d", gotMiB)
+	}
+}
+
+func TestNextConservativeBalloonTarget_AllocStallDeflates(t *testing.T) {
+	stats := BalloonStats{
+		TotalMemory:     1 << 30,
+		AvailableMemory: 10 << 20,
+		TargetMiB:       128,
+		AllocStall:      10,
+	}
+	last := BalloonStats{AllocStall: 5}
+	gotMiB, gotOK := nextConservativeBalloonTarget(stats, last, 1024)
+	if !gotOK {
+		t.Fatal("expected ok=true for alloc stall pressure")
+	}
+	if gotMiB >= 128 {
+		t.Fatalf("expected deflation below 128, got %d", gotMiB)
+	}
+}
+
+func TestNextConservativeBalloonTarget_SmallBaseUsesLowerReserve(t *testing.T) {
+	// With baseMemMiB<=512, reserve should be 64 and highWater 128
+	stats := BalloonStats{
+		TotalMemory:     512 << 20,
+		AvailableMemory: 260 << 20, // > 128 + 64
+		TargetMiB:       0,
+	}
+	gotMiB, gotOK := nextConservativeBalloonTarget(stats, BalloonStats{}, 512)
+	if !gotOK {
+		t.Fatal("expected ok=true for headroom inflate on small base")
+	}
+	if gotMiB == 0 {
+		t.Fatal("expected nonzero inflate target")
+	}
+}
+
+func TestNextConservativeBalloonTarget_MaxTargetCapping(t *testing.T) {
+	// If next target exceeds maxTarget (baseMem - reserve), it should be capped
+	stats := BalloonStats{
+		TotalMemory:     512 << 20,
+		AvailableMemory: 500 << 20,
+		TargetMiB:       500,
+	}
+	gotMiB, gotOK := nextConservativeBalloonTarget(stats, BalloonStats{}, 256)
+	if gotOK && gotMiB > 256 {
+		t.Fatalf("target %d exceeds base mem 256", gotMiB)
+	}
+}
+
+func TestNextConservativeBalloonTarget_PressureBelowStep(t *testing.T) {
+	// Target < step size should go to 0
+	stats := BalloonStats{
+		TotalMemory:     1 << 30,
+		AvailableMemory: 10 << 20,
+		TargetMiB:       32,
+		OOMKill:         1,
+	}
+	last := BalloonStats{OOMKill: 0}
+	gotMiB, gotOK := nextConservativeBalloonTarget(stats, last, 1024)
+	if !gotOK {
+		t.Fatal("expected ok=true")
+	}
+	if gotMiB != 0 {
+		t.Fatalf("expected target 0 for small deflation, got %d", gotMiB)
+	}
+}
+
+func TestNormalizeSnapshotMachineArch_Valid(t *testing.T) {
+	tests := []struct {
+		raw     string
+		want    MachineArch
+		wantErr bool
+	}{
+		{"", ArchAMD64, false},
+		{"  ", ArchAMD64, false},
+		{"amd64", ArchAMD64, false},
+		{"arm64", ArchARM64, false},
+		{"bogus", "", true},
+	}
+	for _, tt := range tests {
+		got, err := normalizeSnapshotMachineArch(tt.raw)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("normalizeSnapshotMachineArch(%q) error = %v, wantErr %v", tt.raw, err, tt.wantErr)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("normalizeSnapshotMachineArch(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+}
+
+func TestIsIgnorableKVMClockCtrlError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"EINVAL", unix.EINVAL, true},
+		{"ENOTTY", unix.ENOTTY, true},
+		{"ENOSYS", unix.ENOSYS, true},
+		{"EPERM", unix.EPERM, false},
+		{"nil", nil, false},
+		{"generic", fmt.Errorf("something"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isIgnorableKVMClockCtrlError(tt.err)
+			if got != tt.want {
+				t.Fatalf("isIgnorableKVMClockCtrlError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClearSignalRestart_Succeeds(t *testing.T) {
+	// Use a harmless signal to test clearSignalRestart doesn't return error
+	err := clearSignalRestart(syscall.SIGUSR2)
+	if err != nil {
+		t.Fatalf("clearSignalRestart(SIGUSR2) error = %v", err)
+	}
+}
+
+func TestExecAgentPort(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want uint32
+	}{
+		{"nil exec", Config{}, 10022},
+		{"exec disabled", Config{Exec: &ExecConfig{Enabled: false}}, 10022},
+		{"exec enabled no port", Config{Exec: &ExecConfig{Enabled: true}}, 10022},
+		{"exec enabled custom port", Config{Exec: &ExecConfig{Enabled: true, VsockPort: 9999}}, 9999},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := execAgentPort(tt.cfg)
+			if got != tt.want {
+				t.Fatalf("execAgentPort() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRewriteSnapshotPathsForBundle(t *testing.T) {
+	snap := &Snapshot{
+		MemFile: "old-mem.bin",
+		Config: Config{
+			KernelPath: "/host/vmlinuz",
+			InitrdPath: "/host/initrd",
+			DiskImage:  "/host/disk.ext4",
+		},
+	}
+	rewriteSnapshotPathsForBundle(snap)
+	if snap.MemFile != migrationMemFile {
+		t.Fatalf("MemFile = %q, want %q", snap.MemFile, migrationMemFile)
+	}
+	if snap.Config.KernelPath != "artifacts/kernel" {
+		t.Fatalf("KernelPath = %q, want artifacts/kernel", snap.Config.KernelPath)
+	}
+	if snap.Config.InitrdPath != "artifacts/initrd" {
+		t.Fatalf("InitrdPath = %q, want artifacts/initrd", snap.Config.InitrdPath)
+	}
+	if snap.Config.DiskImage != "artifacts/disk.ext4" {
+		t.Fatalf("DiskImage = %q, want artifacts/disk.ext4", snap.Config.DiskImage)
+	}
+}
+
+func TestRewriteSnapshotPathsForBundle_EmptyPaths(t *testing.T) {
+	snap := &Snapshot{
+		Config: Config{},
+	}
+	rewriteSnapshotPathsForBundle(snap)
+	if snap.Config.KernelPath != "" {
+		t.Fatalf("empty KernelPath should stay empty, got %q", snap.Config.KernelPath)
+	}
+	if snap.Config.InitrdPath != "" {
+		t.Fatalf("empty InitrdPath should stay empty, got %q", snap.Config.InitrdPath)
+	}
+	if snap.Config.DiskImage != "" {
+		t.Fatalf("empty DiskImage should stay empty, got %q", snap.Config.DiskImage)
+	}
+}
+
+func TestMergeDirtyBitmaps(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b []uint64
+		want []uint64
+	}{
+		{"both nil", nil, nil, nil},
+		{"a only", []uint64{0x1, 0x2}, nil, []uint64{0x1, 0x2}},
+		{"b only", nil, []uint64{0x3, 0x4}, []uint64{0x3, 0x4}},
+		{"same size", []uint64{0x1, 0x0}, []uint64{0x0, 0x2}, []uint64{0x1, 0x2}},
+		{"a longer", []uint64{0x1, 0x2, 0x3}, []uint64{0x4}, []uint64{0x5, 0x2, 0x3}},
+		{"b longer", []uint64{0x1}, []uint64{0x2, 0x4}, []uint64{0x3, 0x4}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mergeDirtyBitmaps(tt.a, tt.b)
+			if len(got) != len(tt.want) {
+				t.Fatalf("len = %d, want %d", len(got), len(tt.want))
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("bitmap[%d] = %x, want %x", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestSameFilePath(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want bool
+	}{
+		{"/a/b/c", "/a/b/c", true},
+		{"/a/b/../b/c", "/a/b/c", true},
+		{"/a/b/c", "/a/b/d", false},
+		{"", "", true},
+	}
+	for _, tt := range tests {
+		if got := sameFilePath(tt.a, tt.b); got != tt.want {
+			t.Errorf("sameFilePath(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+func TestBundleAsset_EmptySrc(t *testing.T) {
+	got, err := bundleAsset(t.TempDir(), "", "artifacts/kernel")
+	if err != nil {
+		t.Fatalf("bundleAsset(empty) error = %v", err)
+	}
+	if got != "" {
+		t.Fatalf("expected empty result, got %q", got)
+	}
+}
+
+func TestBundleAsset_SameFile(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "artifacts", "kernel")
+	if err := os.MkdirAll(filepath.Dir(src), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte("kernel"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := bundleAsset(dir, "artifacts/kernel", "artifacts/kernel")
+	if err != nil {
+		t.Fatalf("bundleAsset(same) error = %v", err)
+	}
+	if got != "artifacts/kernel" {
+		t.Fatalf("got %q, want artifacts/kernel", got)
+	}
+}
+
+func TestBundleAsset_CopiesFile(t *testing.T) {
+	dir := t.TempDir()
+	srcDir := t.TempDir()
+	src := filepath.Join(srcDir, "vmlinuz")
+	if err := os.WriteFile(src, []byte("kernel-data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := bundleAsset(dir, src, "artifacts/kernel")
+	if err != nil {
+		t.Fatalf("bundleAsset() error = %v", err)
+	}
+	if got != "artifacts/kernel" {
+		t.Fatalf("got %q, want artifacts/kernel", got)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "artifacts", "kernel"))
+	if err != nil {
+		t.Fatalf("read copied file: %v", err)
+	}
+	if string(data) != "kernel-data" {
+		t.Fatalf("copied data = %q", data)
+	}
+}
+
+func TestResolveSnapshotPath_Extended(t *testing.T) {
+	tests := []struct {
+		dir, value, want string
+	}{
+		{"/snap", "", ""},
+		{"/snap", "/absolute/path", "/absolute/path"},
+		{"/snap", "mem.bin", "/snap/mem.bin"},
+		{"/snap", "artifacts/kernel", "/snap/artifacts/kernel"},
+	}
+	for _, tt := range tests {
+		got := resolveSnapshotPath(tt.dir, tt.value)
+		if got != tt.want {
+			t.Errorf("resolveSnapshotPath(%q, %q) = %q, want %q", tt.dir, tt.value, got, tt.want)
+		}
+	}
+}
+
+func TestBalloonStatsJSON_RoundTrip(t *testing.T) {
+	stats := BalloonStats{
+		TargetPages:     256,
+		ActualPages:     128,
+		TargetMiB:       1,
+		ActualMiB:       0,
+		SwapIn:          10,
+		FreeMemory:      1024,
+		TotalMemory:     2048,
+		AvailableMemory: 512,
+		OOMKill:         1,
+	}
+	data, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var restored BalloonStats
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if restored.TargetPages != 256 || restored.OOMKill != 1 || restored.FreeMemory != 1024 {
+		t.Fatalf("roundtrip mismatch: %+v", restored)
+	}
+}
+
+func TestBalloonUpdateJSON_RoundTrip(t *testing.T) {
+	update := BalloonUpdate{AmountMiB: 128}
+	data, err := json.Marshal(update)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var restored BalloonUpdate
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if restored.AmountMiB != 128 {
+		t.Fatalf("AmountMiB = %d, want 128", restored.AmountMiB)
+	}
+}
+
+func TestMemoryHotplugConfigJSON_RoundTrip(t *testing.T) {
+	cfg := MemoryHotplugConfig{
+		TotalSizeMiB: 2048,
+		SlotSizeMiB:  512,
+		BlockSizeMiB: 128,
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var restored MemoryHotplugConfig
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if restored.TotalSizeMiB != 2048 || restored.SlotSizeMiB != 512 || restored.BlockSizeMiB != 128 {
+		t.Fatalf("roundtrip mismatch: %+v", restored)
+	}
+}
+
+func TestMemoryHotplugStatusJSON_RoundTrip(t *testing.T) {
+	status := MemoryHotplugStatus{
+		TotalSizeMiB:     1024,
+		SlotSizeMiB:      256,
+		BlockSizeMiB:     128,
+		PluggedSizeMiB:   512,
+		RequestedSizeMiB: 768,
+	}
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var restored MemoryHotplugStatus
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if restored.PluggedSizeMiB != 512 || restored.RequestedSizeMiB != 768 {
+		t.Fatalf("roundtrip mismatch: %+v", restored)
+	}
+}
+
+func TestWorkerMetadataJSON_RoundTrip(t *testing.T) {
+	meta := WorkerMetadata{
+		Kind:       "worker",
+		SocketPath: "/tmp/sock",
+		WorkerPID:  1234,
+		JailRoot:   "/jail",
+		RunDir:     "/run",
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var restored WorkerMetadata
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if restored.Kind != "worker" || restored.SocketPath != "/tmp/sock" || restored.WorkerPID != 1234 {
+		t.Fatalf("roundtrip mismatch: %+v", restored)
+	}
+}
+
+func TestMergeBalloonStats(t *testing.T) {
+	base := virtio.BalloonStats{
+		TargetPages: 100,
+		ActualPages: 50,
+		TargetMiB:   1,
+	}
+	extra := guestexec.MemoryStats{
+		SwapIn:          1,
+		SwapOut:         2,
+		FreeMemory:      3000,
+		TotalMemory:     8000,
+		AvailableMemory: 5000,
+		OOMKill:         7,
+	}
+	merged := mergeBalloonStats(base, extra)
+	if merged.TargetPages != 100 {
+		t.Fatalf("TargetPages = %d, want 100 (from base)", merged.TargetPages)
+	}
+	if merged.SwapIn != 1 || merged.SwapOut != 2 || merged.FreeMemory != 3000 || merged.OOMKill != 7 {
+		t.Fatalf("merged extra stats mismatch: %+v", merged)
+	}
+	if merged.UpdatedAt.IsZero() {
+		t.Fatal("UpdatedAt should be set")
+	}
+}
+
+func TestExecAgentBroker_ListenWrongPort(t *testing.T) {
+	broker := newExecAgentBroker(10022)
+	defer broker.close()
+	_, err := broker.listen(9999)
+	if err == nil {
+		t.Fatal("expected error for wrong port")
+	}
+}
+
+func TestExecAgentBroker_ListenAndAcquire(t *testing.T) {
+	broker := newExecAgentBroker(10022)
+	defer broker.close()
+
+	// listen provides a guest conn; acquire gets the host conn
+	guestConn, err := broker.listen(10022)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer guestConn.Close()
+
+	hostConn, err := broker.acquire()
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer hostConn.Close()
+}
+
+func TestExecAgentBroker_ClosedBroker(t *testing.T) {
+	broker := newExecAgentBroker(10022)
+	broker.close()
+
+	// acquire on closed broker should error
+	_, err := broker.acquire()
+	if err == nil {
+		t.Fatal("expected error from closed broker acquire")
+	}
+}
+
+func TestExecAgentBroker_BacklogFull(t *testing.T) {
+	broker := newExecAgentBroker(10022)
+	defer broker.close()
+
+	// Fill the backlog (capacity 1)
+	conn1, err := broker.listen(10022)
+	if err != nil {
+		t.Fatalf("first listen: %v", err)
+	}
+	defer conn1.Close()
+
+	// Second listen should fail because backlog is full
+	_, err = broker.listen(10022)
+	if err == nil {
+		t.Fatal("expected error when backlog is full")
+	}
+}
+
+func TestCopyReaderAtRange(t *testing.T) {
+	src := bytes.NewReader([]byte("hello world"))
+	var dst bytes.Buffer
+	err := copyReaderAtRange(&dst, src, 6, 5)
+	if err != nil {
+		t.Fatalf("copyReaderAtRange: %v", err)
+	}
+	if dst.String() != "world" {
+		t.Fatalf("got %q, want world", dst.String())
+	}
+}
+
+func TestCopyReaderAtRange_ZeroLength(t *testing.T) {
+	src := bytes.NewReader([]byte("hello"))
+	var dst bytes.Buffer
+	err := copyReaderAtRange(&dst, src, 0, 0)
+	if err != nil {
+		t.Fatalf("copyReaderAtRange: %v", err)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("expected empty output, got %d bytes", dst.Len())
+	}
+}
+
+func TestBuildDirtyFilePatch_EmptyBitmap(t *testing.T) {
+	var dst bytes.Buffer
+	src := bytes.NewReader([]byte("data"))
+	patch, err := buildDirtyFilePatch(&dst, src, 4, "test.bin", 4096, nil, nil)
+	if err != nil {
+		t.Fatalf("buildDirtyFilePatch: %v", err)
+	}
+	if len(patch.Entries) != 0 {
+		t.Fatalf("expected no entries, got %d", len(patch.Entries))
+	}
+}
+
+func TestBuildDirtyFilePatch_ZeroSrcSize(t *testing.T) {
+	var dst bytes.Buffer
+	src := bytes.NewReader(nil)
+	patch, err := buildDirtyFilePatch(&dst, src, 0, "test.bin", 4096, []uint64{0xFF}, nil)
+	if err != nil {
+		t.Fatalf("buildDirtyFilePatch: %v", err)
+	}
+	if len(patch.Entries) != 0 {
+		t.Fatalf("expected no entries for zero src, got %d", len(patch.Entries))
+	}
+}
+
+func TestBuildDirtyFilePatch_SingleDirtyPage(t *testing.T) {
+	data := make([]byte, 8192)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+	src := bytes.NewReader(data)
+	var dst bytes.Buffer
+	var offset uint64
+	// Mark page 1 as dirty (bit 1 of word 0)
+	patch, err := buildDirtyFilePatch(&dst, src, uint64(len(data)), "test.bin", 4096, []uint64{0x2}, &offset)
+	if err != nil {
+		t.Fatalf("buildDirtyFilePatch: %v", err)
+	}
+	if len(patch.Entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(patch.Entries))
+	}
+	if patch.Entries[0].Offset != 4096 {
+		t.Fatalf("entry offset = %d, want 4096", patch.Entries[0].Offset)
+	}
+	if patch.Entries[0].Length != 4096 {
+		t.Fatalf("entry length = %d, want 4096", patch.Entries[0].Length)
+	}
+}
+
+// --- Non-KVM coverage tests: VM lifecycle methods on manually constructed VMs ---
+
+func TestStart_WrongState_Running(t *testing.T) {
+	vm := &VM{state: StateRunning}
+	err := vm.Start()
+	if err == nil || err.Error() != "cannot start VM in state running" {
+		t.Fatalf("Start() on running VM: error = %v, want state error", err)
+	}
+}
+
+func TestStart_WrongState_Stopped(t *testing.T) {
+	vm := &VM{state: StateStopped}
+	err := vm.Start()
+	if err == nil || err.Error() != "cannot start VM in state stopped" {
+		t.Fatalf("Start() on stopped VM: error = %v, want state error", err)
+	}
+}
+
+func TestStart_CreatedState_NoVCPUs(t *testing.T) {
+	vm := &VM{
+		state:       StateCreated,
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
+		events:      NewEventLog(),
+		pausedVCPUs: make(map[int]struct{}),
+	}
+	err := vm.Start()
+	if err != nil {
+		t.Fatalf("Start() on created VM with no vCPUs: error = %v", err)
+	}
+	if vm.state != StateRunning {
+		t.Fatalf("state = %s, want running", vm.state)
+	}
+}
+
+func TestPause_WrongState_Created(t *testing.T) {
+	vm := &VM{state: StateCreated}
+	err := vm.Pause()
+	if err == nil {
+		t.Fatal("Pause() on created VM should fail")
+	}
+}
+
+func TestPause_WrongState_Stopped(t *testing.T) {
+	vm := &VM{state: StateStopped}
+	err := vm.Pause()
+	if err == nil {
+		t.Fatal("Pause() on stopped VM should fail")
+	}
+}
+
+func TestPause_AlreadyPaused(t *testing.T) {
+	vm := &VM{state: StatePaused}
+	err := vm.Pause()
+	if err != nil {
+		t.Fatalf("Pause() on already paused VM: error = %v, want nil", err)
+	}
+}
+
+func TestResume_WrongState_Created(t *testing.T) {
+	vm := &VM{state: StateCreated}
+	err := vm.Resume()
+	if err == nil {
+		t.Fatal("Resume() on created VM should fail")
+	}
+}
+
+func TestResume_WrongState_Running(t *testing.T) {
+	vm := &VM{state: StateRunning}
+	err := vm.Resume()
+	if err == nil {
+		t.Fatal("Resume() on running VM should fail")
+	}
+}
+
+func TestResume_WrongState_Stopped(t *testing.T) {
+	vm := &VM{state: StateStopped}
+	err := vm.Resume()
+	if err == nil {
+		t.Fatal("Resume() on stopped VM should fail")
+	}
+}
+
+func TestResume_PausedState(t *testing.T) {
+	vm := &VM{
+		state:       StatePaused,
+		events:      NewEventLog(),
+		pausedVCPUs: make(map[int]struct{}),
+	}
+	err := vm.Resume()
+	if err != nil {
+		t.Fatalf("Resume() on paused VM: error = %v", err)
+	}
+	if vm.state != StateRunning {
+		t.Fatalf("state = %s, want running", vm.state)
+	}
+}
+
+func TestTakeSnapshotWithOptions_WrongState_Created(t *testing.T) {
+	vm := &VM{state: StateCreated}
+	_, err := vm.TakeSnapshotWithOptions(t.TempDir(), SnapshotOptions{})
+	if err == nil {
+		t.Fatal("TakeSnapshotWithOptions() on created VM should fail")
+	}
+}
+
+func TestTakeSnapshotWithOptions_WrongState_Stopped(t *testing.T) {
+	vm := &VM{state: StateStopped}
+	_, err := vm.TakeSnapshotWithOptions(t.TempDir(), SnapshotOptions{})
+	if err == nil {
+		t.Fatal("TakeSnapshotWithOptions() on stopped VM should fail")
+	}
+}
+
+func TestGetMemoryHotplug_NilState(t *testing.T) {
+	vm := &VM{memoryHotplug: nil}
+	_, err := vm.GetMemoryHotplug()
+	if err == nil {
+		t.Fatal("GetMemoryHotplug() without config should fail")
+	}
+	if err.Error() != "memory hotplug is not configured" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestGetMemoryHotplug_WithState_NoExecAgent(t *testing.T) {
+	vm := &VM{
+		memoryHotplug: &memoryHotplugState{
+			cfg:            MemoryHotplugConfig{TotalSizeMiB: 1024, SlotSizeMiB: 256, BlockSizeMiB: 128},
+			totalBytes:     1024 << 20,
+			slotBytes:      256 << 20,
+			blockBytes:     128 << 20,
+			requestedBytes: 256 << 20,
+			pluggedBytes:   256 << 20,
+		},
+		cfg:   Config{},
+		state: StateRunning,
+	}
+	status, err := vm.GetMemoryHotplug()
+	if err != nil {
+		t.Fatalf("GetMemoryHotplug() error = %v", err)
+	}
+	if status.TotalSizeMiB != 1024 {
+		t.Fatalf("TotalSizeMiB = %d, want 1024", status.TotalSizeMiB)
+	}
+	if status.RequestedSizeMiB != 256 {
+		t.Fatalf("RequestedSizeMiB = %d, want 256", status.RequestedSizeMiB)
+	}
+}
+
+func TestUpdateMemoryHotplug_NilState(t *testing.T) {
+	vm := &VM{memoryHotplug: nil}
+	err := vm.UpdateMemoryHotplug(MemoryHotplugSizeUpdate{RequestedSizeMiB: 256})
+	if err == nil {
+		t.Fatal("UpdateMemoryHotplug() without config should fail")
+	}
+}
+
+func TestUpdateMemoryHotplug_NoExecAgent(t *testing.T) {
+	vm := &VM{
+		memoryHotplug: &memoryHotplugState{
+			totalBytes: 1024 << 20,
+			blockBytes: 128 << 20,
+		},
+		cfg: Config{}, // no Exec
+	}
+	err := vm.UpdateMemoryHotplug(MemoryHotplugSizeUpdate{RequestedSizeMiB: 256})
+	if err == nil {
+		t.Fatal("UpdateMemoryHotplug() without exec agent should fail")
+	}
+	if err.Error() != "memory hotplug requires the guest exec agent to be enabled" {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestUpdateMemoryHotplug_ExceedsTotal(t *testing.T) {
+	vm := &VM{
+		memoryHotplug: &memoryHotplugState{
+			totalBytes: 1024 << 20,
+			blockBytes: 128 << 20,
+		},
+		cfg: Config{Exec: &ExecConfig{Enabled: true}},
+	}
+	err := vm.UpdateMemoryHotplug(MemoryHotplugSizeUpdate{RequestedSizeMiB: 2048})
+	if err == nil {
+		t.Fatal("UpdateMemoryHotplug() exceeding total should fail")
+	}
+}
+
+func TestDeviceList_NilBackend(t *testing.T) {
+	vm := &VM{archBackend: nil}
+	if devices := vm.DeviceList(); devices != nil {
+		t.Fatalf("DeviceList() on nil backend = %v, want nil", devices)
+	}
+}
+
+func TestConsoleOutput_NilBackend(t *testing.T) {
+	vm := &VM{archBackend: nil}
+	if output := vm.ConsoleOutput(); output != nil {
+		t.Fatalf("ConsoleOutput() on nil backend = %v, want nil", output)
+	}
+}
+
+func TestUptime_ZeroStartTime(t *testing.T) {
+	vm := &VM{}
+	if d := vm.Uptime(); d != 0 {
+		t.Fatalf("Uptime() on unstarted VM = %v, want 0", d)
+	}
+}
+
+func TestUptime_NonZero(t *testing.T) {
+	vm := &VM{startTime: time.Now().Add(-5 * time.Second)}
+	d := vm.Uptime()
+	if d < 4*time.Second || d > 10*time.Second {
+		t.Fatalf("Uptime() = %v, want ~5s", d)
+	}
+}
+
+func TestKickVCPUs_NoTIDs(t *testing.T) {
+	vm := &VM{vcpuTIDs: make(map[int]int)}
+	// Should not panic
+	vm.kickVCPUs()
+}
+
+func TestCleanup_EmptyVM(t *testing.T) {
+	vm := &VM{}
+	// Should not panic on nil fields
+	vm.cleanup()
+}
+
+func TestCleanup_Idempotent(t *testing.T) {
+	vm := &VM{}
+	vm.cleanup()
+	vm.cleanup() // should not panic on double call
+}
+
+func TestACPIMMIODevices_NoTransports(t *testing.T) {
+	vm := &VM{}
+	if devices := vm.acpiMMIODevices(); devices != nil {
+		t.Fatalf("acpiMMIODevices() with no transports = %v, want nil", devices)
+	}
+}
+
+func TestSnapshotVCPUCount_VCPUsField(t *testing.T) {
+	snap := Snapshot{
+		VCPUs: []VCPUState{{ID: 0}, {ID: 1}, {ID: 2}},
+		Config: Config{VCPUs: 1},
+	}
+	if got := snapshotVCPUCount(snap); got != 3 {
+		t.Fatalf("snapshotVCPUCount() = %d, want 3", got)
+	}
+}
+
+func TestSnapshotVCPUCount_ConfigFallback(t *testing.T) {
+	snap := Snapshot{Config: Config{VCPUs: 4}}
+	if got := snapshotVCPUCount(snap); got != 4 {
+		t.Fatalf("snapshotVCPUCount() = %d, want 4", got)
+	}
+}
+
+func TestSnapshotVCPUCount_Default(t *testing.T) {
+	snap := Snapshot{}
+	if got := snapshotVCPUCount(snap); got != 1 {
+		t.Fatalf("snapshotVCPUCount() = %d, want 1", got)
+	}
+}
+
+func TestNormalizeSnapshotVCPUStates_FromVCPUs(t *testing.T) {
+	snap := Snapshot{
+		VCPUs: []VCPUState{{ID: 0}, {ID: 1}},
+	}
+	states := normalizeSnapshotVCPUStates(snap)
+	if len(states) != 2 {
+		t.Fatalf("len = %d, want 2", len(states))
+	}
+}
+
+func TestNormalizeSnapshotVCPUStates_LegacyFallback(t *testing.T) {
+	snap := Snapshot{
+		Regs:    kvm.Regs{RAX: 42},
+		MPState: kvm.MPState{State: 1},
+	}
+	states := normalizeSnapshotVCPUStates(snap)
+	if len(states) != 1 {
+		t.Fatalf("len = %d, want 1", len(states))
+	}
+	if states[0].X86 == nil {
+		t.Fatal("expected X86 state to be set")
+	}
+	if states[0].X86.Regs.RAX != 42 {
+		t.Fatalf("RAX = %d, want 42", states[0].X86.Regs.RAX)
+	}
+}
+
+func TestTransportInBlockDevices_Nil(t *testing.T) {
+	if transportInBlockDevices(nil, nil) {
+		t.Fatal("expected false for nil blocks")
+	}
+}
+
+func TestTransportInBlockDevices_NoMatch(t *testing.T) {
+	if transportInBlockDevices([]*virtio.BlockDevice{nil}, nil) {
+		t.Fatal("expected false for nil transport check")
+	}
+}
+
+func TestPrepareSnapshot_MemoryHotplugReject(t *testing.T) {
+	vm := &VM{cfg: Config{MemoryHotplug: &MemoryHotplugConfig{TotalSizeMiB: 1024}}}
+	err := vm.prepareSnapshot()
+	if err == nil {
+		t.Fatal("prepareSnapshot() with hotplug should fail")
+	}
+}
+
+func TestPrepareSnapshot_AdditionalDrivesReject(t *testing.T) {
+	vm := &VM{cfg: Config{
+		Drives: []DriveConfig{
+			{ID: "root", Root: true},
+			{ID: "data", Root: false},
+		},
+	}}
+	err := vm.prepareSnapshot()
+	if err == nil {
+		t.Fatal("prepareSnapshot() with additional drives should fail")
+	}
+}
+
+func TestPrepareSnapshot_NoBalloon_NoDisk(t *testing.T) {
+	vm := &VM{cfg: Config{}}
+	err := vm.prepareSnapshot()
+	if err != nil {
+		t.Fatalf("prepareSnapshot() error = %v", err)
+	}
+}
+
+func TestSetupMemoryHotplug_NilConfig(t *testing.T) {
+	vm := &VM{cfg: Config{MemoryHotplug: nil}}
+	err := vm.setupMemoryHotplug()
+	if err != nil {
+		t.Fatalf("setupMemoryHotplug() with nil config: error = %v", err)
+	}
+}
+
+func TestWaitIfPaused_StoppedReturnsTrue(t *testing.T) {
+	vm := &VM{
+		state:       StateStopped,
+		pausedVCPUs: make(map[int]struct{}),
+	}
+	if !vm.waitIfPaused(0) {
+		t.Fatal("waitIfPaused() on stopped VM should return true")
+	}
+}
+
+func TestWaitIfPaused_RunningReturnsFalse(t *testing.T) {
+	vm := &VM{
+		state:       StateRunning,
+		pausedVCPUs: make(map[int]struct{}),
+	}
+	if vm.waitIfPaused(0) {
+		t.Fatal("waitIfPaused() on running VM should return false")
+	}
+}
+
+func TestRegisterUnregisterVCPUThread(t *testing.T) {
+	vm := &VM{
+		vcpuTIDs:    make(map[int]int),
+		pausedVCPUs: make(map[int]struct{}),
+	}
+	vm.registerVCPUThread(0, 12345)
+	if vm.vcpuTIDs[0] != 12345 {
+		t.Fatalf("vcpuTIDs[0] = %d, want 12345", vm.vcpuTIDs[0])
+	}
+	vm.pausedVCPUs[0] = struct{}{}
+	vm.unregisterVCPUThread(0)
+	if _, ok := vm.vcpuTIDs[0]; ok {
+		t.Fatal("expected vcpuTIDs[0] to be deleted")
+	}
+	if _, ok := vm.pausedVCPUs[0]; ok {
+		t.Fatal("expected pausedVCPUs[0] to be deleted")
+	}
+}
+
+func TestReadSnapshot_MissingFile(t *testing.T) {
+	_, err := readSnapshot(t.TempDir())
+	if err == nil {
+		t.Fatal("readSnapshot() with missing file should fail")
+	}
+}
+
+func TestReadSnapshot_InvalidJSON(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "snapshot.json"), []byte("{invalid"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := readSnapshot(dir)
+	if err == nil {
+		t.Fatal("readSnapshot() with invalid JSON should fail")
+	}
+}
+
+func TestReadSnapshot_Valid(t *testing.T) {
+	dir := t.TempDir()
+	snap := Snapshot{Version: 2, ID: "test"}
+	data, _ := json.MarshalIndent(snap, "", "  ")
+	if err := os.WriteFile(filepath.Join(dir, "snapshot.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readSnapshot(dir)
+	if err != nil {
+		t.Fatalf("readSnapshot() error = %v", err)
+	}
+	if got.ID != "test" || got.Version != 2 {
+		t.Fatalf("snapshot = %+v", got)
+	}
+}
+
+func TestFinishStop_Idempotent(t *testing.T) {
+	vm := &VM{
+		doneCh: make(chan struct{}),
+		events: NewEventLog(),
+	}
+	vm.finishStop()
+	vm.finishStop() // should not panic or close doneCh twice
+}
+
+func TestVMState_Accessor(t *testing.T) {
+	vm := &VM{state: StatePaused}
+	if vm.State() != StatePaused {
+		t.Fatalf("State() = %s, want paused", vm.State())
+	}
+}
+
+func TestVMID_Accessor(t *testing.T) {
+	vm := &VM{cfg: Config{ID: "my-vm"}}
+	if vm.ID() != "my-vm" {
+		t.Fatalf("ID() = %q, want my-vm", vm.ID())
+	}
+}
+
+func TestVMConfig_Accessor(t *testing.T) {
+	vm := &VM{cfg: Config{MemMB: 512, ID: "cfg-test"}}
+	cfg := vm.VMConfig()
+	if cfg.MemMB != 512 || cfg.ID != "cfg-test" {
+		t.Fatalf("VMConfig() = %+v", cfg)
+	}
+}
+
+func TestEvents_Accessor(t *testing.T) {
+	el := NewEventLog()
+	vm := &VM{events: el}
+	if vm.Events() != el {
+		t.Fatal("Events() should return the event log")
+	}
+}
+
+func TestBuildDirtyFilePatch_ZeroPageSize(t *testing.T) {
+	data := make([]byte, 4096)
+	src := bytes.NewReader(data)
+	var dst bytes.Buffer
+	// pageSize 0 should default to 4096
+	patch, err := buildDirtyFilePatch(&dst, src, 4096, "test.bin", 0, []uint64{0x1}, nil)
+	if err != nil {
+		t.Fatalf("buildDirtyFilePatch: %v", err)
+	}
+	if patch.PageSize != 4096 {
+		t.Fatalf("page size = %d, want 4096 default", patch.PageSize)
+	}
+}
+
+func TestErrorsIsNotExist(t *testing.T) {
+	if errorsIsNotExist(nil) {
+		t.Fatal("nil should not be not-exist")
+	}
+	if errorsIsNotExist(fmt.Errorf("random")) {
+		t.Fatal("random error should not be not-exist")
+	}
+	if !errorsIsNotExist(os.ErrNotExist) {
+		t.Fatal("os.ErrNotExist should be not-exist")
+	}
+}
+
+func TestDirtyPatchEntryJSON(t *testing.T) {
+	e := DirtyPatchEntry{Offset: 100, Length: 200, DataOffset: 300}
+	data, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored DirtyPatchEntry
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Offset != 100 || restored.Length != 200 || restored.DataOffset != 300 {
+		t.Fatalf("roundtrip: %+v", restored)
+	}
+}
+
+func TestMigrationPatchSetJSON(t *testing.T) {
+	ps := MigrationPatchSet{
+		Version: 1,
+		Patches: []DirtyFilePatch{
+			{Path: "mem.bin", PageSize: 4096, Entries: []DirtyPatchEntry{{Offset: 0, Length: 4096}}},
+		},
+	}
+	data, err := json.Marshal(ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored MigrationPatchSet
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Version != 1 || len(restored.Patches) != 1 {
+		t.Fatalf("roundtrip: %+v", restored)
+	}
+}
+
+func TestSnapshotVCPUCount(t *testing.T) {
+	tests := []struct {
+		name string
+		snap Snapshot
+		want int
+	}{
+		{"from VCPUs", Snapshot{VCPUs: []VCPUState{{ID: 0}, {ID: 1}}}, 2},
+		{"from config", Snapshot{Config: Config{VCPUs: 4}}, 4},
+		{"default", Snapshot{}, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := snapshotVCPUCount(tt.snap)
+			if got != tt.want {
+				t.Fatalf("snapshotVCPUCount() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplyMigrationPatches_NoPatches(t *testing.T) {
+	dir := t.TempDir()
+	// No patches.json => should succeed silently
+	err := ApplyMigrationPatches(dir)
+	if err != nil {
+		t.Fatalf("ApplyMigrationPatches(empty dir) error = %v", err)
+	}
+}
+
+func TestApplyMigrationPatches_EmptyPatchSet(t *testing.T) {
+	dir := t.TempDir()
+	ps := MigrationPatchSet{Version: 1}
+	data, _ := json.Marshal(ps)
+	if err := os.WriteFile(filepath.Join(dir, migrationPatchMeta), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := ApplyMigrationPatches(dir)
+	if err != nil {
+		t.Fatalf("ApplyMigrationPatches(empty patches) error = %v", err)
+	}
+}
+
+func TestApplyMigrationPatches_WithPatch(t *testing.T) {
+	dir := t.TempDir()
+	// Create target file
+	targetPath := filepath.Join(dir, "mem.bin")
+	originalData := []byte("AAAA")
+	if err := os.WriteFile(targetPath, originalData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Create patch data
+	patchData := []byte("BB")
+	if err := os.WriteFile(filepath.Join(dir, migrationPatchData), patchData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Create patch metadata
+	ps := MigrationPatchSet{
+		Version: 1,
+		Patches: []DirtyFilePatch{
+			{
+				Path:     "mem.bin",
+				PageSize: 1,
+				Entries:  []DirtyPatchEntry{{Offset: 1, Length: 2, DataOffset: 0}},
+			},
+		},
+	}
+	data, _ := json.Marshal(ps)
+	if err := os.WriteFile(filepath.Join(dir, migrationPatchMeta), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrationPatches(dir); err != nil {
+		t.Fatalf("ApplyMigrationPatches error = %v", err)
+	}
+	result, _ := os.ReadFile(targetPath)
+	if string(result) != "ABBA" {
+		t.Fatalf("patched data = %q, want ABBA", result)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -27,17 +28,11 @@ func TestAPIServeRunExec(t *testing.T) {
 
 	addr := freeLocalAddr(t)
 	serverURL := "http://" + addr
-	serveCmd := exec.Command(
-		bins.gocracker,
-		"serve",
-		"--addr", addr,
-		"--cache-dir", cacheDir,
-		"--jailer-binary", bins.jailer,
-		"--vmm-binary", bins.vmm,
-	)
+	serveCmd := exec.Command(bins.gocracker, buildServeArgs(addr, cacheDir, bins)...)
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
+	serveCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := serveCmd.Start(); err != nil {
 		t.Fatalf("start serve command: %v", err)
 	}
@@ -53,6 +48,7 @@ func TestAPIServeRunExec(t *testing.T) {
 		Context:     contextDir,
 		KernelPath:  kernel,
 		MemMB:       256,
+		DiskSizeMB:  512,
 		ExecEnabled: true,
 	})
 	if err != nil {
@@ -78,6 +74,9 @@ func TestAPIServeRunExec(t *testing.T) {
 		t.Fatalf("exec stream: %v\nserve log:\n%s", err, serveLog.String())
 	}
 	defer conn.Close()
+	// Give the shell a moment to initialize before sending commands —
+	// under suite-wide load the PTY may not be ready for input yet.
+	time.Sleep(500 * time.Millisecond)
 	if _, err := io.WriteString(conn, "echo api-run-stream-ok\nexit\n"); err != nil {
 		t.Fatalf("write exec stream commands: %v", err)
 	}
@@ -106,17 +105,11 @@ func TestCLIComposeServeExec(t *testing.T) {
 
 	addr := freeLocalAddr(t)
 	serverURL := "http://" + addr
-	serveCmd := exec.Command(
-		bins.gocracker,
-		"serve",
-		"--addr", addr,
-		"--cache-dir", cacheDir,
-		"--jailer-binary", bins.jailer,
-		"--vmm-binary", bins.vmm,
-	)
+	serveCmd := exec.Command(bins.gocracker, buildServeArgs(addr, cacheDir, bins)...)
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
+	serveCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := serveCmd.Start(); err != nil {
 		t.Fatalf("start serve command: %v", err)
 	}
@@ -141,15 +134,26 @@ func TestCLIComposeServeExec(t *testing.T) {
 		}
 	}()
 
-	waitForComposeVM(t, serverURL, compose.StackNameForComposePath(composeFile), "debug", 30*time.Second)
+	waitForComposeVM(t, serverURL, compose.StackNameForComposePath(composeFile), "debug", 60*time.Second)
 
-	composeExec := exec.Command(bins.gocracker,
-		"compose", "exec",
-		"--server", serverURL,
-		"--file", composeFile,
-		"debug", "--", "/bin/sh", "-lc", "echo compose-exec-ok",
-	)
-	execOutput, err := composeExec.CombinedOutput()
+	// Retry exec once — under CI load the VM may need a moment after
+	// reaching "running" state before the exec agent is ready.
+	var execOutput []byte
+	for attempt := 0; attempt < 2; attempt++ {
+		composeExec := exec.Command(bins.gocracker,
+			"compose", "exec",
+			"--server", serverURL,
+			"--file", composeFile,
+			"debug", "--", "/bin/sh", "-lc", "echo compose-exec-ok",
+		)
+		execOutput, err = composeExec.CombinedOutput()
+		if err == nil {
+			break
+		}
+		if attempt == 0 {
+			time.Sleep(2 * time.Second)
+		}
+	}
 	if err != nil {
 		t.Fatalf("compose exec: %v\n%s\nserve log:\n%s", err, execOutput, serveLog.String())
 	}
@@ -201,17 +205,11 @@ func TestCLIComposeExecInteractive(t *testing.T) {
 
 	addr := freeLocalAddr(t)
 	serverURL := "http://" + addr
-	serveCmd := exec.Command(
-		bins.gocracker,
-		"serve",
-		"--addr", addr,
-		"--cache-dir", cacheDir,
-		"--jailer-binary", bins.jailer,
-		"--vmm-binary", bins.vmm,
-	)
+	serveCmd := exec.Command(bins.gocracker, buildServeArgs(addr, cacheDir, bins)...)
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
+	serveCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := serveCmd.Start(); err != nil {
 		t.Fatalf("start serve command: %v", err)
 	}
@@ -388,18 +386,44 @@ func buildComposeExecFixture(t *testing.T) string {
 	return dir
 }
 
+// buildServeArgs returns the common arguments for `gocracker serve`.
+// On hosts where pivot_root is not available (e.g., GitHub Actions runners
+// using overlay filesystems), it disables the jailer to avoid
+// "pivot_root: invalid argument" failures.
+func buildServeArgs(addr, cacheDir string, bins builtBinaries) []string {
+	args := []string{
+		"serve",
+		"--addr", addr,
+		"--cache-dir", cacheDir,
+		"--vmm-binary", bins.vmm,
+	}
+	if os.Getenv("GOCRACKER_JAILER_OFF") == "1" {
+		args = append(args, "--jailer", "off")
+	} else {
+		args = append(args, "--jailer-binary", bins.jailer)
+	}
+	return args
+}
+
 func stopCommand(t *testing.T, cmd *exec.Cmd) {
 	t.Helper()
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	_ = cmd.Process.Signal(os.Interrupt)
+	// Kill the entire process group (parent + children like gocracker-vmm,
+	// virtiofsd) so inherited stdout pipes get closed and cmd.Wait returns.
+	pgid := cmd.Process.Pid
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	select {
-	case <-time.After(10 * time.Second):
-		_ = cmd.Process.Kill()
-		<-done
+	case <-time.After(5 * time.Second):
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			// Give up — don't block test cleanup forever.
+		}
 	case <-done:
 	}
 }

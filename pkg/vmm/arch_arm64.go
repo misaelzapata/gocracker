@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strings"
 	"time"
 	"unsafe"
 
+	"github.com/gocracker/gocracker/internal/arm64layout"
 	"github.com/gocracker/gocracker/internal/fdt"
 	"github.com/gocracker/gocracker/internal/kvm"
 	"github.com/gocracker/gocracker/internal/loader"
+	"github.com/gocracker/gocracker/internal/rtc"
 	gclog "github.com/gocracker/gocracker/internal/log"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
 	"github.com/gocracker/gocracker/internal/uart"
@@ -22,16 +23,21 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Firecracker ARM64 MMIO layout:
-//   0x40000000 = BOOT_DEVICE (RTC)
-//   0x40001000 = RTC
-//   0x40002000 = SERIAL (PL011)
-//   0x40003000 = MEM_32BIT_DEVICES_START (first virtio-mmio device)
+// Firecracker's AArch64 MMIO layout reserves:
+//
+//	0x40000000 = BOOT_DEVICE (RTC)
+//	0x40001000 = RTC
+//	0x40002000 = serial slot
+//	0x40003000 = first virtio-mmio device
+//
+// gocracker currently reuses the serial slot at 0x40002000 but exposes an
+// ns16550a-compatible UART there, so the guest console stays on ttyS0. The
+// Firecracker benchmark path still uses its own PL011/ttyAMA0 console.
 const (
 	arm64VirtioBase    = 0x40003000 // Firecracker: MEM_32BIT_DEVICES_START
-	arm64VirtioStride  = 0x1000    // Firecracker: MMIO_LEN
-	arm64VirtioIRQBase = 2         // SPI 2 → INTID 34 (SPI 0=RTC, SPI 1=PL011)
-	arm64PL011SPI      = 1         // SPI 1 → INTID 33
+	arm64VirtioStride  = 0x1000     // Firecracker: MMIO_LEN
+	arm64VirtioIRQBase = 2          // SPI 2 → INTID 34 (SPI 0=RTC, SPI 1=serial)
+	arm64PL011SPI      = 1          // SPI 1 → INTID 33
 )
 
 // ARM64 KVM ONE_REG encoding constants (mirrors internal/kvm/cpu_arm64.go
@@ -79,6 +85,20 @@ func init() {
 
 type arm64MachineBackend struct{}
 
+func (vm *VM) ensureARM64GICLayout() (arm64layout.GICLayout, error) {
+	if vm.arm64GICLayout.Valid() {
+		return vm.arm64GICLayout, nil
+	}
+	// 128 IRQs matches Firecracker: 32 private (SGI+PPI) + 96 SPIs.
+	const nrIRQs = 128
+	layout, err := vm.kvmVM.ProbeGICLayout(vm.cfg.VCPUs, nrIRQs)
+	if err != nil {
+		return arm64layout.GICLayout{}, err
+	}
+	vm.arm64GICLayout = layout
+	return layout, nil
+}
+
 // ---------------------------------------------------------------------------
 // setupDevices
 // ---------------------------------------------------------------------------
@@ -107,9 +127,9 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 	mem := vm.kvmVM.Memory()
 	slot := 0
 
-	// Serial console — Firecracker uses ns16550a (same UART as x86) on ARM64,
-	// mapped at MMIO address 0x40002000 instead of I/O port 0x3F8.
-	// IRQ delivery via irqfd (eventfd → KVM → GIC), matching Firecracker.
+	// Serial console — gocracker currently exposes an ns16550a-compatible UART
+	// in Firecracker's serial MMIO slot at 0x40002000 instead of using PL011.
+	// IRQ delivery still goes through irqfd (eventfd -> KVM -> GIC).
 	consoleOut := vm.cfg.ConsoleOut
 	if consoleOut == nil {
 		consoleOut = os.Stdout
@@ -120,6 +140,9 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 		return fmt.Errorf("serial eventfd: %w", err)
 	}
 	vm.uart0 = uart.New(consoleOut, consoleIn, serialIRQFn)
+
+	// PL031 RTC — provides wall clock to the guest kernel at boot.
+	vm.rtcDev = rtc.New()
 
 	// virtio-rng
 	{
@@ -249,9 +272,50 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 // ---------------------------------------------------------------------------
 
 func (arm64MachineBackend) setupIRQs(_ *VM) error {
-	// ARM64 GSI routing is set up in setupVCPU after the GIC is created,
+	// ARM64 GSI routing is set up after all vCPU fds exist and the GIC is created,
 	// because KVM_SET_GSI_ROUTING requires the in-kernel irqchip to exist.
 	return nil
+}
+
+func (arm64MachineBackend) postCreateVCPUs(vm *VM) error {
+	// Match Firecracker's ordering on aarch64: create all vCPU fds first, then
+	// create/configure the irqchip, and only afterwards initialize each vCPU.
+	const nrIRQs = 128
+	gicLayout, err := vm.ensureARM64GICLayout()
+	if err != nil {
+		return fmt.Errorf("select arm64 gic layout: %w", err)
+	}
+	gic, err := vm.kvmVM.CreateGIC(gicLayout, nrIRQs)
+	if err != nil {
+		return fmt.Errorf("create GIC: %w", err)
+	}
+	vm.gicDev = gic
+
+	// Set up GSI routing table — maps each GSI to the in-kernel GIC (irqchip=0).
+	var gsis []uint32
+	gsis = append(gsis, uint32(fdt.DefaultARM64PL011IRQ))
+	for i := range vm.transports {
+		gsis = append(gsis, uint32(arm64VirtioIRQBase+i))
+	}
+	if err := vm.kvmVM.SetGSIRoutingGIC(gsis); err != nil {
+		return fmt.Errorf("arm64 GSI routing: %w", err)
+	}
+
+	// Wire all device eventfds into KVM after the routing table exists.
+	if len(vm.irqEventFds) != len(gsis) {
+		return fmt.Errorf("irqfd count mismatch: %d eventfds vs %d GSIs", len(vm.irqEventFds), len(gsis))
+	}
+	for i, efd := range vm.irqEventFds {
+		if err := vm.kvmVM.RegisterIRQFD(efd, gsis[i]); err != nil {
+			return fmt.Errorf("register irqfd gsi=%d: %w", gsis[i], err)
+		}
+	}
+	gclog.VMM.Info("arm64 irqfd registered", "id", vm.cfg.ID, "count", len(gsis))
+	return nil
+}
+
+func (arm64MachineBackend) setupVCPUsInParallel() bool {
+	return arm64SetupVCPUsInParallel()
 }
 
 // ---------------------------------------------------------------------------
@@ -276,16 +340,7 @@ func (arm64MachineBackend) loadKernel(vm *VM) (*loader.KernelInfo, error) {
 		return nil, err
 	}
 
-	// Build cmdline. ARM64 uses ns16550a (same as x86) so console=ttyS0 is correct.
-	// Firecracker uses "console=ttyS0 reboot=k panic=1 keep_bootcon" on aarch64.
-	cmdline := vm.cfg.Cmdline
-	if cmdline == "" {
-		cmdline = runtimecfg.DefaultKernelCmdline(false)
-	}
-	if !strings.Contains(cmdline, "keep_bootcon") {
-		cmdline += " keep_bootcon"
-	}
-	cmdline = stripX86Args(cmdline)
+	cmdline := normalizeARM64KernelCmdline(vm.cfg.Cmdline)
 
 	if len(cmdline)+1 > runtimecfg.KernelCmdlineMax {
 		return nil, fmt.Errorf("kernel cmdline too long: %d bytes exceeds limit %d", len(cmdline)+1, runtimecfg.KernelCmdlineMax)
@@ -309,9 +364,11 @@ func (arm64MachineBackend) loadKernel(vm *VM) (*loader.KernelInfo, error) {
 		alignedSize := (initrdSize + 0xFFF) &^ 0xFFF
 		initrdAddr = dtbGuestAddr - alignedSize
 		if initrdAddr < info.KernelEnd {
-			return nil, fmt.Errorf("initrd (%d bytes) does not fit between kernel end %#x and DTB %#x", len(initrd), info.KernelEnd, dtbGuestAddr)
+			return nil, fmt.Errorf("initrd (%d bytes) does not fit between kernel end %#x and DTB %#x", initrdSize, info.KernelEnd, dtbGuestAddr)
 		}
-		copy(mem[initrdAddr-memBase:], initrd)
+		if err := copyGuestPayload(mem, memBase, initrdAddr, initrd); err != nil {
+			return nil, fmt.Errorf("copy initrd: %w", err)
+		}
 	}
 
 	// Build list of virtio devices for the DTB.
@@ -328,6 +385,10 @@ func (arm64MachineBackend) loadKernel(vm *VM) (*loader.KernelInfo, error) {
 	// Firecracker reserves the first 2 MiB of DRAM (SYSTEM_MEM_SIZE) and starts
 	// the DTB memory node at DRAM + 0x200000, with size reduced by 0x200000.
 	const systemReserve = fdt.DefaultARM64SystemSize // 2 MiB
+	gicLayout, err := vm.ensureARM64GICLayout()
+	if err != nil {
+		return nil, fmt.Errorf("select arm64 gic layout: %w", err)
+	}
 	dtb, err := fdt.GenerateARM64(fdt.ARM64Config{
 		MemBase:       memBase + systemReserve,
 		MemBytes:      memBytes - systemReserve,
@@ -335,6 +396,7 @@ func (arm64MachineBackend) loadKernel(vm *VM) (*loader.KernelInfo, error) {
 		Cmdline:       cmdline,
 		InitrdAddr:    initrdAddr,
 		InitrdSize:    initrdSize,
+		GIC:           gicLayout,
 		VirtioDevices: virtioDevs,
 	})
 	if err != nil {
@@ -351,70 +413,11 @@ func (arm64MachineBackend) loadKernel(vm *VM) (*loader.KernelInfo, error) {
 	return info, nil
 }
 
-// stripX86Args removes x86-specific kernel arguments that are irrelevant on
-// ARM64 (e.g. i8042.*, 8250.nr_uarts=0).
-func stripX86Args(cmdline string) string {
-	parts := strings.Fields(cmdline)
-	filtered := parts[:0]
-	for _, p := range parts {
-		if strings.HasPrefix(p, "i8042.") ||
-			strings.HasPrefix(p, "8250.") ||
-			p == "pci=off" {
-			continue
-		}
-		filtered = append(filtered, p)
-	}
-	return strings.Join(filtered, " ")
-}
-
 // ---------------------------------------------------------------------------
 // setupVCPU
 // ---------------------------------------------------------------------------
 
 func (arm64MachineBackend) setupVCPU(vm *VM, vcpu *kvm.VCPU, index int, kernelInfo *loader.KernelInfo) error {
-	// Create the GICv3 interrupt controller on the first vCPU — it must be
-	// created after all vCPUs exist in KVM but before they run. We create it
-	// here on index==0 which runs after CreateVCPU(0).
-	if index == 0 {
-		// 128 IRQs matches Firecracker: 32 private (SGI+PPI) + 96 SPIs.
-		// CreateGIC tries GICv2 first (Graviton 1), falls back to GICv3.
-		const nrIRQs = 128
-		gic, err := vm.kvmVM.CreateGIC(fdt.DefaultARM64GICDBase, fdt.DefaultARM64GICRBase, nrIRQs)
-		if err != nil {
-			return fmt.Errorf("create GIC: %w", err)
-		}
-		vm.gicDev = gic
-
-		// Set up GSI routing table — maps each GSI to the in-kernel GIC
-		// (irqchip=0). This is required before registering irqfds.
-		// Firecracker does exactly this: setup_irq_routing() with
-		// KVM_IRQ_ROUTING_IRQCHIP entries pointing to irqchip 0.
-		var gsis []uint32
-		// Serial UART: SPI 1 (INTID 33)
-		gsis = append(gsis, uint32(fdt.DefaultARM64PL011IRQ))
-		// Virtio devices: SPI 2+ (INTID 34+)
-		for i := range vm.transports {
-			gsis = append(gsis, uint32(arm64VirtioIRQBase+i))
-		}
-		if err := vm.kvmVM.SetGSIRoutingGIC(gsis); err != nil {
-			return fmt.Errorf("arm64 GSI routing: %w", err)
-		}
-
-		// Register irqfds — each eventfd created in setupDevices is wired
-		// to its GSI so KVM injects the interrupt into the GIC when the
-		// device writes to the eventfd. This matches Firecracker's
-		// register_irqfd() calls.
-		if len(vm.irqEventFds) != len(gsis) {
-			return fmt.Errorf("irqfd count mismatch: %d eventfds vs %d GSIs", len(vm.irqEventFds), len(gsis))
-		}
-		for i, efd := range vm.irqEventFds {
-			if err := vm.kvmVM.RegisterIRQFD(efd, gsis[i]); err != nil {
-				return fmt.Errorf("register irqfd gsi=%d: %w", gsis[i], err)
-			}
-		}
-		gclog.VMM.Info("arm64 irqfd registered", "id", vm.cfg.ID, "count", len(gsis))
-	}
-
 	// Get the preferred target type for this host.
 	init, err := vm.kvmVM.PreferredARM64Target()
 	if err != nil {

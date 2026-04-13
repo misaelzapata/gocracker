@@ -23,6 +23,7 @@ import (
 	"unsafe"
 
 	"github.com/gocracker/gocracker/internal/acpi"
+	"github.com/gocracker/gocracker/internal/arm64layout"
 	"github.com/gocracker/gocracker/internal/i8042"
 	"github.com/gocracker/gocracker/internal/kvm"
 	"github.com/gocracker/gocracker/internal/loader"
@@ -254,22 +255,24 @@ type VM struct {
 
 	archBackend machineArchBackend
 
-	uart0      *uart.UART
-	i8042      *i8042.Device
-	pl011dev   any // reserved for future PL011 device, currently unused
-	gicDev      any   // *kvm.GICDevice on ARM64, nil on x86
-	irqEventFds []int // eventfds for irqfd-based interrupt delivery (ARM64)
-	transports  []*virtio.Transport
-	rngDev        *virtio.RNGDevice
-	balloonDev    *virtio.BalloonDevice
-	memoryHotplug *memoryHotplugState
-	netDev        *virtio.NetDevice
-	blkDev        *virtio.BlockDevice
-	blkDevs       []*virtio.BlockDevice
-	fsDevs        []*virtio.FSDevice
-	vsockDev      *vsock.Device
-	execBroker    *execAgentBroker
-	memDirty      *virtio.DirtyTracker
+	uart0          *uart.UART
+	i8042          *i8042.Device
+	pl011dev       any // reserved for future PL011 device, currently unused
+	gicDev         any // *kvm.GICDevice on ARM64, nil on x86
+	arm64GICLayout arm64layout.GICLayout
+	irqEventFds    []int // eventfds for irqfd-based interrupt delivery (ARM64)
+	transports     []*virtio.Transport
+	rngDev         *virtio.RNGDevice
+	balloonDev     *virtio.BalloonDevice
+	memoryHotplug  *memoryHotplugState
+	netDev         *virtio.NetDevice
+	blkDev         *virtio.BlockDevice
+	blkDevs        []*virtio.BlockDevice
+	fsDevs         []*virtio.FSDevice
+	vsockDev       *vsock.Device
+	rtcDev         interface{ ReadBytes(uint16, []byte); WriteBytes(uint16, []byte) }
+	execBroker     *execAgentBroker
+	memDirty       *virtio.DirtyTracker
 
 	startTime   time.Time
 	cleanupOnce sync.Once
@@ -379,9 +382,31 @@ func New(cfg Config) (*VM, error) {
 		}
 		m.vcpus = append(m.vcpus, vcpu)
 	}
-	for i, vcpu := range m.vcpus {
-		if err := m.archBackend.setupVCPU(m, vcpu, i, kernelInfo); err != nil {
-			return nil, err
+	if err := m.archBackend.postCreateVCPUs(m); err != nil {
+		return nil, err
+	}
+
+	if m.archBackend.setupVCPUsInParallel() {
+		vcpuErrs := make([]error, len(m.vcpus))
+		var vcpuWG sync.WaitGroup
+		for i, vcpu := range m.vcpus {
+			vcpuWG.Add(1)
+			go func(i int, vcpu *kvm.VCPU) {
+				defer vcpuWG.Done()
+				vcpuErrs[i] = m.archBackend.setupVCPU(m, vcpu, i, kernelInfo)
+			}(i, vcpu)
+		}
+		vcpuWG.Wait()
+		for _, err := range vcpuErrs {
+			if err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		for i, vcpu := range m.vcpus {
+			if err := m.archBackend.setupVCPU(m, vcpu, i, kernelInfo); err != nil {
+				return nil, err
+			}
 		}
 	}
 	m.events.Emit(EventCPUConfigured, fmt.Sprintf("%d vCPU(s) configured", len(m.vcpus)))
@@ -717,6 +742,17 @@ func (m *VM) ConsoleOutput() []byte {
 		return nil
 	}
 	return m.archBackend.consoleOutput(m)
+}
+
+// FirstOutputAt returns the wall-clock instant at which the guest first
+// transmitted a byte on the UART console. Zero time until the guest has
+// written anything. Used by boot-time instrumentation to report the
+// guest_first_output_ms phase.
+func (m *VM) FirstOutputAt() time.Time {
+	if m.uart0 == nil {
+		return time.Time{}
+	}
+	return m.uart0.FirstOutputAt()
 }
 
 // ---- Snapshot / Restore ----
@@ -1145,24 +1181,34 @@ func (m *VM) loadKernel() (*loader.KernelInfo, error) {
 	}
 	copy(mem[CmdlineAddr:], cmdline+"\x00")
 
-	// Load initrd — place after kernel to avoid overlap with ELF segments
 	var initrdAddr, initrdSize uint64
 	if m.cfg.InitrdPath != "" {
-		initrd, err := os.ReadFile(m.cfg.InitrdPath)
+		f, err := os.Open(m.cfg.InitrdPath)
 		if err != nil {
-			return nil, fmt.Errorf("read initrd: %w", err)
+			return nil, fmt.Errorf("open initrd: %w", err)
 		}
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("stat initrd: %w", err)
+		}
+		size := uint64(fi.Size())
 		// Place initrd at max(InitrdAddr, kernelEnd rounded up to 2MiB)
 		iAddr := uint64(InitrdAddr)
 		if info.KernelEnd > iAddr {
 			iAddr = (info.KernelEnd + 0x1FFFFF) &^ 0x1FFFFF // align 2MiB
 		}
-		if iAddr+uint64(len(initrd)) > uint64(len(mem)) {
-			return nil, fmt.Errorf("initrd at %#x (%d bytes) exceeds guest RAM", iAddr, len(initrd))
+		if iAddr+size > uint64(len(mem)) {
+			f.Close()
+			return nil, fmt.Errorf("initrd at %#x (%d bytes) exceeds guest RAM", iAddr, size)
 		}
-		copy(mem[iAddr:], initrd)
+		if _, err := io.ReadFull(f, mem[iAddr:iAddr+size]); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("read initrd: %w", err)
+		}
+		f.Close()
 		initrdAddr = iAddr
-		initrdSize = uint64(len(initrd))
+		initrdSize = size
 	}
 
 	loader.WriteBootParams(mem, info, loader.BootConfig{
@@ -1367,6 +1413,8 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 	if err := seccomp.InstallThreadProfile(seccomp.ProfileVCPU); err != nil {
 		gclog.VMM.Error("install vcpu seccomp profile failed", "id", m.cfg.ID, "vcpu", vcpu.ID, "error", err)
 		m.events.Emit(EventError, fmt.Sprintf("install vcpu seccomp profile: %v", err))
+		// Seccomp was NOT installed, so the thread is clean — unlock it
+		// to avoid leaking a locked OS thread.
 		runtime.UnlockOSThread()
 		m.Stop()
 		m.runWG.Done()
@@ -1376,7 +1424,8 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 	defer m.runWG.Done()
 	defer func() {
 		m.unregisterVCPUThread(vcpu.ID)
-		runtime.UnlockOSThread()
+		// DO NOT unlock after successful seccomp install — the thread
+		// is tainted with a strict filter and must not be reused.
 	}()
 	for {
 		if m.waitIfPaused(vcpu.ID) {
@@ -1502,6 +1551,9 @@ func (m *VM) cleanup() {
 	m.cleanupOnce.Do(func() {
 		if m.execBroker != nil {
 			m.execBroker.close()
+		}
+		if m.vsockDev != nil {
+			m.vsockDev.Close()
 		}
 		if m.balloonDev != nil {
 			_ = m.balloonDev.Close()
@@ -1652,6 +1704,23 @@ func (m *VM) handleMMIO(vcpu *kvm.VCPU) {
 	mmio := vcpu.GetMMIOData()
 	// ARM64 UART dispatch via MMIO (Firecracker uses ns16550a at 0x40002000).
 	// On x86, uart0 is accessed via I/O ports in handleIO; on ARM64 it's MMIO.
+	// PL031 RTC at 0x40001000 (Firecracker: RTC_MEM_START).
+	if m.rtcDev != nil {
+		const rtcBase = 0x40001000
+		const rtcSize = 0x1000
+		if mmio.PhysAddr >= rtcBase && mmio.PhysAddr < rtcBase+rtcSize {
+			offset := uint16(mmio.PhysAddr - rtcBase)
+			if mmio.IsWrite == 1 {
+				m.rtcDev.WriteBytes(offset, mmio.Data[:mmio.Len])
+			} else {
+				for i := range mmio.Data {
+					mmio.Data[i] = 0
+				}
+				m.rtcDev.ReadBytes(offset, mmio.Data[:mmio.Len])
+			}
+			return
+		}
+	}
 	if m.uart0 != nil {
 		const serialBase = 0x40002000
 		const serialSize = 0x1000

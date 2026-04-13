@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gocracker/gocracker/internal/buildserver"
@@ -114,6 +115,11 @@ type RunOptions struct {
 }
 
 // RunResult is returned after a VM is started.
+//
+// Duration is the total wall clock reported by the runtime and is kept for
+// backwards compatibility. New code should prefer Timings, which breaks the
+// total down into orchestration / VMM setup / start / guest-first-output
+// phases so the caller can see exactly where the time is going.
 type RunResult struct {
 	VM           vmm.Handle
 	DiskPath     string
@@ -123,13 +129,40 @@ type RunResult struct {
 	GuestIP      string
 	Gateway      string
 	WorkerSocket string
+	Duration     time.Duration
+	Timings      vmm.BootTimings
 	cleanup      func()
 }
 
 const (
 	runtimeDiskRetention    = time.Minute
 	runArtifactCacheVersion = 2
+
+	// firstOutputWaitMax is how long to wait for the guest's first UART byte.
+	firstOutputWaitMax = 3 * time.Second
 )
+
+// waitFirstOutput polls for the guest's first UART output, returning the
+// elapsed time from startedAt. Returns 0 if h is nil or nothing arrives.
+func waitFirstOutput(h vmm.Handle, startedAt time.Time, maxWait time.Duration) time.Duration {
+	if h == nil {
+		return 0
+	}
+	deadline := startedAt.Add(maxWait)
+	for {
+		if at := h.FirstOutputAt(); !at.IsZero() {
+			d := at.Sub(startedAt)
+			if d < 0 {
+				return 0
+			}
+			return d
+		}
+		if time.Now().After(deadline) {
+			return 0
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
 
 func (r *RunResult) Close() {
 	if r == nil || r.cleanup == nil {
@@ -332,6 +365,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 			return nil, fmt.Errorf("write runtime spec: %w", err)
 		}
 
+		injectHostCACerts(rootfsDir)
 		if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 			return nil, fmt.Errorf("ext4: %w", err)
 		}
@@ -378,15 +412,13 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prepare boot disk: %w", err)
 	}
-	if err := writeRuntimeSpecToDiskImage(bootDiskPath, guestSpec); err != nil {
-		cleanupRuntimeDisk()
-		return nil, fmt.Errorf("write runtime spec to boot disk: %w", err)
-	}
-
 	// ---- Boot ----
 	gclog.Container.Info("booting", "id", opts.ID)
 	t0 := time.Now()
+	var timings vmm.BootTimings
 
+	tPreNew := time.Now()
+	timings.Orchestration = tPreNew.Sub(t0)
 	vm, err := vmm.New(vmm.Config{
 		ID:         opts.ID,
 		MemMB:      opts.MemMB,
@@ -414,6 +446,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		}
 		return nil, fmt.Errorf("create vm: %w", err)
 	}
+	timings.VMMSetup = time.Since(tPreNew)
 	if autoNet != nil {
 		if err := autoNet.Activate(); err != nil {
 			vm.Stop()
@@ -421,12 +454,15 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 			return nil, fmt.Errorf("activate auto network: %w", err)
 		}
 	}
+	tPreStart := time.Now()
 	if err := vm.Start(); err != nil {
 		if autoNet != nil {
 			autoNet.Close()
 		}
 		return nil, fmt.Errorf("start vm: %w", err)
 	}
+	timings.Start = time.Since(tPreStart)
+	timings.GuestFirstOutput = waitFirstOutput(vm, time.Now(), firstOutputWaitMax)
 
 	var cleanupOnce sync.Once
 	cleanupFn := cleanupRuntimeDisk
@@ -449,7 +485,14 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		}()
 	}
 
-	gclog.Container.Info("started", "id", opts.ID, "duration", time.Since(t0).Round(time.Millisecond))
+	timings = timings.Sum()
+	bootDuration := time.Since(t0).Round(time.Millisecond)
+	gclog.Container.Info("started", "id", opts.ID,
+		"duration", bootDuration,
+		"orchestration_ms", timings.Orchestration.Milliseconds(),
+		"vmm_setup_ms", timings.VMMSetup.Milliseconds(),
+		"start_ms", timings.Start.Milliseconds(),
+		"guest_first_output_ms", timings.GuestFirstOutput.Milliseconds())
 	return &RunResult{
 		VM:       vm,
 		DiskPath: bootDiskPath,
@@ -458,6 +501,8 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		TapName:  opts.TapName,
 		GuestIP:  trimCIDR(opts.StaticIP),
 		Gateway:  opts.Gateway,
+		Duration: bootDuration,
+		Timings:  timings,
 		cleanup:  cleanupFn,
 	}, nil
 }
@@ -634,6 +679,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		if err := writeRuntimeSpecToRootfs(rootfsDir, guestSpec); err != nil {
 			return nil, fmt.Errorf("write runtime spec: %w", err)
 		}
+		injectHostCACerts(rootfsDir)
 		if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 			return nil, fmt.Errorf("ext4: %w", err)
 		}
@@ -676,12 +722,8 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prepare boot disk: %w", err)
 	}
-	if err := writeRuntimeSpecToDiskImage(bootDiskPath, guestSpec); err != nil {
-		cleanupRuntimeDisk()
-		return nil, fmt.Errorf("write runtime spec to boot disk: %w", err)
-	}
-
-	handle, cleanup, err := worker.LaunchVMM(vmm.Config{
+	t0 := time.Now()
+	handle, timings, cleanup, err := worker.LaunchVMMWithTimings(vmm.Config{
 		ID:         opts.ID,
 		MemMB:      opts.MemMB,
 		Arch:       opts.Arch,
@@ -714,6 +756,8 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		}
 		return nil, fmt.Errorf("launch vm worker: %w", err)
 	}
+	timings.GuestFirstOutput = waitFirstOutput(handle, time.Now(), firstOutputWaitMax)
+	timings = timings.Sum()
 	if autoNet != nil {
 		if err := autoNet.Activate(); err != nil {
 			handle.Stop()
@@ -745,6 +789,13 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 			cleanupFn()
 		}()
 	}
+	bootDuration := time.Since(t0).Round(time.Millisecond)
+	gclog.Container.Info("started", "id", opts.ID,
+		"duration", bootDuration,
+		"orchestration_ms", timings.Orchestration.Milliseconds(),
+		"vmm_setup_ms", timings.VMMSetup.Milliseconds(),
+		"start_ms", timings.Start.Milliseconds(),
+		"guest_first_output_ms", timings.GuestFirstOutput.Milliseconds())
 	return &RunResult{
 		VM:           handle,
 		DiskPath:     bootDiskPath,
@@ -754,6 +805,8 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		GuestIP:      trimCIDR(opts.StaticIP),
 		Gateway:      opts.Gateway,
 		WorkerSocket: workerSocket(handle),
+		Duration:     bootDuration,
+		Timings:      timings,
 		cleanup:      cleanupFn,
 	}, nil
 }
@@ -848,6 +901,7 @@ func buildLocal(opts BuildOptions) (*BuildResult, error) {
 		return nil, err
 	}
 
+	injectHostCACerts(rootfsDir)
 	if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 		return nil, fmt.Errorf("ext4: %w", err)
 	}
@@ -917,6 +971,7 @@ func buildViaWorker(opts BuildOptions) (*BuildResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	injectHostCACerts(rootfsDir)
 	if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 		return nil, fmt.Errorf("ext4: %w", err)
 	}
@@ -1071,6 +1126,26 @@ func writeRuntimeSpecToRootfs(rootfsDir string, spec runtimecfg.GuestSpec) error
 	return os.WriteFile(hostPath, data, 0644)
 }
 
+// injectHostCACerts copies the host's CA certificate bundle into the guest
+// rootfs so that TLS-dependent tools (apk, curl, wget) work out of the box.
+func injectHostCACerts(rootfsDir string) {
+	// Only inject if the rootfs doesn't already have CA certs (e.g. alpine:latest has them).
+	guestCerts := filepath.Join(rootfsDir, "etc/ssl/certs/ca-certificates.crt")
+	if info, err := os.Stat(guestCerts); err == nil && info.Size() > 0 {
+		// rootfs already has certs, don't overwrite
+	} else {
+		const hostBundle = "/etc/ssl/certs/ca-certificates.crt"
+		data, err := os.ReadFile(hostBundle)
+		if err == nil {
+			_ = os.MkdirAll(filepath.Dir(guestCerts), 0755)
+			_ = os.WriteFile(guestCerts, data, 0644)
+		}
+	}
+	// Ensure working DNS inside the guest.
+	resolvPath := filepath.Join(rootfsDir, "etc/resolv.conf")
+	_ = os.WriteFile(resolvPath, []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644)
+}
+
 func readImageConfig(path string) (oci.ImageConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -1191,41 +1266,6 @@ func prepareBootDisk(workDir, templateDiskPath, id string) (string, func(), erro
 	return runtimeDiskPath, delayedRemoveAll(runtimeDir, runtimeDiskRetention), nil
 }
 
-func writeRuntimeSpecToDiskImage(diskPath string, spec runtimecfg.GuestSpec) error {
-	if !spec.HasStructuredFields() {
-		return nil
-	}
-	data, err := spec.MarshalJSONBytes()
-	if err != nil {
-		return err
-	}
-	tempFile, err := os.CreateTemp("", "gocracker-runtime-spec-*.json")
-	if err != nil {
-		return err
-	}
-	tempPath := tempFile.Name()
-	defer os.Remove(tempPath)
-	if _, err := tempFile.Write(data); err != nil {
-		tempFile.Close()
-		return err
-	}
-	if err := tempFile.Close(); err != nil {
-		return err
-	}
-	if err := runDebugFSCommand(diskPath, "rm "+runtimecfg.GuestSpecPath); err != nil && !strings.Contains(err.Error(), "File not found by ext2_lookup") {
-		return err
-	}
-	return runDebugFSCommand(diskPath, fmt.Sprintf("write %s %s", tempPath, runtimecfg.GuestSpecPath))
-}
-
-func runDebugFSCommand(diskPath, command string) error {
-	cmd := exec.Command("debugfs", "-w", "-R", command, diskPath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("debugfs %q on %s: %w: %s", command, diskPath, err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
 
 func sanitizeRuntimePathComponent(value string) string {
 	value = strings.TrimSpace(value)
@@ -1252,7 +1292,50 @@ func sanitizeRuntimePathComponent(value string) string {
 	return sanitized
 }
 
+// copyDiskImage copies src to dst: hardlink → reflink → full copy.
 func copyDiskImage(src, dst string) error {
+	// Try hardlink first (same filesystem, instant).
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+
+	// Try reflink (CoW clone). FICLONE = 0x40049409 on Linux.
+	if err := tryReflink(src, dst); err == nil {
+		return nil
+	}
+
+	// Fallback: full copy.
+	return copyDiskImageFull(src, dst)
+}
+
+// ficlone is the Linux ioctl number for FICLONE (copy-on-write clone).
+const ficlone = 0x40049409
+
+func tryReflink(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, out.Fd(), ficlone, in.Fd())
+	if errno != 0 {
+		out.Close()
+		os.Remove(dst)
+		return errno
+	}
+	return out.Close()
+}
+
+func copyDiskImageFull(src, dst string) error {
 	info, err := os.Stat(src)
 	if err != nil {
 		return err
@@ -1624,20 +1707,28 @@ func hasKernelModule(modules []guest.KernelModule, name string) bool {
 	return false
 }
 
+var (
+	hostVirtioFSModuleOnce sync.Once
+	hostVirtioFSModuleVal  string
+)
+
 func hostVirtioFSModulePath() string {
-	release, err := os.ReadFile("/proc/sys/kernel/osrelease")
-	if err != nil {
-		return ""
-	}
-	base := strings.TrimSpace(string(release))
-	if base == "" {
-		return ""
-	}
-	matches, err := filepath.Glob(filepath.Join("/lib/modules", base, "kernel", "fs", "fuse", "virtiofs.ko*"))
-	if err != nil || len(matches) == 0 {
-		return ""
-	}
-	return matches[0]
+	hostVirtioFSModuleOnce.Do(func() {
+		release, err := os.ReadFile("/proc/sys/kernel/osrelease")
+		if err != nil {
+			return
+		}
+		base := strings.TrimSpace(string(release))
+		if base == "" {
+			return
+		}
+		matches, err := filepath.Glob(filepath.Join("/lib/modules", base, "kernel", "fs", "fuse", "virtiofs.ko*"))
+		if err != nil || len(matches) == 0 {
+			return
+		}
+		hostVirtioFSModuleVal = matches[0]
+	})
+	return hostVirtioFSModuleVal
 }
 
 func firstNonNegative(values ...int) int {

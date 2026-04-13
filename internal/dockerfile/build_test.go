@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -18,6 +19,25 @@ import (
 	"github.com/gocracker/gocracker/internal/hostguard"
 	"github.com/gocracker/gocracker/internal/oci"
 )
+
+// skipIfNoMountNS skips tests that need mount namespace creation (unshare).
+// GitHub Actions runners and other restricted environments block this syscall.
+func skipIfNoMountNS(t *testing.T) {
+	t.Helper()
+	// Probe in a locked OS thread so the namespace change doesn't leak
+	// to the rest of the test process. The thread is discarded after
+	// the goroutine exits (LockOSThread without Unlock kills the thread).
+	// Note: even root can fail in constrained containers (no CAP_SYS_ADMIN
+	// or seccomp blocking unshare).
+	ch := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		ch <- syscall.Unshare(syscall.CLONE_NEWNS)
+	}()
+	if err := <-ch; err != nil {
+		t.Skipf("mount namespace not available (unshare: %v); skipping RUN test", err)
+	}
+}
 
 func TestBuild_COPYDirectoryHonorsDockerignore(t *testing.T) {
 	ctxDir := t.TempDir()
@@ -395,6 +415,7 @@ func TestBuild_RUNWorksRootlessWithoutExternalTools(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("exercise rootless RUN as an unprivileged user")
 	}
+	skipIfNoMountNS(t)
 
 	ctxDir := t.TempDir()
 	writeContextFile(t, ctxDir, "Dockerfile", "FROM scratch\nCOPY tool /bin/tool\nENV FOO=bar\nRUN [\"/bin/tool\", \"/out.txt\"]\n")
@@ -452,6 +473,7 @@ func TestBuild_ARGWithoutDefaultIsDefinedEmptyForFROMExpansion(t *testing.T) {
 }
 
 func TestBuild_ARGWithoutDefaultIsNotExportedToRUNWhenUnset(t *testing.T) {
+	skipIfNoMountNS(t)
 	ctxDir := t.TempDir()
 	writeContextFile(t, ctxDir, "Dockerfile", "FROM scratch\nARG JEMALLOC_SYS_WITH_LG_PAGE\nCOPY tool /bin/tool\nRUN [\"/bin/tool\", \"/out.txt\"]\n")
 	buildStaticTestTool(t, ctxDir, "tool", `package main
@@ -479,6 +501,7 @@ func main() {
 }
 
 func TestBuild_RUNSeesARGValues(t *testing.T) {
+	skipIfNoMountNS(t)
 	ctxDir := t.TempDir()
 	writeContextFile(t, ctxDir, "Dockerfile", "FROM scratch\nARG S6_ARCH=x86_64\nCOPY tool /bin/tool\nRUN [\"/bin/tool\", \"/out.txt\"]\n")
 	buildStaticTestTool(t, ctxDir, "tool", `package main
@@ -503,6 +526,7 @@ func main() {
 }
 
 func TestBuild_RUNHasDevPts(t *testing.T) {
+	skipIfNoMountNS(t)
 	ctxDir := t.TempDir()
 	writeContextFile(t, ctxDir, "Dockerfile", "FROM scratch\nCOPY tool /bin/tool\nRUN [\"/bin/tool\", \"/out.txt\"]\n")
 	buildStaticTestTool(t, ctxDir, "tool", `package main

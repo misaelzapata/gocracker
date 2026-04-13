@@ -51,6 +51,13 @@ type Session struct {
 	stopOnce   sync.Once
 }
 
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 4096)
+		return &buf
+	},
+}
+
 func NewSession(mode Mode, wait bool, stdin, stdout *os.File) (*Session, error) {
 	if !wait {
 		if mode == ModeForce {
@@ -171,16 +178,24 @@ func (s *Session) Close() {
 			signal.Stop(s.sigCh)
 			close(s.sigCh)
 		}
+		// Restore terminal state BEFORE closing anything — term.Restore
+		// needs a valid FD on stdin. Closing stdin first would make the
+		// Fd() call return an invalid descriptor.
+		if s.rawState != nil && s.stdin != nil {
+			_ = term.Restore(int(s.stdin.Fd()), s.rawState)
+			if s.stdout != nil {
+				fmt.Fprint(s.stdout, "\033[?25h\r\n")
+			}
+		}
 		if s.slave != nil {
 			_ = s.slave.Close()
 		}
+		// Close the master PTY to unblock pumpInput (blocked on
+		// master.Write) and pumpOutput (blocked on master.Read).
 		if s.master != nil {
 			_ = s.master.Close()
 		}
 		drainInput(s.stdin)
-		if s.rawState != nil {
-			_ = term.Restore(int(s.stdin.Fd()), s.rawState)
-		}
 	})
 }
 
@@ -222,7 +237,9 @@ func (s *Session) pumpInput() {
 	// `exit` arriving as `xt`, etc.
 	const detachByte = 0x1d
 	filter := newInputReplyFilter()
-	buf := make([]byte, 1024)
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
+	buf := *bufPtr
 	for {
 		n, err := s.stdin.Read(buf)
 		if n > 0 {
@@ -341,7 +358,9 @@ func isHostTerminalReply(seq []byte) bool {
 
 func (s *Session) pumpOutput() {
 	filter := terminalOutputFilter{}
-	buf := make([]byte, 1024)
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
+	buf := *bufPtr
 	for {
 		n, err := s.master.Read(buf)
 		if n > 0 {

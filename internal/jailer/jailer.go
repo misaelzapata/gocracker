@@ -4,6 +4,7 @@ package jailer
 
 import (
 	"bufio"
+	"debug/elf"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -107,11 +109,24 @@ func Run(cfg Config) error {
 		defer unix.Close(netnsFD)
 	}
 
+	// Clean any stale mounts and remnants from a previous crash at this
+	if chrootDir == "" || chrootDir == "/" || chrootDir == "/tmp" {
+		return fmt.Errorf("refusing to operate on dangerous chroot path: %q", chrootDir)
+	}
+	// Clean stale mounts from a previous crash, then remove the dir.
+	cleanStaleMounts(chrootDir)
+	_ = os.RemoveAll(chrootDir)
+
 	if err := mkdirAllNoSymlink(chrootDir, 0755); err != nil {
 		return fmt.Errorf("create chroot dir %s: %w", chrootDir, err)
 	}
-	if err := copyRegularFile(cfg.ExecFile, filepath.Join(chrootDir, execName), 0755); err != nil {
-		return fmt.Errorf("copy exec-file into jail: %w", err)
+	// Try hardlink first (instant, same filesystem). Fall back to full copy
+	// if it fails (e.g. cross-device link, permission denied).
+	jailExec := filepath.Join(chrootDir, execName)
+	if err := os.Link(cfg.ExecFile, jailExec); err != nil {
+		if err := copyRegularFile(cfg.ExecFile, jailExec, 0755); err != nil {
+			return fmt.Errorf("copy exec-file into jail: %w", err)
+		}
 	}
 	if err := applyResourceLimits(cfg.ResourceLimits); err != nil {
 		return err
@@ -137,7 +152,15 @@ func Run(cfg Config) error {
 	if err := dropPrivileges(cfg.UID, cfg.GID); err != nil {
 		return err
 	}
-	return syscall.Exec(execPathInJail, append([]string{execName}, cfg.ExtraArgs...), cfg.execEnv())
+	// Verify the binary exists before exec — syscall.Exec returns a raw
+	// errno ("no such file or directory") without any path context.
+	if _, err := os.Stat(execPathInJail); err != nil {
+		return fmt.Errorf("exec binary not found in jail: stat %s: %w", execPathInJail, err)
+	}
+	if err := syscall.Exec(execPathInJail, append([]string{execName}, cfg.ExtraArgs...), cfg.execEnv()); err != nil {
+		return fmt.Errorf("exec %s: %w", execPathInJail, err)
+	}
+	return nil // unreachable after successful exec
 }
 
 func (cfg Config) validate() error {
@@ -382,11 +405,30 @@ func prepareMountTarget(path string, isDir bool) error {
 	return unix.Close(fd)
 }
 
+// isStaticBinary returns true if the given ELF binary has no PT_INTERP
+// program header, meaning it does not require a dynamic linker.
+func isStaticBinary(path string) bool {
+	f, err := elf.Open(path)
+	if err != nil {
+		return false // assume dynamic if we can't read
+	}
+	defer f.Close()
+	for _, p := range f.Progs {
+		if p.Type == elf.PT_INTERP {
+			return false // has dynamic linker
+		}
+	}
+	return true // no interpreter = static
+}
+
 func binaryDependencyMounts(execFile string) ([]string, error) {
+	if isStaticBinary(execFile) {
+		return nil, nil
+	}
 	cmd := exec.Command("ldd", execFile)
 	output, err := cmd.Output()
 	if err != nil {
-		// Static binaries are fine; if ldd cannot inspect the file we do not fail hard.
+		// If ldd cannot inspect the file we do not fail hard.
 		return nil, nil
 	}
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
@@ -628,6 +670,46 @@ func copyRegularFile(src, dst string, mode os.FileMode) error {
 		return err
 	}
 	return out.Close()
+}
+
+// cleanStaleMounts recursively unmounts any leftover bind mounts inside dir.
+// This handles the case where a previous jailer session crashed before
+// pivot_root, leaving host-visible mounts that prevent reuse of the path.
+func cleanStaleMounts(dir string) {
+	dir = filepath.Clean(dir)
+	if dir == "" || dir == "/" {
+		return
+	}
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	var targets []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 5 {
+			continue
+		}
+		mountpoint := fields[4]
+		if strings.HasPrefix(mountpoint, dir+"/") || mountpoint == dir {
+			targets = append(targets, mountpoint)
+		}
+	}
+	if scanner.Err() != nil {
+		return // partial read — don't unmount based on incomplete data
+	}
+	// Unmount deepest first with MNT_DETACH so children are released
+	// before parents. Sort by path length descending (deeper paths are
+	// longer) to ensure correct order regardless of mountinfo ordering.
+	sort.Slice(targets, func(i, j int) bool {
+		return len(targets[i]) > len(targets[j])
+	})
+	for _, t := range targets {
+		_ = unix.Unmount(t, unix.MNT_DETACH)
+	}
 }
 
 func mkdirAllNoSymlink(path string, perm os.FileMode) error {

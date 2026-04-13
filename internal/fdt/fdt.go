@@ -9,6 +9,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+
+	"github.com/gocracker/gocracker/internal/arm64layout"
 )
 
 // DTB magic and version
@@ -39,6 +41,7 @@ type ARM64Config struct {
 	Cmdline       string
 	InitrdAddr    uint64
 	InitrdSize    uint64
+	GIC           arm64layout.GICLayout
 	VirtioDevices []VirtioDevice
 }
 
@@ -51,8 +54,14 @@ const (
 
 	DefaultARM64MMIO32Start = 0x40000000 // MMIO32 region start
 
-	// Firecracker places UART(PL011) in the MMIO32 region.
-	DefaultARM64PL011Base = 0x40002000 // Firecracker: SERIAL_MEM_START
+	// RTC PL031 at Firecracker's RTC_MEM_START (MMIO32 + 0x1000).
+	DefaultARM64RTCBase = 0x40001000
+	DefaultARM64RTCSize = 0x00001000
+
+	// Firecracker reserves the serial MMIO slot at 0x40002000. gocracker
+	// currently exposes an ns16550a UART at that address, while Firecracker's
+	// own AArch64 guests use PL011/ttyAMA0 there.
+	DefaultARM64PL011Base = 0x40002000
 	DefaultARM64PL011Size = 0x00001000
 	DefaultARM64PL011IRQ  = 1 // SPI 1, INTID 33
 
@@ -271,14 +280,15 @@ func Generate(memBytes uint64, cpus int, devices []VirtioDevice) ([]byte, error)
 		b.endNode()
 	}
 
-	b.endNode()       // close root node
+	b.endNode() // close root node
 	b.putU32(tokenEnd)
 
 	return b.buildDTB(), nil
 }
 
 // GenerateARM64 builds a DTB suitable for an arm64 Linux guest booting with a
-// DTB, PSCI, GICv3, PL011, and virtio-mmio devices.
+// DTB, PSCI, a probed GIC layout, the current gocracker serial device model,
+// and virtio-mmio devices.
 func GenerateARM64(cfg ARM64Config) ([]byte, error) {
 	if cfg.MemBase == 0 {
 		cfg.MemBase = DefaultARM64MemoryBase
@@ -288,6 +298,9 @@ func GenerateARM64(cfg ARM64Config) ([]byte, error) {
 	}
 	if cfg.CPUs <= 0 {
 		cfg.CPUs = 1
+	}
+	if !cfg.GIC.Valid() {
+		cfg.GIC = arm64layout.GICv2()
 	}
 
 	b := newBuilder()
@@ -336,28 +349,25 @@ func GenerateARM64(cfg ARM64Config) ([]byte, error) {
 	b.endNode()
 
 	b.beginNode("intc")
-	// Firecracker uses "arm,gic-400" for GICv2 and "arm,gic-v3" for GICv3.
-	// "arm,gic-400" is the standard GICv2 compatible string recognized by Linux.
-	b.propStrList("compatible", "arm,gic-400")
+	b.propStrList("compatible", cfg.GIC.Compat)
 	b.propEmpty("interrupt-controller")
 	b.propU32("#interrupt-cells", 3)
 	b.propU32("#address-cells", 2)
 	b.propU32("#size-cells", 2)
 	b.propU32("phandle", DefaultARM64GICPhandle)
 	b.propRegPairs("reg",
-		[2]uint64{DefaultARM64GICDBase, DefaultARM64GICDSize},
-		[2]uint64{DefaultARM64GICRBase, DefaultARM64GICRSize},
+		[2]uint64{cfg.GIC.Properties[0], cfg.GIC.Properties[1]},
+		[2]uint64{cfg.GIC.Properties[2], cfg.GIC.Properties[3]},
 	)
 	b.propEmpty("ranges")
-	// Maintenance interrupt: PPI 8 for GICv2 (Firecracker: ARCH_GIC_V2_MAINT_IRQ=8).
-	b.propU32s("interrupts", 1, 8, 4) // PPI, irq 8, LEVEL_HI
+	b.propU32s("interrupts", 1, cfg.GIC.MaintIRQ, 4)
 	b.endNode()
 
 	// Timer node (Firecracker: create_timer_node).
 	const (
-		gicIRQTypePPI   = 1
-		irqTypeLevelHi  = 4
-		clockPhandle    = 2
+		gicIRQTypePPI  = 1
+		irqTypeLevelHi = 4
+		clockPhandle   = 2
 	)
 	b.beginNode("timer")
 	b.propStr("compatible", "arm,armv8-timer")
@@ -380,7 +390,14 @@ func GenerateARM64(cfg ARM64Config) ([]byte, error) {
 	b.propU32("phandle", clockPhandle)
 	b.endNode()
 
-	// Firecracker uses ns16550a (same as x86 UART) mapped at MMIO on ARM64.
+	// PL031 RTC — the kernel reads RTCDR at boot to set the wall clock.
+	b.beginNode(fmt.Sprintf("rtc@%x", DefaultARM64RTCBase))
+	b.propStrList("compatible", "arm,pl031", "arm,primecell")
+	b.propReg(DefaultARM64RTCBase, DefaultARM64RTCSize)
+	b.propU32("clocks", clockPhandle)
+	b.propStr("clock-names", "apb_pclk")
+	b.endNode()
+
 	b.beginNode(fmt.Sprintf("uart@%x", DefaultARM64PL011Base))
 	b.propStr("compatible", "ns16550a")
 	b.propReg(DefaultARM64PL011Base, DefaultARM64PL011Size)
@@ -400,7 +417,7 @@ func GenerateARM64(cfg ARM64Config) ([]byte, error) {
 		b.endNode()
 	}
 
-	b.endNode()       // close root node
+	b.endNode() // close root node
 	b.putU32(tokenEnd)
 	return b.buildDTB(), nil
 }
