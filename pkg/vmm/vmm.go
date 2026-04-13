@@ -23,6 +23,7 @@ import (
 	"unsafe"
 
 	"github.com/gocracker/gocracker/internal/acpi"
+	"github.com/gocracker/gocracker/internal/arm64layout"
 	"github.com/gocracker/gocracker/internal/i8042"
 	"github.com/gocracker/gocracker/internal/kvm"
 	"github.com/gocracker/gocracker/internal/loader"
@@ -254,22 +255,24 @@ type VM struct {
 
 	archBackend machineArchBackend
 
-	uart0         *uart.UART
-	i8042         *i8042.Device
-	pl011dev      any   // reserved for future PL011 device, currently unused
-	gicDev        any   // *kvm.GICDevice on ARM64, nil on x86
-	irqEventFds   []int // eventfds for irqfd-based interrupt delivery (ARM64)
-	transports    []*virtio.Transport
-	rngDev        *virtio.RNGDevice
-	balloonDev    *virtio.BalloonDevice
-	memoryHotplug *memoryHotplugState
-	netDev        *virtio.NetDevice
-	blkDev        *virtio.BlockDevice
-	blkDevs       []*virtio.BlockDevice
-	fsDevs        []*virtio.FSDevice
-	vsockDev      *vsock.Device
-	execBroker    *execAgentBroker
-	memDirty      *virtio.DirtyTracker
+	uart0          *uart.UART
+	i8042          *i8042.Device
+	pl011dev       any // reserved for future PL011 device, currently unused
+	gicDev         any // *kvm.GICDevice on ARM64, nil on x86
+	arm64GICLayout arm64layout.GICLayout
+	irqEventFds    []int // eventfds for irqfd-based interrupt delivery (ARM64)
+	transports     []*virtio.Transport
+	rngDev         *virtio.RNGDevice
+	balloonDev     *virtio.BalloonDevice
+	memoryHotplug  *memoryHotplugState
+	netDev         *virtio.NetDevice
+	blkDev         *virtio.BlockDevice
+	blkDevs        []*virtio.BlockDevice
+	fsDevs         []*virtio.FSDevice
+	vsockDev       *vsock.Device
+	rtcDev         interface{ ReadBytes(uint16, []byte); WriteBytes(uint16, []byte) }
+	execBroker     *execAgentBroker
+	memDirty       *virtio.DirtyTracker
 
 	startTime   time.Time
 	cleanupOnce sync.Once
@@ -379,9 +382,31 @@ func New(cfg Config) (*VM, error) {
 		}
 		m.vcpus = append(m.vcpus, vcpu)
 	}
-	for i, vcpu := range m.vcpus {
-		if err := m.archBackend.setupVCPU(m, vcpu, i, kernelInfo); err != nil {
-			return nil, err
+	if err := m.archBackend.postCreateVCPUs(m); err != nil {
+		return nil, err
+	}
+
+	if m.archBackend.setupVCPUsInParallel() {
+		vcpuErrs := make([]error, len(m.vcpus))
+		var vcpuWG sync.WaitGroup
+		for i, vcpu := range m.vcpus {
+			vcpuWG.Add(1)
+			go func(i int, vcpu *kvm.VCPU) {
+				defer vcpuWG.Done()
+				vcpuErrs[i] = m.archBackend.setupVCPU(m, vcpu, i, kernelInfo)
+			}(i, vcpu)
+		}
+		vcpuWG.Wait()
+		for _, err := range vcpuErrs {
+			if err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		for i, vcpu := range m.vcpus {
+			if err := m.archBackend.setupVCPU(m, vcpu, i, kernelInfo); err != nil {
+				return nil, err
+			}
 		}
 	}
 	m.events.Emit(EventCPUConfigured, fmt.Sprintf("%d vCPU(s) configured", len(m.vcpus)))
@@ -1156,24 +1181,34 @@ func (m *VM) loadKernel() (*loader.KernelInfo, error) {
 	}
 	copy(mem[CmdlineAddr:], cmdline+"\x00")
 
-	// Load initrd — place after kernel to avoid overlap with ELF segments
 	var initrdAddr, initrdSize uint64
 	if m.cfg.InitrdPath != "" {
-		initrd, err := os.ReadFile(m.cfg.InitrdPath)
+		f, err := os.Open(m.cfg.InitrdPath)
 		if err != nil {
-			return nil, fmt.Errorf("read initrd: %w", err)
+			return nil, fmt.Errorf("open initrd: %w", err)
 		}
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("stat initrd: %w", err)
+		}
+		size := uint64(fi.Size())
 		// Place initrd at max(InitrdAddr, kernelEnd rounded up to 2MiB)
 		iAddr := uint64(InitrdAddr)
 		if info.KernelEnd > iAddr {
 			iAddr = (info.KernelEnd + 0x1FFFFF) &^ 0x1FFFFF // align 2MiB
 		}
-		if iAddr+uint64(len(initrd)) > uint64(len(mem)) {
-			return nil, fmt.Errorf("initrd at %#x (%d bytes) exceeds guest RAM", iAddr, len(initrd))
+		if iAddr+size > uint64(len(mem)) {
+			f.Close()
+			return nil, fmt.Errorf("initrd at %#x (%d bytes) exceeds guest RAM", iAddr, size)
 		}
-		copy(mem[iAddr:], initrd)
+		if _, err := io.ReadFull(f, mem[iAddr:iAddr+size]); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("read initrd: %w", err)
+		}
+		f.Close()
 		initrdAddr = iAddr
-		initrdSize = uint64(len(initrd))
+		initrdSize = size
 	}
 
 	loader.WriteBootParams(mem, info, loader.BootConfig{
@@ -1225,6 +1260,31 @@ func (m *VM) makePulseIRQFn(irq uint32) func(bool) {
 	}
 }
 
+// makeEventFDIRQFn creates an eventfd and returns an IRQ callback that writes
+// a single uint64(1) into it on each assert. Paired with a KVM_IRQFD
+// registration (see archBackend.postCreateVCPUs), this lets virtio devices
+// inject interrupts with zero ioctl(KVM_IRQ_LINE) traffic and zero vCPU
+// context switches during the injection itself — Firecracker's model, which
+// arm64 already followed. The caller is expected to append the returned fd
+// to vm.irqEventFds in the same order as the GSIs it later registers, so
+// cleanup (vmm.cleanup) can close them on shutdown.
+func (m *VM) makeEventFDIRQFn() (int, func(bool), error) {
+	efd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		return -1, nil, fmt.Errorf("eventfd: %w", err)
+	}
+	m.irqEventFds = append(m.irqEventFds, efd)
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], 1)
+	fn := func(assert bool) {
+		if !assert {
+			return
+		}
+		_, _ = unix.Write(efd, buf[:])
+	}
+	return efd, fn, nil
+}
+
 func (m *VM) setupIRQs() error {
 	routes := []uint32{COM1IRQ}
 	for _, t := range m.transports {
@@ -1261,7 +1321,17 @@ func (m *VM) setupDevices() error {
 	if consoleIn == nil {
 		consoleIn = os.Stdin
 	}
-	m.uart0 = uart.New(consoleOut, consoleIn, m.makePulseIRQFn(COM1IRQ))
+	// IRQ delivery on x86 uses KVM_IRQFD: each device owns an eventfd and
+	// writing to it injects the GSI without a ioctl(KVM_IRQ_LINE). The
+	// eventfds are registered with KVM in postCreateVCPUs once GSI routing
+	// exists; the order of makeEventFDIRQFn calls here must mirror the GSI
+	// order produced by setupIRQs (COM1, then each transport in append order)
+	// so registerIRQFDs below can pair them.
+	_, serialIRQFn, err := m.makeEventFDIRQFn()
+	if err != nil {
+		return fmt.Errorf("serial irqfd: %w", err)
+	}
+	m.uart0 = uart.New(consoleOut, consoleIn, serialIRQFn)
 	m.i8042 = i8042.New(func() {
 		gclog.VMM.Info("guest reboot requested via i8042", "id", m.cfg.ID)
 		m.events.Emit(EventShutdown, "guest reboot requested via i8042")
@@ -1272,7 +1342,11 @@ func (m *VM) setupDevices() error {
 	{
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		rng := virtio.NewRNGDevice(mem, base, irq, m.memDirty, m.makeIRQFn(uint32(irq)))
+		_, irqFn, err := m.makeEventFDIRQFn()
+		if err != nil {
+			return fmt.Errorf("virtio-rng irqfd: %w", err)
+		}
+		rng := virtio.NewRNGDevice(mem, base, irq, m.memDirty, irqFn)
 		rng.SetRateLimiter(buildRateLimiter(m.cfg.RNGRateLimiter))
 		m.rngDev = rng
 		m.transports = append(m.transports, rng.Transport)
@@ -1283,12 +1357,16 @@ func (m *VM) setupDevices() error {
 	if m.cfg.Balloon != nil {
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
+		_, irqFn, err := m.makeEventFDIRQFn()
+		if err != nil {
+			return fmt.Errorf("virtio-balloon irqfd: %w", err)
+		}
 		balloon := virtio.NewBalloonDevice(mem, base, irq, virtio.BalloonDeviceConfig{
 			AmountMiB:            m.cfg.Balloon.AmountMiB,
 			DeflateOnOOM:         m.cfg.Balloon.DeflateOnOOM,
 			StatsPollingInterval: time.Duration(m.cfg.Balloon.StatsPollingIntervalS) * time.Second,
 			SnapshotPages:        append([]uint32(nil), m.cfg.Balloon.SnapshotPages...),
-		}, m.memDirty, m.makeIRQFn(uint32(irq)))
+		}, m.memDirty, irqFn)
 		m.balloonDev = balloon
 		m.transports = append(m.transports, balloon.Transport)
 		slot++
@@ -1302,7 +1380,11 @@ func (m *VM) setupDevices() error {
 		}
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		nd, err := virtio.NewNetDevice(mem, base, irq, mac, m.cfg.TapName, m.memDirty, m.makeIRQFn(uint32(irq)))
+		_, irqFn, err := m.makeEventFDIRQFn()
+		if err != nil {
+			return fmt.Errorf("virtio-net irqfd: %w", err)
+		}
+		nd, err := virtio.NewNetDevice(mem, base, irq, mac, m.cfg.TapName, m.memDirty, irqFn)
 		if err != nil {
 			return fmt.Errorf("virtio-net: %w", err)
 		}
@@ -1321,7 +1403,11 @@ func (m *VM) setupDevices() error {
 			m.execBroker = newExecAgentBroker(m.cfg.Exec.VsockPort)
 			listenFn = m.execBroker.listen
 		}
-		vsockDev := vsock.NewDevice(mem, base, irq, listenFn, m.memDirty, m.makeIRQFn(uint32(irq)))
+		_, irqFn, err := m.makeEventFDIRQFn()
+		if err != nil {
+			return fmt.Errorf("virtio-vsock irqfd: %w", err)
+		}
+		vsockDev := vsock.NewDevice(mem, base, irq, listenFn, m.memDirty, irqFn)
 		m.vsockDev = vsockDev
 		m.transports = append(m.transports, vsockDev.Transport)
 		slot++
@@ -1331,7 +1417,11 @@ func (m *VM) setupDevices() error {
 	for _, drive := range m.cfg.DriveList() {
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		bd, err := virtio.NewBlockDevice(mem, base, irq, drive.Path, drive.ReadOnly, m.memDirty, m.makeIRQFn(uint32(irq)))
+		_, irqFn, err := m.makeEventFDIRQFn()
+		if err != nil {
+			return fmt.Errorf("virtio-blk %s irqfd: %w", drive.ID, err)
+		}
+		bd, err := virtio.NewBlockDevice(mem, base, irq, drive.Path, drive.ReadOnly, m.memDirty, irqFn)
 		if err != nil {
 			return fmt.Errorf("virtio-blk %s: %w", drive.ID, err)
 		}
@@ -1347,7 +1437,11 @@ func (m *VM) setupDevices() error {
 	for _, fsCfg := range m.cfg.SharedFS {
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		fsDev, err := virtio.NewFSDevice(mem, m.kvmVM.MemoryFD(), base, irq, fsCfg.Source, fsCfg.Tag, fsCfg.SocketPath, m.memDirty, m.makeIRQFn(uint32(irq)))
+		_, irqFn, err := m.makeEventFDIRQFn()
+		if err != nil {
+			return fmt.Errorf("virtio-fs %s irqfd: %w", fsCfg.Tag, err)
+		}
+		fsDev, err := virtio.NewFSDevice(mem, m.kvmVM.MemoryFD(), base, irq, fsCfg.Source, fsCfg.Tag, fsCfg.SocketPath, m.memDirty, irqFn)
 		if err != nil {
 			return fmt.Errorf("virtio-fs %s: %w", fsCfg.Tag, err)
 		}
@@ -1517,6 +1611,9 @@ func (m *VM) cleanup() {
 		if m.execBroker != nil {
 			m.execBroker.close()
 		}
+		if m.vsockDev != nil {
+			m.vsockDev.Close()
+		}
 		if m.balloonDev != nil {
 			_ = m.balloonDev.Close()
 		}
@@ -1666,6 +1763,23 @@ func (m *VM) handleMMIO(vcpu *kvm.VCPU) {
 	mmio := vcpu.GetMMIOData()
 	// ARM64 UART dispatch via MMIO (Firecracker uses ns16550a at 0x40002000).
 	// On x86, uart0 is accessed via I/O ports in handleIO; on ARM64 it's MMIO.
+	// PL031 RTC at 0x40001000 (Firecracker: RTC_MEM_START).
+	if m.rtcDev != nil {
+		const rtcBase = 0x40001000
+		const rtcSize = 0x1000
+		if mmio.PhysAddr >= rtcBase && mmio.PhysAddr < rtcBase+rtcSize {
+			offset := uint16(mmio.PhysAddr - rtcBase)
+			if mmio.IsWrite == 1 {
+				m.rtcDev.WriteBytes(offset, mmio.Data[:mmio.Len])
+			} else {
+				for i := range mmio.Data {
+					mmio.Data[i] = 0
+				}
+				m.rtcDev.ReadBytes(offset, mmio.Data[:mmio.Len])
+			}
+			return
+		}
+	}
 	if m.uart0 != nil {
 		const serialBase = 0x40002000
 		const serialSize = 0x1000

@@ -255,8 +255,8 @@ func (c *vsockConn) Close() error                { return c.file.Close() }
 func (c *vsockConn) Shutdown() error {
 	return unix.Shutdown(int(c.file.Fd()), unix.SHUT_RDWR)
 }
-func (c *vsockConn) LocalAddr() net.Addr         { return c.local }
-func (c *vsockConn) RemoteAddr() net.Addr        { return c.peer }
+func (c *vsockConn) LocalAddr() net.Addr  { return c.local }
+func (c *vsockConn) RemoteAddr() net.Addr { return c.peer }
 func (c *vsockConn) SetDeadline(t time.Time) error {
 	return c.file.SetDeadline(t)
 }
@@ -1223,7 +1223,7 @@ func setupConsole() {
 		minor int
 	}{
 		{"/dev/console", 5, 1},
-		{"/dev/ttyS0", 4, 64},    // x86 16550A UART
+		{"/dev/ttyS0", 4, 64},     // x86 16550A UART
 		{"/dev/ttyAMA0", 204, 64}, // ARM64 PL011 UART
 	} {
 		c, err := os.OpenFile(dev.path, os.O_RDWR|syscall.O_NONBLOCK, 0)

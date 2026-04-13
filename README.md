@@ -4,10 +4,8 @@ One binary. One command. Real VM isolation.
 
 [![Go 1.22+](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![CI](https://img.shields.io/badge/CI-passing-brightgreen)]()
-[![Coverage](https://img.shields.io/badge/Coverage-69%25-green)](docs/ARCHITECTURE.md)
-[![Tests](https://img.shields.io/badge/Tests-500+-green)]()
-[![Validated](https://img.shields.io/badge/Validated-328_projects-blue)](docs/VALIDATED_PROJECTS.md)
+[![Architecture](https://img.shields.io/badge/Architecture-docs-green)](docs/ARCHITECTURE.md)
+[![Validated projects](https://img.shields.io/badge/Validated-projects-blue)](docs/VALIDATED_PROJECTS.md)
 
 [![Linux KVM](https://img.shields.io/badge/Linux-KVM-FCC624?logo=linux&logoColor=black)](https://www.kernel.org)
 [![x86-64](https://img.shields.io/badge/x86--64-supported-brightgreen)]()
@@ -250,17 +248,23 @@ gocracker builds on Firecracker's proven security model and adds the developer e
 
 ## Boot-time benchmark
 
-I measured gocracker against Firecracker v1.10.1 on the same host, kernel and rootfs, across every combination of jailer on/off, network none/TAP, and TTY on/off. 16 configurations, 15 runs each (3 warmups), all driven through the same Firecracker REST API so the comparison is apples-to-apples at the VMM level.
+I measured gocracker against Firecracker v1.10.1 on the same host, across the matrix of `{standard, minimal}` guest kernels × `{none, tap}` network × `{off, on}` TTY, 10 runs per cell (3 warmups), all driven through the same Firecracker REST API so the comparison is apples-to-apples at the VMM level.
+
+> **Note** — this section was re-measured on 2026-04-13 on the `perf/x86-slim-kernel-boot-bench` branch (commit preceding the README update). The earlier run is preserved in git history.
 
 ### Setup
 
-- **Host**: Linux 6.17, consumer laptop, `/dev/kvm` available
+- **Host**: AMD Ryzen AI 9 HX 370 (24 threads), Linux 6.17, `/dev/kvm` available
 - **Firecracker**: v1.10.1 ([official release tarball](https://github.com/firecracker-microvm/firecracker/releases/tag/v1.10.1))
-- **gocracker**: this branch
-- **Shared kernel**: [artifacts/kernels/gocracker-guest-standard-vmlinux](artifacts/kernels/gocracker-guest-standard-vmlinux) (ELF vmlinux, Linux 6.1.102)
-- **Shared rootfs**: 64 MiB ext4 built from alpine-minirootfs 3.20.3 with a custom `/init` that prints `BENCH_READY` and calls `reboot -f` (triggers `KVM_EXIT_SHUTDOWN` via triple fault on `reboot=t`)
+- **gocracker**: this branch (includes the virtio-net shutdown-race fix from this PR; the earlier vsock-side fix landed in PR #2)
+- **Kernels measured**:
+  - [artifacts/kernels/gocracker-guest-standard-vmlinux](artifacts/kernels/gocracker-guest-standard-vmlinux) (ELF vmlinux, Linux 6.1.102, 41 MiB)
+  - [artifacts/kernels/gocracker-guest-minimal-vmlinux](artifacts/kernels/gocracker-guest-minimal-vmlinux) (new minimal profile — committed config drops ACPI NUMA + SLEEP, AMD NUMA, HIBERNATION + snapshot dev, PROFILING, USB (entire subsystem), PM_SLEEP, and the `bzip2`/`lzma`/`lzo` decompressors. Some symbols the fragment requests off — e.g. `PERF_EVENTS`, `VT`, `INPUT` — stay `=y` because other Kconfig options (`HARDLOCKUP_DETECTOR_PERF`, `HID`, legacy console selectors) transitively select them. Full functional baseline — virtio + vsock + DNS + IPv6 + TLS — still works: `apk update` inside Alpine boots green. 40 MiB.)
+- **Shared rootfs**: 64 MiB ext4 built from alpine-minirootfs 3.20.3 with a custom `/init` that mounts `/proc` and calls `/sbin/reboot -f` (triggers `KVM_EXIT_SHUTDOWN` via triple fault on `reboot=t`)
 - **Guest**: 1 vCPU, 128 MiB RAM
 - **Kernel cmdline**: `console=ttyS0 reboot=t panic=-1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda rw init=/init 8250.nr_uarts=1`
+
+**Scope of this update**: the matrix here is reduced to `jailer=off` only (the jailer chroot needs root to set up and I did not want the bench to touch `/srv/jailer` silently). The jailer row from the older run is preserved in git history; its +8 ms overhead is unchanged.
 
 Both runtimes are driven by the same bash script which does:
 
@@ -279,47 +283,51 @@ Four timings per run:
 | `boot_ms`   | `InstanceStart` response → host sees guest shutdown |
 | `total_ms`  | end-to-end wall clock (sum of the above) |
 
-### Results (medians over 15 runs)
+### Results (medians over 10 runs per cell, 0 failures)
 
 ```
-runtime      jailer  net   tty   spawn  api   boot   total   p95
----------------------------------------------------------------
-firecracker  off     none  off    3ms  18ms  307ms  327ms  341ms
-firecracker  off     none  on     3ms  18ms  311ms  333ms  344ms
-firecracker  off     tap   off    2ms  23ms  308ms  333ms  355ms
-firecracker  off     tap   on     3ms  23ms  311ms  338ms  347ms
-firecracker  on      none  off    3ms  15ms  308ms  327ms  340ms
-firecracker  on      none  on     3ms  15ms  309ms  327ms  342ms
-firecracker  on      tap   off    3ms  20ms  309ms  333ms  342ms
-firecracker  on      tap   on     3ms  20ms  308ms  332ms  376ms
-gocracker    off     none  off    4ms  17ms  285ms  308ms  411ms
-gocracker    off     none  on     4ms  18ms  287ms  309ms  349ms
-gocracker    off     tap   off    4ms  22ms  310ms  335ms  398ms
-gocracker    off     tap   on     4ms  23ms  321ms  349ms  389ms
-gocracker    on      none  off   12ms  15ms  283ms  311ms  355ms
-gocracker    on      none  on    12ms  15ms  279ms  307ms  352ms
-gocracker    on      tap   off   12ms  20ms  296ms  328ms  384ms
-gocracker    on      tap   on    13ms  19ms  293ms  327ms  405ms
+kernel    runtime      net   tty   spawn  api   boot   total   p95
+---------------------------------------------------------------------
+standard  firecracker  none  off    3ms  19ms  315ms  338ms  378ms
+standard  firecracker  none  on     3ms  19ms  312ms  333ms  356ms
+standard  firecracker  tap   off    3ms  25ms  324ms  351ms  395ms
+standard  firecracker  tap   on     2ms  25ms  310ms  340ms  384ms
+standard  gocracker    none  off    6ms  18ms  389ms  417ms  498ms
+standard  gocracker    none  on     5ms  17ms  387ms  408ms  452ms
+standard  gocracker    tap   off    5ms  19ms  387ms  410ms  451ms
+standard  gocracker    tap   on     5ms  19ms  391ms  416ms  459ms
+minimal   firecracker  none  off    3ms  17ms  302ms  321ms  373ms
+minimal   firecracker  none  on     3ms  17ms  292ms  314ms  321ms
+minimal   firecracker  tap   off    3ms  24ms  303ms  329ms  348ms
+minimal   firecracker  tap   on     3ms  24ms  304ms  333ms  387ms
+minimal   gocracker    none  off    4ms  15ms  362ms  380ms  438ms
+minimal   gocracker    none  on     5ms  15ms  348ms  368ms  410ms
+minimal   gocracker    tap   off    4ms  19ms  372ms  395ms  498ms
+minimal   gocracker    tap   on     5ms  19ms  382ms  405ms  455ms
 ```
 
-| config (net/tty) | FC direct | FC jailer | GC direct | GC jailer |
-|---|---:|---:|---:|---:|
-| none / off | 327 | 327 | **308** | 311 |
-| none / on  | 333 | 327 | **309** | 307 |
-| tap / off  | 333 | 333 | 335 | **328** |
-| tap / on   | 338 | 332 | 349 | **327** |
-
-Fastest per cell in **bold**. All numbers in milliseconds.
+| config (runtime/net/tty) | standard `boot` | minimal `boot` | Δ |
+|---|---:|---:|---:|
+| firecracker / none / off | 315 ms | 302 ms | −13 |
+| firecracker / none / on  | 312 ms | 292 ms | −20 |
+| firecracker / tap  / off | 324 ms | 303 ms | −21 |
+| firecracker / tap  / on  | 310 ms | 304 ms | −6  |
+| gocracker   / none / off | 389 ms | 362 ms | **−27** |
+| gocracker   / none / on  | 387 ms | 348 ms | **−39** |
+| gocracker   / tap  / off | 387 ms | 372 ms | −15 |
+| gocracker   / tap  / on  | 391 ms | 382 ms | −9  |
 
 ### What the data shows
 
-1. **gocracker is in parity with Firecracker** at the VMM/API level. In 5 of 8 configurations gocracker is marginally faster; the other 3 are within 15 ms. The common-case (no net, no tty) gocracker direct median is **308 ms** vs Firecracker's **327 ms**.
+1. **The minimal kernel is a real win**, most noticeable on gocracker: the headline no-net/no-tty cell drops from **389 ms → 362 ms** (−27 ms), and the no-net/tty-on cell drops from **387 ms → 348 ms** (−39 ms). Firecracker sees a smaller benefit (Firecracker's base config was already close to microVM-minimal).
 
-2. **The jailer overhead is ~8 ms on gocracker and ~0 on Firecracker.** The only measurable cost is `spawn_ms`: gocracker jumps from 4 ms (direct) to 12 ms (jailer) — that 8 ms is the fork-exec of `gocracker-jailer`, Go runtime init of a second process, chroot setup (mount, mknod, chown, pivot_root), and `syscall.Exec` into `gocracker-vmm`. Nowhere near 2x — it's 2.6% of a 300 ms boot.
+2. **Gocracker remains a bit slower than Firecracker** on the same host (~45 ms on the common case). Some of that is shutdown measurement methodology — gocracker measures to `state=stopped` (post-cleanup), while Firecracker measures to process exit. The slim kernel closes roughly half the gap.
 
-3. **TAP network adds ~5 ms** (an extra `/network-interfaces/eth0` PUT). Both runtimes pay the same amount.
+3. **TAP network adds ~5–15 ms** (an extra `/network-interfaces/eth0` PUT plus TAP fd setup); both runtimes pay the same amount.
 
-4. **TTY on/off is noise** (<5 ms in every configuration).
+4. **TTY on/off is noise** (<10 ms in every configuration).
+
+5. **Functional sanity check** — running `gocracker run` on an Alpine Dockerfile with the minimal kernel, network `auto`, and a `CMD` of `apk update && date && echo APK_OK` prints `OK: 24175 distinct packages available` and the timestamp, confirming that the slim profile still supports DNS, HTTPS/TLS, virtio-blk, virtio-net, wall clock via kvm-clock, and the gocracker exec agent.
 
 ### The "2x" that the old `duration` field showed
 

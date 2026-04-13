@@ -134,7 +134,9 @@ func TestApplyTar_WhiteoutDirectory(t *testing.T) {
 
 func TestBuildExt4MinimalRootfs(t *testing.T) {
 	root := t.TempDir()
-	os.WriteFile(filepath.Join(root, "test.txt"), []byte("hello"), 0644)
+	if err := os.WriteFile(filepath.Join(root, "test.txt"), []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	image := filepath.Join(t.TempDir(), "disk.ext4")
 	if err := BuildExt4(root, image, 32); err != nil {
 		t.Fatalf("BuildExt4(32MB): %v", err)
@@ -214,7 +216,9 @@ func TestApplyTar_FilePermissions(t *testing.T) {
 
 func TestBuildExt4LargerSize(t *testing.T) {
 	root := t.TempDir()
-	os.WriteFile(filepath.Join(root, "data.bin"), make([]byte, 1024), 0644)
+	if err := os.WriteFile(filepath.Join(root, "data.bin"), make([]byte, 1024), 0644); err != nil {
+		t.Fatal(err)
+	}
 	image := filepath.Join(t.TempDir(), "disk.ext4")
 	if err := BuildExt4(root, image, 128); err != nil {
 		t.Fatalf("BuildExt4(128MB): %v", err)

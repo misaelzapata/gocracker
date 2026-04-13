@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
+
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
@@ -66,22 +67,31 @@ type KernelInfo struct {
 // LoadKernel loads a bzImage or ELF vmlinux into guest memory.
 // bootParamsAddr is the guest-physical address where boot_params will live.
 func LoadKernel(mem []byte, kernelPath string, bootParamsAddr uint64) (*KernelInfo, error) {
-	data, err := os.ReadFile(kernelPath)
+	f, err := os.Open(kernelPath)
 	if err != nil {
-		return nil, fmt.Errorf("read kernel %s: %w", kernelPath, err)
+		return nil, fmt.Errorf("open kernel %s: %w", kernelPath, err)
+	}
+	defer f.Close()
+
+	var magic [0x200]byte
+	n, _ := io.ReadFull(f, magic[:])
+
+	if n >= 4 && magic[0] == 0x7F && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F' {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		return loadELFFromFile(mem, f)
 	}
 
-	// Check ELF magic
-	if len(data) >= 4 && data[0] == 0x7F && data[1] == 'E' && data[2] == 'L' && data[3] == 'F' {
-		return loadELF(mem, data)
-	}
-
-	// Check bzImage magic (0xAA55 at offset 0x1FE)
-	if len(data) > 0x200 && binary.LittleEndian.Uint16(data[0x1FE:]) == 0xAA55 {
-		// Firecracker's primary x86 path is an uncompressed ELF vmlinux.
-		// For distro kernels that are packaged as vmlinuz/bzImage, first try to
-		// normalize the image back to its embedded ELF payload and use the ELF
-		// loader path. If extraction fails, fall back to the legacy bzImage path.
+	if n >= 0x200 && binary.LittleEndian.Uint16(magic[0x1FE:]) == 0xAA55 {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return nil, fmt.Errorf("read kernel %s: %w", kernelPath, err)
+		}
+		// Try to normalize bzImage to ELF payload; fall back to legacy path.
 		if vmlinux, err := extractVmlinuxFromBzImage(data); err == nil {
 			if info, elfErr := loadELF(mem, vmlinux); elfErr == nil {
 				return info, nil
@@ -91,6 +101,77 @@ func LoadKernel(mem []byte, kernelPath string, bootParamsAddr uint64) (*KernelIn
 	}
 
 	return nil, fmt.Errorf("unknown kernel format (not ELF or bzImage)")
+}
+
+// loadELFFromFile loads an ELF vmlinux from an open file into guest RAM.
+func loadELFFromFile(mem []byte, f *os.File) (*KernelInfo, error) {
+	ef, err := elf.NewFile(f)
+	if err != nil {
+		return nil, fmt.Errorf("elf parse: %w", err)
+	}
+	defer ef.Close()
+
+	type loadSeg struct {
+		prog  *elf.Prog
+		start uint64
+		end   uint64
+	}
+	var segs []loadSeg
+	for _, ph := range ef.Progs {
+		if ph.Type != elf.PT_LOAD {
+			continue
+		}
+		if ph.Memsz > math.MaxUint64-ph.Paddr || ph.Paddr+ph.Memsz > uint64(len(mem)) {
+			return nil, fmt.Errorf("ELF segment [%#x,%#x) exceeds guest RAM",
+				ph.Paddr, ph.Paddr+ph.Memsz)
+		}
+		if ph.Filesz > uint64(math.MaxInt) {
+			return nil, fmt.Errorf("ELF segment filesz %#x exceeds addressable range", ph.Filesz)
+		}
+		if ph.Filesz > math.MaxUint64-ph.Paddr || ph.Paddr+ph.Filesz > uint64(len(mem)) {
+			return nil, fmt.Errorf("ELF segment [%#x,%#x) filesz exceeds guest RAM",
+				ph.Paddr, ph.Paddr+ph.Filesz)
+		}
+		segs = append(segs, loadSeg{prog: ph, start: ph.Paddr, end: ph.Paddr + ph.Memsz})
+	}
+	sort.Slice(segs, func(i, j int) bool { return segs[i].start < segs[j].start })
+	for i := 1; i < len(segs); i++ {
+		if segs[i].start < segs[i-1].end {
+			return nil, fmt.Errorf("ELF segments overlap: [%#x,%#x) and [%#x,%#x)",
+				segs[i-1].start, segs[i-1].end, segs[i].start, segs[i].end)
+		}
+	}
+
+	var kernEnd uint64
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(segs))
+
+	for _, s := range segs {
+		wg.Add(1)
+		go func(s loadSeg) {
+			defer wg.Done()
+			dst := mem[s.start : s.start+s.prog.Filesz]
+			if _, err := s.prog.ReadAt(dst, 0); err != nil {
+				errCh <- fmt.Errorf("read ELF segment: %w", err)
+				return
+			}
+		}(s)
+		if s.end > kernEnd {
+			kernEnd = s.end
+		}
+	}
+	wg.Wait()
+	close(errCh)
+	if err := <-errCh; err != nil {
+		return nil, err
+	}
+
+	return &KernelInfo{
+		EntryPoint: ef.Entry,
+		SetupBase:  0x7000,
+		KernelEnd:  kernEnd,
+		Protocol:   0x020F,
+	}, nil
 }
 
 // NormalizeKernelImage reads a kernel image and returns the preferred runtime
@@ -258,14 +339,14 @@ func loadELF(mem, data []byte) (*KernelInfo, error) {
 		if ph.Type != elf.PT_LOAD {
 			continue
 		}
-		if ph.Paddr+ph.Memsz > uint64(len(mem)) {
+		if ph.Memsz > math.MaxUint64-ph.Paddr || ph.Paddr+ph.Memsz > uint64(len(mem)) {
 			return nil, fmt.Errorf("ELF segment [%#x,%#x) exceeds guest RAM",
 				ph.Paddr, ph.Paddr+ph.Memsz)
 		}
 		if ph.Filesz > uint64(math.MaxInt) {
 			return nil, fmt.Errorf("ELF segment filesz %#x exceeds addressable range", ph.Filesz)
 		}
-		if ph.Paddr+ph.Filesz > uint64(len(mem)) {
+		if ph.Filesz > math.MaxUint64-ph.Paddr || ph.Paddr+ph.Filesz > uint64(len(mem)) {
 			return nil, fmt.Errorf("ELF segment [%#x,%#x) filesz exceeds guest RAM",
 				ph.Paddr, ph.Paddr+ph.Filesz)
 		}
@@ -288,12 +369,11 @@ func loadELF(mem, data []byte) (*KernelInfo, error) {
 		wg.Add(1)
 		go func(s loadSeg) {
 			defer wg.Done()
-			seg := make([]byte, int(s.prog.Filesz))
-			if _, err := s.prog.ReadAt(seg, 0); err != nil {
+			dst := mem[s.start : s.start+s.prog.Filesz]
+			if _, err := s.prog.ReadAt(dst, 0); err != nil {
 				errCh <- fmt.Errorf("read ELF segment: %w", err)
 				return
 			}
-			copy(mem[s.start:], seg)
 		}(s)
 		if s.end > kernEnd {
 			kernEnd = s.end

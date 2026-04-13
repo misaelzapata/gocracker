@@ -10,30 +10,37 @@ import (
 func TestDockerfileRuntimeRank(t *testing.T) {
 	dir := t.TempDir()
 
+	writeDF := func(path string, body string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
 	// File with ENTRYPOINT -> rank 0
 	f1 := filepath.Join(dir, "df1")
-	os.WriteFile(f1, []byte("FROM scratch\nENTRYPOINT [\"/app\"]\n"), 0644)
+	writeDF(f1, "FROM scratch\nENTRYPOINT [\"/app\"]\n")
 	if got := dockerfileRuntimeRank(f1); got != 0 {
 		t.Fatalf("ENTRYPOINT rank = %d, want 0", got)
 	}
 
 	// File with CMD -> rank 0
 	f2 := filepath.Join(dir, "df2")
-	os.WriteFile(f2, []byte("FROM scratch\nCMD [\"/app\"]\n"), 0644)
+	writeDF(f2, "FROM scratch\nCMD [\"/app\"]\n")
 	if got := dockerfileRuntimeRank(f2); got != 0 {
 		t.Fatalf("CMD rank = %d, want 0", got)
 	}
 
 	// File with EXPOSE -> rank 1
 	f3 := filepath.Join(dir, "df3")
-	os.WriteFile(f3, []byte("FROM scratch\nEXPOSE 8080\n"), 0644)
+	writeDF(f3, "FROM scratch\nEXPOSE 8080\n")
 	if got := dockerfileRuntimeRank(f3); got != 1 {
 		t.Fatalf("EXPOSE rank = %d, want 1", got)
 	}
 
 	// File with only FROM -> rank 2
 	f4 := filepath.Join(dir, "df4")
-	os.WriteFile(f4, []byte("FROM scratch\nRUN echo hello\n"), 0644)
+	writeDF(f4, "FROM scratch\nRUN echo hello\n")
 	if got := dockerfileRuntimeRank(f4); got != 2 {
 		t.Fatalf("no runtime rank = %d, want 2", got)
 	}
@@ -47,7 +54,9 @@ func TestDockerfileRuntimeRank(t *testing.T) {
 func TestDockerfileRuntimeRankENTRYPOINTAtStart(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "df")
-	os.WriteFile(f, []byte("ENTRYPOINT [\"/app\"]\n"), 0644)
+	if err := os.WriteFile(f, []byte("ENTRYPOINT [\"/app\"]\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
 	if got := dockerfileRuntimeRank(f); got != 0 {
 		t.Fatalf("ENTRYPOINT at start rank = %d, want 0", got)
 	}
@@ -56,7 +65,9 @@ func TestDockerfileRuntimeRankENTRYPOINTAtStart(t *testing.T) {
 func TestDockerfileRuntimeRankCMDAtStart(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "df")
-	os.WriteFile(f, []byte("CMD [\"/app\"]\n"), 0644)
+	if err := os.WriteFile(f, []byte("CMD [\"/app\"]\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
 	if got := dockerfileRuntimeRank(f); got != 0 {
 		t.Fatalf("CMD at start rank = %d, want 0", got)
 	}
@@ -65,7 +76,9 @@ func TestDockerfileRuntimeRankCMDAtStart(t *testing.T) {
 func TestDockerfileRuntimeRankEXPOSEAtStart(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "df")
-	os.WriteFile(f, []byte("EXPOSE 80\n"), 0644)
+	if err := os.WriteFile(f, []byte("EXPOSE 80\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
 	if got := dockerfileRuntimeRank(f); got != 1 {
 		t.Fatalf("EXPOSE at start rank = %d, want 1", got)
 	}
@@ -84,7 +97,9 @@ func TestResolveComposePath_StatError(t *testing.T) {
 	}
 	dir := t.TempDir()
 	noAccess := filepath.Join(dir, "noaccess")
-	os.MkdirAll(noAccess, 0000)
+	if err := os.MkdirAll(noAccess, 0000); err != nil {
+		t.Fatalf("mkdir %s: %v", noAccess, err)
+	}
 	defer os.Chmod(noAccess, 0755)
 	_, err := ResolveComposePath(filepath.Join(noAccess, "compose.yml"))
 	if err == nil {
@@ -95,7 +110,9 @@ func TestResolveComposePath_StatError(t *testing.T) {
 func TestFindOneNotDirectory(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "file.txt")
-	os.WriteFile(f, []byte("x"), 0644)
+	if err := os.WriteFile(f, []byte("x"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
 	_, err := findOne(f, dockerfileNameRank, "test")
 	if err == nil {
 		t.Fatal("expected error for non-directory root")
@@ -160,13 +177,21 @@ func TestFindDockerfilePrefersEntrypointOverExpose(t *testing.T) {
 	root := t.TempDir()
 	svcA := filepath.Join(root, "a")
 	svcB := filepath.Join(root, "b")
-	os.MkdirAll(svcA, 0755)
-	os.MkdirAll(svcB, 0755)
+	if err := os.MkdirAll(svcA, 0755); err != nil {
+		t.Fatalf("mkdir %s: %v", svcA, err)
+	}
+	if err := os.MkdirAll(svcB, 0755); err != nil {
+		t.Fatalf("mkdir %s: %v", svcB, err)
+	}
 	// a has EXPOSE only
-	os.WriteFile(filepath.Join(svcA, "Dockerfile"), []byte("FROM scratch\nEXPOSE 80\n"), 0644)
+	if err := os.WriteFile(filepath.Join(svcA, "Dockerfile"), []byte("FROM scratch\nEXPOSE 80\n"), 0644); err != nil {
+		t.Fatalf("write a/Dockerfile: %v", err)
+	}
 	// b has ENTRYPOINT
 	bDF := filepath.Join(svcB, "Dockerfile")
-	os.WriteFile(bDF, []byte("FROM scratch\nENTRYPOINT [\"/app\"]\n"), 0644)
+	if err := os.WriteFile(bDF, []byte("FROM scratch\nENTRYPOINT [\"/app\"]\n"), 0644); err != nil {
+		t.Fatalf("write b/Dockerfile: %v", err)
+	}
 	path, _, err := FindDockerfile(root)
 	if err != nil {
 		t.Fatalf("FindDockerfile: %v", err)

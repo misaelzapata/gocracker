@@ -6,11 +6,22 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 
 	"github.com/gocracker/gocracker/internal/vmmserver"
 	"github.com/gocracker/gocracker/pkg/vmm"
 )
+
+func init() {
+	// The gocracker-vmm process is short-lived (one VM per lifetime) and
+	// holds less than ~10 MiB of Go-managed heap even during boot. Disabling
+	// GC trades that heap growth for a few hundred microseconds of scheduler
+	// time on the critical boot path — worth it here because the process
+	// exits on VM teardown. Users who want normal GC behaviour can override
+	// with GOGC=100 in the env.
+	debug.SetGCPercent(-1)
+}
 
 type unixListener interface {
 	Close()
@@ -52,6 +63,10 @@ func run(args []string, stderr io.Writer) int {
 	}()
 
 	if err := srv.ListenUnix(*socketPath); err != nil {
+		// Stop the signal goroutine so it doesn't leak when ListenUnix
+		// fails immediately (e.g., in unit tests).
+		signal.Stop(sigCh)
+		close(sigCh)
 		fmt.Fprintln(stderr, fmt.Errorf("listen unix socket %s: %w", *socketPath, err))
 		return 1
 	}

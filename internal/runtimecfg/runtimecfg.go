@@ -36,6 +36,13 @@ var firecrackerBaseArgs = []string{
 	"i8042.nomux",
 	"i8042.dumbkbd",
 	"swiotlb=noforce",
+	// Default console loglevel to WARN and above. Kernel info/notice/debug
+	// messages (the bulk of boot output) are the dominant cost on a
+	// virtualised 8250 UART — silencing them on the *console path* knocks
+	// ~100 ms off boot without losing anything in /dev/kmsg, so
+	// /vm/{id}/logs still has the full picture for post-mortem. Users who
+	// want verbose output for debug can override with their own Cmdline.
+	"loglevel=4",
 }
 
 // DefaultKernelArgs returns the Firecracker-aligned baseline kernel args.

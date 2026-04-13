@@ -16,6 +16,14 @@ import (
 	"github.com/gocracker/gocracker/internal/oci"
 )
 
+func newTestServer(opts ...func(*Server)) *Server {
+	s := New()
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
 func TestHandleBuildMissingOutputDir(t *testing.T) {
 	body := `{"image":"alpine:latest"}`
 	rec := httptest.NewRecorder()
@@ -53,17 +61,17 @@ func TestHandleBuildNeitherImageNorDockerfile(t *testing.T) {
 }
 
 func TestHandleBuildDockerfileError(t *testing.T) {
-	origBuild := buildDockerfile
-	buildDockerfile = func(opts dockerfile.BuildOptions) (*dockerfile.BuildResult, error) {
-		return nil, errors.New("dockerfile build failed")
-	}
-	defer func() { buildDockerfile = origBuild }()
+	srv := newTestServer(func(s *Server) {
+		s.buildDockerfile = func(opts dockerfile.BuildOptions) (*dockerfile.BuildResult, error) {
+			return nil, errors.New("dockerfile build failed")
+		}
+	})
 
 	outputDir := filepath.Join(t.TempDir(), "rootfs")
 	body := `{"dockerfile":"/tmp/Dockerfile","output_dir":` + jsonString(outputDir) + `}`
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/build", strings.NewReader(body))
-	New().ServeHTTP(rec, req)
+	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -73,26 +81,22 @@ func TestHandleBuildDockerfileError(t *testing.T) {
 }
 
 func TestHandleBuildImageWithCacheDir(t *testing.T) {
-	origPull := pullImage
-	origExtract := extractToDir
-	pullImage = func(opts oci.PullOptions) (*oci.PulledImage, error) {
-		if !strings.Contains(opts.CacheDir, "custom-cache") {
-			t.Fatalf("CacheDir = %q, want to contain custom-cache", opts.CacheDir)
+	srv := newTestServer(func(s *Server) {
+		s.pullImage = func(opts oci.PullOptions) (*oci.PulledImage, error) {
+			if !strings.Contains(opts.CacheDir, "custom-cache") {
+				t.Fatalf("CacheDir = %q, want to contain custom-cache", opts.CacheDir)
+			}
+			return &oci.PulledImage{Config: oci.ImageConfig{}}, nil
 		}
-		return &oci.PulledImage{Config: oci.ImageConfig{}}, nil
-	}
-	extractToDir = func(_ *oci.PulledImage, dir string) error { return nil }
-	defer func() {
-		pullImage = origPull
-		extractToDir = origExtract
-	}()
+		s.extractToDir = func(_ *oci.PulledImage, dir string) error { return nil }
+	})
 
 	cacheDir := filepath.Join(t.TempDir(), "custom-cache")
 	outputDir := filepath.Join(t.TempDir(), "rootfs")
 	body := `{"image":"alpine:latest","output_dir":` + jsonString(outputDir) + `,"cache_dir":` + jsonString(cacheDir) + `}`
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/build", strings.NewReader(body))
-	New().ServeHTTP(rec, req)
+	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -132,24 +136,20 @@ func TestServeHTTPSetsContentType(t *testing.T) {
 }
 
 func TestHandleBuildExtractError(t *testing.T) {
-	origPull := pullImage
-	origExtract := extractToDir
-	pullImage = func(opts oci.PullOptions) (*oci.PulledImage, error) {
-		return &oci.PulledImage{Config: oci.ImageConfig{}}, nil
-	}
-	extractToDir = func(_ *oci.PulledImage, dir string) error {
-		return errors.New("extract failed")
-	}
-	defer func() {
-		pullImage = origPull
-		extractToDir = origExtract
-	}()
+	srv := newTestServer(func(s *Server) {
+		s.pullImage = func(opts oci.PullOptions) (*oci.PulledImage, error) {
+			return &oci.PulledImage{Config: oci.ImageConfig{}}, nil
+		}
+		s.extractToDir = func(_ *oci.PulledImage, dir string) error {
+			return errors.New("extract failed")
+		}
+	})
 
 	outputDir := filepath.Join(t.TempDir(), "rootfs")
 	body := `{"image":"alpine:latest","output_dir":` + jsonString(outputDir) + `}`
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/build", strings.NewReader(body))
-	New().ServeHTTP(rec, req)
+	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -159,16 +159,12 @@ func TestHandleBuildExtractError(t *testing.T) {
 }
 
 func TestHandleBuildClearsExistingOutput(t *testing.T) {
-	origPull := pullImage
-	origExtract := extractToDir
-	pullImage = func(opts oci.PullOptions) (*oci.PulledImage, error) {
-		return &oci.PulledImage{Config: oci.ImageConfig{}}, nil
-	}
-	extractToDir = func(_ *oci.PulledImage, dir string) error { return nil }
-	defer func() {
-		pullImage = origPull
-		extractToDir = origExtract
-	}()
+	srv := newTestServer(func(s *Server) {
+		s.pullImage = func(opts oci.PullOptions) (*oci.PulledImage, error) {
+			return &oci.PulledImage{Config: oci.ImageConfig{}}, nil
+		}
+		s.extractToDir = func(_ *oci.PulledImage, dir string) error { return nil }
+	})
 
 	outputDir := filepath.Join(t.TempDir(), "rootfs")
 	os.MkdirAll(outputDir, 0755)
@@ -177,7 +173,7 @@ func TestHandleBuildClearsExistingOutput(t *testing.T) {
 	body := `{"image":"alpine","output_dir":` + jsonString(outputDir) + `}`
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/build", strings.NewReader(body))
-	New().ServeHTTP(rec, req)
+	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -219,6 +215,17 @@ func TestListenUnixCreatesSocket(t *testing.T) {
 	go func() {
 		errCh <- srv.ListenUnix(sockPath)
 	}()
+	// Ensure the server goroutine is cleaned up when the test ends by
+	// closing the listener directly — removing the socket file does not
+	// stop http.Serve.
+	t.Cleanup(func() {
+		_ = srv.Close()
+		select {
+		case <-errCh:
+		case <-time.After(2 * time.Second):
+			t.Error("ListenUnix goroutine did not exit within 2s")
+		}
+	})
 
 	// Wait for socket to appear
 	deadline := time.Now().Add(3 * time.Second)

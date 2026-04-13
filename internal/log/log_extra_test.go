@@ -72,8 +72,6 @@ func TestLogHTTPAccessLevels(t *testing.T) {
 		t.Error("missing ERROR for 500")
 	}
 
-	// Restore
-	Init(false)
 }
 
 func TestCliHandlerNoComponent(t *testing.T) {
@@ -139,4 +137,7 @@ func TestAccessLogMiddlewareWith400(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
 }

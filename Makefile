@@ -38,7 +38,7 @@ test:
 	go test ./...
 
 coverage:
-	./tools/coverage-repo.sh
+	chmod +x ./tools/coverage-repo.sh && ./tools/coverage-repo.sh
 
 kernel-host:
 	./tools/prepare-kernel.sh --profile standard

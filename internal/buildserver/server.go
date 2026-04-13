@@ -10,15 +10,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/gocracker/gocracker/internal/dockerfile"
 	"github.com/gocracker/gocracker/internal/oci"
-)
-
-var (
-	pullImage       = oci.Pull
-	extractToDir    = func(img *oci.PulledImage, dir string) error { return img.ExtractToDir(dir) }
-	buildDockerfile = dockerfile.Build
 )
 
 type BuildRequest struct {
@@ -40,12 +35,22 @@ type apiError struct {
 }
 
 type Server struct {
-	router http.Handler
+	router          http.Handler
+	pullImage       func(oci.PullOptions) (*oci.PulledImage, error)
+	extractToDir    func(img *oci.PulledImage, dir string) error
+	buildDockerfile func(dockerfile.BuildOptions) (*dockerfile.BuildResult, error)
+
+	mu sync.Mutex
+	ln net.Listener
 }
 
 func New() *Server {
 	mux := http.NewServeMux()
-	s := &Server{}
+	s := &Server{
+		pullImage:       oci.Pull,
+		extractToDir:    func(img *oci.PulledImage, dir string) error { return img.ExtractToDir(dir) },
+		buildDockerfile: dockerfile.Build,
+	}
 	mux.HandleFunc("/build", s.handleBuild)
 	s.router = mux
 	return s
@@ -62,8 +67,32 @@ func (s *Server) ListenUnix(path string) error {
 	if err != nil {
 		return err
 	}
-	defer ln.Close()
-	return http.Serve(ln, s)
+	s.mu.Lock()
+	s.ln = ln
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.ln = nil
+		s.mu.Unlock()
+		ln.Close()
+	}()
+	if err := http.Serve(ln, s); err != nil && !errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	return nil
+}
+
+// Close stops a running ListenUnix server, unblocking its http.Serve call.
+// Safe to call when no server is running.
+func (s *Server) Close() error {
+	s.mu.Lock()
+	ln := s.ln
+	s.ln = nil
+	s.mu.Unlock()
+	if ln == nil {
+		return nil
+	}
+	return ln.Close()
 }
 
 func (s *Server) handleBuild(w http.ResponseWriter, r *http.Request) {
@@ -99,9 +128,9 @@ func (s *Server) handleBuild(w http.ResponseWriter, r *http.Request) {
 	)
 	switch {
 	case req.Image != "":
-		cfg, err = buildFromImage(req.OutputDir, req.Image, req.CacheDir)
+		cfg, err = s.buildFromImage(req.OutputDir, req.Image, req.CacheDir)
 	case req.Dockerfile != "":
-		cfg, err = buildFromDockerfile(req.OutputDir, req)
+		cfg, err = s.buildFromDockerfile(req.OutputDir, req)
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -113,23 +142,23 @@ func (s *Server) handleBuild(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func buildFromImage(outputDir, ref, cacheDir string) (oci.ImageConfig, error) {
+func (s *Server) buildFromImage(outputDir, ref, cacheDir string) (oci.ImageConfig, error) {
 	base := cacheDir
 	if base == "" {
 		base = filepath.Join(os.TempDir(), "gocracker", "cache")
 	}
-	pulled, err := pullImage(oci.PullOptions{
+	pulled, err := s.pullImage(oci.PullOptions{
 		Ref:      ref,
 		CacheDir: filepath.Join(base, "layers"),
 	})
 	if err != nil {
 		return oci.ImageConfig{}, err
 	}
-	return pulled.Config, extractToDir(pulled, outputDir)
+	return pulled.Config, s.extractToDir(pulled, outputDir)
 }
 
-func buildFromDockerfile(outputDir string, req BuildRequest) (oci.ImageConfig, error) {
-	result, err := buildDockerfile(dockerfile.BuildOptions{
+func (s *Server) buildFromDockerfile(outputDir string, req BuildRequest) (oci.ImageConfig, error) {
+	result, err := s.buildDockerfile(dockerfile.BuildOptions{
 		DockerfilePath: req.Dockerfile,
 		ContextDir:     req.Context,
 		BuildArgs:      req.BuildArgs,

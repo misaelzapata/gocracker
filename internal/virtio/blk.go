@@ -79,6 +79,15 @@ var punchHole = func(fd int, off, len int64) error {
 	return unix.Fallocate(fd, unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, off, len)
 }
 
+// discardSupportCache memoises the FALLOC_FL_PUNCH_HOLE probe per backing
+// filesystem. The probe writes + syncs + punches a 512-byte hole in a temp
+// file; that costs ~2–5 ms every time we open a block device, and the
+// answer is a property of the filesystem, not the image. Keying on the
+// parent directory is a cheap proxy (images in the same cache dir share a
+// result); we also re-probe if the cached dir is gone so that stale entries
+// do not poison later launches.
+var discardSupportCache sync.Map // map[string]bool
+
 // NewBlockDevice creates a virtio-blk device from a raw image file.
 func NewBlockDevice(mem []byte, basePA uint64, irq uint8, imagePath string, readOnly bool, dirty *DirtyTracker, irqFn func(bool)) (*BlockDevice, error) {
 	flags := os.O_RDWR
@@ -407,6 +416,15 @@ func (d *BlockDevice) discardRange(sector uint64, numSectors uint32) error {
 
 func detectDiscardSupport(imagePath string) bool {
 	dir := filepath.Dir(imagePath)
+	if v, ok := discardSupportCache.Load(dir); ok {
+		return v.(bool)
+	}
+	result := detectDiscardSupportUncached(dir)
+	discardSupportCache.Store(dir, result)
+	return result
+}
+
+func detectDiscardSupportUncached(dir string) bool {
 	f, err := os.CreateTemp(dir, ".gocracker-discard-*")
 	if err != nil {
 		return false

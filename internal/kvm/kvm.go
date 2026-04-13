@@ -314,6 +314,8 @@ func (s *System) CreateVMWithBase(memMB uint64, guestPhysBase uint64) (*VM, erro
 		_ = unix.Close(memfd)
 		return nil, fmt.Errorf("mmap guest memory: %w", err)
 	}
+	// Request transparent huge pages to reduce page faults during kernel loading.
+	_ = unix.Madvise(mem, unix.MADV_HUGEPAGE)
 
 	vm := &VM{fd: int(vmFd), mem: mem, memSize: memSize, vcpuMmapSz: int(mmapSz), memfd: memfd, regions: make(map[uint32]*MappedMemoryRegion)}
 
