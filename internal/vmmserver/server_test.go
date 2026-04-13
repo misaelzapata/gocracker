@@ -66,6 +66,7 @@ func (f *fakeVM) Events() vmm.EventSource      { return f.events }
 func (f *fakeVM) VMConfig() vmm.Config         { return f.cfg }
 func (f *fakeVM) DeviceList() []vmm.DeviceInfo { return nil }
 func (f *fakeVM) ConsoleOutput() []byte        { return []byte("hello\n") }
+func (f *fakeVM) FirstOutputAt() time.Time     { return time.Time{} }
 func (f *fakeVM) UpdateNetRateLimiter(cfg *vmm.RateLimiterConfig) error {
 	f.netRL = cfg
 	f.cfg.NetRateLimiter = cfg

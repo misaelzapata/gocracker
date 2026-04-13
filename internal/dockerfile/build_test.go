@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -23,12 +24,17 @@ import (
 // GitHub Actions runners and other restricted environments block this syscall.
 func skipIfNoMountNS(t *testing.T) {
 	t.Helper()
-	if os.Getuid() == 0 {
-		return // root can always unshare
-	}
-	// Try creating a mount namespace — if this fails, RUN tests will also fail.
-	err := syscall.Unshare(syscall.CLONE_NEWNS)
-	if err != nil {
+	// Probe in a locked OS thread so the namespace change doesn't leak
+	// to the rest of the test process. The thread is discarded after
+	// the goroutine exits (LockOSThread without Unlock kills the thread).
+	// Note: even root can fail in constrained containers (no CAP_SYS_ADMIN
+	// or seccomp blocking unshare).
+	ch := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		ch <- syscall.Unshare(syscall.CLONE_NEWNS)
+	}()
+	if err := <-ch; err != nil {
 		t.Skipf("mount namespace not available (unshare: %v); skipping RUN test", err)
 	}
 }

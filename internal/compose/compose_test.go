@@ -1070,6 +1070,7 @@ func (f fakeHandleForComposeTest) VMConfig() vmm.Config                         
 func (f fakeHandleForComposeTest) WorkerMetadata() vmm.WorkerMetadata                { return vmm.WorkerMetadata{} }
 func (f fakeHandleForComposeTest) DeviceList() []vmm.DeviceInfo                      { return nil }
 func (f fakeHandleForComposeTest) ConsoleOutput() []byte                             { return nil }
+func (f fakeHandleForComposeTest) FirstOutputAt() time.Time                          { return time.Time{} }
 func (f fakeHandleForComposeTest) WaitStopped(context.Context) error                 { return nil }
 func (f fakeHandleForComposeTest) UpdateNetRateLimiter(*vmm.RateLimiterConfig) error { return nil }
 func (f fakeHandleForComposeTest) UpdateBlockRateLimiter(*vmm.RateLimiterConfig) error {

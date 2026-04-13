@@ -114,6 +114,11 @@ type RunOptions struct {
 }
 
 // RunResult is returned after a VM is started.
+//
+// Duration is the total wall clock reported by the runtime and is kept for
+// backwards compatibility. New code should prefer Timings, which breaks the
+// total down into orchestration / VMM setup / start / guest-first-output
+// phases so the caller can see exactly where the time is going.
 type RunResult struct {
 	VM           vmm.Handle
 	DiskPath     string
@@ -124,13 +129,46 @@ type RunResult struct {
 	Gateway      string
 	WorkerSocket string
 	Duration     time.Duration
+	Timings      vmm.BootTimings
 	cleanup      func()
 }
 
 const (
 	runtimeDiskRetention    = time.Minute
 	runArtifactCacheVersion = 2
+
+	// firstOutputWaitMax is how long we'll block in the boot path waiting
+	// for the guest kernel to print its first byte to the UART. Sized to
+	// cover a worst-case generic kernel boot on consumer hardware (~2 s
+	// in practice). If the guest doesn't print in this window we give up
+	// and return a zero value — the caller can still use the other phases.
+	firstOutputWaitMax = 3 * time.Second
 )
+
+// waitFirstOutput blocks up to maxWait for vm.FirstOutputAt() to become
+// non-zero and returns the elapsed time from startedAt. If the VM handle
+// is nil or nothing arrives in the window it returns 0. The poll loop is
+// intentionally simple and cheap (sub-millisecond busy waits) because we
+// only run this on the boot critical path for a few hundred ms at most.
+func waitFirstOutput(h vmm.Handle, startedAt time.Time, maxWait time.Duration) time.Duration {
+	if h == nil {
+		return 0
+	}
+	deadline := startedAt.Add(maxWait)
+	for {
+		if at := h.FirstOutputAt(); !at.IsZero() {
+			d := at.Sub(startedAt)
+			if d < 0 {
+				return 0
+			}
+			return d
+		}
+		if time.Now().After(deadline) {
+			return 0
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
 
 func (r *RunResult) Close() {
 	if r == nil || r.cleanup == nil {
@@ -387,7 +425,10 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	// ---- Boot ----
 	gclog.Container.Info("booting", "id", opts.ID)
 	t0 := time.Now()
+	var timings vmm.BootTimings
 
+	tPreNew := time.Now()
+	timings.Orchestration = tPreNew.Sub(t0)
 	vm, err := vmm.New(vmm.Config{
 		ID:         opts.ID,
 		MemMB:      opts.MemMB,
@@ -415,6 +456,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		}
 		return nil, fmt.Errorf("create vm: %w", err)
 	}
+	timings.VMMSetup = time.Since(tPreNew)
 	if autoNet != nil {
 		if err := autoNet.Activate(); err != nil {
 			vm.Stop()
@@ -422,12 +464,15 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 			return nil, fmt.Errorf("activate auto network: %w", err)
 		}
 	}
+	tPreStart := time.Now()
 	if err := vm.Start(); err != nil {
 		if autoNet != nil {
 			autoNet.Close()
 		}
 		return nil, fmt.Errorf("start vm: %w", err)
 	}
+	timings.Start = time.Since(tPreStart)
+	timings.GuestFirstOutput = waitFirstOutput(vm, time.Now(), firstOutputWaitMax)
 
 	var cleanupOnce sync.Once
 	cleanupFn := cleanupRuntimeDisk
@@ -450,8 +495,14 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		}()
 	}
 
+	timings = timings.Sum()
 	bootDuration := time.Since(t0).Round(time.Millisecond)
-	gclog.Container.Info("started", "id", opts.ID, "duration", bootDuration)
+	gclog.Container.Info("started", "id", opts.ID,
+		"duration", bootDuration,
+		"orchestration_ms", timings.Orchestration.Milliseconds(),
+		"vmm_setup_ms", timings.VMMSetup.Milliseconds(),
+		"start_ms", timings.Start.Milliseconds(),
+		"guest_first_output_ms", timings.GuestFirstOutput.Milliseconds())
 	return &RunResult{
 		VM:       vm,
 		DiskPath: bootDiskPath,
@@ -461,6 +512,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		GuestIP:  trimCIDR(opts.StaticIP),
 		Gateway:  opts.Gateway,
 		Duration: bootDuration,
+		Timings:  timings,
 		cleanup:  cleanupFn,
 	}, nil
 }
@@ -685,7 +737,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 	}
 
 	t0 := time.Now()
-	handle, cleanup, err := worker.LaunchVMM(vmm.Config{
+	handle, timings, cleanup, err := worker.LaunchVMMWithTimings(vmm.Config{
 		ID:         opts.ID,
 		MemMB:      opts.MemMB,
 		Arch:       opts.Arch,
@@ -718,6 +770,8 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		}
 		return nil, fmt.Errorf("launch vm worker: %w", err)
 	}
+	timings.GuestFirstOutput = waitFirstOutput(handle, time.Now(), firstOutputWaitMax)
+	timings = timings.Sum()
 	if autoNet != nil {
 		if err := autoNet.Activate(); err != nil {
 			handle.Stop()
@@ -749,6 +803,13 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 			cleanupFn()
 		}()
 	}
+	bootDuration := time.Since(t0).Round(time.Millisecond)
+	gclog.Container.Info("started", "id", opts.ID,
+		"duration", bootDuration,
+		"orchestration_ms", timings.Orchestration.Milliseconds(),
+		"vmm_setup_ms", timings.VMMSetup.Milliseconds(),
+		"start_ms", timings.Start.Milliseconds(),
+		"guest_first_output_ms", timings.GuestFirstOutput.Milliseconds())
 	return &RunResult{
 		VM:           handle,
 		DiskPath:     bootDiskPath,
@@ -758,7 +819,8 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		GuestIP:      trimCIDR(opts.StaticIP),
 		Gateway:      opts.Gateway,
 		WorkerSocket: workerSocket(handle),
-		Duration:     time.Since(t0).Round(time.Millisecond),
+		Duration:     bootDuration,
+		Timings:      timings,
 		cleanup:      cleanupFn,
 	}, nil
 }

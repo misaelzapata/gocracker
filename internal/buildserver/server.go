@@ -34,12 +34,19 @@ type apiError struct {
 }
 
 type Server struct {
-	router http.Handler
+	router          http.Handler
+	pullImage       func(oci.PullOptions) (*oci.PulledImage, error)
+	extractToDir    func(img *oci.PulledImage, dir string) error
+	buildDockerfile func(dockerfile.BuildOptions) (*dockerfile.BuildResult, error)
 }
 
 func New() *Server {
 	mux := http.NewServeMux()
-	s := &Server{}
+	s := &Server{
+		pullImage:       oci.Pull,
+		extractToDir:    func(img *oci.PulledImage, dir string) error { return img.ExtractToDir(dir) },
+		buildDockerfile: dockerfile.Build,
+	}
 	mux.HandleFunc("/build", s.handleBuild)
 	s.router = mux
 	return s
@@ -93,9 +100,9 @@ func (s *Server) handleBuild(w http.ResponseWriter, r *http.Request) {
 	)
 	switch {
 	case req.Image != "":
-		cfg, err = buildFromImage(req.OutputDir, req.Image, req.CacheDir)
+		cfg, err = s.buildFromImage(req.OutputDir, req.Image, req.CacheDir)
 	case req.Dockerfile != "":
-		cfg, err = buildFromDockerfile(req.OutputDir, req)
+		cfg, err = s.buildFromDockerfile(req.OutputDir, req)
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -107,23 +114,23 @@ func (s *Server) handleBuild(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func buildFromImage(outputDir, ref, cacheDir string) (oci.ImageConfig, error) {
+func (s *Server) buildFromImage(outputDir, ref, cacheDir string) (oci.ImageConfig, error) {
 	base := cacheDir
 	if base == "" {
 		base = filepath.Join(os.TempDir(), "gocracker", "cache")
 	}
-	pulled, err := oci.Pull(oci.PullOptions{
+	pulled, err := s.pullImage(oci.PullOptions{
 		Ref:      ref,
 		CacheDir: filepath.Join(base, "layers"),
 	})
 	if err != nil {
 		return oci.ImageConfig{}, err
 	}
-	return pulled.Config, pulled.ExtractToDir(outputDir)
+	return pulled.Config, s.extractToDir(pulled, outputDir)
 }
 
-func buildFromDockerfile(outputDir string, req BuildRequest) (oci.ImageConfig, error) {
-	result, err := dockerfile.Build(dockerfile.BuildOptions{
+func (s *Server) buildFromDockerfile(outputDir string, req BuildRequest) (oci.ImageConfig, error) {
+	result, err := s.buildDockerfile(dockerfile.BuildOptions{
 		DockerfilePath: req.Dockerfile,
 		ContextDir:     req.Context,
 		BuildArgs:      req.BuildArgs,

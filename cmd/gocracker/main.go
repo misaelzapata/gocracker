@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -80,12 +81,19 @@ type interactiveMode struct {
 }
 
 var (
-	terminalGetFdInfo   = mobyterm.GetFdInfo
-	terminalSetRaw      = mobyterm.SetRawTerminal
-	terminalRestore     = mobyterm.RestoreTerminal
+	terminalGetFdInfo             = mobyterm.GetFdInfo
+	terminalSetRaw                = mobyterm.SetRawTerminal
+	terminalRestore               = mobyterm.RestoreTerminal
 	terminalOutput      io.Writer = os.Stdout
-	terminalInputReader          = os.Stdin
+	terminalInputReader           = os.Stdin
 )
+
+var ioCopyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 4096)
+		return &buf
+	},
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -311,6 +319,8 @@ func cmdRepo(args []string) {
 			fatal(err.Error())
 		}
 		stopVMAndWait(result.VM, 15*time.Second)
+		// Final newline to ensure the shell prompt redraws after VM stop messages.
+		fmt.Println()
 		return
 	}
 	if *wait {
@@ -477,26 +487,40 @@ func runInteractiveConn(conn net.Conn) error {
 
 func runInteractiveConnWithIO(conn net.Conn, stdin *os.File, stdout io.Writer) error {
 	defer conn.Close()
-	defer prepareInteractiveTerminal(stdin, stdout)()
+	restore := prepareInteractiveTerminal(stdin, stdout)
+	defer restore()
 	copyInputDone := make(chan error, 1)
 	go func() {
-		_, err := io.Copy(conn, stdin)
+		buf := ioCopyBufPool.Get().(*[]byte)
+		defer ioCopyBufPool.Put(buf)
+		_, err := io.CopyBuffer(conn, stdin, *buf)
 		closeNetWriter(conn)
 		copyInputDone <- err
 	}()
 	copyOutputDone := make(chan error, 1)
 	go func() {
-		_, err := io.Copy(stdout, conn)
+		buf := ioCopyBufPool.Get().(*[]byte)
+		defer ioCopyBufPool.Put(buf)
+		_, err := io.CopyBuffer(stdout, conn, *buf)
 		copyOutputDone <- err
 	}()
 
 	select {
 	case inputErr := <-copyInputDone:
-		if err := normalizeCopyError(inputErr); err != nil {
-			return err
+		// Input copy finished first. If it returned a real error (e.g.
+		// write to a closed vsock pipe), the remote has already gone away
+		// — force-close the conn so the output copy's Read() unblocks
+		// immediately. If input ended cleanly (EOF from stdin), the
+		// remote may still have data in flight, so wait for the output
+		// copy to drain naturally.
+		if normalizeCopyError(inputErr) != nil {
+			conn.Close()
 		}
 		return normalizeCopyError(<-copyOutputDone)
 	case outputErr := <-copyOutputDone:
+		if stdin != nil && stdin == os.Stdin {
+			restore() // Restore state before returning
+		}
 		return normalizeCopyError(outputErr)
 	}
 }
@@ -513,13 +537,16 @@ func prepareInteractiveTerminal(stdin *os.File, stdout io.Writer) func() {
 	if err != nil {
 		return func() {}
 	}
+	var once sync.Once
 	return func() {
-		_ = terminalRestore(stdinFD, oldState)
-		if stdout != nil {
-			// Reset cursor visibility and print carriage return + newline
-			// so the shell prompt reappears cleanly after raw mode.
-			fmt.Fprint(stdout, "\033[?25h\r\n")
-		}
+		once.Do(func() {
+			_ = terminalRestore(stdinFD, oldState)
+			if stdout != nil {
+				// Reset cursor visibility and print carriage return + newline
+				// so the shell prompt reappears cleanly after raw mode.
+				fmt.Fprint(stdout, "\033[?25h\r\n")
+			}
+		})
 	}
 }
 
@@ -712,18 +739,18 @@ func cmdServe(args []string) {
 	}
 
 	srv := api.NewWithOptions(api.Options{
-		DefaultX86Boot: vmm.X86BootMode(*x86Boot),
-		JailerMode:     *jailerMode,
-		JailerBinary:   resolvedJailer,
-		VMMBinary:      resolvedVMM,
-		StateDir:       *stateDir,
-		CacheDir:       *cacheDir,
-		ChrootBaseDir:  *chrootBaseDir,
-		UID:            *uid,
-		GID:            *gid,
-		AuthToken:      strings.TrimSpace(*authToken),
-		TrustedKernelDirs: kernelDirs,
-		TrustedWorkDirs:   workDirs,
+		DefaultX86Boot:      vmm.X86BootMode(*x86Boot),
+		JailerMode:          *jailerMode,
+		JailerBinary:        resolvedJailer,
+		VMMBinary:           resolvedVMM,
+		StateDir:            *stateDir,
+		CacheDir:            *cacheDir,
+		ChrootBaseDir:       *chrootBaseDir,
+		UID:                 *uid,
+		GID:                 *gid,
+		AuthToken:           strings.TrimSpace(*authToken),
+		TrustedKernelDirs:   kernelDirs,
+		TrustedWorkDirs:     workDirs,
 		TrustedSnapshotDirs: snapshotDirs,
 	})
 	if *addr != "" {
@@ -883,10 +910,27 @@ func printResult(r *container.RunResult) {
 	if state == vmm.StateCreated && r.WorkerSocket != "" {
 		state = vmm.StateRunning
 	}
-	if r.Duration > 0 {
-		fmt.Printf("\n✓ VM %s is %s (%s)\n", r.ID, state, r.Duration)
+	bootTime := r.Timings.Total.Round(time.Millisecond)
+	if bootTime == 0 {
+		bootTime = r.Duration
+	}
+	if bootTime > 0 {
+		fmt.Printf("\n✓ VM %s is %s (%s)\n", r.ID, state, bootTime)
 	} else {
 		fmt.Printf("\n✓ VM %s is %s\n", r.ID, state)
+	}
+	// Per-phase boot time breakdown. This replaces the old single
+	// "duration=Xms" number that compared apples to oranges between the
+	// runLocal and runViaWorker paths. See the "Boot-time benchmark"
+	// section of the README for the methodology.
+	t := r.Timings
+	if t.Total > 0 || t.VMMSetup > 0 || t.Orchestration > 0 {
+		fmt.Printf("  boot:   orchestration=%dms  vmm_setup=%dms  start=%dms  guest_first_output=%dms  total=%dms\n",
+			t.Orchestration.Milliseconds(),
+			t.VMMSetup.Milliseconds(),
+			t.Start.Milliseconds(),
+			t.GuestFirstOutput.Milliseconds(),
+			t.Total.Milliseconds())
 	}
 	if r.DiskPath != "" {
 		fmt.Printf("  disk:   %s\n", r.DiskPath)
@@ -899,9 +943,6 @@ func printResult(r *container.RunResult) {
 	}
 	if r.Gateway != "" {
 		fmt.Printf("  gw:     %s\n", r.Gateway)
-	}
-	if r.WorkerSocket != "" {
-		fmt.Printf("  worker: %s\n", r.WorkerSocket)
 	}
 }
 
@@ -1069,7 +1110,7 @@ func closeNetWriter(conn net.Conn) {
 }
 
 func normalizeCopyError(err error) error {
-	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
 		return nil
 	}
 	if opErr, ok := err.(*net.OpError); ok && opErr.Err != nil {
@@ -1156,9 +1197,14 @@ func resolveRequiredExistingPath(label, raw string) string {
 	return abs
 }
 
-func fatal(msg string) {
+// fatalFunc can be overridden in tests to avoid os.Exit.
+var fatalFunc = func(msg string) {
 	fmt.Fprintln(os.Stderr, "error:", msg)
 	os.Exit(1)
+}
+
+func fatal(msg string) {
+	fatalFunc(msg)
 }
 
 func splitComma(s string) []string {

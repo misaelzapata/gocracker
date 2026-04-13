@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -28,17 +29,11 @@ func TestCLIComposeServeHealthcheckExecBinary(t *testing.T) {
 
 	addr := freeLocalAddr(t)
 	serverURL := "http://" + addr
-	serveCmd := exec.Command(
-		bins.gocracker,
-		"serve",
-		"--addr", addr,
-		"--cache-dir", cacheDir,
-		"--jailer-binary", bins.jailer,
-		"--vmm-binary", bins.vmm,
-	)
+	serveCmd := exec.Command(bins.gocracker, buildServeArgs(addr, cacheDir, bins)...)
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
+	serveCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := serveCmd.Start(); err != nil {
 		t.Fatalf("start serve command: %v", err)
 	}
@@ -77,17 +72,11 @@ func TestComposeStackIsolationAndCleanup(t *testing.T) {
 
 	addr := freeLocalAddr(t)
 	serverURL := "http://" + addr
-	serveCmd := exec.Command(
-		bins.gocracker,
-		"serve",
-		"--addr", addr,
-		"--cache-dir", cacheDir,
-		"--jailer-binary", bins.jailer,
-		"--vmm-binary", bins.vmm,
-	)
+	serveCmd := exec.Command(bins.gocracker, buildServeArgs(addr, cacheDir, bins)...)
 	var serveLog lockedBuffer
 	serveCmd.Stdout = &serveLog
 	serveCmd.Stderr = &serveLog
+	serveCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := serveCmd.Start(); err != nil {
 		t.Fatalf("start serve command: %v", err)
 	}
@@ -161,6 +150,7 @@ func TestComposeStackIsolationAndCleanup(t *testing.T) {
 		Context:     filepath.Join(fixtureA, "app"),
 		KernelPath:  kernel,
 		MemMB:       256,
+		DiskSizeMB:  512,
 		CacheDir:    cacheDir,
 		ExecEnabled: true,
 	})

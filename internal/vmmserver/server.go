@@ -34,6 +34,7 @@ type VM interface {
 	VMConfig() vmm.Config
 	DeviceList() []vmm.DeviceInfo
 	ConsoleOutput() []byte
+	FirstOutputAt() time.Time
 }
 
 // VMFactory creates a VM for the worker.
@@ -155,13 +156,17 @@ type APIError struct {
 }
 
 type VMInfo struct {
-	ID      string           `json:"id"`
-	State   string           `json:"state"`
-	Uptime  string           `json:"uptime"`
-	MemMB   uint64           `json:"mem_mb"`
-	Kernel  string           `json:"kernel"`
-	Events  []vmm.Event      `json:"events"`
-	Devices []vmm.DeviceInfo `json:"devices,omitempty"`
+	ID             string           `json:"id"`
+	State          string           `json:"state"`
+	Uptime         string           `json:"uptime"`
+	MemMB          uint64           `json:"mem_mb"`
+	Kernel         string           `json:"kernel"`
+	Events         []vmm.Event      `json:"events"`
+	Devices        []vmm.DeviceInfo `json:"devices,omitempty"`
+	// FirstOutputAt is the wall-clock time at which the guest first
+	// transmitted a byte on the serial console. Populated from the VMM's
+	// UART as soon as the guest prints anything; zero until then.
+	FirstOutputAt time.Time `json:"first_output_at,omitempty"`
 }
 
 type SnapshotRequest struct {
@@ -805,13 +810,14 @@ func (s *Server) handleVMInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := vm.VMConfig()
 	_ = json.NewEncoder(w).Encode(VMInfo{
-		ID:      vm.ID(),
-		State:   vm.State().String(),
-		Uptime:  vm.Uptime().String(),
-		MemMB:   cfg.MemMB,
-		Kernel:  cfg.KernelPath,
-		Events:  vm.Events().Events(time.Time{}),
-		Devices: vm.DeviceList(),
+		ID:            vm.ID(),
+		State:         vm.State().String(),
+		Uptime:        vm.Uptime().String(),
+		MemMB:         cfg.MemMB,
+		Kernel:        cfg.KernelPath,
+		Events:        vm.Events().Events(time.Time{}),
+		Devices:       vm.DeviceList(),
+		FirstOutputAt: vm.FirstOutputAt(),
 	})
 }
 
