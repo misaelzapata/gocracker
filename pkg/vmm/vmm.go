@@ -988,6 +988,16 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		}
 		m.vcpus = append(m.vcpus, vcpu)
 	}
+	// Mirror the cold-boot sequence: archBackend.postCreateVCPUs runs after
+	// the vCPU fds exist and before per-vCPU state is restored. On x86 it
+	// registers the per-device eventfds with KVM_IRQFD against the freshly
+	// created GSIs (otherwise device interrupts silently drop until the
+	// first VM.Start, and we pay a reconfiguration VMexit on every queue
+	// notify). On arm64 it is where the GIC is created — without this call,
+	// a restored arm64 VM has no interrupt controller at all.
+	if err := m.archBackend.postCreateVCPUs(m); err != nil {
+		return nil, fmt.Errorf("post-create vcpus (restore): %w", err)
+	}
 	for i, vcpu := range m.vcpus {
 		if err := m.archBackend.restoreVCPU(sys, kvmVM, vcpu, vcpuStates[i]); err != nil {
 			if isIgnorableKVMClockCtrlError(err) {
