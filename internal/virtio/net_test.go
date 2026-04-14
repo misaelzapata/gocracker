@@ -28,6 +28,7 @@ func TestNetRxPumpRetriesTransientReadErrors(t *testing.T) {
 	defer r.Close()
 	defer w.Close()
 	dev.tapFd = r
+	dev.tapRawFd = int(r.Fd())
 
 	rxQ := dev.Queue(0)
 	rxQ.Ready = true
@@ -169,6 +170,7 @@ func TestNetDeviceHandleQueue_TXQueue(t *testing.T) {
 	defer r.Close()
 	defer w.Close()
 	dev.tapFd = r
+	dev.tapRawFd = int(r.Fd())
 
 	// HandleQueue with idx=0 (RX) should be a no-op
 	dev.HandleQueue(0, dev.Queue(0))
@@ -268,6 +270,7 @@ func TestNetDeviceTransmit_EmptyQueue(t *testing.T) {
 	defer r.Close()
 	defer w.Close()
 	dev.tapFd = r
+	dev.tapRawFd = int(r.Fd())
 
 	txQ := dev.Queue(1)
 	txQ.Ready = true
@@ -293,6 +296,7 @@ func TestNetDeviceTransmit_WithPacket(t *testing.T) {
 	defer r.Close()
 	defer w.Close()
 	dev.tapFd = w
+	dev.tapRawFd = int(w.Fd())
 	dev.Transport = NewTransport(dev, mem, 0x1000, 5, nil, nil)
 
 	txQ := dev.Queue(1)
