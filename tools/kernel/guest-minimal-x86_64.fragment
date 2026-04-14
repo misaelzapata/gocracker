@@ -9,11 +9,15 @@
 #   - INET + IPv6 + UNIX + PACKET + DNS_RESOLVER        → guest networking,
 #                                                         image pulls, TLS
 #   - X86 local + I/O APIC                              → IRQ delivery (KVM)
-#   - KVM paravirt clock + CMOS RTC                     → guest wall clock
+#   - KVM paravirt clock (kvm-clock), no CMOS RTC       → guest wall clock
 #   - ELF binfmt + initrd (gzip/xz/zstd/lz4)            → boot + exec
 #
-# Everything below removes hardware/drivers/subsystems the microVM path
-# never uses.
+# Everything below asks Kconfig to remove hardware/drivers/subsystems the
+# microVM path never uses. Note that some symbols (PERF_EVENTS, VT, INPUT,
+# SOUND-related, THERMAL, etc.) may stay =y after `make olddefconfig`
+# because of transitive `select` chains — e.g. HARDLOCKUP_DETECTOR_PERF
+# selects PERF_EVENTS, HID selects INPUT. The README's "what's actually
+# dropped" list is the authoritative view; these lines capture the intent.
 
 # -------- hardware the microVM never exposes --------
 # PCI stays enabled: gocracker's ACPI boot path uses the PCI subsystem to

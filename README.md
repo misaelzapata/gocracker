@@ -259,7 +259,7 @@ I measured gocracker against Firecracker v1.10.1 on the same host, across the ma
 - **gocracker**: this branch (includes the vsock + virtio-net shutdown-race fix from this PR)
 - **Kernels measured**:
   - [artifacts/kernels/gocracker-guest-standard-vmlinux](artifacts/kernels/gocracker-guest-standard-vmlinux) (ELF vmlinux, Linux 6.1.102, 41 MiB)
-  - [artifacts/kernels/gocracker-guest-minimal-vmlinux](artifacts/kernels/gocracker-guest-minimal-vmlinux) (new minimal profile — drops ACPI NUMA/hotplug/sleep, PCI hotplug helpers, HIBERNATION, sound/DRM/USB/input, perf/tracing, 40 MiB. Full baseline — vsock + virtio + DNS + IPv6 + TLS — still works: `apk update` inside Alpine boots green.)
+  - [artifacts/kernels/gocracker-guest-minimal-vmlinux](artifacts/kernels/gocracker-guest-minimal-vmlinux) (new minimal profile — committed config drops ACPI NUMA + SLEEP, AMD NUMA, HIBERNATION + snapshot dev, PROFILING, USB (entire subsystem), PM_SLEEP, and the `bzip2`/`lzma`/`lzo` decompressors. Some symbols the fragment requests off — e.g. `PERF_EVENTS`, `VT`, `INPUT` — stay `=y` because other Kconfig options (`HARDLOCKUP_DETECTOR_PERF`, `HID`, legacy console selectors) transitively select them. Full functional baseline — virtio + vsock + DNS + IPv6 + TLS — still works: `apk update` inside Alpine boots green. 40 MiB.)
 - **Shared rootfs**: 64 MiB ext4 built from alpine-minirootfs 3.20.3 with a custom `/init` that mounts `/proc` and calls `/sbin/reboot -f` (triggers `KVM_EXIT_SHUTDOWN` via triple fault on `reboot=t`)
 - **Guest**: 1 vCPU, 128 MiB RAM
 - **Kernel cmdline**: `console=ttyS0 reboot=t panic=-1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda rw init=/init 8250.nr_uarts=1`

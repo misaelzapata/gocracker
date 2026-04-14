@@ -179,7 +179,11 @@ func (d *NetDevice) transmit(q *Queue) {
 		if d.rl != nil {
 			d.rl.Wait(uint64(len(pkt)), 1)
 		}
-		_ = writeTapFrame(int(d.tapFd.Fd()), pkt)
+		// Use the cached raw fd — calling (*os.File).Fd() here would
+		// re-enable blocking mode on the TAP fd (see openTAP) and let
+		// rxPump get stuck in a bare unix.Read that Close() cannot
+		// wake, reintroducing the shutdown race this PR fixed.
+		_ = writeTapFrame(d.tapRawFd, pkt)
 		_ = q.PushUsed(uint32(head), 0)
 	}); err != nil {
 		gclog.VMM.Warn("virtio-net TX queue iteration failed", "error", err)

@@ -193,6 +193,11 @@ func runtimeSyscalls() []uintptr {
 		unix.SYS_EPOLL_CREATE1,
 		unix.SYS_EPOLL_CTL,
 		unix.SYS_EPOLL_PWAIT,
+		// virtio-net rxPump polls the TAP fd with unix.Poll (→ ppoll)
+		// so it can observe shutdown promptly; without SYS_PPOLL here
+		// the VMM SIGSYS's under seccomp on arm64 as soon as a network
+		// interface is configured.
+		unix.SYS_PPOLL,
 		unix.SYS_EVENTFD2,
 		unix.SYS_TIMER_CREATE,
 		unix.SYS_TIMER_SETTIME,
