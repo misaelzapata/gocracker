@@ -1,0 +1,89 @@
+# Minimal x86_64 microVM guest — extra trims on top of guest-common-x86_64.
+# Goal: reduce bzImage size and boot-path work for faster TTI. Mirrors the
+# arm64 standard/minimal split.
+#
+# Functional baseline — this fragment MUST keep:
+#   - virtio transport (mmio + blk + net + rng + vsock) → rootfs, net, agent
+#   - ext4 + tmpfs + devtmpfs                           → rootfs mount
+#   - 8250 serial console                               → kernel console
+#   - INET + IPv6 + UNIX + PACKET + DNS_RESOLVER        → guest networking,
+#                                                         image pulls, TLS
+#   - X86 local + I/O APIC                              → IRQ delivery (KVM)
+#   - KVM paravirt clock (kvm-clock), no CMOS RTC       → guest wall clock
+#   - ELF binfmt + initrd (gzip/xz/zstd/lz4)            → boot + exec
+#
+# Everything below asks Kconfig to remove hardware/drivers/subsystems the
+# microVM path never uses. Note that some symbols (PERF_EVENTS, VT, INPUT,
+# SOUND-related, THERMAL, etc.) may stay =y after `make olddefconfig`
+# because of transitive `select` chains — e.g. HARDLOCKUP_DETECTOR_PERF
+# selects PERF_EVENTS, HID selects INPUT. The README's "what's actually
+# dropped" list is the authoritative view; these lines capture the intent.
+
+# -------- hardware the microVM never exposes --------
+# PCI stays enabled: gocracker's ACPI boot path uses the PCI subsystem to
+# enumerate virtio-mmio devices via SSDT on x86 (disabling it hangs the
+# kernel for >1s waiting for /dev/vda to appear).
+# CONFIG_HYPERV is not set
+# CONFIG_XEN is not set
+
+# -------- legacy x86 boot helpers we skip in favour of MPTable/ACPI-direct --
+# CONFIG_EFI is not set
+# CONFIG_EFI_STUB is not set
+# CONFIG_X86_MCE is not set
+
+# -------- perf / profiling / tracing --------
+# CONFIG_PERF_EVENTS is not set
+# CONFIG_PROFILING is not set
+# CONFIG_KPROBES is not set
+# CONFIG_FTRACE is not set
+# CONFIG_TRACING is not set
+
+# -------- NUMA — 1-node guests --------
+# CONFIG_NUMA is not set
+# CONFIG_NUMA_BALANCING is not set
+
+# -------- power / suspend / sound / gfx / input --------
+# CONFIG_SUSPEND is not set
+# CONFIG_HIBERNATION is not set
+# CONFIG_SOUND is not set
+# CONFIG_DRM is not set
+# CONFIG_FB is not set
+# CONFIG_VT is not set
+# CONFIG_USB_SUPPORT is not set
+# CONFIG_INPUT is not set
+# CONFIG_THERMAL is not set
+# CONFIG_PCCARD is not set
+# CONFIG_AGP is not set
+
+# -------- compressors not used for our initrd/rootfs --------
+# CONFIG_RD_BZIP2 is not set
+# CONFIG_RD_LZMA is not set
+# CONFIG_RD_LZO is not set
+
+# -------- re-assert the virtio + net + vsock + fs baseline (belt & braces) --
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_HW_RANDOM_VIRTIO=y
+CONFIG_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS=y
+CONFIG_PACKET=y
+CONFIG_UNIX=y
+CONFIG_INET=y
+CONFIG_IPV6=y
+CONFIG_DNS_RESOLVER=y
+CONFIG_EXT4_FS=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+
+# -------- wall clock --------
+# kvm-clock via paravirt is the canonical x86 microVM clocksource. We do NOT
+# enable CONFIG_RTC_CLASS / CONFIG_RTC_DRV_CMOS here — gocracker's x86 VMM
+# does not emulate a CMOS RTC (only ARM has PL031), and enabling those adds
+# a ~1.2s probe timeout at boot while rtc_cmos fails to access the device.
+CONFIG_PARAVIRT=y
+CONFIG_HYPERVISOR_GUEST=y
+CONFIG_KVM_GUEST=y
+CONFIG_PARAVIRT_CLOCK=y
+# CONFIG_RTC_CLASS is not set

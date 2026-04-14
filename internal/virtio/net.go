@@ -6,6 +6,8 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -49,6 +51,19 @@ type NetDevice struct {
 	tapFd   *os.File
 	tapName string
 	rl      *RateLimiter
+
+	// tapRawFd is a cached copy of the TAP kernel fd captured at
+	// construction; rxPump polls on this directly so calling *os.File.Fd()
+	// from the poll path cannot re-enable blocking mode on us.
+	tapRawFd int
+
+	// closed is set by Close before it closes tapFd, so the rxPump
+	// goroutine can observe shutdown and stop touching guest memory
+	// before it gets unmapped by kvmVM.Close. Pair with rxWG so Close
+	// waits for rxPump to exit; otherwise a SIGSEGV in deliverRXPacket
+	// races with cleanup.
+	closed atomic.Bool
+	rxWG   sync.WaitGroup
 }
 
 // NewNetDevice creates a virtio-net device with a TAP backend.
@@ -59,16 +74,21 @@ func NewNetDevice(mem []byte, basePA uint64, irq uint8, mac net.HardwareAddr, ta
 	d.cfg.Status = 0 // starts link-down; flipped to link-up on DRIVER_OK via ActivateLink()
 
 	// Open /dev/net/tun and configure the TAP interface
-	tap, err := openTAP(tapName)
+	tap, rawFd, err := openTAP(tapName)
 	if err != nil {
 		return nil, fmt.Errorf("TAP %s: %w", tapName, err)
 	}
 	d.tapFd = tap
 	d.tapName = tapName
+	d.tapRawFd = rawFd
 	d.Transport = NewTransport(d, mem, basePA, irq, dirty, irqFn)
 
 	// Start receive pump: TAP -> guest virtqueue
-	go d.rxPump()
+	d.rxWG.Add(1)
+	go func() {
+		defer d.rxWG.Done()
+		d.rxPump()
+	}()
 	return d, nil
 }
 
@@ -97,12 +117,20 @@ func (d *NetDevice) ConfigBytes() []byte {
 
 func (d *NetDevice) Close() error {
 	var errs []string
+	// Mark closed BEFORE closing the fd so rxPump — which may already have
+	// a frame in hand — observes shutdown on its next iteration and stops
+	// touching guest memory before kvmVM.Close unmaps it.
+	d.closed.Store(true)
 	if d.tapFd != nil {
 		if err := d.tapFd.Close(); err != nil && !strings.Contains(err.Error(), "file already closed") {
 			errs = append(errs, err.Error())
 		}
 		d.tapFd = nil
 	}
+	// Wait for the rxPump goroutine to exit before returning; cleanup in
+	// pkg/vmm calls kvmVM.Close right after this, and a still-running
+	// rxPump that touches q.mem would SIGSEGV.
+	d.rxWG.Wait()
 	if d.tapName != "" {
 		link, err := netlink.LinkByName(d.tapName)
 		switch {
@@ -151,7 +179,11 @@ func (d *NetDevice) transmit(q *Queue) {
 		if d.rl != nil {
 			d.rl.Wait(uint64(len(pkt)), 1)
 		}
-		_ = writeTapFrame(int(d.tapFd.Fd()), pkt)
+		// Use the cached raw fd — calling (*os.File).Fd() here would
+		// re-enable blocking mode on the TAP fd (see openTAP) and let
+		// rxPump get stuck in a bare unix.Read that Close() cannot
+		// wake, reintroducing the shutdown race this PR fixed.
+		_ = writeTapFrame(d.tapRawFd, pkt)
 		_ = q.PushUsed(uint32(head), 0)
 	}); err != nil {
 		gclog.VMM.Warn("virtio-net TX queue iteration failed", "error", err)
@@ -164,18 +196,47 @@ func (d *NetDevice) transmit(q *Queue) {
 func (d *NetDevice) rxPump() {
 	rxQ := d.Transport.queues[0]
 	buf := make([]byte, 65536)
+	fd := d.tapRawFd
+	// Stack-style PollFd reused across iterations — avoids a per-packet
+	// allocation in the hot RX path.
+	pfds := [1]unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
 	for {
-		n, err := tapReadFrameFn(int(d.tapFd.Fd()), buf)
+		if d.closed.Load() {
+			return
+		}
+		// Read-first path: the TAP fd is non-blocking (see openTAP) so
+		// unix.Read returns EAGAIN immediately when idle. On EAGAIN we
+		// poll with a 50 ms timeout — that doubles as our shutdown
+		// observation granularity since Linux close(2) on the TAP fd
+		// does not wake a blocked reader. Tests replace tapReadFrameFn
+		// with a mock on a pipe fd, so this path still works there: we
+		// skip the poll-on-timeout behaviour for the negative/mock fd.
+		n, err := tapReadFrameFn(fd, buf)
 		if err != nil {
-			if isTapShutdownError(err) {
+			if isTapShutdownError(err) || d.closed.Load() {
 				return
 			}
 			if isTapTransientReadError(err) {
-				if tapTransientRetryDelay > 0 {
+				if fd >= 0 {
+					pfds[0].Revents = 0
+					_, perr := unix.Poll(pfds[:], 50)
+					if perr != nil && perr != syscall.EINTR {
+						return
+					}
+					if d.closed.Load() {
+						return
+					}
+					if pfds[0].Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
+						return
+					}
+				} else if tapTransientRetryDelay > 0 {
 					time.Sleep(tapTransientRetryDelay)
 				}
 				continue
 			}
+			return
+		}
+		if d.closed.Load() {
 			return
 		}
 		if n < netHeaderLen {
@@ -261,6 +322,11 @@ func (d *NetDevice) deliverRXPacket(pkt []byte) (uint32, bool) {
 
 // ---- TAP helpers ----
 
+// readTapFrame reads one frame from the TAP fd. The real TAP fd is put into
+// non-blocking mode by openTAP, so unix.Read returns EAGAIN quickly when no
+// frame is ready; rxPump sleeps briefly and checks the shutdown flag between
+// iterations. This keeps close() → rxPump exit bounded even though Linux's
+// close(2) does not wake a blocked reader on the same fd.
 func readTapFrame(fd int, buf []byte) (int, error) {
 	for {
 		n, err := unix.Read(fd, buf)
@@ -313,23 +379,38 @@ type ifreq struct {
 	_     [22]byte
 }
 
-func openTAP(name string) (*os.File, error) {
+// openTAP opens the TAP interface and returns both the *os.File (for Close())
+// and the raw kernel fd. Callers must use the returned rawFd for any
+// subsequent syscalls; calling (*os.File).Fd() re-enables blocking mode on
+// the fd (via fdPoll.SetBlocking), which would reintroduce a read that
+// never wakes on close.
+func openTAP(name string) (*os.File, int, error) {
 	f, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
 	if err != nil {
-		return nil, err
+		return nil, -1, err
 	}
+	fd := int(f.Fd())
 	ifr := ifreq{Flags: iffTAP | iffNoPi | iffVnetHdr}
 	copy(ifr.Name[:], name)
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,
-		f.Fd(), tunSetIFF, uintptr(unsafe.Pointer(&ifr))); errno != 0 {
+		uintptr(fd), tunSetIFF, uintptr(unsafe.Pointer(&ifr))); errno != 0 {
 		f.Close()
-		return nil, fmt.Errorf("TUNSETIFF: %w", errno)
+		return nil, -1, fmt.Errorf("TUNSETIFF: %w", errno)
 	}
 	size := int32(netHeaderLen)
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,
-		f.Fd(), tunSetVnetHdrSz, uintptr(unsafe.Pointer(&size))); errno != 0 {
+		uintptr(fd), tunSetVnetHdrSz, uintptr(unsafe.Pointer(&size))); errno != 0 {
 		f.Close()
-		return nil, fmt.Errorf("TUNSETVNETHDRSZ: %w", errno)
+		return nil, -1, fmt.Errorf("TUNSETVNETHDRSZ: %w", errno)
 	}
-	return f, nil
+	// Put the TAP fd in non-blocking mode so rxPump can poll the
+	// shutdown flag between reads instead of staying blocked in unix.Read
+	// when Close() tries to tear the device down. This must be the LAST
+	// operation using the fd in this function — any later (*os.File).Fd()
+	// call would reset blocking mode.
+	if err := unix.SetNonblock(fd, true); err != nil {
+		f.Close()
+		return nil, -1, fmt.Errorf("set tap nonblock: %w", err)
+	}
+	return f, fd, nil
 }

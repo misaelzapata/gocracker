@@ -25,7 +25,8 @@ Usage:
   tools/build-guest-kernel.sh [options]
 
 Options:
-  --profile standard|virtiofs   Guest kernel profile (default: standard)
+  --profile standard|virtiofs|minimal
+                               Guest kernel profile (default: standard)
   --source-dir PATH             Linux source tree to build from
   --base-config PATH            Base .config to merge from (default: Firecracker 6.1 guest config)
   --build-dir PATH              Out-of-tree build directory
@@ -87,9 +88,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$PROFILE" in
-  standard|virtiofs) ;;
+  standard|virtiofs|minimal) ;;
   *)
-    fail "invalid --profile '$PROFILE' (expected standard or virtiofs)"
+    fail "invalid --profile '$PROFILE' (expected standard, virtiofs, or minimal)"
     ;;
 esac
 
@@ -198,8 +199,15 @@ CONFIG_DST="$ARTIFACT_KERNELS_DIR/${KERNEL_NAME}.config"
 COMMON_FRAGMENT="$TOOLS_DIR/guest-common-x86_64.fragment"
 PROFILE_FRAGMENT=""
 [[ -f "$COMMON_FRAGMENT" ]] || fail "missing common fragment: $COMMON_FRAGMENT"
-if [[ "$PROFILE" == "virtiofs" ]]; then
-  PROFILE_FRAGMENT="$TOOLS_DIR/guest-${PROFILE}.fragment"
+case "$PROFILE" in
+  virtiofs)
+    PROFILE_FRAGMENT="$TOOLS_DIR/guest-virtiofs.fragment"
+    ;;
+  minimal)
+    PROFILE_FRAGMENT="$TOOLS_DIR/guest-minimal-x86_64.fragment"
+    ;;
+esac
+if [[ -n "$PROFILE_FRAGMENT" ]]; then
   [[ -f "$PROFILE_FRAGMENT" ]] || fail "missing profile fragment: $PROFILE_FRAGMENT"
 fi
 

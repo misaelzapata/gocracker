@@ -198,6 +198,10 @@ func runtimeSyscalls() []uintptr {
 		unix.SYS_EPOLL_CTL,
 		unix.SYS_EPOLL_WAIT,
 		unix.SYS_EPOLL_PWAIT,
+		// virtio-net rxPump calls unix.Poll (→ ppoll) on the TAP fd to
+		// sleep with shutdown responsiveness; without this the VMM
+		// SIGSYS's under seccomp any time a network interface exists.
+		unix.SYS_PPOLL,
 		unix.SYS_EVENTFD2,
 		unix.SYS_TIMER_CREATE,
 		unix.SYS_TIMER_SETTIME,
