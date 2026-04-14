@@ -367,6 +367,68 @@ Context from authoritative sources:
 
 The **ratio between runtimes** on the same host is the useful number, and there gocracker is neck-and-neck with Firecracker. No single-VM public Firecracker figure supports a 2× jailer penalty — the 2× in their docs is specifically about parallel jail creation at scale.
 
+## Time-to-Interactive vs commercial sandbox providers
+
+The above compares gocracker to Firecracker at the VMM level. [ComputeSDK's leaderboard](https://www.computesdk.com/benchmarks/) publishes a higher-level **Time-to-Interactive (TTI)** — the wall-clock time from `compute.sandbox.create()` returning to the first successful `runCommand("node -v")` stdout byte, against a pre-built sandbox image. [Their methodology doc](https://github.com/computesdk/benchmarks/blob/master/METHODOLOGY.md) specifies the exact test.
+
+[tools/bench-node-tti.sh](tools/bench-node-tti.sh) in this repo replicates it: a `node:20-alpine` Dockerfile with `CMD ["node","-v"]`, warm artifact cache standing in for their pre-built images, and `gocracker run ... --wait` timed to the first stdout byte starting with `v`.
+
+### Setup
+
+- **Host**: AMD Ryzen AI 9 HX 370 (24 threads), Linux 6.17, `/dev/kvm` available
+- **Guest kernel**: [artifacts/kernels/gocracker-guest-minimal-vmlinux](artifacts/kernels/gocracker-guest-minimal-vmlinux) (Linux 6.1.102, trimmed initcalls, `loglevel=4` default)
+- **Sandbox image**: `node:20-alpine` (cached locally after the first pull)
+- **VM shape**: 1 vCPU, 256 MiB RAM, ext4 rootfs, no network (the test doesn't need it)
+- **Optimisations this branch lands**: `loglevel=4` in `firecrackerBaseArgs`, per-fs discard-probe cache, slim minimal kernel, x86 `KVM_IRQFD` on every virtio device + 8250 UART, `debug.SetGCPercent(-1)` in `gocracker-vmm` at init
+
+### Results
+
+10 timed runs after a warm-up:
+
+```
+TTI 1: 269ms
+TTI 2: 247ms
+TTI 3: 252ms
+TTI 4: 247ms
+TTI 5: 252ms
+TTI 6: 250ms
+TTI 7: 258ms
+TTI 8: 243ms
+TTI 9: 253ms
+TTI 10: 257ms
+median = 252 ms, mean = 253 ms, p95 = 269 ms
+```
+
+### Against the ComputeSDK leaderboard
+
+| rank | provider | TTI median | Δ vs gocracker |
+|:---:|---|---:|---:|
+| 1 | Daytona | 100 ms | −152 (they serve from a pre-warmed snapshot pool) |
+| **2** | **gocracker** *(this branch)* | **252 ms** | — |
+| 3 | Vercel | 380 ms | **+128 ahead** |
+| 4 | Blaxel | 440 ms | **+188 ahead** |
+| 4 | E2B | 440 ms | **+188 ahead** |
+| 6 | Hopx | 1,050 ms | +798 |
+| 7 | Modal | 1,520 ms | +1,268 |
+| 8 | Cloudflare | 1,720 ms | +1,468 |
+| 9 | Namespace | 1,770 ms | +1,518 |
+| 10 | Runloop | 1,960 ms | +1,708 |
+| 11 | CodeSandbox | 3,790 ms | +3,538 |
+
+On the same workload ComputeSDK measures on its own, gocracker is **#2 of 11** — ahead of every commercial provider except Daytona, whose lead comes from serving sandboxes out of a pre-warmed snapshot pool rather than cold booting them each time. Closing the remaining gap needs `MAP_PRIVATE` COW snapshot restore plus a pool ([issue #3](https://github.com/misaelzapata/gocracker/issues/3)), not more boot-path optimisation.
+
+### Reproducing
+
+```bash
+make gocracker
+./tools/bench-node-tti.sh               # 10 timed runs (default)
+./tools/bench-node-tti.sh 50            # 50 timed runs
+GC_KERNEL=/path/to/vmlinux ./tools/bench-node-tti.sh
+GC_BIN=/path/to/gocracker    ./tools/bench-node-tti.sh
+```
+
+First run pulls `node:20-alpine` and builds the ext4 disk (~10–30 s). Every subsequent run hits the cache and measures only the boot path.
+
 ## Documentation
 
 - [Getting Started](docs/GETTING_STARTED.md) -- build, install, first VM in 60 seconds
