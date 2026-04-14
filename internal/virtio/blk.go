@@ -90,6 +90,26 @@ var discardSupportCache sync.Map // map[string]bool
 
 // NewBlockDevice creates a virtio-blk device from a raw image file.
 func NewBlockDevice(mem []byte, basePA uint64, irq uint8, imagePath string, readOnly bool, dirty *DirtyTracker, irqFn func(bool)) (*BlockDevice, error) {
+	return NewBlockDeviceWithOptions(mem, basePA, irq, imagePath, readOnly, dirty, irqFn, BlockDeviceOptions{})
+}
+
+// BlockDeviceOptions lets callers opt out of discovery syscalls that are safe
+// to skip when the answer is already known (e.g. restoring from a snapshot,
+// where the guest already negotiated features and a probe against the host
+// filesystem is wasted work).
+type BlockDeviceOptions struct {
+	// SkipDiscardProbe bypasses the FALLOC_FL_PUNCH_HOLE temp-file probe in
+	// detectDiscardSupport. Callers using this MUST supply Discard below
+	// with the value the device should advertise. Set by the snapshot
+	// restore path, which knows from the captured Transport.drvFeatures
+	// what the guest already accepted.
+	SkipDiscardProbe bool
+	Discard          bool
+}
+
+// NewBlockDeviceWithOptions is the low-level constructor used by restore and
+// advanced callers. The plain NewBlockDevice keeps the old signature.
+func NewBlockDeviceWithOptions(mem []byte, basePA uint64, irq uint8, imagePath string, readOnly bool, dirty *DirtyTracker, irqFn func(bool), opts BlockDeviceOptions) (*BlockDevice, error) {
 	flags := os.O_RDWR
 	if readOnly {
 		flags = os.O_RDONLY
@@ -105,7 +125,12 @@ func NewBlockDevice(mem []byte, basePA uint64, irq uint8, imagePath string, read
 	sectors := uint64(fi.Size()) / 512
 
 	discard := false
-	if !readOnly {
+	switch {
+	case readOnly:
+		// read-only images never advertise discard
+	case opts.SkipDiscardProbe:
+		discard = opts.Discard
+	default:
 		discard = probeDiscardSupport(imagePath)
 	}
 

@@ -1,0 +1,2 @@
+# id	service	command	expect
+actual-server-compose		echo compose-tty-ok	compose-tty-ok

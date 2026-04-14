@@ -28,6 +28,7 @@ import (
 	"github.com/gocracker/gocracker/internal/jailer"
 	"github.com/gocracker/gocracker/internal/oci"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
+	"github.com/gocracker/gocracker/internal/tempprune"
 	"github.com/gocracker/gocracker/internal/vmmserver"
 	"github.com/gocracker/gocracker/internal/worker"
 	"github.com/gocracker/gocracker/pkg/container"
@@ -162,6 +163,7 @@ func cmdRun(args []string) {
 	wait := fs.Bool("wait", false, "Block until VM stops")
 	ttyMode := fs.String("tty", "auto", "Console mode: auto, off, or force")
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
+	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs read-write directly (writes survive VM stop; slower boot). Default: Docker-style tmpfs overlay.")
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
@@ -196,6 +198,7 @@ func cmdRun(args []string) {
 		JailerMode:      *jailerMode,
 		ConsoleOut:      consoleOut,
 		ConsoleIn:       consoleIn,
+		RootfsPersistent: *rootfsPersistent,
 	}
 	if *balloonTargetMiB > 0 || *balloonDeflateOnOOM || *balloonStatsIntervalS > 0 || strings.TrimSpace(*balloonAuto) != "" {
 		runOpts.Balloon = &vmm.BalloonConfig{
@@ -237,6 +240,7 @@ func cmdRepo(args []string) {
 	url := fs.String("url", "", "Git repo URL or local path [required]")
 	ref := fs.String("ref", "", "Branch/tag to checkout")
 	subdir := fs.String("subdir", "", "Subdir inside repo")
+	dockerfileFlag := fs.String("dockerfile", "", "Explicit Dockerfile path relative to --subdir (rescues non-canonical names like Dockerfile-envoy)")
 	kernel := fs.String("kernel", "", "Kernel image path [required]")
 	mem := fs.Uint64("mem", 256, "RAM in MiB")
 	arch := fs.String("arch", runtime.GOARCH, "Guest architecture: amd64 or arm64 (same-arch only)")
@@ -261,6 +265,7 @@ func cmdRepo(args []string) {
 	wait := fs.Bool("wait", false, "Block until VM stops")
 	ttyMode := fs.String("tty", "auto", "Console mode: auto, off, or force")
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
+	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs read-write directly (writes survive VM stop; slower boot). Default: Docker-style tmpfs overlay.")
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
@@ -280,13 +285,14 @@ func cmdRepo(args []string) {
 	}
 
 	runOpts := container.RunOptions{
-		RepoURL: *url, RepoRef: *ref, RepoSubdir: *subdir,
+		RepoURL: *url, RepoRef: *ref, RepoSubdir: *subdir, RepoDockerfile: *dockerfileFlag,
 		KernelPath: *kernel, MemMB: *mem, Arch: *arch, CPUs: *cpus, TapName: *tap, NetworkMode: normalizeNetworkMode(*netMode), X86Boot: vmm.X86BootMode(*x86Boot),
 		DiskSizeMB: *disk, SnapshotDir: *snap,
 		Env: splitComma(*envStr), Cmd: splitFields(*cmdStr),
 		Entrypoint:      splitFields(*entrypointStr),
 		WorkDir:         *workdir,
 		BuildArgs:       buildArgs.Map(),
+		RootfsPersistent: *rootfsPersistent,
 		PID1Mode:        pid1ModeForCLIWait(*wait),
 		CacheDir:        *cacheDir,
 		ExecEnabled:     interactive.enabled,
@@ -355,23 +361,25 @@ func cmdCompose(args []string) {
 	wait := fs.Bool("wait", false, "Block until all VMs stop")
 	doSnap := fs.Bool("save-snapshot", false, "Take snapshots on Ctrl-C / stop")
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
+	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs rw in each service VM (writes survive; slower boot).")
 	fs.Parse(args)
 
 	requireKernel(*kernel)
 	*kernel = resolveRequiredExistingPath("kernel", *kernel)
 
 	stack, err := compose.Up(compose.RunOptions{
-		ComposePath: *file,
-		ServerURL:   *serverURL,
-		CacheDir:    *cacheDir,
-		KernelPath:  *kernel,
-		DefaultMem:  *mem,
-		Arch:        *arch,
-		DefaultDisk: *disk,
-		TapPrefix:   *tapPfx,
-		SnapshotDir: *snapDir,
-		X86Boot:     vmm.X86BootMode(*x86Boot),
-		JailerMode:  *jailerMode,
+		ComposePath:      *file,
+		ServerURL:        *serverURL,
+		CacheDir:         *cacheDir,
+		KernelPath:       *kernel,
+		DefaultMem:       *mem,
+		Arch:             *arch,
+		DefaultDisk:      *disk,
+		TapPrefix:        *tapPfx,
+		SnapshotDir:      *snapDir,
+		X86Boot:          vmm.X86BootMode(*x86Boot),
+		JailerMode:       *jailerMode,
+		RootfsPersistent: *rootfsPersistent,
 	})
 	if err != nil {
 		fatal("compose up: " + err.Error())
@@ -706,9 +714,26 @@ func cmdServe(args []string) {
 	fs.Var(&trustedKernelDirs, "trusted-kernel-dir", "Trusted kernel directory for API-supplied kernel paths (repeatable)")
 	fs.Var(&trustedWorkDirs, "trusted-work-dir", "Trusted workspace directory for API-supplied dockerfile/context/initrd paths (repeatable)")
 	fs.Var(&trustedSnapshotDirs, "trusted-snapshot-dir", "Trusted snapshot directory for API snapshot/restore paths (repeatable)")
+	pruneMaxAge := fs.Duration("prune-stale-temp-age", 48*time.Hour, "Age threshold for pruning /tmp/gocracker-* orphans left by crashed builds; 0 disables")
 	fs.Parse(args)
 	if *addr != "" && !isLoopbackTCPAddr(*addr) && strings.TrimSpace(*authToken) == "" {
 		fatal("--auth-token is required when --addr is not an explicit loopback address; use 127.0.0.1:PORT for local unauthenticated access")
+	}
+
+	// Sweep stale /tmp/gocracker-* dirs BEFORE accepting any HTTP request.
+	// Every temp-dir site has happy-path cleanup, but when the parent process
+	// gets SIGKILL'd (sweep timeouts, OOM-kill, manual Ctrl-C) the deferred
+	// cleanups never run and 10s–100s of MB per orphan pile up. One gocracker
+	// serve restart a day is enough to keep /tmp bounded indefinitely.
+	if *pruneMaxAge > 0 {
+		result := tempprune.PruneStaleTempDirs(tempprune.DefaultPrefixes, *pruneMaxAge)
+		if result.Removed > 0 {
+			fmt.Fprintf(os.Stderr, "[serve] pruned %d/%d stale temp dirs (%.1f MiB freed, max_age=%s)\n",
+				result.Removed, result.Scanned, float64(result.BytesFree)/(1024*1024), pruneMaxAge.String())
+		}
+		for _, err := range result.Errors {
+			fmt.Fprintf(os.Stderr, "[serve] temp prune error: %v\n", err)
+		}
 	}
 
 	kernelDirs := trustedKernelDirs.Values()
@@ -981,13 +1006,19 @@ func waitVM(vm vmm.Handle, session *console.Session) {
 }
 
 func resolveInteractiveRunCommand(imgConfig oci.ImageConfig, opts container.RunOptions) []string {
-	if len(opts.Entrypoint) == 0 && len(opts.Cmd) == 0 {
+	// Consult the EFFECTIVE command — image's Entrypoint/Cmd merged with any
+	// CLI overrides — before deciding whether to fall back to the guest's
+	// default interactive shell. The prior early-return that only checked
+	// opts.Entrypoint/opts.Cmd silently discarded the image's CMD whenever
+	// the user didn't pass --cmd, so `gocracker run --dockerfile=... --wait`
+	// landed in an interactive shell instead of running the image workload
+	// (e.g. Dockerfile `CMD printf 'ok' > /result.txt` never executed).
+	entrypoint := effectiveCommandSlice(opts.Entrypoint, imgConfig.Entrypoint)
+	cmd := effectiveCommandSlice(opts.Cmd, imgConfig.Cmd)
+	if len(entrypoint) == 0 && len(cmd) == 0 {
 		return nil
 	}
-	proc := runtimecfg.ResolveProcess(
-		effectiveCommandSlice(opts.Entrypoint, imgConfig.Entrypoint),
-		effectiveCommandSlice(opts.Cmd, imgConfig.Cmd),
-	)
+	proc := runtimecfg.ResolveProcess(entrypoint, cmd)
 	if proc.IsZero() {
 		return nil
 	}

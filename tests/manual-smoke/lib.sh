@@ -145,7 +145,11 @@ debugfs_exists() {
 
 extract_disk_from_log() {
   local log=$1
-  sed -n 's/^[[:space:]]*disk:[[:space:]]*//p' "$log" 2>/dev/null | tail -n 1
+  # script(1) records guest output with CRLF line endings, so the captured
+  # "disk:" line carries a trailing \r. Strip it before printing or the
+  # subsequent `[[ -f "$disk" ]]` check treats the CR as part of the
+  # filename and fails despite the file existing.
+  sed -n 's/^[[:space:]]*disk:[[:space:]]*//p' "$log" 2>/dev/null | tail -n 1 | tr -d '\r'
 }
 
 resolve_disk_from_log() {
@@ -425,6 +429,7 @@ EOF
     --image "$image" \
     --kernel "$GOCRACKER_KERNEL" \
     --mem "$SMOKE_MEM_MB" \
+    --rootfs-persistent \
     --wait
 
   if ! "$SMOKE_PTY_HELPER" \
@@ -542,6 +547,7 @@ run_shellform_fixture_case() {
     --context "$context_dir" \
     --kernel "$GOCRACKER_KERNEL" \
     --mem "$SMOKE_MEM_MB" \
+    --rootfs-persistent \
     --wait
   run_with_script "$(case_log "$name")" "${cmd[@]}"
 
@@ -565,6 +571,7 @@ run_user_fixture_case() {
     --context "$context_dir" \
     --kernel "$GOCRACKER_KERNEL" \
     --mem "$SMOKE_MEM_MB" \
+    --rootfs-persistent \
     --wait
   run_with_script "$(case_log "$name")" "${cmd[@]}"
 
@@ -650,6 +657,7 @@ run_compose_volume_case() {
   rm -f "$data_file"
   start_compose_case parent_pid "$name" "$compose_file" "$log" \
     --kernel "$virtiofs_kernel" \
+    --rootfs-persistent \
     --x86-boot acpi
   child_pid="$(wait_for_child_pid "$parent_pid")"
 

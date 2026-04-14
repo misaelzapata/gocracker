@@ -4,11 +4,36 @@ import "github.com/gocracker/gocracker/internal/kvm"
 
 // X86VCPUState stores the amd64-specific vCPU state needed for
 // snapshot/restore and migration.
+//
+// The full set mirrors Firecracker's VcpuState (src/vstate/vcpu/src/x86_64.rs):
+// Sregs/Regs establish the CPU mode; MPState/LAPIC drive the APIC and halted
+// bookkeeping; MSRs carry syscall entry points and kvmclock; XSAVE/XCRs carry
+// SSE/AVX state; VCPUEvents carries pending interrupts so a guest captured
+// mid-`hlt` wakes on resume instead of sitting idle forever; DebugRegs
+// preserves hardware breakpoints; TSCKHz pins the virtual clock frequency.
+// Without the last five, a live guest restore looks fine but timekeeping
+// stalls and the exec-agent channel never dials back.
 type X86VCPUState struct {
-	Regs    kvm.Regs        `json:"regs"`
-	Sregs   kvm.Sregs       `json:"sregs"`
-	MPState kvm.MPState     `json:"mp_state"`
-	LAPIC   *kvm.LAPICState `json:"lapic,omitempty"`
+	Regs             kvm.Regs        `json:"regs"`
+	Sregs            kvm.Sregs       `json:"sregs"`
+	MPState          kvm.MPState     `json:"mp_state"`
+	LAPIC            *kvm.LAPICState `json:"lapic,omitempty"`
+	MSRs             []kvm.MSREntry  `json:"msrs,omitempty"`
+	// TSCDeadline is MSR_IA32_TSC_DEADLINE captured separately so the
+	// restore path can write it AFTER the main MSR chunk + LAPIC (KVM
+	// rejects the write otherwise). If the guest captured this MSR as 0
+	// (no armed timer at snapshot time), the capture path rewrites it to
+	// the current value of MSR_IA32_TSC so post-restore the first
+	// LAPIC-timer comparison "deadline < TSC" is true and the interrupt
+	// fires immediately — this is Firecracker's `fix_zero_tsc_deadline_msr`
+	// trick and is what actually wakes a HALTED guest from post-restore HLT.
+	TSCDeadline uint64          `json:"tsc_deadline,omitempty"`
+	FPU         *kvm.FPUState   `json:"fpu,omitempty"`
+	XSAVE       *kvm.XSaveState `json:"xsave,omitempty"`
+	XCRs        *kvm.XCRsState  `json:"xcrs,omitempty"`
+	VCPUEvents  *kvm.VCPUEvents `json:"vcpu_events,omitempty"`
+	DebugRegs   *kvm.DebugRegs  `json:"debug_regs,omitempty"`
+	TSCKHz      uint32          `json:"tsc_khz,omitempty"`
 }
 
 // ARM64VCPUState stores the aarch64-specific vCPU register state needed for
@@ -29,14 +54,14 @@ type VCPUState struct {
 	LAPIC   *kvm.LAPICState `json:"lapic,omitempty"`
 }
 
-func newX86VCPUState(id int, regs kvm.Regs, sregs kvm.Sregs, mpState kvm.MPState, lapic *kvm.LAPICState) VCPUState {
+func newX86VCPUState(id int, x86 X86VCPUState) VCPUState {
 	return VCPUState{
 		ID:      id,
-		X86:     &X86VCPUState{Regs: regs, Sregs: sregs, MPState: mpState, LAPIC: lapic},
-		Regs:    regs,
-		Sregs:   sregs,
-		MPState: mpState,
-		LAPIC:   lapic,
+		X86:     &x86,
+		Regs:    x86.Regs,
+		Sregs:   x86.Sregs,
+		MPState: x86.MPState,
+		LAPIC:   x86.LAPIC,
 	}
 }
 

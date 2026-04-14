@@ -261,8 +261,20 @@ func TestLocateFiles_RecursiveAmbiguousDockerfiles(t *testing.T) {
 	}
 	r := &CloneResult{Dir: dir, ContextDir: dir}
 	locateFiles(r, false)
-	if r.DockerfilePath != "" {
-		t.Fatalf("DockerfilePath = %q, want empty due to ambiguity", r.DockerfilePath)
+	// Ambiguity is now resolved deterministically by lex-smallest path
+	// instead of erroring — real repos (dragonflydb, eclipse-mosquitto)
+	// often ship multiple Dockerfile variants at the same rank and any is
+	// a reasonable default. Callers wanting a specific one pass --subdir
+	// or --dockerfile.
+	wantA := filepath.Join(aDir, "Dockerfile")
+	wantB := filepath.Join(bDir, "Dockerfile")
+	if r.DockerfilePath != wantA && r.DockerfilePath != wantB {
+		t.Fatalf("DockerfilePath = %q, expected %q or %q", r.DockerfilePath, wantA, wantB)
+	}
+	// And the pick must be stable (lex-smallest) — so with "a" before "b",
+	// we expect services/a/Dockerfile.
+	if r.DockerfilePath != wantA {
+		t.Fatalf("DockerfilePath = %q, want lex-smallest %q", r.DockerfilePath, wantA)
 	}
 }
 

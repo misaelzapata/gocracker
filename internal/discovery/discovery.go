@@ -161,12 +161,22 @@ func findOne(root string, rankFn func(string) (int, bool), kind string) (result,
 		return result{}, fmt.Errorf("no %s found under %s", kind, root)
 	}
 	if len(tied) > 1 {
+		// Multiple candidates at the same rank. Pick deterministically by
+		// lex-smallest path rather than erroring out — repos like
+		// eclipse-mosquitto (docker/2.1-alpine/Dockerfile, docker/2.1-ubuntu/
+		// Dockerfile, …) and dragonflydb (Dockerfile.alpine-dev,
+		// Dockerfile.ubuntu-prod, …) tie on every rank dimension but any
+		// variant is a reasonable default. Callers wanting a specific variant
+		// can still pass --subdir / --dockerfile.
 		paths := make([]string, 0, len(tied))
+		byPath := make(map[string]result, len(tied))
 		for _, item := range tied {
 			paths = append(paths, item.path)
+			byPath[item.path] = item
 		}
 		sort.Strings(paths)
-		return result{}, fmt.Errorf("ambiguous candidates under %s: %s", root, strings.Join(paths, ", "))
+		chosen := byPath[paths[0]]
+		return chosen, nil
 	}
 	return *best, nil
 }

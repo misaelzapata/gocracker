@@ -792,7 +792,7 @@ func TestNewX86VCPUState(t *testing.T) {
 	regs := kvm.Regs{RAX: 1}
 	sregs := kvm.Sregs{}
 	mpState := kvm.MPState{State: 0}
-	state := newX86VCPUState(3, regs, sregs, mpState, nil)
+	state := newX86VCPUState(3, X86VCPUState{Regs: regs, Sregs: sregs, MPState: mpState})
 	if state.ID != 3 {
 		t.Fatalf("ID = %d, want 3", state.ID)
 	}
@@ -1165,7 +1165,7 @@ func TestVCPUStateJSON(t *testing.T) {
 
 func TestNewX86VCPUState_WithLAPIC(t *testing.T) {
 	lapic := &kvm.LAPICState{}
-	state := newX86VCPUState(0, kvm.Regs{}, kvm.Sregs{}, kvm.MPState{}, lapic)
+	state := newX86VCPUState(0, X86VCPUState{LAPIC: lapic})
 	if state.X86.LAPIC != lapic {
 		t.Fatal("expected LAPIC in X86 field")
 	}

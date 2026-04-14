@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/gocracker/gocracker/internal/firecrackerapi"
+	"github.com/gocracker/gocracker/internal/guestexec"
 	gclog "github.com/gocracker/gocracker/internal/log"
 	"github.com/gocracker/gocracker/internal/stacknet"
 	"github.com/gocracker/gocracker/pkg/container"
@@ -133,10 +135,12 @@ type Drive struct {
 }
 
 type NetworkInterface struct {
-	IfaceID     string                 `json:"iface_id"`
-	HostDevName string                 `json:"host_dev_name"`
-	GuestMAC    string                 `json:"guest_mac,omitempty"`
-	RateLimiter *vmm.RateLimiterConfig `json:"rate_limiter,omitempty"`
+	IfaceID       string                 `json:"iface_id"`
+	HostDevName   string                 `json:"host_dev_name"`
+	GuestMAC      string                 `json:"guest_mac,omitempty"`
+	RateLimiter   *vmm.RateLimiterConfig `json:"rate_limiter,omitempty"`     // legacy: applied to both RX and TX
+	RxRateLimiter *vmm.RateLimiterConfig `json:"rx_rate_limiter,omitempty"` // Firecracker-parity: host→guest only
+	TxRateLimiter *vmm.RateLimiterConfig `json:"tx_rate_limiter,omitempty"` // Firecracker-parity: guest→host only
 }
 
 type Action struct {
@@ -188,28 +192,87 @@ type RunRequest struct {
 	ExecEnabled   bool                     `json:"exec_enabled,omitempty"`
 	Balloon       *Balloon                 `json:"balloon,omitempty"`
 	MemoryHotplug *vmm.MemoryHotplugConfig `json:"memory_hotplug,omitempty"`
+
+	// NetworkMode selects how gocracker provisions the guest NIC. "" or
+	// "none" keeps today's explicit behaviour (caller supplies tap_name /
+	// static_ip / gateway). "auto" makes the server allocate a fresh TAP
+	// + /30 guest/gateway pair via hostnet.AutoNetwork. When "auto" is set
+	// the caller MUST leave static_ip and gateway empty.
+	NetworkMode string `json:"network_mode,omitempty"`
+
+	// Wait, when true (or when the "wait=true" query parameter is set),
+	// makes the /run handler run synchronously: it performs the full
+	// runFn + vm.Start() inline and only returns once the vCPUs are
+	// spinning (state="running"). For snapshot_dir this is typically
+	// single-digit ms; for a fresh boot this blocks for the kernel boot
+	// duration. When false (default), the handler launches a goroutine and
+	// returns state="starting" immediately.
+	Wait bool `json:"wait,omitempty"`
 }
 
 type RunResponse struct {
 	ID      string `json:"id"`
 	State   string `json:"state"`
 	Message string `json:"message,omitempty"`
+
+	// Network fields echo the effective tap/ip/gateway for the VM. They
+	// are populated only when the handler ran synchronously (wait=true
+	// or the snapshot-restore fast path) and the network was actually
+	// resolved. On async state="starting" these fields are empty; the
+	// caller should poll GET /vms/{id} for the live values.
+	TapName              string `json:"tap_name,omitempty"`
+	GuestIP              string `json:"guest_ip,omitempty"`
+	Gateway              string `json:"gateway,omitempty"`
+	NetworkMode          string `json:"network_mode,omitempty"`
+	RestoredFromSnapshot bool   `json:"restored_from_snapshot,omitempty"`
 }
 
 type SnapshotRequest struct {
 	DestDir string `json:"dest_dir"`
 }
 
-type VMInfo struct {
-	ID       string            `json:"id"`
-	State    string            `json:"state"`
-	Uptime   string            `json:"uptime"`
-	MemMB    uint64            `json:"mem_mb"`
-	Arch     string            `json:"arch,omitempty"`
-	Kernel   string            `json:"kernel"`
-	Events   []vmm.Event       `json:"events"`
-	Devices  []vmm.DeviceInfo  `json:"devices,omitempty"`
+// CloneRequest clones a running VM in-place (no second gocracker serve
+// required). The server snapshots the source to a scratch dir, restores as a
+// new VM with a fresh ID, and applies the per-instance overrides below. The
+// source VM is unaffected (it keeps running). Intended for sandbox-template
+// warm pools: publish one template VM, clone it per sandbox.
+type CloneRequest struct {
+	// Optional: where to drop the intermediate snapshot. If empty, the
+	// server uses a temp dir and deletes it after the clone completes.
+	// Set this if you want to publish the snapshot as a durable template
+	// for later /run snapshot_dir=… calls.
+	SnapshotDir string `json:"snapshot_dir,omitempty"`
+	// TapName / StaticIP / Gateway override the restored VM's network.
+	// Mutually exclusive with NetworkMode=auto.
+	TapName     string `json:"tap_name,omitempty"`
+	StaticIP    string `json:"static_ip,omitempty"`
+	Gateway     string `json:"gateway,omitempty"`
+	NetworkMode string `json:"network_mode,omitempty"`
+	// Mounts: reserved for future virtio-fs rebind once FUSE-session
+	// migration is available. Today /clone rejects VMs with live
+	// virtio-fs mounts at the API (400) to avoid silent hangs, so this
+	// field is validated but not acted on.
+	Mounts []container.Mount `json:"mounts,omitempty"`
+	// ExecEnabled for the clone (the source's exec is not forwarded).
+	ExecEnabled bool `json:"exec_enabled,omitempty"`
+	// Metadata merged onto the clone's VMInfo.
 	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+type VMInfo struct {
+	ID          string            `json:"id"`
+	State       string            `json:"state"`
+	Uptime      string            `json:"uptime"`
+	MemMB       uint64            `json:"mem_mb"`
+	Arch        string            `json:"arch,omitempty"`
+	Kernel      string            `json:"kernel"`
+	Events      []vmm.Event       `json:"events"`
+	Devices     []vmm.DeviceInfo  `json:"devices,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	TapName     string            `json:"tap_name,omitempty"`
+	GuestIP     string            `json:"guest_ip,omitempty"`
+	Gateway     string            `json:"gateway,omitempty"`
+	NetworkMode string            `json:"network_mode,omitempty"`
 }
 
 type APIError struct {
@@ -261,6 +324,7 @@ type composeStack struct {
 
 type rateLimiterUpdater interface {
 	UpdateNetRateLimiter(*vmm.RateLimiterConfig) error
+	UpdateNetRateLimiters(rx, tx *vmm.RateLimiterConfig) error
 	UpdateBlockRateLimiter(*vmm.RateLimiterConfig) error
 	UpdateRNGRateLimiter(*vmm.RateLimiterConfig) error
 }
@@ -357,6 +421,9 @@ func NewWithOptions(opts Options) *Server {
 	r.Get("/vms", s.handleListVMs)
 	r.Get("/vms/{id}", s.handleGetVM)
 	r.Post("/vms/{id}/stop", s.handleStopVM)
+	r.Post("/vms/{id}/pause", s.handleVMPause)
+	r.Post("/vms/{id}/resume", s.handleVMResume)
+	r.Post("/vms/{id}/clone", s.handleVMClone)
 	r.Post("/vms/{id}/migrate", s.handleMigrateVM)
 	r.Post("/vms/{id}/snapshot", s.handleSnapshot)
 	r.Get("/vms/{id}/events", s.handleVMEvents)
@@ -974,6 +1041,10 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := validateNetworkMode(req.NetworkMode, req.StaticIP, req.Gateway); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Generate ID before goroutine so response matches the actual VM
 	id := fmt.Sprintf("gc-%d", time.Now().UnixNano()%100000)
@@ -1000,6 +1071,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		Arch:          req.Arch,
 		KernelPath:    req.KernelPath,
 		TapName:       req.TapName,
+		NetworkMode:   normalizeNetworkMode(req.NetworkMode),
 		X86Boot:       s.defaultX86Boot,
 		Cmd:           cmd,
 		Entrypoint:    ep,
@@ -1067,14 +1139,69 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	if opts.CacheDir == "" {
 		opts.CacheDir = s.cacheDir
 	}
+	opts.JailerBinary = s.jailerBinary
+	opts.VMMBinary = s.vmmBinary
+	opts.ChrootBase = s.chrootBaseDir
+	opts.UID = s.uid
+	opts.GID = s.gid
+
+	// Opt-in synchronous path: used by the snapshot-restore fast path so
+	// the caller can skip the starting→running poll round-trip. Accept
+	// either "wait=true" in the JSON body or the "wait=true" query param.
+	waitSync := req.Wait
+	if !waitSync {
+		if v := strings.TrimSpace(r.URL.Query().Get("wait")); v != "" {
+			if b, err := strconv.ParseBool(v); err == nil {
+				waitSync = b
+			}
+		}
+	}
+	// wait=true runs the full runFn inline and returns once state="running".
+	// For snapshot_dir this is typically single-digit ms; for a fresh boot
+	// this blocks for the kernel boot duration (seconds). Callers that need
+	// the cold-boot fast-return behaviour can leave wait=false and poll
+	// GET /vms/{id}.
+	if waitSync {
+		result, err := s.runFn(opts)
+		if err != nil {
+			gclog.API.Error("run failed", "error", err)
+			apiErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := s.attachComposeStackResources(id, opts, result); err != nil {
+			gclog.API.Error("compose network attach failed", "id", id, "error", err)
+			result.VM.Stop()
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = result.VM.WaitStopped(stopCtx)
+			stopCancel()
+			result.Close()
+			apiErr(w, http.StatusInternalServerError, fmt.Sprintf("attach compose network: %v", err))
+			return
+		}
+		entry := s.newVMEntry(result.VM, result.Close)
+		entry.metadata = mergeMetadata(entry.metadata, map[string]string{
+			"guest_ip":     result.GuestIP,
+			"gateway":      result.Gateway,
+			"tap_name":     result.TapName,
+			"disk_path":    result.DiskPath,
+			"network_mode": opts.NetworkMode,
+		})
+		s.registerVMEntry(result.ID, entry)
+		json.NewEncoder(w).Encode(RunResponse{
+			ID:                   result.ID,
+			State:                "running",
+			Message:              "VM is running",
+			TapName:              result.TapName,
+			GuestIP:              result.GuestIP,
+			Gateway:              result.Gateway,
+			NetworkMode:          opts.NetworkMode,
+			RestoredFromSnapshot: strings.TrimSpace(opts.SnapshotDir) != "",
+		})
+		return
+	}
 
 	// Run asynchronously so the HTTP response returns immediately
 	go func() {
-		opts.JailerBinary = s.jailerBinary
-		opts.VMMBinary = s.vmmBinary
-		opts.ChrootBase = s.chrootBaseDir
-		opts.UID = s.uid
-		opts.GID = s.gid
 		result, err := s.runFn(opts)
 		if err != nil {
 			gclog.API.Error("run failed", "error", err)
@@ -1093,10 +1220,11 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		}
 		entry := s.newVMEntry(result.VM, result.Close)
 		entry.metadata = mergeMetadata(entry.metadata, map[string]string{
-			"guest_ip":  result.GuestIP,
-			"gateway":   result.Gateway,
-			"tap_name":  result.TapName,
-			"disk_path": result.DiskPath,
+			"guest_ip":     result.GuestIP,
+			"gateway":      result.Gateway,
+			"tap_name":     result.TapName,
+			"disk_path":    result.DiskPath,
+			"network_mode": opts.NetworkMode,
 		})
 		s.registerVMEntry(result.ID, entry)
 	}()
@@ -1104,9 +1232,10 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	s.registerVMEntry(id, newPendingVMEntry(id, opts))
 
 	json.NewEncoder(w).Encode(RunResponse{
-		ID:      id,
-		State:   "starting",
-		Message: "VM is booting",
+		ID:          id,
+		State:       "starting",
+		Message:     "VM is booting",
+		NetworkMode: opts.NetworkMode,
 	})
 }
 
@@ -1532,14 +1661,18 @@ func (s *Server) buildVMInfo(entry *vmEntry) VMInfo {
 			metadata[key] = value
 		}
 		return VMInfo{
-			ID:       entry.apiID,
-			State:    entry.pendingState,
-			Uptime:   time.Since(entry.createdAt).Round(time.Second).String(),
-			MemMB:    entry.pendingCfg.MemMB,
-			Arch:     defaultVMArch(entry.pendingCfg.Arch),
-			Kernel:   entry.pendingCfg.KernelPath,
-			Events:   events,
-			Metadata: metadata,
+			ID:          entry.apiID,
+			State:       entry.pendingState,
+			Uptime:      time.Since(entry.createdAt).Round(time.Second).String(),
+			MemMB:       entry.pendingCfg.MemMB,
+			Arch:        defaultVMArch(entry.pendingCfg.Arch),
+			Kernel:      entry.pendingCfg.KernelPath,
+			Events:      events,
+			Metadata:    metadata,
+			TapName:     metadata["tap_name"],
+			GuestIP:     metadata["guest_ip"],
+			Gateway:     metadata["gateway"],
+			NetworkMode: metadata["network_mode"],
 		}
 	}
 	cfg := entry.handle.VMConfig()
@@ -1563,15 +1696,19 @@ func (s *Server) buildVMInfo(entry *vmEntry) VMInfo {
 		id = entry.apiID
 	}
 	return VMInfo{
-		ID:       id,
-		State:    entry.handle.State().String(),
-		Uptime:   entry.handle.Uptime().Round(time.Second).String(),
-		MemMB:    cfg.MemMB,
-		Arch:     defaultVMArch(cfg.Arch),
-		Kernel:   cfg.KernelPath,
-		Events:   events,
-		Devices:  entry.handle.DeviceList(),
-		Metadata: metadata,
+		ID:          id,
+		State:       entry.handle.State().String(),
+		Uptime:      entry.handle.Uptime().Round(time.Second).String(),
+		MemMB:       cfg.MemMB,
+		Arch:        defaultVMArch(cfg.Arch),
+		Kernel:      cfg.KernelPath,
+		Events:      events,
+		Devices:     entry.handle.DeviceList(),
+		Metadata:    metadata,
+		TapName:     metadata["tap_name"],
+		GuestIP:     metadata["guest_ip"],
+		Gateway:     metadata["gateway"],
+		NetworkMode: metadata["network_mode"],
 	}
 }
 
@@ -1596,6 +1733,54 @@ func validateRequestedArch(raw string) error {
 		return fmt.Errorf("arch %q is not compatible with host arch %q (same-arch only)", arch, runtime.GOARCH)
 	}
 	return nil
+}
+
+func validateNetworkMode(mode, staticIP, gateway string) error {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "", "none":
+		return nil
+	case container.NetworkModeAuto:
+		if strings.TrimSpace(staticIP) != "" || strings.TrimSpace(gateway) != "" {
+			return fmt.Errorf("network_mode=auto is exclusive with explicit static_ip/gateway")
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid network_mode %q (want \"\"|\"none\"|\"auto\")", mode)
+	}
+}
+
+// normalizeNetworkMode folds "none" back to "" so downstream code only has to
+// distinguish "" (explicit/none) from "auto".
+func normalizeNetworkMode(mode string) string {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case container.NetworkModeAuto:
+		return container.NetworkModeAuto
+	default:
+		return ""
+	}
+}
+
+// cloneTapName derives a unique tap name for a cloned VM, within the 15-char
+// Linux IFNAMSIZ limit. Source and clone share the snapshot's MAC + guest IP;
+// only the host-side tap name differs. Clones without host-side network
+// routing still boot fine — the exec agent, disk, and virtiofs work — they
+// just cannot reach the outside world until the caller supplies static_ip /
+// gateway or network_mode=auto.
+func cloneTapName(newID string) string {
+	// newID is "gc-<12-digits>"; "tclone-<N>" fits under 15 chars when N is
+	// the last 6 digits of the ID (monotonic per-second in practice).
+	suffix := newID
+	if strings.HasPrefix(suffix, "gc-") {
+		suffix = suffix[3:]
+	}
+	if len(suffix) > 6 {
+		suffix = suffix[len(suffix)-6:]
+	}
+	name := "tclone-" + suffix
+	if len(name) > 15 {
+		name = name[:15]
+	}
+	return name
 }
 
 func matchesVMFilters(info VMInfo, r *http.Request) bool {
@@ -1773,8 +1958,29 @@ func (s *Server) handleVMNetRateLimiter(w http.ResponseWriter, r *http.Request) 
 		apiErr(w, http.StatusNotFound, "VM not found")
 		return
 	}
+	// Accept either the legacy single-bucket shape (TokenBucketConfig
+	// fields directly) OR the Firecracker-parity {rx_rate_limiter, tx_rate_limiter}
+	// envelope. We read the body once and try both.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var envelope struct {
+		Rx *vmm.RateLimiterConfig `json:"rx_rate_limiter,omitempty"`
+		Tx *vmm.RateLimiterConfig `json:"tx_rate_limiter,omitempty"`
+	}
+	_ = json.Unmarshal(body, &envelope)
+	if envelope.Rx != nil || envelope.Tx != nil {
+		if err := updater.UpdateNetRateLimiters(envelope.Rx, envelope.Tx); err != nil {
+			apiErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	var cfg vmm.RateLimiterConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	if err := json.Unmarshal(body, &cfg); err != nil {
 		apiErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1908,6 +2114,336 @@ func (s *Server) handleStopVM(w http.ResponseWriter, r *http.Request) {
 		s.cleanStopped()
 	}()
 	w.WriteHeader(204)
+}
+
+func (s *Server) handleVMPause(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	s.mu.RLock()
+	v, ok := s.vms[id]
+	s.mu.RUnlock()
+	if !ok {
+		apiErr(w, http.StatusNotFound, "VM not found")
+		return
+	}
+	if v.isPending() {
+		apiErr(w, http.StatusConflict, "VM is still starting")
+		return
+	}
+	if err := v.handle.Pause(); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleVMResume(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	s.mu.RLock()
+	v, ok := s.vms[id]
+	s.mu.RUnlock()
+	if !ok {
+		apiErr(w, http.StatusNotFound, "VM not found")
+		return
+	}
+	if v.isPending() {
+		apiErr(w, http.StatusConflict, "VM is still starting")
+		return
+	}
+	if err := v.handle.Resume(); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleVMClone snapshots the source VM and restores it as a new VM on the
+// same server in one HTTP call. The source stays running; the clone gets a
+// fresh ID. Callers can override tap/ip/gateway/mounts/network_mode to
+// differentiate the clone from its template.
+func (s *Server) handleVMClone(w http.ResponseWriter, r *http.Request) {
+	srcID := chi.URLParam(r, "id")
+	var req CloneRequest
+	if err := decodeJSONStrict(r, &req); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateNetworkMode(req.NetworkMode, req.StaticIP, req.Gateway); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	s.mu.RLock()
+	src, ok := s.vms[srcID]
+	s.mu.RUnlock()
+	if !ok {
+		apiErr(w, http.StatusNotFound, "VM not found")
+		return
+	}
+	if src.isPending() {
+		apiErr(w, http.StatusConflict, "source VM is still starting")
+		return
+	}
+
+	// Decide on the snapshot dir. If the caller did not provide one, use a
+	// scratch dir under /tmp and delete it after the clone returns.
+	snapDir := strings.TrimSpace(req.SnapshotDir)
+	retainSnap := snapDir != ""
+	if !retainSnap {
+		tmp, err := os.MkdirTemp("", "gocracker-clone-*")
+		if err != nil {
+			apiErr(w, http.StatusInternalServerError, fmt.Sprintf("create clone tmpdir: %v", err))
+			return
+		}
+		snapDir = tmp
+		defer os.RemoveAll(tmp)
+	} else {
+		if err := s.validateSnapshotPathForServer(snapDir, false); err != nil {
+			apiErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	srcCfg := src.handle.VMConfig()
+	// virtio-fs mounts cannot currently round-trip through snapshot +
+	// restore: the Linux driver's virtqueue index is frozen at snapshot
+	// time and the fresh virtiofsd on restore starts at index 0, which
+	// trips "requests.0:id 0 is not a head!" on first FUSE op. Until
+	// virtiofsd grows FUSE-session migration (or we teach the guest
+	// driver to fully re-init on a specific host signal), block clone of
+	// a VM with live virtio-fs mounts instead of shipping an endpoint
+	// that silently hangs the caller.
+	if len(srcCfg.SharedFS) > 0 {
+		apiErr(w, http.StatusBadRequest, "cloning a VM with active virtio-fs mounts is not supported: the Linux virtio-fs driver's queue state cannot be migrated to a fresh virtiofsd. Snapshot after umount, or use virtio-blk for per-sandbox data.")
+		return
+	}
+	if _, err := src.handle.TakeSnapshot(snapDir); err != nil {
+		apiErr(w, http.StatusInternalServerError, fmt.Sprintf("snapshot source: %v", err))
+		return
+	}
+	newID := fmt.Sprintf("gc-%d", time.Now().UnixNano()%100000)
+	// A clone running alongside its source cannot share the source's TAP —
+	// the TUN/TAP device is exclusive to one opener. When the caller did not
+	// supply tap_name/network_mode, mint a per-clone name derived from the
+	// new VM ID so restore does not hit TUNSETIFF EBUSY against the source.
+	tapName := strings.TrimSpace(req.TapName)
+	if tapName == "" && normalizeNetworkMode(req.NetworkMode) == "" && strings.TrimSpace(srcCfg.TapName) != "" {
+		tapName = cloneTapName(newID)
+	}
+	opts := container.RunOptions{
+		ID:           newID,
+		KernelPath:   srcCfg.KernelPath,
+		TapName:      tapName,
+		NetworkMode:  normalizeNetworkMode(req.NetworkMode),
+		SnapshotDir:  snapDir,
+		StaticIP:     req.StaticIP,
+		Gateway:      req.Gateway,
+		Mounts:       append([]container.Mount(nil), req.Mounts...),
+		ExecEnabled:  req.ExecEnabled,
+		Metadata:     cloneMetadata(req.Metadata),
+		JailerMode:   s.jailerMode,
+		JailerBinary: s.jailerBinary,
+		VMMBinary:    s.vmmBinary,
+		ChrootBase:   s.chrootBaseDir,
+		UID:          s.uid,
+		GID:          s.gid,
+		CacheDir:     s.cacheDir,
+		X86Boot:      s.defaultX86Boot,
+	}
+
+	result, err := s.runFn(opts)
+	if err != nil {
+		apiErr(w, http.StatusInternalServerError, fmt.Sprintf("restore clone: %v", err))
+		return
+	}
+	if err := s.attachComposeStackResources(newID, opts, result); err != nil {
+		result.VM.Stop()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = result.VM.WaitStopped(stopCtx)
+		stopCancel()
+		result.Close()
+		apiErr(w, http.StatusInternalServerError, fmt.Sprintf("attach compose network: %v", err))
+		return
+	}
+	entry := s.newVMEntry(result.VM, result.Close)
+	entry.metadata = mergeMetadata(entry.metadata, map[string]string{
+		"guest_ip":     result.GuestIP,
+		"gateway":      result.Gateway,
+		"tap_name":     result.TapName,
+		"disk_path":    result.DiskPath,
+		"network_mode": opts.NetworkMode,
+		"cloned_from":  srcID,
+	})
+	s.registerVMEntry(result.ID, entry)
+
+	// The clone inherits frozen network/FUSE state from the snapshot. For
+	// either to actually work, the guest has to be walked into the new
+	// world: eth0 re-IP'd onto the fresh tap/subnet, and each virtio-fs
+	// target re-mounted against the new virtiofsd. Both require exec; we
+	// fail the clone loudly if the caller skipped exec_enabled, so they
+	// don't end up with a silently-broken VM.
+	if opts.NetworkMode == container.NetworkModeAuto {
+		if !req.ExecEnabled {
+			_ = s.stopAndUnregisterVM(result.ID)
+			apiErr(w, http.StatusBadRequest, "clone with network_mode=auto requires exec_enabled=true (the clone needs to rewrite guest networking)")
+			return
+		}
+		if err := s.execGuestReIP(result.ID, result.GuestIP, result.Gateway); err != nil {
+			_ = s.stopAndUnregisterVM(result.ID)
+			apiErr(w, http.StatusInternalServerError, fmt.Sprintf("post-restore re-IP: %v", err))
+			return
+		}
+	}
+
+	_ = json.NewEncoder(w).Encode(RunResponse{
+		ID:                   result.ID,
+		State:                "running",
+		Message:              fmt.Sprintf("cloned from %s", srcID),
+		TapName:              result.TapName,
+		GuestIP:              result.GuestIP,
+		Gateway:              result.Gateway,
+		NetworkMode:          opts.NetworkMode,
+		RestoredFromSnapshot: true,
+	})
+}
+
+// execGuestReIP plumbs new IP+gateway into a freshly-restored guest by
+// running a small iproute2 script over the exec agent. Idempotent (uses
+// `ip addr replace` and `ip route replace`); a guest without `ip` is a
+// no-op. Designed for the sandbox-clone flow where the guest kernel was
+// frozen with the template's old IP and we want it to use the per-clone
+// allocation.
+func (s *Server) execGuestReIP(id, guestIP, gateway string) error {
+	if strings.TrimSpace(guestIP) == "" || strings.TrimSpace(gateway) == "" {
+		return nil
+	}
+	cidr := guestIP
+	if !strings.Contains(cidr, "/") {
+		cidr = guestIP + "/30"
+	}
+	script := fmt.Sprintf(`set -e
+if ! command -v ip >/dev/null 2>&1; then exit 0; fi
+ip link set eth0 down 2>/dev/null || true
+ip addr flush dev eth0 2>/dev/null || true
+ip addr add %s dev eth0
+ip link set eth0 up
+ip route replace default via %s
+`, cidr, gateway)
+	return s.execGuestScript(id, script)
+}
+
+
+// execGuestScript runs a shell script inside the guest synchronously via the
+// exec agent. Retries the vsock dial with exponential backoff up to 30 s:
+// immediately after a snapshot restore the guest exec agent's listener may
+// not have re-bound yet (the TRANSPORT_RESET event propagates on the first
+// kvm_run, the guest kernel sees ECONNRESET on its AF_VSOCK accept fd, and
+// the agent has to re-`listen` — all of which needs vCPU cycles). The
+// remaining RPC shares the outer deadline so slow dials don't collapse
+// the I/O budget to nothing.
+func (s *Server) execGuestScript(id, script string) error {
+	s.mu.RLock()
+	v, ok := s.vms[id]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("vm %s not registered", id)
+	}
+	if v.isPending() {
+		return fmt.Errorf("vm %s still pending", id)
+	}
+	dialer, ok := v.handle.(vmm.VsockDialer)
+	if !ok {
+		return fmt.Errorf("vm %s does not expose vsock", id)
+	}
+	cfg := v.handle.VMConfig()
+	if cfg.Exec == nil || !cfg.Exec.Enabled {
+		return fmt.Errorf("vm %s does not have exec enabled", id)
+	}
+	port := cfg.Exec.VsockPort
+	if port == 0 {
+		port = 1056
+	}
+
+	var conn net.Conn
+	var lastErr error
+	deadline := time.Now().Add(30 * time.Second)
+	backoff := 25 * time.Millisecond
+	const maxBackoff = 500 * time.Millisecond
+	for {
+		c, err := dialer.DialVsock(port)
+		if err == nil {
+			conn = c
+			break
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return fmt.Errorf("dial exec agent after %s: %w", 30*time.Second, lastErr)
+		}
+		time.Sleep(backoff)
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+	defer conn.Close()
+	// Cap the RPC deadline at what's left of the outer deadline, with a
+	// 2 s floor so a dial that consumed most of the 30 s still has room
+	// to write+read a short JSON blob.
+	rpcDeadline := deadline
+	if remaining := time.Until(deadline); remaining < 2*time.Second {
+		rpcDeadline = time.Now().Add(2 * time.Second)
+	}
+	if err := conn.SetDeadline(rpcDeadline); err != nil {
+		return err
+	}
+	req := guestexec.Request{
+		Mode:    guestexec.ModeExec,
+		Command: []string{"/bin/sh", "-lc", script},
+	}
+	if err := guestexec.Encode(conn, req); err != nil {
+		return fmt.Errorf("write exec request: %w", err)
+	}
+	var resp guestexec.Response
+	if err := guestexec.Decode(conn, &resp); err != nil {
+		return fmt.Errorf("read exec response: %w", err)
+	}
+	if !resp.OK {
+		return fmt.Errorf("exec failed: %s", resp.Error)
+	}
+	if resp.ExitCode != 0 {
+		return fmt.Errorf("exec exit=%d stdout=%q stderr=%q", resp.ExitCode, resp.Stdout, resp.Stderr)
+	}
+	return nil
+}
+
+// stopAndUnregisterVM tears down a VM that we partially set up and drops
+// it from the registry. Used when a post-restore step (re-IP) fails: we do
+// not leave half-broken VMs discoverable via GET /vms, and we free the API
+// ID so the caller can retry. Returns the WaitStopped error if the guest
+// refuses to halt within 10 s — the registry entry is still removed so a
+// retry is never blocked.
+func (s *Server) stopAndUnregisterVM(id string) error {
+	s.mu.Lock()
+	v, ok := s.vms[id]
+	if ok {
+		delete(s.vms, id)
+	}
+	s.mu.Unlock()
+	if !ok || v == nil {
+		return nil
+	}
+	if v.isPending() {
+		return nil
+	}
+	v.handle.Stop()
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err := v.handle.WaitStopped(stopCtx)
+	stopCancel()
+	if v.cleanup != nil {
+		v.cleanup()
+	}
+	return err
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {

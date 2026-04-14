@@ -34,6 +34,8 @@ type testHandle struct {
 
 func (h *testHandle) Start() error                               { return nil }
 func (h *testHandle) Stop()                                      { h.stopCalls++; h.state = vmm.StateStopped }
+func (h *testHandle) Pause() error                               { h.state = vmm.StatePaused; return nil }
+func (h *testHandle) Resume() error                              { h.state = vmm.StateRunning; return nil }
 func (h *testHandle) TakeSnapshot(string) (*vmm.Snapshot, error) { return nil, nil }
 func (h *testHandle) State() vmm.State                           { return h.state }
 func (h *testHandle) ID() string                                 { return h.cfg.ID }
@@ -2360,6 +2362,47 @@ func TestResolveInteractiveRunCommand_EmptyOverrides(t *testing.T) {
 	got := resolveInteractiveRunCommand(oci.ImageConfig{}, container.RunOptions{})
 	if got != nil {
 		t.Fatalf("expected nil for empty overrides, got %v", got)
+	}
+}
+
+// Regression: the interactive-exec path used to ignore the image's
+// Entrypoint/Cmd when no CLI override was passed, which made
+// `gocracker run --dockerfile ... --wait` drop into a login shell
+// instead of running the Dockerfile's CMD. Reproducer bug surfaced in
+// the manual smoke suite as shellform-fixture, user-fixture, and the
+// interactive-image cases hanging for the full test timeout because
+// the VM never exited on its own.
+func TestResolveInteractiveRunCommand_UsesImageCmdWhenNoOverride(t *testing.T) {
+	img := oci.ImageConfig{
+		Cmd: []string{"sh", "-c", "printf ok"},
+	}
+	got := resolveInteractiveRunCommand(img, container.RunOptions{})
+	want := []string{"sh", "-c", "printf ok"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
+func TestResolveInteractiveRunCommand_ImageEntrypointOnly(t *testing.T) {
+	img := oci.ImageConfig{
+		Entrypoint: []string{"/usr/local/bin/app"},
+	}
+	got := resolveInteractiveRunCommand(img, container.RunOptions{})
+	want := []string{"/usr/local/bin/app"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
+func TestResolveInteractiveRunCommand_ImageEntrypointPlusCmd(t *testing.T) {
+	img := oci.ImageConfig{
+		Entrypoint: []string{"python3"},
+		Cmd:        []string{"-c", "print(42)"},
+	}
+	got := resolveInteractiveRunCommand(img, container.RunOptions{})
+	want := []string{"python3", "-c", "print(42)"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected %v, got %v", want, got)
 	}
 }
 

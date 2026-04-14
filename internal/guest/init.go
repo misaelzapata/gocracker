@@ -286,10 +286,23 @@ func sockaddrToAddr(sa unix.Sockaddr) net.Addr {
 func handleExecAgentConn(conn net.Conn, spec runtimecfg.GuestSpec) {
 	defer conn.Close()
 
+	// No first-Decode read deadline: snapshot-capture now sends
+	// VIRTIO_VSOCK_EVENT_TRANSPORT_RESET before the memory dump (see
+	// QuiesceForSnapshot in internal/vsock), which causes the guest's
+	// vsock driver to close every socket BEFORE the snapshot is taken.
+	// There are no orphaned conns post-restore, so the previously-armed
+	// 2 s deadline was pure overhead — evaluated on every Decode yet
+	// never necessary. Removing it shaves ~5–10 ms off the first /exec
+	// after a restore.
 	var req guestexec.Request
 	if err := guestexec.Decode(conn, &req); err != nil {
 		klogf("exec agent decode failed: %v", err)
-		_ = guestexec.Encode(conn, guestexec.Response{Error: err.Error()})
+		// Do NOT try to Encode an error response here: if the Decode
+		// failure was caused by a virtio-vsock transport-reset (the
+		// host-initiated pre-snapshot quiesce), the conn is already dead
+		// and Encode would either error or — worse — block long enough
+		// to delay the next serveExecAgent dial, pushing the first
+		// post-restore /exec by several ms.
 		return
 	}
 	if err := req.Validate(); err != nil {
@@ -702,6 +715,14 @@ func runExecStream(conn net.Conn, req guestexec.Request, spec runtimecfg.GuestSp
 	}()
 	waitErr := cmd.Wait()
 	_ = ptmx.Close()
+	// Flush the guest rootfs before the host tears us down. In interactive
+	// mode the init stays in runExecIdleSupervisor forever, so the outer
+	// syscall.Sync() after the foreground process (see the supervised
+	// branch of Main) never fires. Without an explicit sync here, anything
+	// the user wrote during the session lives only in the page cache; the
+	// subsequent vm.Stop() from the host hard-kills the VM and those pages
+	// are lost. Cheap relative to the shell's own lifetime.
+	syscall.Sync()
 	// Shutdown the vsock connection to wake the blocked io.Copy(ptmx, conn)
 	// goroutine and trigger the kernel's VIRTIO_VSOCK_OP_SHUTDOWN immediately.
 	// Without this, conn.Close() (in the caller's defer) only decrements the
@@ -724,13 +745,35 @@ func runExecStream(conn net.Conn, req guestexec.Request, spec runtimecfg.GuestSp
 }
 
 func prepareExecCommand(command []string, spec runtimecfg.GuestSpec) (*exec.Cmd, error) {
-	env := ensureEnvDefault(buildEnv(spec.Env), "HOME", "/root")
+	env := buildEnv(spec.Env)
 	path := findShell()
 	args := []string{"-i"}
 	if len(command) > 0 {
 		path = command[0]
 		args = append([]string{}, command[1:]...)
 	}
+	// Resolve spec.User the same way runForeground does so the exec'd
+	// process actually honours the Dockerfile USER directive. Without this,
+	// interactive `gocracker run` against an image that declares
+	// `USER 1000:1000` still runs the command as root — the image's
+	// metadata was read but silently discarded on the exec path.
+	var credential *syscall.Credential
+	defaultHome := "/root"
+	if spec.User != "" {
+		resolvedUser, err := usercfg.Resolve("/", spec.User)
+		if err != nil {
+			return nil, fmt.Errorf("resolve user %q: %w", spec.User, err)
+		}
+		credential = &syscall.Credential{
+			Uid:    resolvedUser.UID,
+			Gid:    resolvedUser.GID,
+			Groups: resolvedUser.Groups,
+		}
+		if resolvedUser.Home != "" {
+			defaultHome = resolvedUser.Home
+		}
+	}
+	env = ensureEnvDefault(env, "HOME", defaultHome)
 	resolvedPath, err := guestexec.ResolveExecutable(path, env)
 	if err != nil {
 		return nil, err
@@ -740,7 +783,7 @@ func prepareExecCommand(command []string, spec runtimecfg.GuestSpec) (*exec.Cmd,
 	if spec.WorkDir != "" {
 		cmd.Dir = spec.WorkDir
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Credential: credential}
 	return cmd, nil
 }
 
@@ -1452,18 +1495,34 @@ func mountRootDisk(cmdline map[string]string) string {
 		klogf("root device %q not present: %v", rootDev, err)
 		return ""
 	}
-	// Mount at /mnt; stage-0 will switch_root into it after moving the runtime
-	// mounts, which keeps the final workload as PID 1 instead of leaving a
-	// long-lived wrapper in the initramfs.
+	// Rootfs overlay: by default the block device mounts read-only as the
+	// LOWER layer of an overlayfs, and all guest writes land in a per-VM
+	// tmpfs UPPER layer. This matches Docker's "each run gets a fresh
+	// writable layer" model, keeps the host-side cached template pristine
+	// across reboots, and lets copyDiskImage use the hardlink fast-path
+	// (pkg/container/container.go) for zero-copy boot.
+	//
+	// Pass gc.rootfs_overlay=off (CLI: --rootfs-persistent) when writes
+	// need to survive VM shutdown, e.g. for image-building or debugfs-based
+	// disk introspection. That path copies the template to a per-VM file
+	// and mounts it directly rw.
 	os.MkdirAll("/mnt", 0755)
-	flags := uintptr(0)
-	if cmdline["rw"] == "" {
-		flags |= syscall.MS_RDONLY
+	overlayDisabled := cmdline["gc.rootfs_overlay"] == "off"
+
+	// The legacy flags apply to both paths: gc.fs_sync still forces sync writes
+	// on the lower mount, and the cmdline "rw" historically opted the rootfs
+	// into writable mode. With overlay on, "rw" is effectively always implied
+	// (the overlay itself is writable) but we still honour gc.fs_sync for the
+	// rare case where someone wants synchronous writes to punch through.
+	lowerFlags := uintptr(syscall.MS_RDONLY)
+	if overlayDisabled && cmdline["rw"] != "" {
+		lowerFlags &^= syscall.MS_RDONLY
 	}
 	if cmdline["gc.fs_sync"] == "1" {
-		flags |= syscall.MS_SYNCHRONOUS
+		lowerFlags |= syscall.MS_SYNCHRONOUS
 	}
-	klogf("about to mount %q on /mnt", rootDev)
+
+	klogf("about to mount %q (overlay=%v)", rootDev, !overlayDisabled)
 	stopMountLog := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
@@ -1477,14 +1536,64 @@ func mountRootDisk(cmdline map[string]string) string {
 			}
 		}
 	}()
-	if err := syscall.Mount(rootDev, "/mnt", fstype, flags, ""); err != nil {
+
+	if overlayDisabled {
+		if err := syscall.Mount(rootDev, "/mnt", fstype, lowerFlags, ""); err != nil {
+			close(stopMountLog)
+			klogf("mount %q on /mnt failed: %v", rootDev, err)
+			fmt.Fprintf(os.Stderr, "[init] mount %s on /mnt: %v\n", rootDev, err)
+			return ""
+		}
 		close(stopMountLog)
-		klogf("mount %q on /mnt failed: %v", rootDev, err)
-		fmt.Fprintf(os.Stderr, "[init] mount %s on /mnt: %v\n", rootDev, err)
+		klogf("mounted %q on /mnt (direct, no overlay)", rootDev)
+		return "/mnt"
+	}
+
+	lowerDir := "/rootfs-lower"
+	scratchDir := "/rootfs-overlay"
+	upperDir := scratchDir + "/upper"
+	workDir := scratchDir + "/work"
+	for _, d := range []string{lowerDir, scratchDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			close(stopMountLog)
+			klogf("mkdir %q failed: %v", d, err)
+			fmt.Fprintf(os.Stderr, "[init] mkdir %s: %v\n", d, err)
+			return ""
+		}
+	}
+	if err := syscall.Mount(rootDev, lowerDir, fstype, lowerFlags, ""); err != nil {
+		close(stopMountLog)
+		klogf("mount %q on %q failed: %v", rootDev, lowerDir, err)
+		fmt.Fprintf(os.Stderr, "[init] mount %s on %s: %v\n", rootDev, lowerDir, err)
+		return ""
+	}
+	if err := syscall.Mount("tmpfs", scratchDir, "tmpfs", 0, "mode=0755"); err != nil {
+		close(stopMountLog)
+		klogf("mount tmpfs on %q failed: %v", scratchDir, err)
+		fmt.Fprintf(os.Stderr, "[init] mount tmpfs %s: %v\n", scratchDir, err)
+		return ""
+	}
+	if err := os.MkdirAll(upperDir, 0755); err != nil {
+		close(stopMountLog)
+		klogf("mkdir %q failed: %v", upperDir, err)
+		fmt.Fprintf(os.Stderr, "[init] mkdir %s: %v\n", upperDir, err)
+		return ""
+	}
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		close(stopMountLog)
+		klogf("mkdir %q failed: %v", workDir, err)
+		fmt.Fprintf(os.Stderr, "[init] mkdir %s: %v\n", workDir, err)
+		return ""
+	}
+	overlayOpts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerDir, upperDir, workDir)
+	if err := syscall.Mount("overlay", "/mnt", "overlay", 0, overlayOpts); err != nil {
+		close(stopMountLog)
+		klogf("mount overlay on /mnt failed: %v", err)
+		fmt.Fprintf(os.Stderr, "[init] mount overlay: %v\n", err)
 		return ""
 	}
 	close(stopMountLog)
-	klogf("mounted %q on /mnt", rootDev)
+	klogf("mounted overlay rootfs on /mnt (lower=%s ro, upper=tmpfs)", rootDev)
 	return "/mnt"
 }
 

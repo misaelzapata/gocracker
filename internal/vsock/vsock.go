@@ -238,7 +238,18 @@ func (d *Device) handleData(hdr *pktHdr, chain []virtio.Desc, q *virtio.Queue) {
 	d.mu.Lock()
 	c := d.conns[connKey{guestPort: hdr.SrcPort, hostPort: hdr.DstPort}]
 	d.mu.Unlock()
-	if c == nil || hdr.Len == 0 {
+	if c == nil {
+		// Unknown connection — mirror Firecracker and reply with RST so the
+		// guest drops the stale socket instead of silently blocking. This
+		// matters after snapshot/restore: the restored host device has a
+		// fresh (empty) conns map, so any packet arriving for a pre-snapshot
+		// conn is "unknown" and the guest needs an explicit kill signal to
+		// reach `for { dial; handleExecAgentConn }` and redial the new
+		// broker. Without this RST the guest sits in Read forever.
+		d.sendReset(hdr)
+		return
+	}
+	if hdr.Len == 0 {
 		return
 	}
 	// Collect data from subsequent descriptors
@@ -297,6 +308,9 @@ func (d *Device) sendPkt(srcCID, dstCID uint64, srcPort, dstPort uint32, op uint
 	hdrBytes := marshalHdr(hdr)
 	payload := append(hdrBytes, data...)
 
+	if d.Transport == nil {
+		return
+	}
 	rxQ := d.Transport.Queue(0)
 	if rxQ == nil || !rxQ.Ready {
 		return
@@ -399,6 +413,62 @@ func (d *Device) Dial(port uint32) (net.Conn, error) {
 		hostConn.Close()
 		deviceConn.Close()
 		return nil, fmt.Errorf("vsock dial timeout for guest port %d", port)
+	}
+}
+
+// QuiesceForSnapshot tells the guest's vsock driver that every open socket
+// must be dropped, by emitting a VIRTIO_VSOCK_EVENT_TRANSPORT_RESET event on
+// the device's event queue (virtqueue index 2). This is Firecracker's
+// documented snapshot contract (docs/snapshotting/snapshot-support.md) and
+// is implemented in their vsock device's `prepare_save` as
+// `send_transport_reset_event()`:
+//
+//	The Linux virtio-vsock driver handles this event by calling
+//	virtio_vsock_reset_sock() on every active AF_VSOCK socket — much more
+//	aggressive (and correct) than sending opShutdown per connection, which
+//	only affects the sockets the host-side device still knows about.
+//
+// Must be called while the vCPUs are still running (so the guest can drain
+// the event queue and actually process the reset) but after the snapshot
+// machinery has committed to pausing. Idempotent: the event queue processes
+// at most one event per available descriptor, so repeated calls just queue
+// more resets — harmless but wasteful.
+func (d *Device) QuiesceForSnapshot() {
+	if d.Transport == nil {
+		return
+	}
+	eventQ := d.Transport.Queue(2)
+	if eventQ == nil || !eventQ.Ready {
+		return
+	}
+	event := make([]byte, 4)
+	binary.LittleEndian.PutUint32(event, 0) // VIRTIO_VSOCK_EVENT_TRANSPORT_RESET = 0
+	_ = eventQ.IterAvail(func(head uint16) {
+		chain, err := eventQ.WalkChain(head)
+		if err != nil || len(chain) == 0 {
+			_ = eventQ.PushUsed(uint32(head), 0)
+			return
+		}
+		if err := eventQ.GuestWrite(chain[0].Addr, event); err != nil {
+			_ = eventQ.PushUsed(uint32(head), 0)
+			return
+		}
+		_ = eventQ.PushUsed(uint32(head), 4)
+	})
+	d.Transport.SignalIRQ(true)
+	// Also drop our server-side state for the reset conns so subsequent
+	// packets arriving for them get opRst (via handleData's unknown-conn
+	// path). This releases the host-side pipes so their rxPumps unblock
+	// and the exec broker's hostConn drains.
+	d.mu.Lock()
+	drained := make([]*Connection, 0, len(d.conns))
+	for _, c := range d.conns {
+		drained = append(drained, c)
+	}
+	d.conns = map[connKey]*Connection{}
+	d.mu.Unlock()
+	for _, c := range drained {
+		c.conn.Close()
 	}
 }
 

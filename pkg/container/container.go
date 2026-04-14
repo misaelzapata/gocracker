@@ -32,6 +32,7 @@ import (
 	"github.com/gocracker/gocracker/internal/runtimecfg"
 	"github.com/gocracker/gocracker/internal/worker"
 	"github.com/gocracker/gocracker/pkg/vmm"
+	"github.com/gocracker/gocracker/pkg/warmcache"
 )
 
 // RunOptions describes how to run a container as a microVM.
@@ -40,9 +41,10 @@ type RunOptions struct {
 	Image      string // OCI ref e.g. "ubuntu:22.04"
 	Dockerfile string // explicit path to a Dockerfile
 	Context    string // build context dir (used with Dockerfile)
-	RepoURL    string // git remote URL or local path — Dockerfile auto-detected
-	RepoRef    string // branch/tag/commit (default: repo default branch)
-	RepoSubdir string // subdir inside repo containing the Dockerfile
+	RepoURL        string // git remote URL or local path — Dockerfile auto-detected
+	RepoRef        string // branch/tag/commit (default: repo default branch)
+	RepoSubdir     string // subdir inside repo containing the Dockerfile
+	RepoDockerfile string // explicit Dockerfile path relative to RepoSubdir (skips name-based discovery); rescues non-canonical filenames like Dockerfile-envoy
 
 	// VM
 	MemMB       uint64
@@ -112,6 +114,13 @@ type RunOptions struct {
 	ChrootBase   string
 	UID          int
 	GID          int
+
+	// RootfsPersistent forces the guest to mount the rootfs read-write
+	// directly (no tmpfs overlay). Writes land on the per-VM disk file and
+	// survive VM shutdown, at the cost of a slower boot (copyDiskImage has
+	// to reflink/copy instead of hardlinking the template). Leave false for
+	// Docker-style ephemeral writes and fast boot.
+	RootfsPersistent bool
 }
 
 // RunResult is returned after a VM is started.
@@ -263,10 +272,15 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto {
 		return nil, fmt.Errorf("invalid network mode %q", opts.NetworkMode)
 	}
+	// network_mode=auto allocates a fresh tap + /30 + guest IP + gateway.
+	// On cold boot this drives the kernel cmdline so the guest comes up with
+	// the right address. On restore the guest kernel is already frozen with
+	// the template's IP, but we still allocate a fresh subnet here for two
+	// reasons: (1) sandboxes need their own tap/subnet to coexist with the
+	// template + sibling clones without colliding, (2) the API layer issues
+	// a post-restore re-IP exec when ExecEnabled to plumb the new addresses
+	// into the running guest.
 	if opts.NetworkMode == NetworkModeAuto {
-		if opts.SnapshotDir != "" {
-			return nil, fmt.Errorf("--net auto is not supported with snapshot restore yet")
-		}
 		var err error
 		autoNet, err = hostnet.NewAuto(opts.ID, opts.TapName)
 		if err != nil {
@@ -282,21 +296,62 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		if len(opts.Drives) > 0 {
 			return nil, fmt.Errorf("snapshot restore is not supported with additional block devices yet")
 		}
+		if err := validateRestoreMounts(opts.Mounts); err != nil {
+			return nil, err
+		}
 		if _, err := os.Stat(opts.SnapshotDir + "/snapshot.json"); err == nil {
 			gclog.Container.Info("restoring from snapshot", "dir", opts.SnapshotDir)
 			t0 := time.Now()
+			// OverrideID ensures the restored VM gets its caller-visible
+			// ID (opts.ID) instead of inheriting the snapshot's cfg.ID.
+			// Without this, the restored VM's internal cfg.ID collides
+			// with the original VM's cfg.ID (both derived from the same
+			// snapshot source). Although the API server tracks VMs by
+			// an external key, logs and any cfg.ID-keyed lookup get
+			// confused, and it becomes harder to distinguish original
+			// from restored in instrumentation.
 			vm, err := vmm.RestoreFromSnapshotWithOptions(opts.SnapshotDir, vmm.RestoreOptions{
-				ConsoleIn:       opts.ConsoleIn,
-				ConsoleOut:      opts.ConsoleOut,
-				OverrideVCPUs:   opts.CPUs,
-				OverrideX86Boot: opts.X86Boot,
+				ConsoleIn:        opts.ConsoleIn,
+				ConsoleOut:       opts.ConsoleOut,
+				OverrideVCPUs:    opts.CPUs,
+				OverrideID:       opts.ID,
+				OverrideTap:      opts.TapName,
+				OverrideX86Boot:  opts.X86Boot,
+				SharedFSRebinds:  buildSharedFSRebinds(opts.Mounts),
 			})
 			if err == nil {
+				// Activate the freshly-allocated host-side tap (assigns the
+				// gateway IP, brings link up, installs NAT) before we resume
+				// the guest. Without this, packets from the restored guest
+				// hit a tap with no host IP and no NAT.
+				if autoNet != nil {
+					if actErr := autoNet.Activate(); actErr != nil {
+						vm.Stop()
+						autoNet.Close()
+						return nil, fmt.Errorf("activate auto network on restore: %w", actErr)
+					}
+				}
 				if err := vm.Start(); err != nil {
 					return nil, err
 				}
 				gclog.Container.Info("restored", "duration", time.Since(t0).Round(time.Millisecond))
-				return &RunResult{VM: vm, ID: opts.ID}, nil
+				tap := opts.TapName
+				if tap == "" {
+					tap = vm.VMConfig().TapName
+				}
+				result := &RunResult{
+					VM:      vm,
+					ID:      opts.ID,
+					TapName: tap,
+					GuestIP: trimCIDR(opts.StaticIP),
+					Gateway: opts.Gateway,
+					cleanup: func() {
+						if autoNet != nil {
+							autoNet.Close()
+						}
+					},
+				}
+				return result, nil
 			}
 			gclog.Container.Warn("snapshot restore failed, building fresh", "error", err)
 		}
@@ -408,7 +463,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	// ---- Assemble kernel cmdline ----
 	cmdline := buildCmdlineWithPlan(opts, sharedFS, len(kernelModules) > 0)
 
-	bootDiskPath, cleanupRuntimeDisk, err := prepareBootDisk(workDir, diskPath, opts.ID)
+	bootDiskPath, cleanupRuntimeDisk, err := prepareBootDisk(workDir, diskPath, opts.ID, !opts.RootfsPersistent)
 	if err != nil {
 		return nil, fmt.Errorf("prepare boot disk: %w", err)
 	}
@@ -566,10 +621,10 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto {
 		return nil, fmt.Errorf("invalid network mode %q", opts.NetworkMode)
 	}
-	if opts.NetworkMode == NetworkModeAuto {
-		if opts.SnapshotDir != "" {
-			return nil, fmt.Errorf("--net auto is not supported with snapshot restore yet")
-		}
+	// See runLocal: auto-allocation only fires on cold boot; restore keeps
+	// the snapshot's IP plan to avoid lying to the caller and breaking the
+	// frozen guest network.
+	if opts.NetworkMode == NetworkModeAuto && opts.SnapshotDir == "" {
 		var err error
 		autoNet, err = hostnet.NewAuto(opts.ID, opts.TapName)
 		if err != nil {
@@ -580,9 +635,34 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		opts.Gateway = autoNet.GatewayIP()
 	}
 
+	// Opportunistic warm-cache lookup. When GOCRACKER_WARM_CACHE=1 is set and
+	// the caller did not already pass an explicit --snapshot dir, consult the
+	// per-image snapshot cache in XDG_CACHE_HOME. A hit rewrites opts.SnapshotDir
+	// so the existing fast-restore branch below picks it up; a miss leaves the
+	// options untouched and we fall through to cold boot.
+	//
+	// Auto-capture on cold boot is NOT wired yet — users must populate the
+	// cache manually with `gocracker snapshot` + rename into Dir(root, key).
+	// That's the intentional MVP: ship the read side so snapshot-resume
+	// becomes the default when a cache entry exists, and add auto-capture in
+	// a follow-up once guest-ready timing is sorted.
+	if opts.SnapshotDir == "" && warmCacheEnabled() && warmCacheInputsReady(opts) {
+		if key, ok := computeWarmCacheKey(opts); ok {
+			if dir, hit := warmcache.Lookup(warmcache.DefaultRoot(), key); hit {
+				gclog.Container.Info("warm-cache hit", "key", key[:12], "dir", dir)
+				opts.SnapshotDir = dir
+			} else {
+				gclog.Container.Debug("warm-cache miss", "key", key[:12])
+			}
+		}
+	}
+
 	if opts.SnapshotDir != "" {
 		if len(opts.Drives) > 0 {
 			return nil, fmt.Errorf("snapshot restore is not supported with additional block devices yet")
+		}
+		if err := validateRestoreMounts(opts.Mounts); err != nil {
+			return nil, err
 		}
 		if _, err := os.Stat(filepath.Join(opts.SnapshotDir, "snapshot.json")); err == nil {
 			gclog.Container.Info("restoring from snapshot via worker", "dir", opts.SnapshotDir)
@@ -592,6 +672,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 				OverrideX86Boot: opts.X86Boot,
 				ConsoleIn:       opts.ConsoleIn,
 				ConsoleOut:      opts.ConsoleOut,
+				SharedFSRebinds: buildSharedFSRebinds(opts.Mounts),
 			}, worker.VMMOptions{
 				JailerBinary: opts.JailerBinary,
 				VMMBinary:    opts.VMMBinary,
@@ -600,10 +681,14 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 				ChrootBase:   opts.ChrootBase,
 			})
 			if err == nil {
+				tap := opts.TapName
+				if tap == "" {
+					tap = handle.VMConfig().TapName
+				}
 				return &RunResult{
 					VM:           handle,
 					ID:           handle.ID(),
-					TapName:      opts.TapName,
+					TapName:      tap,
 					GuestIP:      trimCIDR(opts.StaticIP),
 					Gateway:      opts.Gateway,
 					WorkerSocket: workerSocket(handle),
@@ -718,7 +803,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 	}
 	cmdline := buildCmdlineWithPlan(opts, sharedFS, len(kernelModules) > 0)
 
-	bootDiskPath, cleanupRuntimeDisk, err := prepareBootDisk(workDir, diskPath, opts.ID)
+	bootDiskPath, cleanupRuntimeDisk, err := prepareBootDisk(workDir, diskPath, opts.ID, !opts.RootfsPersistent)
 	if err != nil {
 		return nil, fmt.Errorf("prepare boot disk: %w", err)
 	}
@@ -1006,9 +1091,10 @@ type resolvedRepo struct {
 
 func resolveRepo(opts RunOptions, workDir string) (*resolvedRepo, error) {
 	result, err := repo.Resolve(repo.Source{
-		URL:    opts.RepoURL,
-		Ref:    opts.RepoRef,
-		Subdir: opts.RepoSubdir,
+		URL:        opts.RepoURL,
+		Ref:        opts.RepoRef,
+		Subdir:     opts.RepoSubdir,
+		Dockerfile: opts.RepoDockerfile,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("repo: %w", err)
@@ -1251,7 +1337,7 @@ func inspectCachedRunArtifacts(diskPath, configPath string) (oci.ImageConfig, bo
 	return oci.ImageConfig{}, false, fmt.Sprintf("image config unreadable: %v", err), nil
 }
 
-func prepareBootDisk(workDir, templateDiskPath, id string) (string, func(), error) {
+func prepareBootDisk(workDir, templateDiskPath, id string, overlay bool) (string, func(), error) {
 	runtimeDir := filepath.Join(workDir, "runs", sanitizeRuntimePathComponent(id))
 	if err := os.RemoveAll(runtimeDir); err != nil {
 		return "", nil, err
@@ -1260,7 +1346,7 @@ func prepareBootDisk(workDir, templateDiskPath, id string) (string, func(), erro
 		return "", nil, err
 	}
 	runtimeDiskPath := filepath.Join(runtimeDir, filepath.Base(templateDiskPath))
-	if err := copyDiskImage(templateDiskPath, runtimeDiskPath); err != nil {
+	if err := copyDiskImage(templateDiskPath, runtimeDiskPath, overlay); err != nil {
 		return "", nil, err
 	}
 	return runtimeDiskPath, delayedRemoveAll(runtimeDir, runtimeDiskRetention), nil
@@ -1292,14 +1378,27 @@ func sanitizeRuntimePathComponent(value string) string {
 	return sanitized
 }
 
-// copyDiskImage copies src to dst: hardlink → reflink → full copy.
-func copyDiskImage(src, dst string) error {
-	// Try hardlink first (same filesystem, instant).
-	if err := os.Link(src, dst); err == nil {
-		return nil
+// copyDiskImage provisions a per-VM disk at dst from the cached template at
+// src: hardlink (if safe) → reflink → full copy.
+//
+// Hardlinks share the inode with src. When the guest mounts the block device
+// read-write, a hardlinked runs/ file silently bleeds writes back into the
+// cached template and contaminates every future VM spawned from it — stale
+// /etc/shadow, lockfiles, leftover /marker files, etc. Hardlinks ARE safe
+// when the guest mounts the rootfs read-only and layers tmpfs on top (the
+// `--rootfs-overlay` opt-in path — see mountRootDisk() in internal/guest/init.go).
+// Callers signal that safety by passing overlay=true.
+func copyDiskImage(src, dst string, overlay bool) error {
+	if overlay {
+		// Hardlink is safe because the guest will never write to the
+		// backing file — writes go to a tmpfs upper layer.
+		if err := os.Link(src, dst); err == nil {
+			return nil
+		}
 	}
-
-	// Try reflink (CoW clone). FICLONE = 0x40049409 on Linux.
+	// Try reflink (CoW clone). FICLONE = 0x40049409 on Linux. Safe in both
+	// modes because it produces independent inodes that only share data
+	// pages until first write.
 	if err := tryReflink(src, dst); err == nil {
 		return nil
 	}
@@ -1433,6 +1532,12 @@ func buildCmdlineWithPlan(opts RunOptions, sharedFS sharedFSPlan, allowKernelMod
 	}
 	if hasMaterializedMounts(opts.Mounts) {
 		parts = append(parts, "gc.fs_sync=1")
+	}
+	if opts.RootfsPersistent {
+		// Tells guest init to mount /dev/vda read-write directly, no
+		// overlay. Writes persist on the per-VM disk file after VM
+		// shutdown, at the cost of a slower boot (see prepareBootDisk).
+		parts = append(parts, "gc.rootfs_overlay=off")
 	}
 
 	// Working dir
@@ -1673,6 +1778,7 @@ func resolveSharedFSMounts(mounts []Mount) sharedFSPlan {
 			plan.Exports = append(plan.Exports, vmm.SharedFSConfig{
 				Source: source,
 				Tag:    tag,
+				Target: mount.Target,
 			})
 		}
 		plan.Mounts = append(plan.Mounts, runtimecfg.SharedFSMount{
@@ -1738,4 +1844,38 @@ func firstNonNegative(values ...int) int {
 		}
 	}
 	return 0
+}
+
+// validateRestoreMounts enforces the sandbox-template contract: restore
+// cannot materialize rootfs content (that would defeat the fast-path), so
+// only virtiofs mounts are accepted. Materialized mounts return a clear
+// error the API layer surfaces as 400.
+func validateRestoreMounts(mounts []Mount) error {
+	for _, m := range mounts {
+		if m.Backend != MountBackendVirtioFS {
+			return fmt.Errorf("snapshot restore accepts only virtiofs mounts; got backend=%q for target %q", m.Backend, m.Target)
+		}
+	}
+	return nil
+}
+
+// buildSharedFSRebinds converts the API-level virtiofs mounts into the
+// tag-agnostic rebind records the vmm restore path consumes. The Target
+// string is what the template mounted the virtiofs tag at; the vmm layer
+// matches rebinds against snap.Config.SharedFS[i].Target.
+func buildSharedFSRebinds(mounts []Mount) []vmm.SharedFSRebind {
+	if len(mounts) == 0 {
+		return nil
+	}
+	rebinds := make([]vmm.SharedFSRebind, 0, len(mounts))
+	for _, m := range mounts {
+		if m.Backend != MountBackendVirtioFS {
+			continue
+		}
+		rebinds = append(rebinds, vmm.SharedFSRebind{
+			Target: m.Target,
+			Source: filepath.Clean(m.Source),
+		})
+	}
+	return rebinds
 }

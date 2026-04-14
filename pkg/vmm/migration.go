@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/gocracker/gocracker/internal/uart"
 	"github.com/gocracker/gocracker/internal/virtio"
 )
@@ -113,6 +115,15 @@ func FinalizeMigrationBundle(vm *VM, dir string) (*Snapshot, *MigrationPatchSet,
 	wasRunning := false
 	switch vm.State() {
 	case StateRunning:
+		// Same contract as TakeSnapshotWithOptions: tell the guest driver
+		// to reset every open AF_VSOCK connection BEFORE pausing, so the
+		// restored process on the destination has no pre-migration
+		// orphan conns to deal with. Without this the post-migrate exec
+		// sits waiting on a pipe whose host half disappeared when the
+		// source process exited.
+		if vm.vsockDev != nil {
+			vm.vsockDev.QuiesceForSnapshot()
+		}
 		if err := vm.Pause(); err != nil {
 			return nil, nil, err
 		}
@@ -261,8 +272,29 @@ func rewriteSnapshotBundleWithConfig(dir string, snap Snapshot, cfg Config) (*Sn
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(metaFile, data, 0644); err != nil {
+	// Write with explicit fsync on the file and the parent dir: a crash
+	// between WriteFile and the next sync point otherwise leaves a half
+	// -written snapshot.json that a later restore happily picks up and
+	// feeds to the kernel. Crashing loudly here is strictly better than
+	// booting a corrupt template later.
+	f, err := os.OpenFile(metaFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
 		return nil, err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	if dirF, err := os.Open(dir); err == nil {
+		_ = dirF.Sync()
+		_ = dirF.Close()
 	}
 	return &snap, nil
 }
@@ -548,6 +580,17 @@ func copyFile(dst, src string) error {
 		return err
 	}
 	defer out.Close()
+
+	// Try FICLONE first: on btrfs/xfs/overlayfs this creates a reflink —
+	// a copy-on-write clone that completes in microseconds instead of
+	// streaming every byte. Matters a lot when snapshotting a VM with a
+	// multi-GB disk.ext4: 1 GB io.Copy is ~1 s on NVMe; FICLONE is ~200 µs.
+	// Falls back to io.Copy if the filesystem doesn't support it (ext4,
+	// tmpfs, cross-fs copies).
+	if err := unix.IoctlFileClone(int(out.Fd()), int(in.Fd())); err == nil {
+		return out.Sync()
+	}
+
 	if _, err := io.Copy(out, in); err != nil {
 		return err
 	}

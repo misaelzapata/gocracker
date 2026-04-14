@@ -126,6 +126,57 @@ Flags:
 | `POST /migrations/finalize` | Pause, capture delta on source |
 | `POST /migrations/abort` | Cancel and resume source VM |
 
+## Sandbox template flow
+
+For warm-pool / sandbox-per-template patterns, a second `gocracker serve`
+is not needed — the `POST /vms/{id}/clone` endpoint snapshots a running
+source and restores it as a new VM on the same server in one atomic call.
+
+```
+  boot template (run)  →  install tools (exec)  →  clone per sandbox
+    ▲                                                    │
+    └─── source keeps running ───────────────────────────┘
+```
+
+Typical sequence:
+
+1. Boot a template VM with `network_mode=auto` and `exec_enabled=true`.
+2. Install the toolbox (`apk add …`, `pip install …`, stage binaries). The
+   disk is ext4; changes stay in the VM until clone.
+3. Optionally `POST /vms/{id}/pause` while you wait for a clone request;
+   pause freezes vCPUs without tearing down state.
+4. For each sandbox: `POST /vms/{templateID}/clone` with per-instance
+   overrides (`tap_name`, `mounts` for virtiofs toolbox injection,
+   `metadata`). The clone:
+   - Gets a fresh ID and its own tap (`tclone-<N>` auto-minted when the
+     caller does not override) so source and clone run concurrently.
+   - Inherits the source's disk via snapshot restore — no re-install needed.
+   - Reports `restored_from_snapshot=true`; metadata `cloned_from` points
+     back at the source.
+5. Stop the source when you're done provisioning or keep it as a live
+   template for future clones.
+
+### Virtiofs toolbox injection on clone
+
+When the template boots with a `backend=virtiofs` mount pointing at a
+placeholder directory, `POST /vms/{id}/clone` accepts `mounts` with the same
+guest `target` and a different host `source`. The server rewrites the
+snapshot's shared-FS export by matching guest target, keeps the tag (so the
+guest kernel's frozen mount continues to find its device), and spawns a
+fresh virtiofsd against the new source.
+
+**Convention**: the template must snapshot with a matching virtiofs mount
+point. Restoring with a target the template never mounted returns 400
+(`snapshot has no virtiofs slot for target …`).
+
+**Known limitation**: the snapshot restore fast path uses MAP_PRIVATE COW on
+the memory file, which is incompatible with virtio-fs's memfd requirement.
+The rebind plumbing + validation is in place (covered by unit tests in
+`pkg/vmm/sharedfs_rebind_test.go`), but end-to-end guest I/O through the
+rebound export needs the restore path to materialize guest memory in a memfd
+when any virtio-fs device is present. Tracked as a follow-up gap separate
+from the rest of the sandbox API.
+
 ## Limitations
 
 - Same architecture only (x86-64 to x86-64, or ARM64 to ARM64).
@@ -133,6 +184,10 @@ Flags:
   correctly on all workloads.
 - The destination host must have the same (or newer) kernel and KVM capabilities.
 - Snapshot bundles include the full disk image; large disks produce large bundles.
+- Virtio-fs devices cannot be active through the MAP_PRIVATE restore path;
+  snapshots taken while a virtiofs export was mounted cannot be restored
+  today. Take the snapshot without virtiofs or materialize the mount if the
+  template needs to survive restore.
 
 ---
 

@@ -155,6 +155,13 @@ type Config struct {
 	MACAddr          net.HardwareAddr
 	Metadata         map[string]string  `json:"metadata,omitempty"`
 	NetRateLimiter   *RateLimiterConfig `json:"net_rate_limiter,omitempty"`
+	// RxNetRateLimiter / TxNetRateLimiter allow separate host→guest and
+	// guest→host shaping, matching Firecracker's `rx_rate_limiter` and
+	// `tx_rate_limiter` fields. If both are nil, NetRateLimiter (if set)
+	// applies to both directions. If either is set, it overrides the
+	// generic field for that direction.
+	RxNetRateLimiter *RateLimiterConfig `json:"rx_net_rate_limiter,omitempty"`
+	TxNetRateLimiter *RateLimiterConfig `json:"tx_net_rate_limiter,omitempty"`
 	BlockRateLimiter *RateLimiterConfig `json:"block_rate_limiter,omitempty"`
 	RNGRateLimiter   *RateLimiterConfig `json:"rng_rate_limiter,omitempty"`
 	VCPUs            int
@@ -182,6 +189,11 @@ type ExecConfig struct {
 type SharedFSConfig struct {
 	Source string `json:"source"`
 	Tag    string `json:"tag"`
+	// Target is the guest-side mount point the template configured for this
+	// tag. Populated by the container runtime so the snapshot-restore path
+	// can re-identify the slot when a caller supplies SharedFSRebinds by
+	// guest Target (the caller doesn't know the server-generated Tag).
+	Target string `json:"target,omitempty"`
 	// SocketPath, when set, points to an already-listening virtiofsd unix socket.
 	// In that case the VM does not spawn virtiofsd; it connects to this socket
 	// instead. Used by the worker/jailer path so virtiofsd can run on the host
@@ -281,6 +293,17 @@ type VM struct {
 	events      *EventLog
 	pausedVCPUs map[int]struct{}
 	vcpuTIDs    map[int]int
+
+	// restoring is set while setupDevices runs as part of snapshot restore.
+	// It lets per-device constructors take shortcuts that are only safe when
+	// the guest already negotiated virtio features (e.g. skipping the ~3ms
+	// FALLOC_FL_PUNCH_HOLE probe on the block disk image). Cleared once the
+	// restore returns to the cold-boot device construction rules.
+	restoring bool
+	// restoredDiscard[driveID] captures the discard feature flag from the
+	// snapshot so NewBlockDeviceWithOptions can bypass the probe and still
+	// advertise the right thing. Populated alongside `restoring = true`.
+	restoredDiscard map[string]bool
 }
 
 // New creates a VM from config. Loads kernel, sets up devices and CPU.
@@ -576,13 +599,26 @@ func (m *VM) Events() EventSource { return m.events }
 func (m *VM) VMConfig() Config { return m.cfg }
 
 func (m *VM) UpdateNetRateLimiter(cfg *RateLimiterConfig) error {
+	// Single-bucket compatibility path: applies the same config to both
+	// RX and TX. New code should prefer UpdateNetRateLimiters.
+	return m.UpdateNetRateLimiters(cfg, cfg)
+}
+
+// UpdateNetRateLimiters applies separate RX (host→guest) and TX (guest→host)
+// token buckets at runtime. Either argument may be nil for no limit in that
+// direction. Matches Firecracker's split `rx_rate_limiter` / `tx_rate_limiter`.
+func (m *VM) UpdateNetRateLimiters(rx, tx *RateLimiterConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.netDev == nil {
 		return fmt.Errorf("virtio-net is not configured")
 	}
-	m.netDev.SetRateLimiter(buildRateLimiter(cfg))
-	m.cfg.NetRateLimiter = cloneRateLimiterConfig(cfg)
+	m.netDev.SetRateLimiters(buildRateLimiter(rx), buildRateLimiter(tx))
+	m.cfg.RxNetRateLimiter = cloneRateLimiterConfig(rx)
+	m.cfg.TxNetRateLimiter = cloneRateLimiterConfig(tx)
+	// Clear the legacy generic field when direction-specific ones are set
+	// so snapshot/restore round-trip stays coherent.
+	m.cfg.NetRateLimiter = nil
 	return nil
 }
 
@@ -791,6 +827,18 @@ func (m *VM) TakeSnapshotWithOptions(dir string, opts SnapshotOptions) (*Snapsho
 	m.mu.Unlock()
 	switch state {
 	case StateRunning:
+		// Send opShutdown to every active vsock conn BEFORE pausing the
+		// vCPUs. This gives the guest one last chance to drain the RX
+		// queue while it's still executing, so its blocked Read calls
+		// return immediately and the guest-side `serveExecAgent`/exec
+		// handlers close their sockets and loop back to the dial path.
+		// Post-restore, the guest will re-dial fresh against the new
+		// broker instead of sitting forever on a pipe whose host end
+		// disappeared with the old process. Matches Firecracker's
+		// "vsock connections do not survive snapshot/restore" contract.
+		if m.vsockDev != nil {
+			m.vsockDev.QuiesceForSnapshot()
+		}
 		if err := m.Pause(); err != nil {
 			return nil, err
 		}
@@ -828,12 +876,16 @@ func (m *VM) TakeSnapshotWithOptions(dir string, opts SnapshotOptions) (*Snapsho
 	}
 	snap.MemFile = "mem.bin"
 
-	metaFile := filepath.Join(dir, "snapshot.json")
-	data, _ := json.MarshalIndent(snap, "", "  ")
-	if err := os.WriteFile(metaFile, data, 0644); err != nil {
-		return nil, err
+	// Bundle kernel/initrd/disk into the snapshot dir so restore stays valid
+	// after the original VM's runtime dir (runs/<vm-id>/disk.ext4) is cleaned
+	// up. Without this, restore falls back to cold boot with
+	//   "open .../runs/<vm-id>/disk.ext4: no such file or directory"
+	bundled, err := rewriteSnapshotBundleWithConfig(dir, *snap, snap.Config)
+	if err != nil {
+		return nil, fmt.Errorf("bundle snapshot assets: %w", err)
 	}
-	gclog.VMM.Info("snapshot saved", "path", metaFile)
+	snap = bundled
+	gclog.VMM.Info("snapshot saved", "path", filepath.Join(dir, "snapshot.json"))
 	m.events.Emit(EventSnapshot, fmt.Sprintf("snapshot saved to %s", dir))
 
 	return snap, nil
@@ -860,6 +912,21 @@ type RestoreOptions struct {
 	OverrideID      string
 	OverrideTap     string
 	OverrideX86Boot X86BootMode
+	// SharedFSRebinds remaps virtiofs exports present in the snapshot to new
+	// host source paths, keyed by the guest-side Target that the template
+	// mounted the tag at. The template must have already snapshotted with a
+	// SharedFS entry whose Target matches; empty list means "use the
+	// snapshot's own sources unchanged".
+	SharedFSRebinds []SharedFSRebind
+}
+
+// SharedFSRebind rewrites the Source behind a virtio-fs export that was
+// already present in the snapshot, without changing the MMIO device layout
+// or the tag. Used by the sandbox-template flow to inject a per-instance
+// toolbox on top of a pre-provisioned virtiofs slot.
+type SharedFSRebind struct {
+	Target string `json:"target"`
+	Source string `json:"source"`
 }
 
 // RestoreFromSnapshotWithOptions creates a new VM restored from a snapshot
@@ -870,6 +937,48 @@ func RestoreFromSnapshotWithOptions(dir string, opts RestoreOptions) (*VM, error
 		return nil, err
 	}
 	return restoreFromSnapshot(dir, snap, opts)
+}
+
+// applySharedFSRebinds overrides the Source (and clears any stale SocketPath)
+// of virtio-fs entries in the snapshot whose guest-side Target matches a
+// caller-supplied rebind. Templates that were not snapshotted with a matching
+// Target fail fast with a clear error. Empty rebinds leave the snapshot
+// untouched so existing callers keep today's behaviour.
+func applySharedFSRebinds(snap *Snapshot, rebinds []SharedFSRebind) error {
+	if snap == nil || len(rebinds) == 0 {
+		return nil
+	}
+	idx := make(map[string]int, len(snap.Config.SharedFS))
+	for i, fs := range snap.Config.SharedFS {
+		if fs.Target == "" {
+			continue
+		}
+		idx[fs.Target] = i
+	}
+	for _, rb := range rebinds {
+		i, ok := idx[rb.Target]
+		if !ok {
+			return fmt.Errorf("snapshot has no virtiofs slot for target %q (available targets: %v); template must be rebuilt with a matching virtiofs mount", rb.Target, sharedFSTargets(snap.Config.SharedFS))
+		}
+		snap.Config.SharedFS[i].Source = rb.Source
+		// SocketPath points at the template host's virtiofsd socket; it is
+		// stale on the restore host. Clearing it forces the vmm to spawn a
+		// fresh virtiofsd against the new Source (direct path) or requires
+		// the worker to re-populate it (worker path).
+		snap.Config.SharedFS[i].SocketPath = ""
+	}
+	return nil
+}
+
+func sharedFSTargets(cfgs []SharedFSConfig) []string {
+	out := make([]string, 0, len(cfgs))
+	for _, fs := range cfgs {
+		if fs.Target == "" {
+			continue
+		}
+		out = append(out, fs.Target)
+	}
+	return out
 }
 
 func readSnapshot(dir string) (Snapshot, error) {
@@ -907,6 +1016,9 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	if opts.OverrideTap != "" {
 		snap.Config.TapName = opts.OverrideTap
 	}
+	if err := applySharedFSRebinds(&snap, opts.SharedFSRebinds); err != nil {
+		return nil, err
+	}
 	if opts.OverrideX86Boot != "" {
 		mode, err := normalizeX86BootMode(opts.OverrideX86Boot)
 		if err != nil {
@@ -941,17 +1053,24 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	if err != nil {
 		return nil, err
 	}
-	kvmVM, err := sys.CreateVMWithBase(snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
-	if err != nil {
-		return nil, err
+	// Snapshots that include virtio-fs exports cannot use the MAP_PRIVATE COW
+	// fast path: virtiofsd needs a memfd it can mmap, and a file-backed
+	// PRIVATE mapping has no fd to share. Detect that case and fall back to
+	// the slower memfd-materialize path (one O(mem) read+copy at restore
+	// time, ~60-100 ms on a 128 MiB guest). Snapshots without virtio-fs keep
+	// today's instant lazy-fault restore.
+	var kvmVM *kvm.VM
+	if len(snap.Config.SharedFS) > 0 {
+		kvmVM, err = sys.CreateVMFromSnapshotFileMemfd(snap.MemFile, snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
+		if err != nil {
+			return nil, fmt.Errorf("memfd restore: %w", err)
+		}
+	} else {
+		kvmVM, err = sys.CreateVMFromSnapshotFile(snap.MemFile, snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
+		if err != nil {
+			return nil, fmt.Errorf("cow restore: %w", err)
+		}
 	}
-	// Restore RAM
-	gclog.VMM.Info("loading RAM", "path", snap.MemFile)
-	memData, err := os.ReadFile(snap.MemFile)
-	if err != nil {
-		return nil, fmt.Errorf("read mem: %w", err)
-	}
-	copy(kvmVM.Memory(), memData)
 
 	m := &VM{
 		cfg:         snap.Config,
@@ -967,10 +1086,27 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		memDirty:    virtio.NewDirtyTracker(uint64(len(kvmVM.Memory()))),
 	}
 
+	// Seed the per-device restore shortcuts before setupDevices runs so
+	// NewBlockDeviceWithOptions can skip the FALLOC_FL_PUNCH_HOLE probe
+	// (~3 ms per drive on cold tmpfs). We pre-advertise discard=true for
+	// every writable drive on the restore path; the guest already negotiated
+	// against the original DeviceFeatures before the snapshot was taken, so
+	// advertising here is only informational — the actual runtime behaviour
+	// is decided by Transport.drvFeatures, which is restored from the snap
+	// a few dozen lines below.
+	m.restoring = true
+	m.restoredDiscard = make(map[string]bool, len(snap.Config.DriveList()))
+	for _, drive := range snap.Config.DriveList() {
+		if !drive.ReadOnly {
+			m.restoredDiscard[drive.ID] = true
+		}
+	}
+
 	// Re-attach devices (they reconnect to the existing memory)
 	if err := m.archBackend.setupDevices(m); err != nil {
 		return nil, fmt.Errorf("restore devices: %w", err)
 	}
+	m.restoring = false
 	if err := m.archBackend.setupIRQs(m); err != nil {
 		return nil, fmt.Errorf("restore irqs: %w", err)
 	}
@@ -987,13 +1123,29 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		}
 		m.vcpus = append(m.vcpus, vcpu)
 	}
+	// Mirror the cold-boot sequence: archBackend.postCreateVCPUs runs after
+	// the vCPU fds exist and before per-vCPU state is restored. On x86 it
+	// registers the per-device eventfds with KVM_IRQFD against the freshly
+	// created GSIs (otherwise device interrupts silently drop until the
+	// first VM.Start, and we pay a reconfiguration VMexit on every queue
+	// notify). On arm64 it is where the GIC is created — without this call,
+	// a restored arm64 VM has no interrupt controller at all.
+	if err := m.archBackend.postCreateVCPUs(m); err != nil {
+		return nil, fmt.Errorf("post-create vcpus (restore): %w", err)
+	}
 	for i, vcpu := range m.vcpus {
+		// restoreVCPU already swallows the expected kvmclock-ctrl EINVAL
+		// inline (arch_x86.go:96) and returns nil in that case. Doing a
+		// second isIgnorableKVMClockCtrlError check here is WRONG: it was
+		// masking a real EINVAL from SetSregs (e.g. stale CR0/CR4 bits)
+		// as "kvmclock unsupported", so the vCPU resumed with garbage
+		// segment state, triple-faulted on its first KVM_RUN, emitted
+		// ExitShutdown, and cleanup closed the exec broker — surfacing to
+		// callers as "exec agent broker is closed" / "connection timed
+		// out". Let every non-nil error propagate so real failures are
+		// loud instead of silent.
 		if err := m.archBackend.restoreVCPU(sys, kvmVM, vcpu, vcpuStates[i]); err != nil {
-			if isIgnorableKVMClockCtrlError(err) {
-				gclog.VMM.Warn("kvmclock ctrl unsupported on host; continuing without explicit clock resume", "vcpu", i, "error", err)
-			} else {
-				return nil, err
-			}
+			return nil, fmt.Errorf("restore vcpu %d: %w", i, err)
 		}
 	}
 
@@ -1050,25 +1202,82 @@ func normalizeSnapshotVCPUStates(snap Snapshot) []VCPUState {
 }
 
 func captureVCPUState(vcpu *kvm.VCPU) (VCPUState, error) {
-	// Firecracker captures MP state first because it can affect interrupt
-	// delivery bookkeeping exposed by later ioctls.
-	mpState, err := vcpu.GetMPState()
-	if err != nil {
+	// Order matches Firecracker's VcpuGetState. MP_STATE first so any
+	// interrupt-delivery bookkeeping the kernel updates on later ioctls
+	// is already captured. Full set is required for a live restore:
+	// without MSRs the guest's syscall entry points (LSTAR/STAR) vanish
+	// and the first syscall triple-faults; without VCPU_EVENTS a guest
+	// captured mid-HLT never wakes from the pending timer; without
+	// XSAVE/XCRs AVX state is lost; without DEBUGREGS any active
+	// hw-breakpoint is zeroed.
+	x := X86VCPUState{}
+	var err error
+	if x.MPState, err = vcpu.GetMPState(); err != nil {
 		return VCPUState{}, fmt.Errorf("get mp_state vcpu %d: %w", vcpu.ID, err)
 	}
-	regs, err := vcpu.GetRegs()
-	if err != nil {
+	if x.Regs, err = vcpu.GetRegs(); err != nil {
 		return VCPUState{}, fmt.Errorf("get regs vcpu %d: %w", vcpu.ID, err)
 	}
-	sregs, err := vcpu.GetSregs()
-	if err != nil {
+	if x.Sregs, err = vcpu.GetSregs(); err != nil {
 		return VCPUState{}, fmt.Errorf("get sregs vcpu %d: %w", vcpu.ID, err)
 	}
 	lapic, err := vcpu.GetLAPIC()
 	if err != nil {
 		return VCPUState{}, fmt.Errorf("get lapic vcpu %d: %w", vcpu.ID, err)
 	}
-	return newX86VCPUState(vcpu.ID, regs, sregs, mpState, &lapic), nil
+	x.LAPIC = &lapic
+	msrs, err := vcpu.GetMSRs(kvm.SnapshotMSRIndices())
+	if err != nil {
+		return VCPUState{}, fmt.Errorf("get msrs vcpu %d: %w", vcpu.ID, err)
+	}
+	x.MSRs = msrs
+	// TSC_DEADLINE: capture separately so restore writes it after TSC is
+	// back in place. Apply Firecracker's zero-rewrite trick (see
+	// `fix_zero_tsc_deadline_msr` in their vcpu.rs): if the LAPIC wasn't
+	// armed at snapshot time the MSR reads 0, and writing 0 back means
+	// the guest's HLT is never woken by a timer. Substituting the current
+	// TSC makes the next post-restore "is deadline < TSC?" check true and
+	// fires the timer IRQ immediately.
+	tscD, err := vcpu.GetMSRs([]uint32{kvm.MSRIA32TSCDeadline})
+	if err == nil && len(tscD) == 1 {
+		x.TSCDeadline = tscD[0].Data
+		if x.TSCDeadline == 0 {
+			for _, m := range msrs {
+				if m.Index == kvm.MSRIA32TSC {
+					x.TSCDeadline = m.Data
+					break
+				}
+			}
+		}
+	}
+	fpu, err := vcpu.GetFPU()
+	if err != nil {
+		return VCPUState{}, fmt.Errorf("get fpu vcpu %d: %w", vcpu.ID, err)
+	}
+	x.FPU = &fpu
+	xsave, err := vcpu.GetXSAVE()
+	if err != nil {
+		return VCPUState{}, fmt.Errorf("get xsave vcpu %d: %w", vcpu.ID, err)
+	}
+	x.XSAVE = &xsave
+	xcrs, err := vcpu.GetXCRS()
+	if err == nil {
+		x.XCRs = &xcrs
+	}
+	events, err := vcpu.GetVCPUEvents()
+	if err != nil {
+		return VCPUState{}, fmt.Errorf("get vcpu_events vcpu %d: %w", vcpu.ID, err)
+	}
+	x.VCPUEvents = &events
+	dbg, err := vcpu.GetDebugRegs()
+	if err != nil {
+		return VCPUState{}, fmt.Errorf("get debugregs vcpu %d: %w", vcpu.ID, err)
+	}
+	x.DebugRegs = &dbg
+	if khz, err := vcpu.GetTSCKHz(); err == nil {
+		x.TSCKHz = khz
+	}
+	return newX86VCPUState(vcpu.ID, x), nil
 }
 
 func captureVMArchState(vm *VM) (*SnapshotArchState, error) {
@@ -1388,7 +1597,17 @@ func (m *VM) setupDevices() error {
 		if err != nil {
 			return fmt.Errorf("virtio-net: %w", err)
 		}
-		nd.SetRateLimiter(buildRateLimiter(m.cfg.NetRateLimiter))
+		// Per-direction limiters override the generic NetRateLimiter when
+		// set. If only NetRateLimiter is provided, we apply it to both.
+		rxCfg := m.cfg.RxNetRateLimiter
+		txCfg := m.cfg.TxNetRateLimiter
+		if rxCfg == nil {
+			rxCfg = m.cfg.NetRateLimiter
+		}
+		if txCfg == nil {
+			txCfg = m.cfg.NetRateLimiter
+		}
+		nd.SetRateLimiters(buildRateLimiter(rxCfg), buildRateLimiter(txCfg))
 		m.netDev = nd
 		m.transports = append(m.transports, nd.Transport)
 		slot++
@@ -1421,7 +1640,10 @@ func (m *VM) setupDevices() error {
 		if err != nil {
 			return fmt.Errorf("virtio-blk %s irqfd: %w", drive.ID, err)
 		}
-		bd, err := virtio.NewBlockDevice(mem, base, irq, drive.Path, drive.ReadOnly, m.memDirty, irqFn)
+		bd, err := virtio.NewBlockDeviceWithOptions(mem, base, irq, drive.Path, drive.ReadOnly, m.memDirty, irqFn, virtio.BlockDeviceOptions{
+			SkipDiscardProbe: m.restoring,
+			Discard:          m.restoredDiscard[drive.ID],
+		})
 		if err != nil {
 			return fmt.Errorf("virtio-blk %s: %w", drive.ID, err)
 		}
@@ -1515,7 +1737,20 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 		if !interrupted {
 			switch vcpu.RunData.ExitReason {
 			case kvm.ExitHLT:
-				if len(m.vcpus) == 1 {
+				// A 1-vCPU guest executing `hlt` normally means
+				// "done" (no sibling thread can wake it) — this is
+				// Firecracker's behavior too (VcpuExit::Hlt →
+				// VcpuEmulation::Stopped). But when exec is enabled
+				// the VM is expected to stay alive idling between
+				// host-initiated exec calls; and a guest resumed
+				// from snapshot captured mid-`hlt` re-enters `hlt`
+				// on its first KVM_RUN. In both cases, stopping
+				// on HLT fires cleanup() → execBroker.close() and
+				// the next exec surfaces as "exec agent broker is
+				// closed". Keep the VM alive while exec is wired;
+				// the idle HLT will wake on the next device IRQ
+				// (vsock TX from the guest agent, timer tick, etc).
+				if len(m.vcpus) == 1 && m.execBroker == nil {
 					gclog.VMM.Info("guest HLT", "id", m.cfg.ID, "vcpu", vcpu.ID)
 					m.events.Emit(EventHalted, "guest HLT")
 					m.Stop()

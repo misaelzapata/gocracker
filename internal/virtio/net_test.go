@@ -192,8 +192,25 @@ func TestNetDeviceSetRateLimiter(t *testing.T) {
 
 	rl := NewRateLimiter(RateLimiterConfig{Bandwidth: TokenBucket{Size: 1000, RefillTime: 1000}})
 	dev.SetRateLimiter(rl)
-	if dev.rl != rl {
-		t.Fatal("rate limiter not set")
+	if dev.rlRx != rl || dev.rlTx != rl {
+		t.Fatal("legacy SetRateLimiter should apply to both RX and TX")
+	}
+
+	rxOnly := NewRateLimiter(RateLimiterConfig{Bandwidth: TokenBucket{Size: 500, RefillTime: 1000}})
+	txOnly := NewRateLimiter(RateLimiterConfig{Bandwidth: TokenBucket{Size: 2000, RefillTime: 1000}})
+	dev.SetRateLimiters(rxOnly, txOnly)
+	if dev.rlRx != rxOnly {
+		t.Fatal("SetRateLimiters RX not applied")
+	}
+	if dev.rlTx != txOnly {
+		t.Fatal("SetRateLimiters TX not applied")
+	}
+	dev.SetRateLimiters(nil, txOnly)
+	if dev.rlRx != nil {
+		t.Fatal("SetRateLimiters RX=nil should clear RX")
+	}
+	if dev.rlTx != txOnly {
+		t.Fatal("SetRateLimiters TX preserved when RX cleared")
 	}
 }
 
