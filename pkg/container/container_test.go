@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -37,6 +38,24 @@ func TestBuildCmdline_Defaults(t *testing.T) {
 	}
 	if strings.Contains(cmdline, runtimecfg.SerialDisable8250) {
 		t.Fatalf("serial console cmdline should not disable 8250:\n%s", cmdline)
+	}
+}
+
+// Regression: by default the guest init mounts /dev/vda read-only under
+// an overlay with a tmpfs upper (see internal/guest/init.go mountRootDisk),
+// which keeps the cached template pristine across hardlinked per-VM disks
+// and gives Docker-style ephemeral writes. Setting RootfsPersistent must
+// flip that off so image-builder / debugfs-inspection workflows see the
+// writes land on the block device. Absence of the flag in cmdline means
+// the init defaults to overlay-on.
+func TestBuildCmdline_RootfsPersistentFlag(t *testing.T) {
+	defaultCmdline := buildCmdline(oci.ImageConfig{}, RunOptions{})
+	if strings.Contains(defaultCmdline, "gc.rootfs_overlay=") {
+		t.Fatalf("default cmdline should NOT set gc.rootfs_overlay (overlay is implicit):\n%s", defaultCmdline)
+	}
+	persistentCmdline := buildCmdline(oci.ImageConfig{}, RunOptions{RootfsPersistent: true})
+	if !strings.Contains(persistentCmdline, "gc.rootfs_overlay=off") {
+		t.Fatalf("RootfsPersistent=true must emit gc.rootfs_overlay=off:\n%s", persistentCmdline)
 	}
 }
 
@@ -407,7 +426,7 @@ func TestPrepareBootDisk_CreatesMutableRuntimeCopy(t *testing.T) {
 		t.Fatalf("WriteFile(templateDisk): %v", err)
 	}
 
-	bootDisk, cleanup, err := prepareBootDisk(workDir, templateDisk, "gc-123")
+	bootDisk, cleanup, err := prepareBootDisk(workDir, templateDisk, "gc-123", false)
 	if err != nil {
 		t.Fatalf("prepareBootDisk() error = %v", err)
 	}
@@ -613,7 +632,7 @@ func TestPrepareBootDisk_BootDiskInSubdir(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	bootDisk, cleanup, err := prepareBootDisk(workDir, templateDisk, "gc-test")
+	bootDisk, cleanup, err := prepareBootDisk(workDir, templateDisk, "gc-test", false)
 	if err != nil {
 		t.Fatalf("prepareBootDisk() error = %v", err)
 	}
@@ -1966,7 +1985,7 @@ func TestCopyDiskImage(t *testing.T) {
 	dst := filepath.Join(dir, "dst.ext4")
 	os.WriteFile(src, []byte("disk-data"), 0644)
 
-	if err := copyDiskImage(src, dst); err != nil {
+	if err := copyDiskImage(src, dst, false); err != nil {
 		t.Fatalf("copyDiskImage: %v", err)
 	}
 	data, err := os.ReadFile(dst)
@@ -1978,9 +1997,49 @@ func TestCopyDiskImage(t *testing.T) {
 	}
 }
 
+// Regression: overlay=true signals that the guest will mount the block
+// device read-only, so copyDiskImage can hardlink safely (src/dst share
+// inode with no contamination risk). overlay=false must always produce
+// independent inodes to keep the cached template pristine when the
+// guest mounts rw directly. The prior hardlink-without-overlay code
+// path silently bled guest writes back into the template — see
+// copyDiskImage doc comment.
+func TestCopyDiskImage_HardlinkOnlyWhenOverlay(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.ext4")
+	if err := os.WriteFile(src, []byte("disk-data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcSys := srcInfo.Sys().(*syscall.Stat_t)
+
+	dstOverlay := filepath.Join(dir, "dst-overlay.ext4")
+	if err := copyDiskImage(src, dstOverlay, true); err != nil {
+		t.Fatalf("copyDiskImage(overlay=true): %v", err)
+	}
+	dstOverlayInfo, _ := os.Stat(dstOverlay)
+	if dstOverlayInfo.Sys().(*syscall.Stat_t).Ino != srcSys.Ino {
+		t.Error("overlay=true should hardlink src and dst (share inode)")
+	}
+
+	dstSafe := filepath.Join(dir, "dst-safe.ext4")
+	if err := copyDiskImage(src, dstSafe, false); err != nil {
+		t.Fatalf("copyDiskImage(overlay=false): %v", err)
+	}
+	dstSafeInfo, _ := os.Stat(dstSafe)
+	// Depending on FS: reflink gives new inode, fallback io.Copy gives new
+	// inode. Either way it MUST NOT share the src inode.
+	if dstSafeInfo.Sys().(*syscall.Stat_t).Ino == srcSys.Ino {
+		t.Error("overlay=false must NOT hardlink — would contaminate template on guest writes")
+	}
+}
+
 func TestCopyDiskImage_NonexistentSource(t *testing.T) {
 	dir := t.TempDir()
-	err := copyDiskImage(filepath.Join(dir, "nonexistent"), filepath.Join(dir, "dst"))
+	err := copyDiskImage(filepath.Join(dir, "nonexistent"), filepath.Join(dir, "dst"), false)
 	if err == nil {
 		t.Fatal("expected error")
 	}

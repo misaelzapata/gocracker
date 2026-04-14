@@ -162,6 +162,7 @@ func cmdRun(args []string) {
 	wait := fs.Bool("wait", false, "Block until VM stops")
 	ttyMode := fs.String("tty", "auto", "Console mode: auto, off, or force")
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
+	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs read-write directly (writes survive VM stop; slower boot). Default: Docker-style tmpfs overlay.")
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
@@ -196,6 +197,7 @@ func cmdRun(args []string) {
 		JailerMode:      *jailerMode,
 		ConsoleOut:      consoleOut,
 		ConsoleIn:       consoleIn,
+		RootfsPersistent: *rootfsPersistent,
 	}
 	if *balloonTargetMiB > 0 || *balloonDeflateOnOOM || *balloonStatsIntervalS > 0 || strings.TrimSpace(*balloonAuto) != "" {
 		runOpts.Balloon = &vmm.BalloonConfig{
@@ -355,23 +357,25 @@ func cmdCompose(args []string) {
 	wait := fs.Bool("wait", false, "Block until all VMs stop")
 	doSnap := fs.Bool("save-snapshot", false, "Take snapshots on Ctrl-C / stop")
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
+	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs rw in each service VM (writes survive; slower boot).")
 	fs.Parse(args)
 
 	requireKernel(*kernel)
 	*kernel = resolveRequiredExistingPath("kernel", *kernel)
 
 	stack, err := compose.Up(compose.RunOptions{
-		ComposePath: *file,
-		ServerURL:   *serverURL,
-		CacheDir:    *cacheDir,
-		KernelPath:  *kernel,
-		DefaultMem:  *mem,
-		Arch:        *arch,
-		DefaultDisk: *disk,
-		TapPrefix:   *tapPfx,
-		SnapshotDir: *snapDir,
-		X86Boot:     vmm.X86BootMode(*x86Boot),
-		JailerMode:  *jailerMode,
+		ComposePath:      *file,
+		ServerURL:        *serverURL,
+		CacheDir:         *cacheDir,
+		KernelPath:       *kernel,
+		DefaultMem:       *mem,
+		Arch:             *arch,
+		DefaultDisk:      *disk,
+		TapPrefix:        *tapPfx,
+		SnapshotDir:      *snapDir,
+		X86Boot:          vmm.X86BootMode(*x86Boot),
+		JailerMode:       *jailerMode,
+		RootfsPersistent: *rootfsPersistent,
 	})
 	if err != nil {
 		fatal("compose up: " + err.Error())
@@ -981,13 +985,19 @@ func waitVM(vm vmm.Handle, session *console.Session) {
 }
 
 func resolveInteractiveRunCommand(imgConfig oci.ImageConfig, opts container.RunOptions) []string {
-	if len(opts.Entrypoint) == 0 && len(opts.Cmd) == 0 {
+	// Consult the EFFECTIVE command — image's Entrypoint/Cmd merged with any
+	// CLI overrides — before deciding whether to fall back to the guest's
+	// default interactive shell. The prior early-return that only checked
+	// opts.Entrypoint/opts.Cmd silently discarded the image's CMD whenever
+	// the user didn't pass --cmd, so `gocracker run --dockerfile=... --wait`
+	// landed in an interactive shell instead of running the image workload
+	// (e.g. Dockerfile `CMD printf 'ok' > /result.txt` never executed).
+	entrypoint := effectiveCommandSlice(opts.Entrypoint, imgConfig.Entrypoint)
+	cmd := effectiveCommandSlice(opts.Cmd, imgConfig.Cmd)
+	if len(entrypoint) == 0 && len(cmd) == 0 {
 		return nil
 	}
-	proc := runtimecfg.ResolveProcess(
-		effectiveCommandSlice(opts.Entrypoint, imgConfig.Entrypoint),
-		effectiveCommandSlice(opts.Cmd, imgConfig.Cmd),
-	)
+	proc := runtimecfg.ResolveProcess(entrypoint, cmd)
 	if proc.IsZero() {
 		return nil
 	}

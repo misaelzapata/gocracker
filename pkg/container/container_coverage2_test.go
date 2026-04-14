@@ -330,7 +330,7 @@ func TestCopyDiskImagePreservesContent(t *testing.T) {
 	if err := os.WriteFile(src, content, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := copyDiskImage(src, dst); err != nil {
+	if err := copyDiskImage(src, dst, false); err != nil {
 		t.Fatalf("copyDiskImage: %v", err)
 	}
 	got, err := os.ReadFile(dst)
@@ -343,7 +343,7 @@ func TestCopyDiskImagePreservesContent(t *testing.T) {
 }
 
 func TestCopyDiskImageMissingSrcErrors(t *testing.T) {
-	err := copyDiskImage("/nonexistent", "/tmp/dst")
+	err := copyDiskImage("/nonexistent", "/tmp/dst", false)
 	if err == nil {
 		t.Fatal("expected error")
 	}
