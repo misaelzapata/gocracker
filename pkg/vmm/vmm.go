@@ -1260,6 +1260,31 @@ func (m *VM) makePulseIRQFn(irq uint32) func(bool) {
 	}
 }
 
+// makeEventFDIRQFn creates an eventfd and returns an IRQ callback that writes
+// a single uint64(1) into it on each assert. Paired with a KVM_IRQFD
+// registration (see archBackend.postCreateVCPUs), this lets virtio devices
+// inject interrupts with zero ioctl(KVM_IRQ_LINE) traffic and zero vCPU
+// context switches during the injection itself — Firecracker's model, which
+// arm64 already followed. The caller is expected to append the returned fd
+// to vm.irqEventFds in the same order as the GSIs it later registers, so
+// cleanup (vmm.cleanup) can close them on shutdown.
+func (m *VM) makeEventFDIRQFn() (int, func(bool), error) {
+	efd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		return -1, nil, fmt.Errorf("eventfd: %w", err)
+	}
+	m.irqEventFds = append(m.irqEventFds, efd)
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], 1)
+	fn := func(assert bool) {
+		if !assert {
+			return
+		}
+		_, _ = unix.Write(efd, buf[:])
+	}
+	return efd, fn, nil
+}
+
 func (m *VM) setupIRQs() error {
 	routes := []uint32{COM1IRQ}
 	for _, t := range m.transports {
@@ -1296,7 +1321,17 @@ func (m *VM) setupDevices() error {
 	if consoleIn == nil {
 		consoleIn = os.Stdin
 	}
-	m.uart0 = uart.New(consoleOut, consoleIn, m.makePulseIRQFn(COM1IRQ))
+	// IRQ delivery on x86 uses KVM_IRQFD: each device owns an eventfd and
+	// writing to it injects the GSI without a ioctl(KVM_IRQ_LINE). The
+	// eventfds are registered with KVM in postCreateVCPUs once GSI routing
+	// exists; the order of makeEventFDIRQFn calls here must mirror the GSI
+	// order produced by setupIRQs (COM1, then each transport in append order)
+	// so registerIRQFDs below can pair them.
+	_, serialIRQFn, err := m.makeEventFDIRQFn()
+	if err != nil {
+		return fmt.Errorf("serial irqfd: %w", err)
+	}
+	m.uart0 = uart.New(consoleOut, consoleIn, serialIRQFn)
 	m.i8042 = i8042.New(func() {
 		gclog.VMM.Info("guest reboot requested via i8042", "id", m.cfg.ID)
 		m.events.Emit(EventShutdown, "guest reboot requested via i8042")
@@ -1307,7 +1342,11 @@ func (m *VM) setupDevices() error {
 	{
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		rng := virtio.NewRNGDevice(mem, base, irq, m.memDirty, m.makeIRQFn(uint32(irq)))
+		_, irqFn, err := m.makeEventFDIRQFn()
+		if err != nil {
+			return fmt.Errorf("virtio-rng irqfd: %w", err)
+		}
+		rng := virtio.NewRNGDevice(mem, base, irq, m.memDirty, irqFn)
 		rng.SetRateLimiter(buildRateLimiter(m.cfg.RNGRateLimiter))
 		m.rngDev = rng
 		m.transports = append(m.transports, rng.Transport)
@@ -1318,12 +1357,16 @@ func (m *VM) setupDevices() error {
 	if m.cfg.Balloon != nil {
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
+		_, irqFn, err := m.makeEventFDIRQFn()
+		if err != nil {
+			return fmt.Errorf("virtio-balloon irqfd: %w", err)
+		}
 		balloon := virtio.NewBalloonDevice(mem, base, irq, virtio.BalloonDeviceConfig{
 			AmountMiB:            m.cfg.Balloon.AmountMiB,
 			DeflateOnOOM:         m.cfg.Balloon.DeflateOnOOM,
 			StatsPollingInterval: time.Duration(m.cfg.Balloon.StatsPollingIntervalS) * time.Second,
 			SnapshotPages:        append([]uint32(nil), m.cfg.Balloon.SnapshotPages...),
-		}, m.memDirty, m.makeIRQFn(uint32(irq)))
+		}, m.memDirty, irqFn)
 		m.balloonDev = balloon
 		m.transports = append(m.transports, balloon.Transport)
 		slot++
@@ -1337,7 +1380,11 @@ func (m *VM) setupDevices() error {
 		}
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		nd, err := virtio.NewNetDevice(mem, base, irq, mac, m.cfg.TapName, m.memDirty, m.makeIRQFn(uint32(irq)))
+		_, irqFn, err := m.makeEventFDIRQFn()
+		if err != nil {
+			return fmt.Errorf("virtio-net irqfd: %w", err)
+		}
+		nd, err := virtio.NewNetDevice(mem, base, irq, mac, m.cfg.TapName, m.memDirty, irqFn)
 		if err != nil {
 			return fmt.Errorf("virtio-net: %w", err)
 		}
@@ -1356,7 +1403,11 @@ func (m *VM) setupDevices() error {
 			m.execBroker = newExecAgentBroker(m.cfg.Exec.VsockPort)
 			listenFn = m.execBroker.listen
 		}
-		vsockDev := vsock.NewDevice(mem, base, irq, listenFn, m.memDirty, m.makeIRQFn(uint32(irq)))
+		_, irqFn, err := m.makeEventFDIRQFn()
+		if err != nil {
+			return fmt.Errorf("virtio-vsock irqfd: %w", err)
+		}
+		vsockDev := vsock.NewDevice(mem, base, irq, listenFn, m.memDirty, irqFn)
 		m.vsockDev = vsockDev
 		m.transports = append(m.transports, vsockDev.Transport)
 		slot++
@@ -1366,7 +1417,11 @@ func (m *VM) setupDevices() error {
 	for _, drive := range m.cfg.DriveList() {
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		bd, err := virtio.NewBlockDevice(mem, base, irq, drive.Path, drive.ReadOnly, m.memDirty, m.makeIRQFn(uint32(irq)))
+		_, irqFn, err := m.makeEventFDIRQFn()
+		if err != nil {
+			return fmt.Errorf("virtio-blk %s irqfd: %w", drive.ID, err)
+		}
+		bd, err := virtio.NewBlockDevice(mem, base, irq, drive.Path, drive.ReadOnly, m.memDirty, irqFn)
 		if err != nil {
 			return fmt.Errorf("virtio-blk %s: %w", drive.ID, err)
 		}
@@ -1382,7 +1437,11 @@ func (m *VM) setupDevices() error {
 	for _, fsCfg := range m.cfg.SharedFS {
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		fsDev, err := virtio.NewFSDevice(mem, m.kvmVM.MemoryFD(), base, irq, fsCfg.Source, fsCfg.Tag, fsCfg.SocketPath, m.memDirty, m.makeIRQFn(uint32(irq)))
+		_, irqFn, err := m.makeEventFDIRQFn()
+		if err != nil {
+			return fmt.Errorf("virtio-fs %s irqfd: %w", fsCfg.Tag, err)
+		}
+		fsDev, err := virtio.NewFSDevice(mem, m.kvmVM.MemoryFD(), base, irq, fsCfg.Source, fsCfg.Tag, fsCfg.SocketPath, m.memDirty, irqFn)
 		if err != nil {
 			return fmt.Errorf("virtio-fs %s: %w", fsCfg.Tag, err)
 		}
