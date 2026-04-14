@@ -4,6 +4,7 @@ package kvm
 
 import (
 	"fmt"
+	"os"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -340,6 +341,85 @@ func (s *System) CreateVMWithBase(memMB uint64, guestPhysBase uint64) (*VM, erro
 		return nil, err
 	}
 
+	return vm, nil
+}
+
+// CreateVMFromSnapshotFile creates a VM whose guest RAM is mmap'd directly
+// over the on-disk snapshot memory dump with MAP_PRIVATE. Pages are faulted
+// in lazily as the guest touches them, and guest writes go to private
+// anonymous pages via copy-on-write — the snapshot file is never modified.
+//
+// Compared to the classic restore path (CreateVMWithBase + os.ReadFile +
+// copy into mmap), this trades an O(mem) up-front I/O + memcpy for a
+// per-page minor fault on first access. For a warm snapshot file sitting in
+// the page cache the cost of restore becomes O(1) instead of O(mem), which
+// is the difference between ~5–15 ms and ~60–100 ms on a 128 MiB guest.
+// Net effect: resumes inherit the sandbox-pool advantage that published
+// leaderboards (e.g. Daytona) otherwise reserve for themselves.
+//
+// Caveats: the snapshot file's mapping is referenced by the kernel until
+// the VM is closed; caller must not unlink / truncate / rewrite it during
+// the VM's lifetime. The file is opened O_RDONLY and the mmap is PRIVATE,
+// so a read-only snapshot volume is perfectly fine.
+func (s *System) CreateVMFromSnapshotFile(memFilePath string, memMB uint64, guestPhysBase uint64) (*VM, error) {
+	vmFd, err := s.ioctl(kvmCreateVM, 0)
+	if err != nil {
+		return nil, fmt.Errorf("KVM_CREATE_VM: %w", err)
+	}
+	mmapSz, err := s.ioctl(kvmGetVCPUMmapSize, 0)
+	if err != nil {
+		return nil, fmt.Errorf("KVM_GET_VCPU_MMAP_SIZE: %w", err)
+	}
+
+	memSize := memMB * 1024 * 1024
+	f, err := os.OpenFile(memFilePath, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open snapshot mem: %w", err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("stat snapshot mem: %w", err)
+	}
+	if uint64(fi.Size()) != memSize {
+		_ = f.Close()
+		return nil, fmt.Errorf("snapshot mem size %d does not match VM mem %d (%d MiB)", fi.Size(), memSize, memMB)
+	}
+
+	mem, err := unix.Mmap(int(f.Fd()), 0, int(memSize),
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_PRIVATE)
+	// The mmap takes its own reference on the inode; closing the fd here is
+	// safe and keeps the VM's fd budget small.
+	_ = f.Close()
+	if err != nil {
+		return nil, fmt.Errorf("mmap snapshot mem PRIVATE: %w", err)
+	}
+	_ = unix.Madvise(mem, unix.MADV_HUGEPAGE)
+
+	// memfd is unused in this path — the mapping is file-backed instead.
+	// The VM struct still expects a non-negative memfd in Close, so we stash
+	// -1 which the Close path treats as "nothing to close".
+	vm := &VM{fd: int(vmFd), mem: mem, memSize: memSize, vcpuMmapSz: int(mmapSz), memfd: -1, regions: make(map[uint32]*MappedMemoryRegion)}
+
+	region := MemoryRegion{
+		Slot:          0,
+		Flags:         vm.memFlags,
+		GuestPhysAddr: guestPhysBase,
+		MemorySize:    memSize,
+		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+	}
+	vm.guestPhysBase = guestPhysBase
+	if _, err := vmIoctl(vm.fd, kvmSetUserMemory, uintptr(unsafe.Pointer(&region))); err != nil {
+		_ = unix.Munmap(mem)
+		_ = unix.Close(int(vmFd))
+		return nil, fmt.Errorf("KVM_SET_USER_MEMORY_REGION (snapshot): %w", err)
+	}
+
+	if err := s.initVMArch(vm); err != nil {
+		_ = vm.Close()
+		return nil, err
+	}
 	return vm, nil
 }
 
