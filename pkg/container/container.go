@@ -32,6 +32,7 @@ import (
 	"github.com/gocracker/gocracker/internal/runtimecfg"
 	"github.com/gocracker/gocracker/internal/worker"
 	"github.com/gocracker/gocracker/pkg/vmm"
+	"github.com/gocracker/gocracker/pkg/warmcache"
 )
 
 // RunOptions describes how to run a container as a microVM.
@@ -578,6 +579,28 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		opts.TapName = autoNet.TapName()
 		opts.StaticIP = autoNet.GuestCIDR()
 		opts.Gateway = autoNet.GatewayIP()
+	}
+
+	// Opportunistic warm-cache lookup. When GOCRACKER_WARM_CACHE=1 is set and
+	// the caller did not already pass an explicit --snapshot dir, consult the
+	// per-image snapshot cache in XDG_CACHE_HOME. A hit rewrites opts.SnapshotDir
+	// so the existing fast-restore branch below picks it up; a miss leaves the
+	// options untouched and we fall through to cold boot.
+	//
+	// Auto-capture on cold boot is NOT wired yet — users must populate the
+	// cache manually with `gocracker snapshot` + rename into Dir(root, key).
+	// That's the intentional MVP: ship the read side so snapshot-resume
+	// becomes the default when a cache entry exists, and add auto-capture in
+	// a follow-up once guest-ready timing is sorted.
+	if opts.SnapshotDir == "" && warmCacheEnabled() && warmCacheInputsReady(opts) {
+		if key, ok := computeWarmCacheKey(opts); ok {
+			if dir, hit := warmcache.Lookup(warmcache.DefaultRoot(), key); hit {
+				gclog.Container.Info("warm-cache hit", "key", key[:12], "dir", dir)
+				opts.SnapshotDir = dir
+			} else {
+				gclog.Container.Debug("warm-cache miss", "key", key[:12])
+			}
+		}
 	}
 
 	if opts.SnapshotDir != "" {
