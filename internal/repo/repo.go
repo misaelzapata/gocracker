@@ -84,8 +84,17 @@ func resolveLocal(src Source) (*CloneResult, error) {
 		cleanup: func() {}, // nothing to delete
 	}
 	r.ContextDir = filepath.Join(abs, src.Subdir)
-	locateFiles(r, src.Subdir != "")
+	locateFiles(r, isExplicitSubdir(src.Subdir))
 	return r, nil
+}
+
+// isExplicitSubdir returns true when the caller actually pointed the clone
+// at a subdirectory inside the repo, as opposed to the repo root. "." and
+// "./" both mean "repo root", so they should NOT force exactOnly lookup —
+// that would skip Dockerfiles in subdirs (e.g. grafana/tempo's
+// tools/Dockerfile) and break the historical regression gate.
+func isExplicitSubdir(s string) bool {
+	return s != "" && s != "." && s != "./"
 }
 
 func isHexString(s string) bool {
@@ -204,7 +213,7 @@ func cloneRemote(src Source) (*CloneResult, error) {
 		return r, nil
 	}
 	r.ContextDir = filepath.Join(tmp, src.Subdir)
-	locateFiles(r, src.Subdir != "")
+	locateFiles(r, isExplicitSubdir(src.Subdir))
 	return r, nil
 }
 

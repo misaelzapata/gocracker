@@ -271,6 +271,13 @@ func TestDockerfileNameRank(t *testing.T) {
 		{"Dockerfile.production", 3, true},
 		{"Dockerfile.custom", len(dockerfileNames) + 1, true},
 		{"dockerfile.dev", len(dockerfileNames) + 1, true},
+		// Non-standard variants NOT supported by discovery — they would
+		// create ambiguity when multiple co-exist in one dir (e.g.
+		// chatwoot's rails.Dockerfile + vite.Dockerfile would tie with
+		// canonical docker/Dockerfile). Callers that want those patterns
+		// should point --subdir at the specific file path.
+		{"Dockerfile-envoy", 0, false},
+		{"deployment.Dockerfile", 0, false},
 		{"Makefile", 0, false},
 		{"README.md", 0, false},
 	}

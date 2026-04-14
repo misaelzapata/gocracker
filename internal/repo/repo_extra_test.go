@@ -39,6 +39,27 @@ func TestLocateFilesExact_ComposeCandidates(t *testing.T) {
 	}
 }
 
+// Regression: subdir="." should be treated as "walk the repo root", not as
+// an explicit sub-target that pins locateFiles to an exact-root lookup.
+// Previously, `gocracker repo --subdir .` missed Dockerfiles nested under
+// subdirs (grafana/tempo's tools/Dockerfile) and broke the external-repos
+// regression gate. Same for "./".
+func TestIsExplicitSubdir(t *testing.T) {
+	cases := map[string]bool{
+		"":         false,
+		".":        false,
+		"./":       false,
+		"docker":   true,
+		"cmd/app":  true,
+		"./docker": true, // explicit relative path IS a subdir
+	}
+	for input, want := range cases {
+		if got := isExplicitSubdir(input); got != want {
+			t.Errorf("isExplicitSubdir(%q) = %v, want %v", input, got, want)
+		}
+	}
+}
+
 func TestLocateFilesRecursive(t *testing.T) {
 	dir := t.TempDir()
 	dfPath := filepath.Join(dir, "Dockerfile")
