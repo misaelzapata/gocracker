@@ -256,7 +256,7 @@ I measured gocracker against Firecracker v1.10.1 on the same host, across the ma
 
 - **Host**: AMD Ryzen AI 9 HX 370 (24 threads), Linux 6.17, `/dev/kvm` available
 - **Firecracker**: v1.10.1 ([official release tarball](https://github.com/firecracker-microvm/firecracker/releases/tag/v1.10.1))
-- **gocracker**: this branch (includes the vsock + virtio-net shutdown-race fix from this PR)
+- **gocracker**: this branch (includes the virtio-net shutdown-race fix from this PR; the earlier vsock-side fix landed in PR #2)
 - **Kernels measured**:
   - [artifacts/kernels/gocracker-guest-standard-vmlinux](artifacts/kernels/gocracker-guest-standard-vmlinux) (ELF vmlinux, Linux 6.1.102, 41 MiB)
   - [artifacts/kernels/gocracker-guest-minimal-vmlinux](artifacts/kernels/gocracker-guest-minimal-vmlinux) (new minimal profile — committed config drops ACPI NUMA + SLEEP, AMD NUMA, HIBERNATION + snapshot dev, PROFILING, USB (entire subsystem), PM_SLEEP, and the `bzip2`/`lzma`/`lzo` decompressors. Some symbols the fragment requests off — e.g. `PERF_EVENTS`, `VT`, `INPUT` — stay `=y` because other Kconfig options (`HARDLOCKUP_DETECTOR_PERF`, `HID`, legacy console selectors) transitively select them. Full functional baseline — virtio + vsock + DNS + IPv6 + TLS — still works: `apk update` inside Alpine boots green. 40 MiB.)

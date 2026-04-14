@@ -197,42 +197,39 @@ func (d *NetDevice) rxPump() {
 	rxQ := d.Transport.queues[0]
 	buf := make([]byte, 65536)
 	fd := d.tapRawFd
+	// Stack-style PollFd reused across iterations — avoids a per-packet
+	// allocation in the hot RX path.
+	pfds := [1]unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
 	for {
 		if d.closed.Load() {
 			return
 		}
-		// Poll with a 50ms timeout so the closed flag is observed
-		// quickly during shutdown — Linux close(2) on the TAP fd does
-		// not wake a blocked reader, so we cannot rely on an EBADF
-		// from unix.Read to unstick us. We still delegate the actual
-		// read to tapReadFrameFn (which tests replace) so unit tests
-		// keep working with pipe/mock backends where poll never reports
-		// readable.
-		// Poll to sleep up to 50ms while remaining responsive to the
-		// closed flag; the timeout is also our shutdown-observation
-		// granularity. We always fall through to tapReadFrameFn so
-		// unit tests that replace tapReadFrameFn with a mock keep
-		// running on pipe fds that never report readable.
-		if fd >= 0 {
-			pfds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-			_, perr := unix.Poll(pfds, 50)
-			if perr != nil && perr != syscall.EINTR {
-				return
-			}
-			if d.closed.Load() {
-				return
-			}
-			if pfds[0].Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
-				return
-			}
-		}
+		// Read-first path: the TAP fd is non-blocking (see openTAP) so
+		// unix.Read returns EAGAIN immediately when idle. On EAGAIN we
+		// poll with a 50 ms timeout — that doubles as our shutdown
+		// observation granularity since Linux close(2) on the TAP fd
+		// does not wake a blocked reader. Tests replace tapReadFrameFn
+		// with a mock on a pipe fd, so this path still works there: we
+		// skip the poll-on-timeout behaviour for the negative/mock fd.
 		n, err := tapReadFrameFn(fd, buf)
 		if err != nil {
 			if isTapShutdownError(err) || d.closed.Load() {
 				return
 			}
 			if isTapTransientReadError(err) {
-				if tapTransientRetryDelay > 0 {
+				if fd >= 0 {
+					pfds[0].Revents = 0
+					_, perr := unix.Poll(pfds[:], 50)
+					if perr != nil && perr != syscall.EINTR {
+						return
+					}
+					if d.closed.Load() {
+						return
+					}
+					if pfds[0].Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
+						return
+					}
+				} else if tapTransientRetryDelay > 0 {
 					time.Sleep(tapTransientRetryDelay)
 				}
 				continue
