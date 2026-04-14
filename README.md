@@ -415,7 +415,18 @@ median = 252 ms, mean = 253 ms, p95 = 269 ms
 | 10 | Runloop | 1,960 ms | +1,708 |
 | 11 | CodeSandbox | 3,790 ms | +3,538 |
 
-On the same workload ComputeSDK measures on its own, gocracker is **#2 of 11** — ahead of every commercial provider except Daytona, whose lead comes from serving sandboxes out of a pre-warmed snapshot pool rather than cold booting them each time. Closing the remaining gap needs `MAP_PRIVATE` COW snapshot restore plus a pool ([issue #3](https://github.com/misaelzapata/gocracker/issues/3)), not more boot-path optimisation.
+On the same workload ComputeSDK measures on its own, gocracker is **#2 of 11** — ahead of every commercial provider except Daytona, whose lead comes from serving sandboxes out of a pre-warmed snapshot pool rather than cold booting them each time.
+
+### Snapshot-resume (COW restore)
+
+Issue [#3](https://github.com/misaelzapata/gocracker/issues/3) is implemented: `/restore {resume:true}` maps the memory snapshot `MAP_PRIVATE` (lazy COW — no up-front read or copy), re-wires virtio devices, restores vCPU state, and resumes. First-call restore-to-resume on the same Ryzen AI 9 HX 370 host, 128 MiB guest, `node:20-alpine` workload:
+
+| VMM | median | min | max | measured at |
+|---|---:|---:|---:|---|
+| Firecracker v1.10.1 | **10 ms** | 8 | 11 | `PUT /snapshot/load` RTT |
+| gocracker *(this branch)* | **15 ms** | 11 | 16 | `POST /restore {resume:true}` RTT |
+
+Internal phases (kvm.Open, `CreateVMFromSnapshotFile`, `setupDevices`, `setupIRQs`, `restoreVMState`, `CreateVCPU×N`, `postCreateVCPUs`, `restoreVCPU×N`, device-state restore) each run **<1 ms**; the remaining 5 ms vs Firecracker is HTTP/JSON decode + Go runtime overhead in the VMM process. The `SkipDiscardProbe` restore shortcut (skip the `FALLOC_FL_PUNCH_HOLE` probe on the disk image, since features were already negotiated pre-snapshot) shaves ~7 ms off the restore path. With a pre-warmed pool of restored VMMs, `compute.sandbox.create()` TTI should land in the 20–40 ms range, closing on Daytona.
 
 ### Reproducing
 

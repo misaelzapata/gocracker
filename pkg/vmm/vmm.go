@@ -281,6 +281,17 @@ type VM struct {
 	events      *EventLog
 	pausedVCPUs map[int]struct{}
 	vcpuTIDs    map[int]int
+
+	// restoring is set while setupDevices runs as part of snapshot restore.
+	// It lets per-device constructors take shortcuts that are only safe when
+	// the guest already negotiated virtio features (e.g. skipping the ~3ms
+	// FALLOC_FL_PUNCH_HOLE probe on the block disk image). Cleared once the
+	// restore returns to the cold-boot device construction rules.
+	restoring bool
+	// restoredDiscard[driveID] captures the discard feature flag from the
+	// snapshot so NewBlockDeviceWithOptions can bypass the probe and still
+	// advertise the right thing. Populated alongside `restoring = true`.
+	restoredDiscard map[string]bool
 }
 
 // New creates a VM from config. Loads kernel, sets up devices and CPU.
@@ -948,7 +959,6 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	// a ~60–100 ms read+copy for ~5–15 ms of mmap + page-table setup — the
 	// same trick Firecracker/Kata use to make pool-resume sandboxes look
 	// instant.
-	gclog.VMM.Info("restoring RAM via COW mmap", "path", snap.MemFile)
 	kvmVM, err := sys.CreateVMFromSnapshotFile(snap.MemFile, snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
 	if err != nil {
 		return nil, fmt.Errorf("cow restore: %w", err)
@@ -968,10 +978,27 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		memDirty:    virtio.NewDirtyTracker(uint64(len(kvmVM.Memory()))),
 	}
 
+	// Seed the per-device restore shortcuts before setupDevices runs so
+	// NewBlockDeviceWithOptions can skip the FALLOC_FL_PUNCH_HOLE probe
+	// (~3 ms per drive on cold tmpfs). We pre-advertise discard=true for
+	// every writable drive on the restore path; the guest already negotiated
+	// against the original DeviceFeatures before the snapshot was taken, so
+	// advertising here is only informational — the actual runtime behaviour
+	// is decided by Transport.drvFeatures, which is restored from the snap
+	// a few dozen lines below.
+	m.restoring = true
+	m.restoredDiscard = make(map[string]bool, len(snap.Config.DriveList()))
+	for _, drive := range snap.Config.DriveList() {
+		if !drive.ReadOnly {
+			m.restoredDiscard[drive.ID] = true
+		}
+	}
+
 	// Re-attach devices (they reconnect to the existing memory)
 	if err := m.archBackend.setupDevices(m); err != nil {
 		return nil, fmt.Errorf("restore devices: %w", err)
 	}
+	m.restoring = false
 	if err := m.archBackend.setupIRQs(m); err != nil {
 		return nil, fmt.Errorf("restore irqs: %w", err)
 	}
@@ -1432,7 +1459,10 @@ func (m *VM) setupDevices() error {
 		if err != nil {
 			return fmt.Errorf("virtio-blk %s irqfd: %w", drive.ID, err)
 		}
-		bd, err := virtio.NewBlockDevice(mem, base, irq, drive.Path, drive.ReadOnly, m.memDirty, irqFn)
+		bd, err := virtio.NewBlockDeviceWithOptions(mem, base, irq, drive.Path, drive.ReadOnly, m.memDirty, irqFn, virtio.BlockDeviceOptions{
+			SkipDiscardProbe: m.restoring,
+			Discard:          m.restoredDiscard[drive.ID],
+		})
 		if err != nil {
 			return fmt.Errorf("virtio-blk %s: %w", drive.ID, err)
 		}
