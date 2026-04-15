@@ -192,14 +192,20 @@ type RunRequest struct {
 	Balloon       *Balloon                 `json:"balloon,omitempty"`
 	MemoryHotplug *vmm.MemoryHotplugConfig `json:"memory_hotplug,omitempty"`
 
+	// NetworkMode selects how gocracker provisions the guest NIC. "" or
+	// "none" keeps today's explicit behaviour (caller supplies tap_name /
+	// static_ip / gateway). "auto" makes the server allocate a fresh TAP
+	// + /31 guest/gateway pair via hostnet.AutoNetwork. When "auto" is set
+	// the caller MUST leave static_ip and gateway empty.
+	NetworkMode string `json:"network_mode,omitempty"`
+
 	// Wait, when true (or when the "wait=true" query parameter is set),
 	// makes the /run handler run synchronously: it performs the full
 	// runFn + vm.Start() inline and only returns once the vCPUs are
-	// spinning (state="running"). Intended for the snapshot-restore fast
-	// path where restore+start completes in single-digit ms — the
-	// traditional async/poll dance adds a wasted round-trip. When false
-	// (default), the handler keeps today's behaviour: launch a goroutine
-	// and return state="starting" immediately.
+	// spinning (state="running"). For snapshot_dir this is typically
+	// single-digit ms; for a fresh boot this blocks for the kernel boot
+	// duration. When false (default), the handler launches a goroutine and
+	// returns state="starting" immediately.
 	Wait bool `json:"wait,omitempty"`
 }
 
@@ -207,6 +213,17 @@ type RunResponse struct {
 	ID      string `json:"id"`
 	State   string `json:"state"`
 	Message string `json:"message,omitempty"`
+
+	// Network fields echo the effective tap/ip/gateway for the VM. They
+	// are populated only when the handler ran synchronously (wait=true
+	// or the snapshot-restore fast path) and the network was actually
+	// resolved. On async state="starting" these fields are empty; the
+	// caller should poll GET /vms/{id} for the live values.
+	TapName              string `json:"tap_name,omitempty"`
+	GuestIP              string `json:"guest_ip,omitempty"`
+	Gateway              string `json:"gateway,omitempty"`
+	NetworkMode          string `json:"network_mode,omitempty"`
+	RestoredFromSnapshot bool   `json:"restored_from_snapshot,omitempty"`
 }
 
 type SnapshotRequest struct {
@@ -214,15 +231,19 @@ type SnapshotRequest struct {
 }
 
 type VMInfo struct {
-	ID       string            `json:"id"`
-	State    string            `json:"state"`
-	Uptime   string            `json:"uptime"`
-	MemMB    uint64            `json:"mem_mb"`
-	Arch     string            `json:"arch,omitempty"`
-	Kernel   string            `json:"kernel"`
-	Events   []vmm.Event       `json:"events"`
-	Devices  []vmm.DeviceInfo  `json:"devices,omitempty"`
-	Metadata map[string]string `json:"metadata,omitempty"`
+	ID          string            `json:"id"`
+	State       string            `json:"state"`
+	Uptime      string            `json:"uptime"`
+	MemMB       uint64            `json:"mem_mb"`
+	Arch        string            `json:"arch,omitempty"`
+	Kernel      string            `json:"kernel"`
+	Events      []vmm.Event       `json:"events"`
+	Devices     []vmm.DeviceInfo  `json:"devices,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	TapName     string            `json:"tap_name,omitempty"`
+	GuestIP     string            `json:"guest_ip,omitempty"`
+	Gateway     string            `json:"gateway,omitempty"`
+	NetworkMode string            `json:"network_mode,omitempty"`
 }
 
 type APIError struct {
@@ -371,6 +392,8 @@ func NewWithOptions(opts Options) *Server {
 	r.Get("/vms", s.handleListVMs)
 	r.Get("/vms/{id}", s.handleGetVM)
 	r.Post("/vms/{id}/stop", s.handleStopVM)
+	r.Post("/vms/{id}/pause", s.handleVMPause)
+	r.Post("/vms/{id}/resume", s.handleVMResume)
 	r.Post("/vms/{id}/migrate", s.handleMigrateVM)
 	r.Post("/vms/{id}/snapshot", s.handleSnapshot)
 	r.Get("/vms/{id}/events", s.handleVMEvents)
@@ -988,6 +1011,10 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := validateNetworkMode(req.NetworkMode, req.StaticIP, req.Gateway); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Generate ID before goroutine so response matches the actual VM
 	id := fmt.Sprintf("gc-%d", time.Now().UnixNano()%100000)
@@ -1014,6 +1041,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		Arch:          req.Arch,
 		KernelPath:    req.KernelPath,
 		TapName:       req.TapName,
+		NetworkMode:   normalizeNetworkMode(req.NetworkMode),
 		X86Boot:       s.defaultX86Boot,
 		Cmd:           cmd,
 		Entrypoint:    ep,
@@ -1098,11 +1126,12 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// Only honour wait=true when there's a snapshot to restore from. The
-	// fresh-build path takes multiple seconds and would block the HTTP
-	// response for the entire rootfs + kernel-boot duration, which is
-	// almost certainly not what the caller wants.
-	if waitSync && strings.TrimSpace(opts.SnapshotDir) != "" {
+	// wait=true runs the full runFn inline and returns once state="running".
+	// For snapshot_dir this is typically single-digit ms; for a fresh boot
+	// this blocks for the kernel boot duration (seconds). Callers that need
+	// the cold-boot fast-return behaviour can leave wait=false and poll
+	// GET /vms/{id}.
+	if waitSync {
 		result, err := s.runFn(opts)
 		if err != nil {
 			gclog.API.Error("run failed", "error", err)
@@ -1121,16 +1150,22 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		}
 		entry := s.newVMEntry(result.VM, result.Close)
 		entry.metadata = mergeMetadata(entry.metadata, map[string]string{
-			"guest_ip":  result.GuestIP,
-			"gateway":   result.Gateway,
-			"tap_name":  result.TapName,
-			"disk_path": result.DiskPath,
+			"guest_ip":     result.GuestIP,
+			"gateway":      result.Gateway,
+			"tap_name":     result.TapName,
+			"disk_path":    result.DiskPath,
+			"network_mode": opts.NetworkMode,
 		})
 		s.registerVMEntry(result.ID, entry)
 		json.NewEncoder(w).Encode(RunResponse{
-			ID:      result.ID,
-			State:   "running",
-			Message: "VM is running",
+			ID:                   result.ID,
+			State:                "running",
+			Message:              "VM is running",
+			TapName:              result.TapName,
+			GuestIP:              result.GuestIP,
+			Gateway:              result.Gateway,
+			NetworkMode:          opts.NetworkMode,
+			RestoredFromSnapshot: strings.TrimSpace(opts.SnapshotDir) != "",
 		})
 		return
 	}
@@ -1155,10 +1190,11 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		}
 		entry := s.newVMEntry(result.VM, result.Close)
 		entry.metadata = mergeMetadata(entry.metadata, map[string]string{
-			"guest_ip":  result.GuestIP,
-			"gateway":   result.Gateway,
-			"tap_name":  result.TapName,
-			"disk_path": result.DiskPath,
+			"guest_ip":     result.GuestIP,
+			"gateway":      result.Gateway,
+			"tap_name":     result.TapName,
+			"disk_path":    result.DiskPath,
+			"network_mode": opts.NetworkMode,
 		})
 		s.registerVMEntry(result.ID, entry)
 	}()
@@ -1166,9 +1202,10 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	s.registerVMEntry(id, newPendingVMEntry(id, opts))
 
 	json.NewEncoder(w).Encode(RunResponse{
-		ID:      id,
-		State:   "starting",
-		Message: "VM is booting",
+		ID:          id,
+		State:       "starting",
+		Message:     "VM is booting",
+		NetworkMode: opts.NetworkMode,
 	})
 }
 
@@ -1594,14 +1631,18 @@ func (s *Server) buildVMInfo(entry *vmEntry) VMInfo {
 			metadata[key] = value
 		}
 		return VMInfo{
-			ID:       entry.apiID,
-			State:    entry.pendingState,
-			Uptime:   time.Since(entry.createdAt).Round(time.Second).String(),
-			MemMB:    entry.pendingCfg.MemMB,
-			Arch:     defaultVMArch(entry.pendingCfg.Arch),
-			Kernel:   entry.pendingCfg.KernelPath,
-			Events:   events,
-			Metadata: metadata,
+			ID:          entry.apiID,
+			State:       entry.pendingState,
+			Uptime:      time.Since(entry.createdAt).Round(time.Second).String(),
+			MemMB:       entry.pendingCfg.MemMB,
+			Arch:        defaultVMArch(entry.pendingCfg.Arch),
+			Kernel:      entry.pendingCfg.KernelPath,
+			Events:      events,
+			Metadata:    metadata,
+			TapName:     metadata["tap_name"],
+			GuestIP:     metadata["guest_ip"],
+			Gateway:     metadata["gateway"],
+			NetworkMode: metadata["network_mode"],
 		}
 	}
 	cfg := entry.handle.VMConfig()
@@ -1625,15 +1666,19 @@ func (s *Server) buildVMInfo(entry *vmEntry) VMInfo {
 		id = entry.apiID
 	}
 	return VMInfo{
-		ID:       id,
-		State:    entry.handle.State().String(),
-		Uptime:   entry.handle.Uptime().Round(time.Second).String(),
-		MemMB:    cfg.MemMB,
-		Arch:     defaultVMArch(cfg.Arch),
-		Kernel:   cfg.KernelPath,
-		Events:   events,
-		Devices:  entry.handle.DeviceList(),
-		Metadata: metadata,
+		ID:          id,
+		State:       entry.handle.State().String(),
+		Uptime:      entry.handle.Uptime().Round(time.Second).String(),
+		MemMB:       cfg.MemMB,
+		Arch:        defaultVMArch(cfg.Arch),
+		Kernel:      cfg.KernelPath,
+		Events:      events,
+		Devices:     entry.handle.DeviceList(),
+		Metadata:    metadata,
+		TapName:     metadata["tap_name"],
+		GuestIP:     metadata["guest_ip"],
+		Gateway:     metadata["gateway"],
+		NetworkMode: metadata["network_mode"],
 	}
 }
 
@@ -1658,6 +1703,31 @@ func validateRequestedArch(raw string) error {
 		return fmt.Errorf("arch %q is not compatible with host arch %q (same-arch only)", arch, runtime.GOARCH)
 	}
 	return nil
+}
+
+func validateNetworkMode(mode, staticIP, gateway string) error {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "", "none":
+		return nil
+	case container.NetworkModeAuto:
+		if strings.TrimSpace(staticIP) != "" || strings.TrimSpace(gateway) != "" {
+			return fmt.Errorf("network_mode=auto is exclusive with explicit static_ip/gateway")
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid network_mode %q (want \"\"|\"none\"|\"auto\")", mode)
+	}
+}
+
+// normalizeNetworkMode folds "none" back to "" so downstream code only has to
+// distinguish "" (explicit/none) from "auto".
+func normalizeNetworkMode(mode string) string {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case container.NetworkModeAuto:
+		return container.NetworkModeAuto
+	default:
+		return ""
+	}
 }
 
 func matchesVMFilters(info VMInfo, r *http.Request) bool {
@@ -1991,6 +2061,46 @@ func (s *Server) handleStopVM(w http.ResponseWriter, r *http.Request) {
 		s.cleanStopped()
 	}()
 	w.WriteHeader(204)
+}
+
+func (s *Server) handleVMPause(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	s.mu.RLock()
+	v, ok := s.vms[id]
+	s.mu.RUnlock()
+	if !ok {
+		apiErr(w, http.StatusNotFound, "VM not found")
+		return
+	}
+	if v.isPending() {
+		apiErr(w, http.StatusConflict, "VM is still starting")
+		return
+	}
+	if err := v.handle.Pause(); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleVMResume(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	s.mu.RLock()
+	v, ok := s.vms[id]
+	s.mu.RUnlock()
+	if !ok {
+		apiErr(w, http.StatusNotFound, "VM not found")
+		return
+	}
+	if v.isPending() {
+		apiErr(w, http.StatusConflict, "VM is still starting")
+		return
+	}
+	if err := v.handle.Resume(); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {

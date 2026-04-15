@@ -189,6 +189,11 @@ type ExecConfig struct {
 type SharedFSConfig struct {
 	Source string `json:"source"`
 	Tag    string `json:"tag"`
+	// Target is the guest-side mount point the template configured for this
+	// tag. Populated by the container runtime so the snapshot-restore path
+	// can re-identify the slot when a caller supplies SharedFSRebinds by
+	// guest Target (the caller doesn't know the server-generated Tag).
+	Target string `json:"target,omitempty"`
 	// SocketPath, when set, points to an already-listening virtiofsd unix socket.
 	// In that case the VM does not spawn virtiofsd; it connects to this socket
 	// instead. Used by the worker/jailer path so virtiofsd can run on the host
@@ -901,12 +906,30 @@ func RestoreFromSnapshotWithConsole(dir string, consoleIn io.Reader, consoleOut 
 }
 
 type RestoreOptions struct {
-	ConsoleIn       io.Reader
-	ConsoleOut      io.Writer
-	OverrideVCPUs   int
-	OverrideID      string
-	OverrideTap     string
-	OverrideX86Boot X86BootMode
+	ConsoleIn        io.Reader
+	ConsoleOut       io.Writer
+	OverrideVCPUs    int
+	OverrideID       string
+	OverrideTap      string
+	OverrideStaticIP string
+	OverrideGateway  string
+	OverrideX86Boot  X86BootMode
+	// SharedFSRebinds remaps virtiofs exports present in the snapshot to new
+	// host source paths, keyed by the guest-side Target that the template
+	// mounted the tag at. The template must have already snapshotted with a
+	// SharedFS entry whose Target matches; empty list means "use the
+	// snapshot's own sources unchanged".
+	SharedFSRebinds []SharedFSRebind
+}
+
+// SharedFSRebind rewrites the Source behind a virtio-fs export that was
+// already present in the snapshot, without changing the MMIO device layout
+// or the tag. Used by the sandbox-template flow to inject a per-instance
+// toolbox on top of a pre-provisioned virtiofs slot.
+type SharedFSRebind struct {
+	Target   string `json:"target"`
+	Source   string `json:"source"`
+	ReadOnly bool   `json:"read_only,omitempty"`
 }
 
 // RestoreFromSnapshotWithOptions creates a new VM restored from a snapshot
@@ -917,6 +940,45 @@ func RestoreFromSnapshotWithOptions(dir string, opts RestoreOptions) (*VM, error
 		return nil, err
 	}
 	return restoreFromSnapshot(dir, snap, opts)
+}
+
+// applySharedFSRebinds overrides the Source (and clears any stale SocketPath)
+// of virtio-fs entries in the snapshot whose guest-side Target matches a
+// caller-supplied rebind. Templates that were not snapshotted with a matching
+// Target fail fast with a clear error. Empty rebinds leave the snapshot
+// untouched so existing callers keep today's behaviour.
+func applySharedFSRebinds(snap *Snapshot, rebinds []SharedFSRebind) error {
+	if snap == nil || len(rebinds) == 0 {
+		return nil
+	}
+	idx := make(map[string]int, len(snap.Config.SharedFS))
+	for i, fs := range snap.Config.SharedFS {
+		if fs.Target == "" {
+			continue
+		}
+		idx[fs.Target] = i
+	}
+	for _, rb := range rebinds {
+		i, ok := idx[rb.Target]
+		if !ok {
+			return fmt.Errorf("snapshot has no virtiofs slot for target %q (available targets: %v); template must be rebuilt with a matching virtiofs mount", rb.Target, sharedFSTargets(snap.Config.SharedFS))
+		}
+		snap.Config.SharedFS[i].Source = rb.Source
+		// SocketPath points at the template host's virtiofsd socket; it is
+		// stale on the restore host. Clearing it forces the vmm to spawn a
+		// fresh virtiofsd against the new Source (direct path) or requires
+		// the worker to re-populate it (worker path).
+		snap.Config.SharedFS[i].SocketPath = ""
+	}
+	return nil
+}
+
+func sharedFSTargets(cfgs []SharedFSConfig) []string {
+	out := make([]string, 0, len(cfgs))
+	for _, fs := range cfgs {
+		out = append(out, fs.Target)
+	}
+	return out
 }
 
 func readSnapshot(dir string) (Snapshot, error) {
@@ -953,6 +1015,9 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	}
 	if opts.OverrideTap != "" {
 		snap.Config.TapName = opts.OverrideTap
+	}
+	if err := applySharedFSRebinds(&snap, opts.SharedFSRebinds); err != nil {
+		return nil, err
 	}
 	if opts.OverrideX86Boot != "" {
 		mode, err := normalizeX86BootMode(opts.OverrideX86Boot)

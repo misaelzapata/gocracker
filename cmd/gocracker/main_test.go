@@ -34,6 +34,8 @@ type testHandle struct {
 
 func (h *testHandle) Start() error                               { return nil }
 func (h *testHandle) Stop()                                      { h.stopCalls++; h.state = vmm.StateStopped }
+func (h *testHandle) Pause() error                               { h.state = vmm.StatePaused; return nil }
+func (h *testHandle) Resume() error                              { h.state = vmm.StateRunning; return nil }
 func (h *testHandle) TakeSnapshot(string) (*vmm.Snapshot, error) { return nil, nil }
 func (h *testHandle) State() vmm.State                           { return h.state }
 func (h *testHandle) ID() string                                 { return h.cfg.ID }

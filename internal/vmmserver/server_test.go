@@ -45,6 +45,16 @@ func (f *fakeVM) Stop() {
 	f.events.Emit(vmm.EventStopped, "stopped")
 }
 
+func (f *fakeVM) Pause() error {
+	f.events.Emit(vmm.EventPaused, "paused")
+	return nil
+}
+
+func (f *fakeVM) Resume() error {
+	f.events.Emit(vmm.EventResumed, "resumed")
+	return nil
+}
+
 func (f *fakeVM) TakeSnapshot(dir string) (*vmm.Snapshot, error) {
 	return &vmm.Snapshot{Version: 2, ID: f.cfg.ID, Timestamp: time.Now(), MemFile: filepath.Join(dir, "mem.bin")}, nil
 }

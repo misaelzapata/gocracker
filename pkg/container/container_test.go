@@ -1777,6 +1777,8 @@ type mockHandle struct {
 
 func (m *mockHandle) Start() error                                    { return nil }
 func (m *mockHandle) Stop()                                           {}
+func (m *mockHandle) Pause() error                                    { return nil }
+func (m *mockHandle) Resume() error                                   { return nil }
 func (m *mockHandle) TakeSnapshot(string) (*vmm.Snapshot, error)      { return nil, nil }
 func (m *mockHandle) State() vmm.State                                { return vmm.StateRunning }
 func (m *mockHandle) ID() string                                      { return "mock" }

@@ -271,10 +271,13 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto {
 		return nil, fmt.Errorf("invalid network mode %q", opts.NetworkMode)
 	}
-	if opts.NetworkMode == NetworkModeAuto {
-		if opts.SnapshotDir != "" {
-			return nil, fmt.Errorf("--net auto is not supported with snapshot restore yet")
-		}
+	// Fresh-subnet allocation only makes sense for cold boot. On restore the
+	// guest kernel is frozen with its original IP + gateway, so assigning a
+	// new subnet would just break the guest's network and lie to the caller.
+	// For restore we only need a tap name; the IP plan stays as whatever the
+	// snapshot had. If the caller explicitly set tap_name/static_ip/gateway
+	// on restore, they win — that lets callers drive the old manual path.
+	if opts.NetworkMode == NetworkModeAuto && opts.SnapshotDir == "" {
 		var err error
 		autoNet, err = hostnet.NewAuto(opts.ID, opts.TapName)
 		if err != nil {
@@ -290,6 +293,9 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		if len(opts.Drives) > 0 {
 			return nil, fmt.Errorf("snapshot restore is not supported with additional block devices yet")
 		}
+		if err := validateRestoreMounts(opts.Mounts); err != nil {
+			return nil, err
+		}
 		if _, err := os.Stat(opts.SnapshotDir + "/snapshot.json"); err == nil {
 			gclog.Container.Info("restoring from snapshot", "dir", opts.SnapshotDir)
 			t0 := time.Now()
@@ -302,18 +308,38 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 			// confused, and it becomes harder to distinguish original
 			// from restored in instrumentation.
 			vm, err := vmm.RestoreFromSnapshotWithOptions(opts.SnapshotDir, vmm.RestoreOptions{
-				ConsoleIn:       opts.ConsoleIn,
-				ConsoleOut:      opts.ConsoleOut,
-				OverrideVCPUs:   opts.CPUs,
-				OverrideID:      opts.ID,
-				OverrideX86Boot: opts.X86Boot,
+				ConsoleIn:        opts.ConsoleIn,
+				ConsoleOut:       opts.ConsoleOut,
+				OverrideVCPUs:    opts.CPUs,
+				OverrideID:       opts.ID,
+				OverrideTap:      opts.TapName,
+				OverrideStaticIP: opts.StaticIP,
+				OverrideGateway:  opts.Gateway,
+				OverrideX86Boot:  opts.X86Boot,
+				SharedFSRebinds:  buildSharedFSRebinds(opts.Mounts),
 			})
 			if err == nil {
 				if err := vm.Start(); err != nil {
 					return nil, err
 				}
 				gclog.Container.Info("restored", "duration", time.Since(t0).Round(time.Millisecond))
-				return &RunResult{VM: vm, ID: opts.ID}, nil
+				tap := opts.TapName
+				if tap == "" {
+					tap = vm.VMConfig().TapName
+				}
+				result := &RunResult{
+					VM:      vm,
+					ID:      opts.ID,
+					TapName: tap,
+					GuestIP: trimCIDR(opts.StaticIP),
+					Gateway: opts.Gateway,
+					cleanup: func() {
+						if autoNet != nil {
+							autoNet.Close()
+						}
+					},
+				}
+				return result, nil
 			}
 			gclog.Container.Warn("snapshot restore failed, building fresh", "error", err)
 		}
@@ -583,10 +609,10 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto {
 		return nil, fmt.Errorf("invalid network mode %q", opts.NetworkMode)
 	}
-	if opts.NetworkMode == NetworkModeAuto {
-		if opts.SnapshotDir != "" {
-			return nil, fmt.Errorf("--net auto is not supported with snapshot restore yet")
-		}
+	// See runLocal: auto-allocation only fires on cold boot; restore keeps
+	// the snapshot's IP plan to avoid lying to the caller and breaking the
+	// frozen guest network.
+	if opts.NetworkMode == NetworkModeAuto && opts.SnapshotDir == "" {
 		var err error
 		autoNet, err = hostnet.NewAuto(opts.ID, opts.TapName)
 		if err != nil {
@@ -601,14 +627,20 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		if len(opts.Drives) > 0 {
 			return nil, fmt.Errorf("snapshot restore is not supported with additional block devices yet")
 		}
+		if err := validateRestoreMounts(opts.Mounts); err != nil {
+			return nil, err
+		}
 		if _, err := os.Stat(filepath.Join(opts.SnapshotDir, "snapshot.json")); err == nil {
 			gclog.Container.Info("restoring from snapshot via worker", "dir", opts.SnapshotDir)
 			handle, cleanup, err := worker.LaunchRestoredVMM(opts.SnapshotDir, vmm.RestoreOptions{
-				OverrideTap:     opts.TapName,
-				OverrideVCPUs:   opts.CPUs,
-				OverrideX86Boot: opts.X86Boot,
-				ConsoleIn:       opts.ConsoleIn,
-				ConsoleOut:      opts.ConsoleOut,
+				OverrideTap:      opts.TapName,
+				OverrideStaticIP: opts.StaticIP,
+				OverrideGateway:  opts.Gateway,
+				OverrideVCPUs:    opts.CPUs,
+				OverrideX86Boot:  opts.X86Boot,
+				ConsoleIn:        opts.ConsoleIn,
+				ConsoleOut:       opts.ConsoleOut,
+				SharedFSRebinds:  buildSharedFSRebinds(opts.Mounts),
 			}, worker.VMMOptions{
 				JailerBinary: opts.JailerBinary,
 				VMMBinary:    opts.VMMBinary,
@@ -617,10 +649,14 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 				ChrootBase:   opts.ChrootBase,
 			})
 			if err == nil {
+				tap := opts.TapName
+				if tap == "" {
+					tap = handle.VMConfig().TapName
+				}
 				return &RunResult{
 					VM:           handle,
 					ID:           handle.ID(),
-					TapName:      opts.TapName,
+					TapName:      tap,
 					GuestIP:      trimCIDR(opts.StaticIP),
 					Gateway:      opts.Gateway,
 					WorkerSocket: workerSocket(handle),
@@ -1710,6 +1746,7 @@ func resolveSharedFSMounts(mounts []Mount) sharedFSPlan {
 			plan.Exports = append(plan.Exports, vmm.SharedFSConfig{
 				Source: source,
 				Tag:    tag,
+				Target: mount.Target,
 			})
 		}
 		plan.Mounts = append(plan.Mounts, runtimecfg.SharedFSMount{
@@ -1775,4 +1812,39 @@ func firstNonNegative(values ...int) int {
 		}
 	}
 	return 0
+}
+
+// validateRestoreMounts enforces the sandbox-template contract: restore
+// cannot materialize rootfs content (that would defeat the fast-path), so
+// only virtiofs mounts are accepted. Materialized mounts return a clear
+// error the API layer surfaces as 400.
+func validateRestoreMounts(mounts []Mount) error {
+	for _, m := range mounts {
+		if m.Backend != MountBackendVirtioFS {
+			return fmt.Errorf("snapshot restore accepts only virtiofs mounts; got backend=%q for target %q", m.Backend, m.Target)
+		}
+	}
+	return nil
+}
+
+// buildSharedFSRebinds converts the API-level virtiofs mounts into the
+// tag-agnostic rebind records the vmm restore path consumes. The Target
+// string is what the template mounted the virtiofs tag at; the vmm layer
+// matches rebinds against snap.Config.SharedFS[i].Target.
+func buildSharedFSRebinds(mounts []Mount) []vmm.SharedFSRebind {
+	if len(mounts) == 0 {
+		return nil
+	}
+	rebinds := make([]vmm.SharedFSRebind, 0, len(mounts))
+	for _, m := range mounts {
+		if m.Backend != MountBackendVirtioFS {
+			continue
+		}
+		rebinds = append(rebinds, vmm.SharedFSRebind{
+			Target:   m.Target,
+			Source:   filepath.Clean(m.Source),
+			ReadOnly: m.ReadOnly,
+		})
+	}
+	return rebinds
 }
