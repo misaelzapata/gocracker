@@ -234,6 +234,19 @@ func cloneRemote(src Source) (*CloneResult, error) {
 
 	fmt.Printf("[repo] cloned in %s\n", time.Since(t0).Round(time.Millisecond))
 
+	// Fetch submodules when present. Many non-trivial Dockerfiles build
+	// from submodule trees (dragonflydb ships helio as a submodule and its
+	// Dockerfile does `cmake /build/helio`). Checking .gitmodules first
+	// keeps submodule-less repos unaffected by the extra git call.
+	if _, err := os.Stat(filepath.Join(tmp, ".gitmodules")); err == nil {
+		cmd := exec.Command("git", "-C", tmp, "submodule", "update", "--init", "--recursive", "--depth", "1")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("[repo] WARNING: submodule update failed: %v (continuing — build may fail if submodule content is required)\n", err)
+		}
+	}
+
 	r := &CloneResult{
 		Dir:     tmp,
 		IsLocal: false,

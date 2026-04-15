@@ -35,7 +35,7 @@ valkey-valkey	dockerfile	https://github.com/valkey-io/valkey.git	1db8bab50851cc2
 memcached-memcached	dockerfile	https://github.com/memcached/memcached.git	3824603965ecbd38e552a725dbfc4ff38ab40cb2	.	c	service	none			128	4096	cache
 envoy-envoy	dockerfile	https://github.com/envoyproxy/envoy.git	6b29862c77b55e17f0bc7b5a4e0f08355cdcd967	.	cpp	service	none			512	4096	proxy
 haproxy-haproxy	dockerfile	https://github.com/haproxy/haproxy.git	774d0dfe1454a73346a3fbd7f8a7f04e2972e6c0	.	c	service	none			256	4096	proxy
-eclipse-mosquitto	dockerfile	https://github.com/eclipse-mosquitto/mosquitto.git	b3b4d77ef3faef6dfcdfac3fb00a9b5a42859aca	.	c	service	none			128	4096	mqtt broker
+eclipse-mosquitto	dockerfile	https://github.com/eclipse-mosquitto/mosquitto.git	b3b4d77ef3faef6dfcdfac3fb00a9b5a42859aca	docker/2.1-alpine	c	service	none			128	4096	mqtt broker
 nats-server	dockerfile	https://github.com/nats-io/nats-server.git	74cbb964b5545f8230c370fddabe108260e079e5	.	go	service	none			128	4096	messaging
 emqx-emqx	dockerfile	https://github.com/emqx/emqx.git	941e17fdadcd8a4754bcedf050f35306f5365110	.	erlang	service	none			512	4096	mqtt platform
 dragonflydb-dragonfly	dockerfile	https://github.com/dragonflydb/dragonfly.git	1304655b16f6ffc8ac8eb0dcde833d30f26aa103	.	cpp	service	none			512	4096	cache
@@ -52,7 +52,7 @@ streamlit-streamlit	dockerfile	https://github.com/streamlit/streamlit.git	3b6b46
 locust-locust	dockerfile	https://github.com/locustio/locust.git	2c8f587a60a0c5b0bb27ee395b0d1ca5149ca6f2	.	python	service	none			128	4096	load testing
 celery-celery	dockerfile	https://github.com/celery/celery.git	f9ea6771e67205a4fbb8b4dc3890f3ad5d704924	.	python	service	none			128	4096	worker
 httpbin	dockerfile	https://github.com/postmanlabs/httpbin.git	f8ec666b4d1b654e4ff6aedd356f510dcac09f83	.	python	service	none			128	4096	test api
-uvicorn-gunicorn-fastapi	dockerfile	https://github.com/tiangolo/uvicorn-gunicorn-fastapi-docker.git	339a5c92e9eff025fd9fceaf4bf1a04d43b56be7	.	python	service	none			128	4096	fastapi base
+uvicorn-gunicorn-fastapi	dockerfile	https://github.com/tiangolo/uvicorn-gunicorn-fastapi-docker.git	339a5c92e9eff025fd9fceaf4bf1a04d43b56be7	docker-images	python	service	none			128	4096	fastapi base	python3.11-slim.dockerfile
 plotly-dash	dockerfile	https://github.com/plotly/dash.git	fa21fcb2e955e13cbc98b06479b95378e524ec13	.	python	service	none			256	4096	dashboard
 wger	dockerfile	https://github.com/wger-project/wger.git	3b58d398a28d47965549eaf0a5c7cfa0da8c4d47	.	python	service	none			256	4096	django app
 semaphore	dockerfile	https://github.com/semaphoreui/semaphore.git	84c9b8ae186afaec46694be871bc80fb8ab9f7f3	.	go	service	none			256	4096	ansible ui
