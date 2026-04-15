@@ -28,6 +28,7 @@ import (
 	"github.com/gocracker/gocracker/internal/jailer"
 	"github.com/gocracker/gocracker/internal/oci"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
+	"github.com/gocracker/gocracker/internal/tempprune"
 	"github.com/gocracker/gocracker/internal/vmmserver"
 	"github.com/gocracker/gocracker/internal/worker"
 	"github.com/gocracker/gocracker/pkg/container"
@@ -713,9 +714,26 @@ func cmdServe(args []string) {
 	fs.Var(&trustedKernelDirs, "trusted-kernel-dir", "Trusted kernel directory for API-supplied kernel paths (repeatable)")
 	fs.Var(&trustedWorkDirs, "trusted-work-dir", "Trusted workspace directory for API-supplied dockerfile/context/initrd paths (repeatable)")
 	fs.Var(&trustedSnapshotDirs, "trusted-snapshot-dir", "Trusted snapshot directory for API snapshot/restore paths (repeatable)")
+	pruneMaxAge := fs.Duration("prune-stale-temp-age", 48*time.Hour, "Age threshold for pruning /tmp/gocracker-* orphans left by crashed builds; 0 disables")
 	fs.Parse(args)
 	if *addr != "" && !isLoopbackTCPAddr(*addr) && strings.TrimSpace(*authToken) == "" {
 		fatal("--auth-token is required when --addr is not an explicit loopback address; use 127.0.0.1:PORT for local unauthenticated access")
+	}
+
+	// Sweep stale /tmp/gocracker-* dirs BEFORE accepting any HTTP request.
+	// Every temp-dir site has happy-path cleanup, but when the parent process
+	// gets SIGKILL'd (sweep timeouts, OOM-kill, manual Ctrl-C) the deferred
+	// cleanups never run and 10s–100s of MB per orphan pile up. One gocracker
+	// serve restart a day is enough to keep /tmp bounded indefinitely.
+	if *pruneMaxAge > 0 {
+		result := tempprune.PruneStaleTempDirs(tempprune.DefaultPrefixes, *pruneMaxAge)
+		if result.Removed > 0 {
+			fmt.Fprintf(os.Stderr, "[serve] pruned %d/%d stale temp dirs (%.1f MiB freed, max_age=%s)\n",
+				result.Removed, result.Scanned, float64(result.BytesFree)/(1024*1024), pruneMaxAge.String())
+		}
+		for _, err := range result.Errors {
+			fmt.Fprintf(os.Stderr, "[serve] temp prune error: %v\n", err)
+		}
 	}
 
 	kernelDirs := trustedKernelDirs.Values()
