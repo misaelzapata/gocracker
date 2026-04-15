@@ -272,44 +272,28 @@ func TestE2ESandboxCloneInstall(t *testing.T) {
 	}
 }
 
-// TestE2ESandboxCloneVirtiofsRebind covers the virtiofs rebind plumbing
-// against the Linux virtio-fs driver's queue-state snapshot limitation:
-// after restore, the guest driver's request-ID tracking does not match the
-// fresh virtiofsd, yielding "requests.0:id 0 is not a head!" in dmesg and
-// -EIO on the first FUSE op. Making this transparent needs FUSE-session
-// migration (on virtiofsd) or a coordinated device-reset + guest umount
-// hook; either is bigger than this PR. The rebind contract (host-side
-// Source rewrite + SocketPath clear + memfd-backed restore) is fully
-// covered by unit tests in pkg/vmm/sharedfs_rebind_test.go.
-func TestE2ESandboxCloneVirtiofsRebind(t *testing.T) {
-	t.Skip("Linux virtio-fs driver's queue state does not survive snapshot+restore against a new virtiofsd; needs FUSE-session migration, tracked separately")
+// TestE2ECloneRejectsActiveVirtiofs proves that cloning a VM that holds a
+// live virtio-fs mount is rejected at the API (400), not silently hung. The
+// Linux virtio-fs driver's in-flight queue state cannot be migrated to a
+// fresh virtiofsd on the restored side, so the only safe contract today is
+// "snapshot after umount, or use virtio-blk for per-sandbox data". The
+// endpoint failing loudly is the guarantee sandboxd relies on.
+func TestE2ECloneRejectsActiveVirtiofs(t *testing.T) {
 	if os.Getenv("E2E") != "1" {
 		t.Skip("set E2E=1 to enable")
 	}
 	requirePrivilegedExecIntegration(t)
-	// Needs the virtiofs-enabled kernel to mount inside the guest.
 	root := repoRoot(t)
 	kernel := filepath.Join(root, "artifacts/kernels/gocracker-guest-virtiofs-vmlinux")
 	if _, err := os.Stat(kernel); err != nil {
 		t.Skipf("virtiofs kernel missing at %s", kernel)
 	}
 	bins := buildProjectBinaries(t)
-
-	// Two host dirs: placeholder (template) and toolbox (per-clone).
-	placeholder := filepath.Join(t.TempDir(), "placeholder")
-	toolbox := filepath.Join(t.TempDir(), "toolbox")
-	for _, d := range []string{placeholder, toolbox} {
-		if err := os.MkdirAll(d, 0755); err != nil {
-			t.Fatalf("mkdir %s: %v", d, err)
-		}
-		_ = os.Chmod(d, 0777)
+	sharedDir := filepath.Join(t.TempDir(), "shared")
+	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(placeholder, "hello.txt"), []byte("from-template\n"), 0644); err != nil {
-		t.Fatalf("write placeholder: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(toolbox, "hello.txt"), []byte("from-toolbox\n"), 0644); err != nil {
-		t.Fatalf("write toolbox: %v", err)
-	}
+	_ = os.Chmod(sharedDir, 0777)
 
 	addr := freeLocalAddr(t)
 	serverURL := "http://" + addr
@@ -327,7 +311,6 @@ func TestE2ESandboxCloneVirtiofsRebind(t *testing.T) {
 	runCtx, runCancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer runCancel()
 
-	// Source VM with virtiofs placeholder mount.
 	src, err := client.Run(runCtx, internalapi.RunRequest{
 		Image:       "alpine:3.20",
 		KernelPath:  kernel,
@@ -335,7 +318,7 @@ func TestE2ESandboxCloneVirtiofsRebind(t *testing.T) {
 		DiskSizeMB:  512,
 		NetworkMode: "auto",
 		Mounts: []container.Mount{{
-			Source:  placeholder,
+			Source:  sharedDir,
 			Target:  "/mnt/toolbox",
 			Backend: container.MountBackendVirtioFS,
 		}},
@@ -344,41 +327,20 @@ func TestE2ESandboxCloneVirtiofsRebind(t *testing.T) {
 		Wait:        true,
 	})
 	if err != nil {
-		t.Fatalf("/run source with virtiofs: %v\nserve:\n%s", err, serveLog.String())
+		t.Fatalf("/run source: %v\nserve:\n%s", err, serveLog.String())
 	}
 	t.Cleanup(func() { _ = client.StopVM(context.Background(), src.ID) })
 
-	// Source sees placeholder content.
-	srcRead := waitForExecResponse(t, client, src.ID, internalapi.ExecRequest{
-		Command: []string{"/bin/sh", "-lc", "cat /mnt/toolbox/hello.txt"},
-	}, 30*time.Second)
-	if !strings.Contains(srcRead.Stdout, "from-template") {
-		t.Fatalf("source virtiofs read failed: stdout=%q stderr=%q", srcRead.Stdout, srcRead.Stderr)
-	}
-
-	// Clone with rebind to toolbox dir.
-	cloneCtx, cloneCancel := context.WithTimeout(context.Background(), 120*time.Second)
-	clone, err := client.CloneVM(cloneCtx, src.ID, internalapi.CloneRequest{
+	cloneCtx, cloneCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, err = client.CloneVM(cloneCtx, src.ID, internalapi.CloneRequest{
 		ExecEnabled: true,
-		Mounts: []container.Mount{{
-			Source:  toolbox,
-			Target:  "/mnt/toolbox",
-			Backend: container.MountBackendVirtioFS,
-		}},
 	})
 	cloneCancel()
-	if err != nil {
-		t.Fatalf("/clone with virtiofs rebind: %v\nserve:\n%s", err, serveLog.String())
+	if err == nil {
+		t.Fatal("expected 400 when cloning a VM with active virtio-fs mounts")
 	}
-	t.Cleanup(func() { _ = client.StopVM(context.Background(), clone.ID) })
-
-	// Clone must see the NEW content — otherwise rebind did not take effect.
-	cloneRead := waitForExecResponse(t, client, clone.ID, internalapi.ExecRequest{
-		Command: []string{"/bin/sh", "-lc", "cat /mnt/toolbox/hello.txt"},
-	}, 30*time.Second)
-	if !strings.Contains(cloneRead.Stdout, "from-toolbox") {
-		t.Fatalf("clone virtiofs rebind failed — guest still sees template content: stdout=%q stderr=%q",
-			cloneRead.Stdout, cloneRead.Stderr)
+	if !strings.Contains(err.Error(), "virtio-fs") {
+		t.Errorf("error does not mention virtio-fs: %v", err)
 	}
 }
 

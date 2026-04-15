@@ -2205,17 +2205,18 @@ func (s *Server) handleVMClone(w http.ResponseWriter, r *http.Request) {
 	}
 
 	srcCfg := src.handle.VMConfig()
-	// Virtio-fs sessions are stateful on the FUSE protocol level: a guest
-	// kernel snapshotted with a live virtiofs mount holds FUSE FDs bound to
-	// the template's virtiofsd, and restoring against a fresh virtiofsd
-	// returns EBADF on first touch. When the caller asked to clone a VM
-	// that has virtiofs mounts, we require exec_enabled so the clone can
-	// remount each virtio-fs target against its new backend post-restore.
-	if len(srcCfg.SharedFS) > 0 && !req.ExecEnabled {
-		apiErr(w, http.StatusBadRequest, "cloning a VM with virtiofs mounts requires exec_enabled=true on the clone (the guest kernel re-initializes its FUSE session via an exec-driven remount after restore)")
+	// virtio-fs mounts cannot currently round-trip through snapshot +
+	// restore: the Linux driver's virtqueue index is frozen at snapshot
+	// time and the fresh virtiofsd on restore starts at index 0, which
+	// trips "requests.0:id 0 is not a head!" on first FUSE op. Until
+	// virtiofsd grows FUSE-session migration (or we teach the guest
+	// driver to fully re-init on a specific host signal), block clone of
+	// a VM with live virtio-fs mounts instead of shipping an endpoint
+	// that silently hangs the caller.
+	if len(srcCfg.SharedFS) > 0 {
+		apiErr(w, http.StatusBadRequest, "cloning a VM with active virtio-fs mounts is not supported: the Linux virtio-fs driver's queue state cannot be migrated to a fresh virtiofsd. Snapshot after umount, or use virtio-blk for per-sandbox data.")
 		return
 	}
-
 	if _, err := src.handle.TakeSnapshot(snapDir); err != nil {
 		apiErr(w, http.StatusInternalServerError, fmt.Sprintf("snapshot source: %v", err))
 		return
@@ -2281,23 +2282,15 @@ func (s *Server) handleVMClone(w http.ResponseWriter, r *http.Request) {
 	// target re-mounted against the new virtiofsd. Both require exec; we
 	// fail the clone loudly if the caller skipped exec_enabled, so they
 	// don't end up with a silently-broken VM.
-	needExec := opts.NetworkMode == container.NetworkModeAuto || len(req.Mounts) > 0
-	if needExec && !req.ExecEnabled {
-		_ = s.stopAndUnregisterVM(result.ID)
-		apiErr(w, http.StatusBadRequest, "clone with network_mode=auto or virtiofs mounts requires exec_enabled=true (the clone needs to rewrite guest state)")
-		return
-	}
 	if opts.NetworkMode == container.NetworkModeAuto {
+		if !req.ExecEnabled {
+			_ = s.stopAndUnregisterVM(result.ID)
+			apiErr(w, http.StatusBadRequest, "clone with network_mode=auto requires exec_enabled=true (the clone needs to rewrite guest networking)")
+			return
+		}
 		if err := s.execGuestReIP(result.ID, result.GuestIP, result.Gateway); err != nil {
 			_ = s.stopAndUnregisterVM(result.ID)
 			apiErr(w, http.StatusInternalServerError, fmt.Sprintf("post-restore re-IP: %v", err))
-			return
-		}
-	}
-	if len(result.VM.VMConfig().SharedFS) > 0 {
-		if err := s.execGuestRemountVirtiofs(result.ID, req.Mounts, result.VM.VMConfig().SharedFS); err != nil {
-			_ = s.stopAndUnregisterVM(result.ID)
-			apiErr(w, http.StatusInternalServerError, fmt.Sprintf("post-restore virtiofs remount: %v", err))
 			return
 		}
 	}
@@ -2339,86 +2332,6 @@ ip route replace default via %s
 	return s.execGuestScript(id, script)
 }
 
-// execGuestUnmountVirtiofs umounts each virtio-fs target inside the guest.
-// Called on the source VM before a /clone-triggered snapshot so the
-// snapshot captures clean (dismounted) FUSE state, avoiding the EBADF
-// cascade described on execGuestRemountVirtiofs. If any target is busy
-// the fall-back `umount -l` (lazy) disconnects the mount immediately and
-// lets the kernel tear it down once the last FD closes; both paths leave
-// the guest in a consistent, remountable state.
-func (s *Server) execGuestUnmountVirtiofs(id string, snap []vmm.SharedFSConfig) error {
-	if len(snap) == 0 {
-		return nil
-	}
-	var script strings.Builder
-	script.WriteString("set -e\n")
-	wrote := false
-	for _, fs := range snap {
-		target := strings.TrimRight(fs.Target, "/")
-		if target == "" {
-			continue
-		}
-		// Try normal umount first so busy mounts surface as errors; only
-		// escalate to lazy if the target is still held (umount -l never
-		// fails unless the mount does not exist).
-		fmt.Fprintf(&script, "if mountpoint -q %s 2>/dev/null; then umount %s 2>/dev/null || umount -l %s; fi\n", target, target, target)
-		wrote = true
-	}
-	if !wrote {
-		return nil
-	}
-	return s.execGuestScript(id, script.String())
-}
-
-// execGuestRemountVirtiofs re-mounts each virtio-fs export inside the guest
-// so the new virtiofsd backend (rebound by /clone) takes over the FUSE
-// session cleanly. Without this the guest's frozen kernel keeps file
-// handles pointing at the template's now-dead virtiofsd and first-touch
-// returns EBADF. The script umounts (lazy if busy) then mounts; both the
-// tag and target come from the snapshot's own SharedFS so this works even
-// when the caller did not explicitly request a rebind.
-func (s *Server) execGuestRemountVirtiofs(id string, requested []container.Mount, snap []vmm.SharedFSConfig) error {
-	if len(snap) == 0 {
-		return nil
-	}
-	wantTargets := map[string]struct{}{}
-	for _, m := range requested {
-		if m.Backend == container.MountBackendVirtioFS {
-			wantTargets[strings.TrimRight(m.Target, "/")] = struct{}{}
-		}
-	}
-	var script strings.Builder
-	script.WriteString("set -e\n")
-	wrote := false
-	for _, fs := range snap {
-		target := strings.TrimRight(fs.Target, "/")
-		if target == "" || fs.Tag == "" {
-			continue
-		}
-		if len(wantTargets) > 0 {
-			if _, ok := wantTargets[target]; !ok {
-				continue
-			}
-		}
-		fmt.Fprintf(&script, "if mountpoint -q %s 2>/dev/null; then umount %s 2>/dev/null || umount -l %s; fi\n", target, target, target)
-		fmt.Fprintf(&script, "mkdir -p %s\n", target)
-		fmt.Fprintf(&script, `for i in 1 2 3 4 5 6 7 8 9 10; do
-  if mount -t virtiofs %s %s 2>/tmp/.mnt-err; then break; fi
-  sleep 0.5
-done
-`, fs.Tag, target)
-		fmt.Fprintf(&script, `if ! ls %s >/dev/null 2>/tmp/.ls-err; then
-  echo "mount %s ready-check failed: $(cat /tmp/.ls-err 2>/dev/null)" >&2
-  exit 91
-fi
-`, target, target)
-		wrote = true
-	}
-	if !wrote {
-		return nil
-	}
-	return s.execGuestScript(id, script.String())
-}
 
 // execGuestScript runs a shell script inside the guest synchronously via the
 // exec agent. Retries the vsock dial with exponential backoff up to 30 s:
