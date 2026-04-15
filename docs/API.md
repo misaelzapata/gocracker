@@ -130,13 +130,45 @@ curl -s http://localhost:8080/run -X POST \
   }'
 ```
 
-Response: `{"id": "vm-abc123", "state": "running"}`
+Response (sync path, `wait=true`):
+
+```json
+{
+  "id": "vm-abc123",
+  "state": "running",
+  "message": "VM is running",
+  "tap_name": "gct-gc-12345",
+  "guest_ip": "198.18.0.2",
+  "gateway": "198.18.0.1",
+  "network_mode": "auto",
+  "restored_from_snapshot": false
+}
+```
+
+Async path (default) returns only `id`, `state="starting"`, and `network_mode`
+echoed back; poll `GET /vms/{id}` for the allocated tap/ip/gateway.
 
 Request body fields: `image`, `dockerfile`, `context`, `vcpu_count`, `mem_mb`,
 `arch`, `kernel_path`, `tap_name`, `x86_boot`, `cmd`, `entrypoint`, `env`,
 `workdir`, `pid1_mode`, `build_args`, `disk_size_mb`, `mounts`, `drives`,
-`snapshot_dir`, `static_ip`, `gateway`, `cache_dir`, `metadata`,
-`exec_enabled`, `balloon`, `memory_hotplug`.
+`snapshot_dir`, `static_ip`, `gateway`, `network_mode`, `cache_dir`,
+`metadata`, `exec_enabled`, `balloon`, `memory_hotplug`, `wait`.
+
+**`network_mode`** selects how the guest NIC is provisioned:
+- `""` / `"none"` — use `tap_name` / `static_ip` / `gateway` exactly as supplied
+  (today's behaviour).
+- `"auto"` — the server picks a free `/30` subnet via `hostnet.AutoNetwork`,
+  brings up the tap, adds NAT, and returns the resolved tap/ip/gateway in the
+  response. Mutually exclusive with an explicit `static_ip` or `gateway`.
+  On snapshot-restore, `auto` is accepted but the guest's frozen IP wins —
+  the tap is allocated fresh while the IP plan stays with the snapshot. See
+  [SNAPSHOTS.md](SNAPSHOTS.md#sandbox-template-flow) for the template pattern
+  that works end-to-end.
+
+**`wait`** (bool; default `false`). When `true`, the handler blocks until the
+VM reaches `state=running` and the response includes the resolved network
+fields. For snapshot-restore this is typically single-digit ms; for a fresh
+boot it blocks for the whole kernel+init duration.
 
 ### POST /build -- Build image only (no boot)
 
@@ -165,6 +197,45 @@ curl -s http://localhost:8080/vms/vm-abc123
 ```bash
 curl -s -X POST http://localhost:8080/vms/vm-abc123/stop
 ```
+
+### POST /vms/{id}/pause -- Freeze vCPUs
+
+Pauses the guest — the vCPUs stop executing but memory and open files stay.
+Returns `204 No Content` on success, `400 Bad Request` if the VM is not in a
+pausable state.
+
+```bash
+curl -s -X POST http://localhost:8080/vms/vm-abc123/pause -d '{}'
+```
+
+### POST /vms/{id}/resume -- Unfreeze vCPUs
+
+Resumes a paused VM. `204 No Content` on success.
+
+```bash
+curl -s -X POST http://localhost:8080/vms/vm-abc123/resume -d '{}'
+```
+
+### POST /vms/{id}/clone -- In-place snapshot+restore
+
+Snapshots the source VM and restores it as a new VM on the same server in one
+atomic call. The source stays running. The clone gets a fresh ID and can
+override the restored network / virtiofs mounts / exec_enabled. Useful for
+sandbox-pool warm-starts without standing up a second `gocracker serve`.
+
+```bash
+curl -s -X POST http://localhost:8080/vms/vm-abc123/clone \
+  -d '{
+    "exec_enabled": true,
+    "mounts": [{"source":"/opt/toolbox","target":"/opt/gc","backend":"virtiofs"}]
+  }'
+```
+
+Fields: `snapshot_dir` (optional, set to persist the snapshot), `tap_name` /
+`static_ip` / `gateway` / `network_mode`, `mounts` (virtiofs-only on restore),
+`exec_enabled`, `metadata`, `wait` (default true). Response mirrors `/run`
+with `restored_from_snapshot=true`. Metadata key `cloned_from` on the new VM
+points back at the source.
 
 ### POST /vms/{id}/snapshot -- Take snapshot
 

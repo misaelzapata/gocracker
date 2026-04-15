@@ -1760,6 +1760,29 @@ func normalizeNetworkMode(mode string) string {
 	}
 }
 
+// cloneTapName derives a unique tap name for a cloned VM, within the 15-char
+// Linux IFNAMSIZ limit. Source and clone share the snapshot's MAC + guest IP;
+// only the host-side tap name differs. Clones without host-side network
+// routing still boot fine — the exec agent, disk, and virtiofs work — they
+// just cannot reach the outside world until the caller supplies static_ip /
+// gateway or network_mode=auto.
+func cloneTapName(newID string) string {
+	// newID is "gc-<12-digits>"; "tclone-<N>" fits under 15 chars when N is
+	// the last 6 digits of the ID (monotonic per-second in practice).
+	suffix := newID
+	if strings.HasPrefix(suffix, "gc-") {
+		suffix = suffix[3:]
+	}
+	if len(suffix) > 6 {
+		suffix = suffix[len(suffix)-6:]
+	}
+	name := "tclone-" + suffix
+	if len(name) > 15 {
+		name = name[:15]
+	}
+	return name
+}
+
 func matchesVMFilters(info VMInfo, r *http.Request) bool {
 	filters := map[string]string{
 		"stack":        "stack_name",
@@ -2187,10 +2210,18 @@ func (s *Server) handleVMClone(w http.ResponseWriter, r *http.Request) {
 
 	srcCfg := src.handle.VMConfig()
 	newID := fmt.Sprintf("gc-%d", time.Now().UnixNano()%100000)
+	// A clone running alongside its source cannot share the source's TAP —
+	// the TUN/TAP device is exclusive to one opener. When the caller did not
+	// supply tap_name/network_mode, mint a per-clone name derived from the
+	// new VM ID so restore does not hit TUNSETIFF EBUSY against the source.
+	tapName := strings.TrimSpace(req.TapName)
+	if tapName == "" && normalizeNetworkMode(req.NetworkMode) == "" && strings.TrimSpace(srcCfg.TapName) != "" {
+		tapName = cloneTapName(newID)
+	}
 	opts := container.RunOptions{
 		ID:           newID,
 		KernelPath:   srcCfg.KernelPath,
-		TapName:      req.TapName,
+		TapName:      tapName,
 		NetworkMode:  normalizeNetworkMode(req.NetworkMode),
 		SnapshotDir:  snapDir,
 		StaticIP:     req.StaticIP,

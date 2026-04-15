@@ -128,6 +128,22 @@ func (c *Client) SnapshotVM(ctx context.Context, id, destDir string) error {
 	return c.doJSON(ctx, http.MethodPost, "/vms/"+id+"/snapshot", SnapshotRequest{DestDir: destDir}, nil)
 }
 
+func (c *Client) PauseVM(ctx context.Context, id string) error {
+	return c.doJSON(ctx, http.MethodPost, "/vms/"+id+"/pause", map[string]any{}, nil)
+}
+
+func (c *Client) ResumeVM(ctx context.Context, id string) error {
+	return c.doJSON(ctx, http.MethodPost, "/vms/"+id+"/resume", map[string]any{}, nil)
+}
+
+func (c *Client) CloneVM(ctx context.Context, id string, req CloneRequest) (RunResponse, error) {
+	var out RunResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/vms/"+id+"/clone", req, &out); err != nil {
+		return RunResponse{}, err
+	}
+	return out, nil
+}
+
 func (c *Client) Logs(ctx context.Context, id string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/vms/"+id+"/logs", nil)
 	if err != nil {
