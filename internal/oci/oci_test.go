@@ -146,6 +146,34 @@ func TestApplyTar_Symlinks(t *testing.T) {
 	}
 }
 
+// Regression: messense/rust-musl-cross ships symlinks like
+// `usr/lib/llvm-14/build/Debug+Asserts -> ..`. A strict root-containment
+// check on the resolved symlink target would wrongly reject these because
+// filepath.Base("..") is ".." which joins above root. Symlink *files* are
+// stored pointers resolved lazily by the guest; only the entry's write
+// path needs containment, not the link's target.
+func TestApplyTar_SymlinkToParentIsAllowed(t *testing.T) {
+	dir := t.TempDir()
+	buf := makeTar(t, []tarEntry{
+		{Name: "usr/lib/llvm-14/build/", Type: tar.TypeDir, Mode: 0755},
+		{Name: "usr/lib/llvm-14/build/Debug+Asserts", Type: tar.TypeSymlink, Linkname: ".."},
+		{Name: "usr/lib/llvm-14/build/Release", Type: tar.TypeSymlink, Linkname: ".."},
+	})
+	if err := applyTar(dir, buf); err != nil {
+		t.Fatalf("applyTar: %v", err)
+	}
+	for _, name := range []string{"Debug+Asserts", "Release"} {
+		link := filepath.Join(dir, "usr/lib/llvm-14/build", name)
+		dest, err := os.Readlink(link)
+		if err != nil {
+			t.Fatalf("readlink %s: %v", name, err)
+		}
+		if dest != ".." {
+			t.Errorf("%s symlink target = %q, want %q", name, dest, "..")
+		}
+	}
+}
+
 func TestApplyTar_AbsoluteEntryStaysInsideRoot(t *testing.T) {
 	dir := t.TempDir()
 	buf := makeTar(t, []tarEntry{
