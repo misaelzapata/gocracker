@@ -22,6 +22,12 @@ type Source struct {
 	Ref string
 	// Subdir inside the repo where the Dockerfile lives (default: root)
 	Subdir string
+	// Dockerfile, if set, pins the exact Dockerfile path relative to the
+	// resolved ContextDir (Dir/Subdir). Skips name-based discovery entirely,
+	// which is the only way to pick non-canonical filenames like
+	// `Dockerfile-envoy`, `Dockerfile.prod`, `docker/release.Dockerfile`.
+	// The file must exist inside ContextDir; otherwise Resolve errors out.
+	Dockerfile string
 	// Depth for shallow clone (default: 1 — fastest)
 	Depth int
 }
@@ -84,7 +90,36 @@ func resolveLocal(src Source) (*CloneResult, error) {
 		cleanup: func() {}, // nothing to delete
 	}
 	r.ContextDir = filepath.Join(abs, src.Subdir)
+	if src.Dockerfile != "" {
+		return applyExplicitDockerfile(r, src.Dockerfile)
+	}
 	locateFiles(r, isExplicitSubdir(src.Subdir))
+	return r, nil
+}
+
+// applyExplicitDockerfile honors src.Dockerfile when the caller pinned a
+// specific Dockerfile path. Supports both a filename relative to ContextDir
+// (e.g. "Dockerfile-envoy") and a path with subdirs (e.g. "release/Dockerfile").
+// Also records a ComposePath match if the explicit path turns out to be a
+// compose file — rare but not impossible.
+func applyExplicitDockerfile(r *CloneResult, explicit string) (*CloneResult, error) {
+	candidate := filepath.Join(r.ContextDir, explicit)
+	info, err := os.Stat(candidate)
+	if err != nil {
+		r.Cleanup()
+		return nil, fmt.Errorf("explicit dockerfile %s: %w", explicit, err)
+	}
+	if info.IsDir() {
+		r.Cleanup()
+		return nil, fmt.Errorf("explicit dockerfile %s is a directory", explicit)
+	}
+	base := strings.ToLower(filepath.Base(candidate))
+	if strings.HasSuffix(base, ".yml") || strings.HasSuffix(base, ".yaml") ||
+		strings.HasPrefix(base, "compose.") || strings.HasPrefix(base, "docker-compose.") {
+		r.ComposePath = candidate
+	} else {
+		r.DockerfilePath = candidate
+	}
 	return r, nil
 }
 
@@ -213,6 +248,9 @@ func cloneRemote(src Source) (*CloneResult, error) {
 		return r, nil
 	}
 	r.ContextDir = filepath.Join(tmp, src.Subdir)
+	if src.Dockerfile != "" {
+		return applyExplicitDockerfile(r, src.Dockerfile)
+	}
 	locateFiles(r, isExplicitSubdir(src.Subdir))
 	return r, nil
 }

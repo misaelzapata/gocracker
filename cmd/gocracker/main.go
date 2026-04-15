@@ -239,6 +239,7 @@ func cmdRepo(args []string) {
 	url := fs.String("url", "", "Git repo URL or local path [required]")
 	ref := fs.String("ref", "", "Branch/tag to checkout")
 	subdir := fs.String("subdir", "", "Subdir inside repo")
+	dockerfileFlag := fs.String("dockerfile", "", "Explicit Dockerfile path relative to --subdir (rescues non-canonical names like Dockerfile-envoy)")
 	kernel := fs.String("kernel", "", "Kernel image path [required]")
 	mem := fs.Uint64("mem", 256, "RAM in MiB")
 	arch := fs.String("arch", runtime.GOARCH, "Guest architecture: amd64 or arm64 (same-arch only)")
@@ -263,6 +264,7 @@ func cmdRepo(args []string) {
 	wait := fs.Bool("wait", false, "Block until VM stops")
 	ttyMode := fs.String("tty", "auto", "Console mode: auto, off, or force")
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
+	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs read-write directly (writes survive VM stop; slower boot). Default: Docker-style tmpfs overlay.")
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
@@ -282,13 +284,14 @@ func cmdRepo(args []string) {
 	}
 
 	runOpts := container.RunOptions{
-		RepoURL: *url, RepoRef: *ref, RepoSubdir: *subdir,
+		RepoURL: *url, RepoRef: *ref, RepoSubdir: *subdir, RepoDockerfile: *dockerfileFlag,
 		KernelPath: *kernel, MemMB: *mem, Arch: *arch, CPUs: *cpus, TapName: *tap, NetworkMode: normalizeNetworkMode(*netMode), X86Boot: vmm.X86BootMode(*x86Boot),
 		DiskSizeMB: *disk, SnapshotDir: *snap,
 		Env: splitComma(*envStr), Cmd: splitFields(*cmdStr),
 		Entrypoint:      splitFields(*entrypointStr),
 		WorkDir:         *workdir,
 		BuildArgs:       buildArgs.Map(),
+		RootfsPersistent: *rootfsPersistent,
 		PID1Mode:        pid1ModeForCLIWait(*wait),
 		CacheDir:        *cacheDir,
 		ExecEnabled:     interactive.enabled,

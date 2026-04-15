@@ -60,6 +60,55 @@ func TestIsExplicitSubdir(t *testing.T) {
 	}
 }
 
+// Regression: a repo may ship a Dockerfile under a non-canonical name
+// (Dockerfile-envoy, Dockerfile.prod, etc.). Without Source.Dockerfile
+// the name-based discovery misses it and Resolve errors out. With the
+// explicit Dockerfile field, we pick the exact file the caller pinned.
+func TestResolveLocalWithExplicitDockerfile(t *testing.T) {
+	dir := t.TempDir()
+	// Dockerfile-envoy at the repo root. Canonical "Dockerfile" NOT present.
+	dfPath := filepath.Join(dir, "Dockerfile-envoy")
+	os.WriteFile(dfPath, []byte("FROM scratch\nCMD [\"/envoy\"]\n"), 0644)
+
+	src := Source{URL: dir, Dockerfile: "Dockerfile-envoy"}
+	result, err := resolveLocal(src)
+	if err != nil {
+		t.Fatalf("resolveLocal with explicit Dockerfile: %v", err)
+	}
+	if result.DockerfilePath != dfPath {
+		t.Fatalf("DockerfilePath = %q, want %q", result.DockerfilePath, dfPath)
+	}
+	if result.ContextDir != dir {
+		t.Fatalf("ContextDir = %q, want %q", result.ContextDir, dir)
+	}
+}
+
+func TestResolveLocalWithExplicitDockerfileMissing(t *testing.T) {
+	dir := t.TempDir()
+	src := Source{URL: dir, Dockerfile: "does-not-exist.Dockerfile"}
+	if _, err := resolveLocal(src); err == nil {
+		t.Fatal("expected error for missing explicit dockerfile")
+	}
+}
+
+func TestResolveLocalWithExplicitDockerfileInSubdir(t *testing.T) {
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "distribution", "docker")
+	os.MkdirAll(subdir, 0755)
+	dfPath := filepath.Join(subdir, "Dockerfile-envoy")
+	os.WriteFile(dfPath, []byte("FROM scratch\n"), 0644)
+
+	// Subdir points at distribution/docker, Dockerfile is the pinned file inside it.
+	src := Source{URL: dir, Subdir: "distribution/docker", Dockerfile: "Dockerfile-envoy"}
+	result, err := resolveLocal(src)
+	if err != nil {
+		t.Fatalf("resolveLocal subdir+explicit: %v", err)
+	}
+	if result.DockerfilePath != dfPath {
+		t.Fatalf("DockerfilePath = %q, want %q", result.DockerfilePath, dfPath)
+	}
+}
+
 func TestLocateFilesRecursive(t *testing.T) {
 	dir := t.TempDir()
 	dfPath := filepath.Join(dir, "Dockerfile")

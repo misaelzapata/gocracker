@@ -40,9 +40,10 @@ type RunOptions struct {
 	Image      string // OCI ref e.g. "ubuntu:22.04"
 	Dockerfile string // explicit path to a Dockerfile
 	Context    string // build context dir (used with Dockerfile)
-	RepoURL    string // git remote URL or local path — Dockerfile auto-detected
-	RepoRef    string // branch/tag/commit (default: repo default branch)
-	RepoSubdir string // subdir inside repo containing the Dockerfile
+	RepoURL        string // git remote URL or local path — Dockerfile auto-detected
+	RepoRef        string // branch/tag/commit (default: repo default branch)
+	RepoSubdir     string // subdir inside repo containing the Dockerfile
+	RepoDockerfile string // explicit Dockerfile path relative to RepoSubdir (skips name-based discovery); rescues non-canonical filenames like Dockerfile-envoy
 
 	// VM
 	MemMB       uint64
@@ -292,10 +293,19 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		if _, err := os.Stat(opts.SnapshotDir + "/snapshot.json"); err == nil {
 			gclog.Container.Info("restoring from snapshot", "dir", opts.SnapshotDir)
 			t0 := time.Now()
+			// OverrideID ensures the restored VM gets its caller-visible
+			// ID (opts.ID) instead of inheriting the snapshot's cfg.ID.
+			// Without this, the restored VM's internal cfg.ID collides
+			// with the original VM's cfg.ID (both derived from the same
+			// snapshot source). Although the API server tracks VMs by
+			// an external key, logs and any cfg.ID-keyed lookup get
+			// confused, and it becomes harder to distinguish original
+			// from restored in instrumentation.
 			vm, err := vmm.RestoreFromSnapshotWithOptions(opts.SnapshotDir, vmm.RestoreOptions{
 				ConsoleIn:       opts.ConsoleIn,
 				ConsoleOut:      opts.ConsoleOut,
 				OverrideVCPUs:   opts.CPUs,
+				OverrideID:      opts.ID,
 				OverrideX86Boot: opts.X86Boot,
 			})
 			if err == nil {
@@ -1013,9 +1023,10 @@ type resolvedRepo struct {
 
 func resolveRepo(opts RunOptions, workDir string) (*resolvedRepo, error) {
 	result, err := repo.Resolve(repo.Source{
-		URL:    opts.RepoURL,
-		Ref:    opts.RepoRef,
-		Subdir: opts.RepoSubdir,
+		URL:        opts.RepoURL,
+		Ref:        opts.RepoRef,
+		Subdir:     opts.RepoSubdir,
+		Dockerfile: opts.RepoDockerfile,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("repo: %w", err)
