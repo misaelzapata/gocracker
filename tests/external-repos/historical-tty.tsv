@@ -1,0 +1,3 @@
+# id	command	expect
+distribution-registry	echo historical-tty-ok	historical-tty-ok
+go-gitea-gitea	echo historical-tty-ok	historical-tty-ok

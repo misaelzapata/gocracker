@@ -1,4 +1,4 @@
-# id	kind	url	ref	path	stack	mode	probe_type	probe_target	probe_expect	mem_mb	disk_mb	notes
+# id	kind	url	ref	path	stack	mode	probe_type	probe_target	probe_expect	mem_mb	disk_mb	notes	dockerfile
 traefik-whoami	dockerfile	https://github.com/traefik/whoami.git	3c6fc4814630c9645affe0e2ff42c8bc2d8aadae	.	go	service	none			128	4096	small http service
 minio-minio	dockerfile	https://github.com/minio/minio.git	7aac2a2c5b7c882e68c1ce017d8256be2feea27f	.	go	service	none			256	4096	object storage
 go-gitea-gitea	dockerfile	https://github.com/go-gitea/gitea.git	4fa319b9dca4	.	go	service	none			256	4096	forge
@@ -19,7 +19,7 @@ chartmuseum-chartmuseum	dockerfile	https://github.com/helm/chartmuseum.git	75088
 qdrant-qdrant	dockerfile	https://github.com/qdrant/qdrant.git	eabee371fda447974a94d29fbaa675a6a596cc7b	.	rust	service	none			512	4096	vector db
 meilisearch-meilisearch	dockerfile	https://github.com/meilisearch/meilisearch.git	14efbaeef1b87491707e396950be57ef0587f743	.	rust	service	none			512	4096	search engine
 coredns-coredns	dockerfile	https://github.com/coredns/coredns.git	510977c476609f4c75ffb924deb5101556069761	.	go	service	none			128	4096	dns server
-gotenberg-gotenberg	dockerfile	https://github.com/gotenberg/gotenberg.git	4811a005439f	.	go	service	none			512	4096	document api
+gotenberg-gotenberg	dockerfile	https://github.com/gotenberg/gotenberg.git	4811a005439f	.	go	service	none			512	4096	document api	build/Dockerfile
 gogs-gogs	dockerfile	https://github.com/gogs/gogs.git	b53d316233f9447309c2d8140e263e147d720e01	.	go	service	none			256	4096	forge
 woodpecker-ci-woodpecker	dockerfile	https://github.com/woodpecker-ci/woodpecker.git	2496287790b7	.	go	service	none			256	4096	ci
 drone-drone	dockerfile	https://github.com/drone/drone.git	20da7b5320d9	.	go	service	none			256	4096	ci
@@ -327,3 +327,53 @@ rust-web-example	dockerfile	https://github.com/zupzup/rust-web-example.git	ae230
 docker-gs-ping	dockerfile	https://github.com/docker/docker-gs-ping.git	fbee2036cc90b84f87e8a95b7de2a1c4065c87c7	.	go	service	none			128	2048	Official Docker Go sample (Echo)
 fiber-go-template	dockerfile	https://github.com/create-go-app/fiber-go-template.git	286d0d84d3373668634fcc30a3cec60740a8f4dc	.	go	service	none			128	2048	Go Fiber production template
 go-gin-example	dockerfile	https://github.com/eddycjy/go-gin-example.git	4f5174ca325b37f23edadad7c88d49586816a69c	.	go	service	none			128	2048	Popular Gin tutorial example
+charmbracelet-gum	dockerfile	https://github.com/charmbracelet/gum.git	ed78cffe351cc67609111ec54e19aa0d1c396365	.		service	none			256	4096	auto-curated
+charmbracelet-soft-serve	dockerfile	https://github.com/charmbracelet/soft-serve.git	c01f4ebaf201e28bf6fa190da610a3674192e4d8	.		service	none			256	4096	auto-curated
+sigstore-cosign	dockerfile	https://github.com/sigstore/cosign.git	1d5c7a6d34ce6ec314400c33c1e8d1a2ffde3eeb	.		service	none			256	4096	auto-curated
+google-ko	dockerfile	https://github.com/ko-build/ko.git	21305f1fd5a399962f0d8751cd041501e8b3fca2	.		service	none			256	4096	auto-curated
+hairyhenderson-gomplate	dockerfile	https://github.com/hairyhenderson/gomplate.git	d09b2062e6765aff1347411f260a99dd385603cf	.		service	none			256	4096	auto-curated
+derailed-k9s	dockerfile	https://github.com/derailed/k9s.git	0da2636cc324b1d78ba120d21bf5831f8027f5c3	.		service	none			256	4096	auto-curated
+sharkdp-bat	dockerfile	https://github.com/sharkdp/bat.git	f822bd05cefc34e9eda943122c94880b0a600693	.		service	none			256	4096	auto-curated
+BurntSushi-ripgrep	dockerfile	https://github.com/BurntSushi/ripgrep.git	4519153e5e461527f4bca45b042fff45c4ec6fb9	.		service	none			256	4096	auto-curated
+ogham-exa	dockerfile	https://github.com/ogham/exa.git	3d1edbb47052cb416ef9478106c3907586da5150	.		service	none			256	4096	auto-curated
+nushell-nushell	dockerfile	https://github.com/nushell/nushell.git	fa06e5434233a744b709f2780cb045740c2c866b	.		service	none			256	4096	auto-curated
+denoland-deno	dockerfile	https://github.com/denoland/deno.git	d98d2d8c51290aaefa20f9cb57ead146b0c8678d	.		service	none			256	4096	auto-curated
+plausible-analytics	dockerfile	https://github.com/plausible/community-edition.git	15529b26b8d692285184524241ba0825feb13c9a	.		service	none			256	4096	auto-curated
+pleroma	dockerfile	https://git.pleroma.social/pleroma/pleroma.git	683ab39160a2ff95d151887a89217bd1d4a6dcf5	.		service	none			256	4096	auto-curated
+koka-lang	dockerfile	https://github.com/koka-lang/koka.git	958cf72aebebc49b03aca4120dbad372d1ed37e1	util		service	none			512	6144	auto-curated; subdir fixed
+pandoc	dockerfile	https://github.com/jgm/pandoc.git	5caad90fc44669ced0abdd7a890108a995689a90	.		service	none			256	4096	auto-curated
+mirage-skeleton	dockerfile	https://github.com/mirage/mirage-skeleton.git	f89ae9e1a80eaf983622cc8c192c1214b219b9e0	.		service	none			256	4096	auto-curated
+crystal-lang	dockerfile	https://github.com/crystal-lang/crystal.git	1a6ac44a515bb826a5b0d9fc843214e9bdf252b6	.		service	none			256	4096	auto-curated
+kemalcr-kemal	dockerfile	https://github.com/kemalcr/kemal.git	c4be7e41f602475723b52dc8d30b5c5ca68803f5	.		service	none			256	4096	auto-curated
+nim-lang	dockerfile	https://github.com/nim-lang/Nim.git	5b1a05e2826ae222b0cedce740b809ae318af392	.		service	none			256	4096	auto-curated
+jester-nim	dockerfile	https://github.com/dom96/jester.git	ac9b8541dce64feff9b53b700cab8496c1816651	.		service	none			256	4096	auto-curated
+nushell-nu_scripts	dockerfile	https://github.com/nushell/nu_scripts.git	68af8db2fc540343affe089008c8292f767ca16e	.		service	none			256	4096	auto-curated
+racket-lang	dockerfile	https://github.com/racket/racket.git	9435b98316356ecda997f2e5f63e4e1178f0d151	.github/images		service	none			512	6144	auto-curated; subdir fixed (CI deps image)
+ktor-samples	dockerfile	https://github.com/ktorio/ktor-samples.git	59ab228bc321a1117985ecb70e736479522ecc24	.		service	none			256	4096	auto-curated
+spring-petclinic-kotlin	dockerfile	https://github.com/spring-petclinic/spring-petclinic-kotlin.git	735df8697f18a5199170cf94e8e92599d9804e6b	.		service	none			256	4096	auto-curated
+nginx	dockerfile	https://github.com/nginx/nginx.git	abc72c5a57890ba4ce235fe3339dbf31af40604e	.		service	none			256	4096	auto-curated
+mongoose	dockerfile	https://github.com/cesanta/mongoose.git	1be11a981ca33359f713896c97824108ea5a7a60	.		service	none			256	4096	auto-curated
+h2o	dockerfile	https://github.com/h2o/h2o.git	df7915db85501798de7b104085f4ee790ba20a45	.		service	none			256	4096	non-canonical Dockerfile.ubuntu2404	misc/docker-ci/Dockerfile.ubuntu2404
+drogonframework	dockerfile	https://github.com/drogonframework/drogon.git	4c05658259a83dbaea2bdcd8fd6d713f24ed7bdc	docker/ubuntu		service	none			512	6144	auto-curated; subdir fixed
+CrowCpp	dockerfile	https://github.com/CrowCpp/Crow.git	21f8bcfa6b900fcc76ee01a5bc6823b129f1e63f	.		service	none			256	4096	auto-curated
+sinatra	dockerfile	https://github.com/sinatra/sinatra.git	f891dd2b6f4911e356600efe6c3b82af97d262c6	.		service	none			256	4096	auto-curated
+mastodon	dockerfile	https://github.com/mastodon/mastodon.git	2b93d19d2ca18366b015e3dcde412e67625fe8f5	.		service	none			256	4096	auto-curated
+huginn	dockerfile	https://github.com/huginn/huginn.git	420816f61a026cb845d8537e79c3f5fdc857e026	.		service	none			256	4096	Dockerfile needs repo-root context	docker/single-process/Dockerfile
+denoland-fresh	dockerfile	https://github.com/denoland/fresh.git	36dd6375ebb9414e8f040b4f888995526d070444	.		service	none			256	4096	auto-curated
+oakserver-oak	dockerfile	https://github.com/oakserver/oak.git	185baef02551a84798000f25d3bd01c2fdfcb1ce	.devcontainer		service	none			256	4096	auto-curated; subdir fixed (devcontainer)
+nixos-docker	dockerfile	https://github.com/nix-community/docker-nixpkgs.git	10b83cdcf12c7d37db50cd8d2c68b336881b91de	.		service	none			256	4096	auto-curated
+bottlepy	dockerfile	https://github.com/bottlepy/bottle.git	2a743a302a71460bfe4c0b8b7cb99a306b0328c6	.		service	none			256	4096	auto-curated
+pyscript	dockerfile	https://github.com/pyscript/pyscript.git	7f856a107e8c392ab20a1d917962a207c4dcc9a6	.		service	none			256	4096	auto-curated
+litestar	dockerfile	https://github.com/litestar-org/litestar.git	f416d1ecf2d953f2ab6ff6992b516af84b450e6b	.		service	none			256	4096	auto-curated
+gleam-lang	dockerfile	https://github.com/gleam-lang/gleam.git	9492968b5f28db40f9fc9003853972417dc1c3b7	.		service	none			256	4096	auto-curated
+vlang	dockerfile	https://github.com/vlang/v.git	55e8faaedf64ec9e77581af873479891baf249d1	.		service	none			256	4096	auto-curated
+janet-lang	dockerfile	https://github.com/janet-lang/janet.git	c6b802b082aa21b6e65e8c2729c85237b0cc8a24	.		service	none			256	4096	auto-curated
+idris-lang	dockerfile	https://github.com/idris-lang/Idris2.git	19a3f4ec0c957220e7a5c0f98923932cdfcc6a48	.		service	none			256	4096	auto-curated
+zola	dockerfile	https://github.com/getzola/zola.git	5d2d821ab6509bc2e3e06d9e654ba58d0610b426	.		service	none			256	4096	auto-curated
+hugo	dockerfile	https://github.com/gohugoio/hugo.git	974772422258f1e8aab1c7603fc09bbb1a2c2571	.		service	none			256	4096	auto-curated
+act	dockerfile	https://github.com/nektos/act.git	bd86152165b976e89c24093ceb039d732b5ed95f	.		service	none			256	4096	auto-curated
+dive	dockerfile	https://github.com/wagoodman/dive.git	d6c691947f8fda635c952a17ee3b7555379d58f0	.		service	none			256	4096	auto-curated
+lazydocker	dockerfile	https://github.com/jesseduffield/lazydocker.git	2ebe3848d67720f641c1f2ff2a7fe0a7bcaf9422	.		service	none			256	4096	auto-curated
+gotty	dockerfile	https://github.com/yudai/gotty.git	a080c85cbc59226c94c6941ad8c395232d72d517	.		service	none			256	4096	auto-curated
+shiori	dockerfile	https://github.com/go-shiori/shiori.git	585ea341aa59219b0477f991eadb545d24e3a121	.		service	none			256	4096	auto-curated
+memos	dockerfile	https://github.com/usememos/memos.git	ab5332901fd6626f0a2ae6b99671af9663f68078	.		service	none			256	4096	auto-curated
