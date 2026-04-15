@@ -26,6 +26,8 @@ import (
 type VM interface {
 	Start() error
 	Stop()
+	Pause() error
+	Resume() error
 	TakeSnapshot(string) (*vmm.Snapshot, error)
 	State() vmm.State
 	ID() string
@@ -185,11 +187,12 @@ type SnapshotRequest struct {
 }
 
 type RestoreRequest struct {
-	SnapshotDir string `json:"snapshot_dir"`
-	TapName     string `json:"tap_name,omitempty"`
-	VcpuCount   int    `json:"vcpu_count,omitempty"`
-	X86Boot     string `json:"x86_boot,omitempty"`
-	Resume      bool   `json:"resume"`
+	SnapshotDir     string               `json:"snapshot_dir"`
+	TapName         string               `json:"tap_name,omitempty"`
+	VcpuCount       int                  `json:"vcpu_count,omitempty"`
+	X86Boot         string               `json:"x86_boot,omitempty"`
+	Resume          bool                 `json:"resume"`
+	SharedFSRebinds []vmm.SharedFSRebind `json:"shared_fs_rebinds,omitempty"`
 }
 
 // restoreResponse is the minimal payload returned by POST /restore. It stays
@@ -257,6 +260,8 @@ func NewWithOptions(opts Options) *Server {
 	r.Get("/logs", s.handleLogs)
 	r.Post("/snapshot", s.handleSnapshot)
 	r.Post("/restore", s.handleRestore)
+	r.Post("/pause", s.handlePause)
+	r.Post("/resume", s.handleResume)
 	r.Post("/migrations/prepare", s.handleMigrationPrepare)
 	r.Post("/migrations/finalize", s.handleMigrationFinalize)
 	r.Post("/migrations/reset", s.handleMigrationReset)
@@ -1023,6 +1028,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		OverrideTap:     req.TapName,
 		OverrideVCPUs:   req.VcpuCount,
 		OverrideX86Boot: mode,
+		SharedFSRebinds: req.SharedFSRebinds,
 	})
 	if err != nil {
 		apiErr(w, http.StatusBadRequest, err.Error())
@@ -1050,6 +1056,43 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		State: vm.State().String(),
 		MemMB: cfg.MemMB,
 	})
+}
+
+func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
+	vm, err := s.currentVM()
+	if err != nil {
+		apiErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	if err := vm.Pause(); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
+	vm, err := s.currentVM()
+	if err != nil {
+		apiErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	state := vm.State()
+	if state == vmm.StateCreated {
+		// The restore path leaves the VM in StateCreated when Resume=false;
+		// first transition is Start, not Resume.
+		if err := vm.Start(); err != nil {
+			apiErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := vm.Resume(); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleMigrationPrepare(w http.ResponseWriter, r *http.Request) {
@@ -1705,6 +1748,14 @@ func (c *Client) Restore(ctx context.Context, reqBody RestoreRequest) (VMInfo, e
 		return VMInfo{}, err
 	}
 	return info, nil
+}
+
+func (c *Client) Pause(ctx context.Context) error {
+	return c.doJSON(ctx, http.MethodPost, "/pause", nil, nil)
+}
+
+func (c *Client) Resume(ctx context.Context) error {
+	return c.doJSON(ctx, http.MethodPost, "/resume", nil, nil)
 }
 
 func (c *Client) PrepareMigrationBundle(ctx context.Context, reqBody SnapshotRequest) error {

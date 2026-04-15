@@ -189,6 +189,11 @@ type ExecConfig struct {
 type SharedFSConfig struct {
 	Source string `json:"source"`
 	Tag    string `json:"tag"`
+	// Target is the guest-side mount point the template configured for this
+	// tag. Populated by the container runtime so the snapshot-restore path
+	// can re-identify the slot when a caller supplies SharedFSRebinds by
+	// guest Target (the caller doesn't know the server-generated Tag).
+	Target string `json:"target,omitempty"`
 	// SocketPath, when set, points to an already-listening virtiofsd unix socket.
 	// In that case the VM does not spawn virtiofsd; it connects to this socket
 	// instead. Used by the worker/jailer path so virtiofsd can run on the host
@@ -907,6 +912,21 @@ type RestoreOptions struct {
 	OverrideID      string
 	OverrideTap     string
 	OverrideX86Boot X86BootMode
+	// SharedFSRebinds remaps virtiofs exports present in the snapshot to new
+	// host source paths, keyed by the guest-side Target that the template
+	// mounted the tag at. The template must have already snapshotted with a
+	// SharedFS entry whose Target matches; empty list means "use the
+	// snapshot's own sources unchanged".
+	SharedFSRebinds []SharedFSRebind
+}
+
+// SharedFSRebind rewrites the Source behind a virtio-fs export that was
+// already present in the snapshot, without changing the MMIO device layout
+// or the tag. Used by the sandbox-template flow to inject a per-instance
+// toolbox on top of a pre-provisioned virtiofs slot.
+type SharedFSRebind struct {
+	Target string `json:"target"`
+	Source string `json:"source"`
 }
 
 // RestoreFromSnapshotWithOptions creates a new VM restored from a snapshot
@@ -917,6 +937,48 @@ func RestoreFromSnapshotWithOptions(dir string, opts RestoreOptions) (*VM, error
 		return nil, err
 	}
 	return restoreFromSnapshot(dir, snap, opts)
+}
+
+// applySharedFSRebinds overrides the Source (and clears any stale SocketPath)
+// of virtio-fs entries in the snapshot whose guest-side Target matches a
+// caller-supplied rebind. Templates that were not snapshotted with a matching
+// Target fail fast with a clear error. Empty rebinds leave the snapshot
+// untouched so existing callers keep today's behaviour.
+func applySharedFSRebinds(snap *Snapshot, rebinds []SharedFSRebind) error {
+	if snap == nil || len(rebinds) == 0 {
+		return nil
+	}
+	idx := make(map[string]int, len(snap.Config.SharedFS))
+	for i, fs := range snap.Config.SharedFS {
+		if fs.Target == "" {
+			continue
+		}
+		idx[fs.Target] = i
+	}
+	for _, rb := range rebinds {
+		i, ok := idx[rb.Target]
+		if !ok {
+			return fmt.Errorf("snapshot has no virtiofs slot for target %q (available targets: %v); template must be rebuilt with a matching virtiofs mount", rb.Target, sharedFSTargets(snap.Config.SharedFS))
+		}
+		snap.Config.SharedFS[i].Source = rb.Source
+		// SocketPath points at the template host's virtiofsd socket; it is
+		// stale on the restore host. Clearing it forces the vmm to spawn a
+		// fresh virtiofsd against the new Source (direct path) or requires
+		// the worker to re-populate it (worker path).
+		snap.Config.SharedFS[i].SocketPath = ""
+	}
+	return nil
+}
+
+func sharedFSTargets(cfgs []SharedFSConfig) []string {
+	out := make([]string, 0, len(cfgs))
+	for _, fs := range cfgs {
+		if fs.Target == "" {
+			continue
+		}
+		out = append(out, fs.Target)
+	}
+	return out
 }
 
 func readSnapshot(dir string) (Snapshot, error) {
@@ -954,6 +1016,9 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	if opts.OverrideTap != "" {
 		snap.Config.TapName = opts.OverrideTap
 	}
+	if err := applySharedFSRebinds(&snap, opts.SharedFSRebinds); err != nil {
+		return nil, err
+	}
 	if opts.OverrideX86Boot != "" {
 		mode, err := normalizeX86BootMode(opts.OverrideX86Boot)
 		if err != nil {
@@ -988,16 +1053,23 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	if err != nil {
 		return nil, err
 	}
-	// Map the snapshot memory file directly into the guest memory region with
-	// MAP_PRIVATE. The restore path pays zero I/O up front: pages are faulted
-	// in lazily as the guest touches them, and dirty pages go to private COW
-	// pages so the snapshot file stays intact. On a 128 MiB guest this trades
-	// a ~60–100 ms read+copy for ~5–15 ms of mmap + page-table setup — the
-	// same trick Firecracker/Kata use to make pool-resume sandboxes look
-	// instant.
-	kvmVM, err := sys.CreateVMFromSnapshotFile(snap.MemFile, snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
-	if err != nil {
-		return nil, fmt.Errorf("cow restore: %w", err)
+	// Snapshots that include virtio-fs exports cannot use the MAP_PRIVATE COW
+	// fast path: virtiofsd needs a memfd it can mmap, and a file-backed
+	// PRIVATE mapping has no fd to share. Detect that case and fall back to
+	// the slower memfd-materialize path (one O(mem) read+copy at restore
+	// time, ~60-100 ms on a 128 MiB guest). Snapshots without virtio-fs keep
+	// today's instant lazy-fault restore.
+	var kvmVM *kvm.VM
+	if len(snap.Config.SharedFS) > 0 {
+		kvmVM, err = sys.CreateVMFromSnapshotFileMemfd(snap.MemFile, snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
+		if err != nil {
+			return nil, fmt.Errorf("memfd restore: %w", err)
+		}
+	} else {
+		kvmVM, err = sys.CreateVMFromSnapshotFile(snap.MemFile, snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
+		if err != nil {
+			return nil, fmt.Errorf("cow restore: %w", err)
+		}
 	}
 
 	m := &VM{

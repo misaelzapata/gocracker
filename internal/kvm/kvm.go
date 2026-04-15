@@ -4,6 +4,7 @@ package kvm
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"unsafe"
 
@@ -356,6 +357,105 @@ func (s *System) CreateVMWithBase(memMB uint64, guestPhysBase uint64) (*VM, erro
 	return vm, nil
 }
 
+// CreateVMFromSnapshotFileMemfd is the memfd-backed restore path. Unlike
+// CreateVMFromSnapshotFile (which mmaps the snapshot file MAP_PRIVATE for
+// O(1) lazy-fault restore), this path materializes the snapshot bytes into a
+// fresh memfd up front. Required when the restored VM owns virtio-fs
+// devices: virtiofsd needs a stable shared memfd it can mmap, and that
+// guarantee is impossible to provide on top of a file-backed PRIVATE
+// mapping. Pays an O(mem) read+copy at restore time (~60–100 ms on a 128
+// MiB guest) in exchange for working shared-memory device backends.
+func (s *System) CreateVMFromSnapshotFileMemfd(memFilePath string, memMB uint64, guestPhysBase uint64) (*VM, error) {
+	vmFd, err := s.ioctl(kvmCreateVM, 0)
+	if err != nil {
+		return nil, fmt.Errorf("KVM_CREATE_VM: %w", err)
+	}
+	mmapSz, err := s.ioctl(kvmGetVCPUMmapSize, 0)
+	if err != nil {
+		return nil, fmt.Errorf("KVM_GET_VCPU_MMAP_SIZE: %w", err)
+	}
+
+	memSize := memMB * 1024 * 1024
+	memfd, err := unix.MemfdCreate("gocracker-restore-ram", unix.MFD_CLOEXEC)
+	if err != nil {
+		return nil, fmt.Errorf("memfd_create restore guest memory: %w", err)
+	}
+	if err := unix.Ftruncate(memfd, int64(memSize)); err != nil {
+		_ = unix.Close(memfd)
+		return nil, fmt.Errorf("ftruncate restore memfd: %w", err)
+	}
+	mem, err := unix.Mmap(memfd, 0, int(memSize),
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_SHARED)
+	if err != nil {
+		_ = unix.Close(memfd)
+		return nil, fmt.Errorf("mmap restore memfd: %w", err)
+	}
+	_ = unix.Madvise(mem, unix.MADV_HUGEPAGE)
+	// Prefault the first 8 MiB: kernel text, page tables, vCPU stack live
+	// in the first few pages of guest RAM. Matches the COW-path heuristic
+	// so virtio-fs restores don't take a latency hit vs non-virtiofs ones.
+	if len(mem) >= 8<<20 {
+		_ = unix.Madvise(mem[:8<<20], unix.MADV_WILLNEED)
+	} else {
+		_ = unix.Madvise(mem, unix.MADV_WILLNEED)
+	}
+
+	// Stream snapshot bytes into the memfd. We could try MAP_PRIVATE-then-
+	// memcpy here, but a straight read into the already-mapped slice is just
+	// as fast (the kernel handles the page cache) and keeps the failure
+	// modes simpler.
+	f, err := os.OpenFile(memFilePath, os.O_RDONLY, 0)
+	if err != nil {
+		_ = unix.Munmap(mem)
+		_ = unix.Close(memfd)
+		return nil, fmt.Errorf("open snapshot mem: %w", err)
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		_ = unix.Munmap(mem)
+		_ = unix.Close(memfd)
+		return nil, fmt.Errorf("stat snapshot mem: %w", err)
+	}
+	if uint64(fi.Size()) != memSize {
+		_ = f.Close()
+		_ = unix.Munmap(mem)
+		_ = unix.Close(memfd)
+		return nil, fmt.Errorf("snapshot mem size %d does not match VM mem %d (%d MiB)", fi.Size(), memSize, memMB)
+	}
+	if _, err := io.ReadFull(f, mem); err != nil {
+		_ = f.Close()
+		_ = unix.Munmap(mem)
+		_ = unix.Close(memfd)
+		return nil, fmt.Errorf("read snapshot mem: %w", err)
+	}
+	_ = f.Close()
+
+	vm := &VM{fd: int(vmFd), mem: mem, memSize: memSize, vcpuMmapSz: int(mmapSz), memfd: memfd, regions: make(map[uint32]*MappedMemoryRegion)}
+
+	region := MemoryRegion{
+		Slot:          0,
+		Flags:         vm.memFlags,
+		GuestPhysAddr: guestPhysBase,
+		MemorySize:    memSize,
+		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+	}
+	vm.guestPhysBase = guestPhysBase
+	if _, err := vmIoctl(vm.fd, kvmSetUserMemory, uintptr(unsafe.Pointer(&region))); err != nil {
+		_ = unix.Munmap(mem)
+		_ = unix.Close(memfd)
+		_ = unix.Close(int(vmFd))
+		return nil, fmt.Errorf("KVM_SET_USER_MEMORY_REGION (memfd restore): %w", err)
+	}
+
+	if err := s.initVMArch(vm); err != nil {
+		_ = vm.Close()
+		return nil, err
+	}
+	return vm, nil
+}
+
 // CreateVMFromSnapshotFile creates a VM whose guest RAM is mmap'd directly
 // over the on-disk snapshot memory dump with MAP_PRIVATE. Pages are faulted
 // in lazily as the guest touches them, and guest writes go to private
@@ -372,7 +472,9 @@ func (s *System) CreateVMWithBase(memMB uint64, guestPhysBase uint64) (*VM, erro
 // Caveats: the snapshot file's mapping is referenced by the kernel until
 // the VM is closed; caller must not unlink / truncate / rewrite it during
 // the VM's lifetime. The file is opened O_RDONLY and the mmap is PRIVATE,
-// so a read-only snapshot volume is perfectly fine.
+// so a read-only snapshot volume is perfectly fine. Use
+// CreateVMFromSnapshotFileMemfd instead when the restored VM needs a memfd
+// for shared-memory device backends (virtio-fs).
 func (s *System) CreateVMFromSnapshotFile(memFilePath string, memMB uint64, guestPhysBase uint64) (*VM, error) {
 	vmFd, err := s.ioctl(kvmCreateVM, 0)
 	if err != nil {

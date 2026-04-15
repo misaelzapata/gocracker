@@ -128,6 +128,8 @@ type DeviceInfo struct {
 type Handle interface {
 	Start() error
 	Stop()
+	Pause() error
+	Resume() error
 	TakeSnapshot(string) (*Snapshot, error)
 	State() State
 	ID() string
