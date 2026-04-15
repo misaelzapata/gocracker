@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -133,10 +134,12 @@ type Drive struct {
 }
 
 type NetworkInterface struct {
-	IfaceID     string                 `json:"iface_id"`
-	HostDevName string                 `json:"host_dev_name"`
-	GuestMAC    string                 `json:"guest_mac,omitempty"`
-	RateLimiter *vmm.RateLimiterConfig `json:"rate_limiter,omitempty"`
+	IfaceID       string                 `json:"iface_id"`
+	HostDevName   string                 `json:"host_dev_name"`
+	GuestMAC      string                 `json:"guest_mac,omitempty"`
+	RateLimiter   *vmm.RateLimiterConfig `json:"rate_limiter,omitempty"`     // legacy: applied to both RX and TX
+	RxRateLimiter *vmm.RateLimiterConfig `json:"rx_rate_limiter,omitempty"` // Firecracker-parity: host→guest only
+	TxRateLimiter *vmm.RateLimiterConfig `json:"tx_rate_limiter,omitempty"` // Firecracker-parity: guest→host only
 }
 
 type Action struct {
@@ -188,6 +191,16 @@ type RunRequest struct {
 	ExecEnabled   bool                     `json:"exec_enabled,omitempty"`
 	Balloon       *Balloon                 `json:"balloon,omitempty"`
 	MemoryHotplug *vmm.MemoryHotplugConfig `json:"memory_hotplug,omitempty"`
+
+	// Wait, when true (or when the "wait=true" query parameter is set),
+	// makes the /run handler run synchronously: it performs the full
+	// runFn + vm.Start() inline and only returns once the vCPUs are
+	// spinning (state="running"). Intended for the snapshot-restore fast
+	// path where restore+start completes in single-digit ms — the
+	// traditional async/poll dance adds a wasted round-trip. When false
+	// (default), the handler keeps today's behaviour: launch a goroutine
+	// and return state="starting" immediately.
+	Wait bool `json:"wait,omitempty"`
 }
 
 type RunResponse struct {
@@ -261,6 +274,7 @@ type composeStack struct {
 
 type rateLimiterUpdater interface {
 	UpdateNetRateLimiter(*vmm.RateLimiterConfig) error
+	UpdateNetRateLimiters(rx, tx *vmm.RateLimiterConfig) error
 	UpdateBlockRateLimiter(*vmm.RateLimiterConfig) error
 	UpdateRNGRateLimiter(*vmm.RateLimiterConfig) error
 }
@@ -1067,14 +1081,62 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	if opts.CacheDir == "" {
 		opts.CacheDir = s.cacheDir
 	}
+	opts.JailerBinary = s.jailerBinary
+	opts.VMMBinary = s.vmmBinary
+	opts.ChrootBase = s.chrootBaseDir
+	opts.UID = s.uid
+	opts.GID = s.gid
+
+	// Opt-in synchronous path: used by the snapshot-restore fast path so
+	// the caller can skip the starting→running poll round-trip. Accept
+	// either "wait=true" in the JSON body or the "wait=true" query param.
+	waitSync := req.Wait
+	if !waitSync {
+		if v := strings.TrimSpace(r.URL.Query().Get("wait")); v != "" {
+			if b, err := strconv.ParseBool(v); err == nil {
+				waitSync = b
+			}
+		}
+	}
+	// Only honour wait=true when there's a snapshot to restore from. The
+	// fresh-build path takes multiple seconds and would block the HTTP
+	// response for the entire rootfs + kernel-boot duration, which is
+	// almost certainly not what the caller wants.
+	if waitSync && strings.TrimSpace(opts.SnapshotDir) != "" {
+		result, err := s.runFn(opts)
+		if err != nil {
+			gclog.API.Error("run failed", "error", err)
+			apiErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := s.attachComposeStackResources(id, opts, result); err != nil {
+			gclog.API.Error("compose network attach failed", "id", id, "error", err)
+			result.VM.Stop()
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = result.VM.WaitStopped(stopCtx)
+			stopCancel()
+			result.Close()
+			apiErr(w, http.StatusInternalServerError, fmt.Sprintf("attach compose network: %v", err))
+			return
+		}
+		entry := s.newVMEntry(result.VM, result.Close)
+		entry.metadata = mergeMetadata(entry.metadata, map[string]string{
+			"guest_ip":  result.GuestIP,
+			"gateway":   result.Gateway,
+			"tap_name":  result.TapName,
+			"disk_path": result.DiskPath,
+		})
+		s.registerVMEntry(result.ID, entry)
+		json.NewEncoder(w).Encode(RunResponse{
+			ID:      result.ID,
+			State:   "running",
+			Message: "VM is running",
+		})
+		return
+	}
 
 	// Run asynchronously so the HTTP response returns immediately
 	go func() {
-		opts.JailerBinary = s.jailerBinary
-		opts.VMMBinary = s.vmmBinary
-		opts.ChrootBase = s.chrootBaseDir
-		opts.UID = s.uid
-		opts.GID = s.gid
 		result, err := s.runFn(opts)
 		if err != nil {
 			gclog.API.Error("run failed", "error", err)
@@ -1773,8 +1835,29 @@ func (s *Server) handleVMNetRateLimiter(w http.ResponseWriter, r *http.Request) 
 		apiErr(w, http.StatusNotFound, "VM not found")
 		return
 	}
+	// Accept either the legacy single-bucket shape (TokenBucketConfig
+	// fields directly) OR the Firecracker-parity {rx_rate_limiter, tx_rate_limiter}
+	// envelope. We read the body once and try both.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var envelope struct {
+		Rx *vmm.RateLimiterConfig `json:"rx_rate_limiter,omitempty"`
+		Tx *vmm.RateLimiterConfig `json:"tx_rate_limiter,omitempty"`
+	}
+	_ = json.Unmarshal(body, &envelope)
+	if envelope.Rx != nil || envelope.Tx != nil {
+		if err := updater.UpdateNetRateLimiters(envelope.Rx, envelope.Tx); err != nil {
+			apiErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	var cfg vmm.RateLimiterConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	if err := json.Unmarshal(body, &cfg); err != nil {
 		apiErr(w, http.StatusBadRequest, err.Error())
 		return
 	}

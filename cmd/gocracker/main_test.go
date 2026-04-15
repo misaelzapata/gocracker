@@ -2363,6 +2363,47 @@ func TestResolveInteractiveRunCommand_EmptyOverrides(t *testing.T) {
 	}
 }
 
+// Regression: the interactive-exec path used to ignore the image's
+// Entrypoint/Cmd when no CLI override was passed, which made
+// `gocracker run --dockerfile ... --wait` drop into a login shell
+// instead of running the Dockerfile's CMD. Reproducer bug surfaced in
+// the manual smoke suite as shellform-fixture, user-fixture, and the
+// interactive-image cases hanging for the full test timeout because
+// the VM never exited on its own.
+func TestResolveInteractiveRunCommand_UsesImageCmdWhenNoOverride(t *testing.T) {
+	img := oci.ImageConfig{
+		Cmd: []string{"sh", "-c", "printf ok"},
+	}
+	got := resolveInteractiveRunCommand(img, container.RunOptions{})
+	want := []string{"sh", "-c", "printf ok"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
+func TestResolveInteractiveRunCommand_ImageEntrypointOnly(t *testing.T) {
+	img := oci.ImageConfig{
+		Entrypoint: []string{"/usr/local/bin/app"},
+	}
+	got := resolveInteractiveRunCommand(img, container.RunOptions{})
+	want := []string{"/usr/local/bin/app"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
+func TestResolveInteractiveRunCommand_ImageEntrypointPlusCmd(t *testing.T) {
+	img := oci.ImageConfig{
+		Entrypoint: []string{"python3"},
+		Cmd:        []string{"-c", "print(42)"},
+	}
+	got := resolveInteractiveRunCommand(img, container.RunOptions{})
+	want := []string{"python3", "-c", "print(42)"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
 func TestCmdServe_TCPAddr_WithAuth(t *testing.T) {
 	// TCP addr with auth token should pass validation but fail at listen
 	msg := catchFatal(t, func() {

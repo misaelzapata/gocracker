@@ -151,7 +151,7 @@ func TestSnapshotJSONCarriesExplicitX86ArchState(t *testing.T) {
 		ID:      "vm-test",
 		Config:  Config{Arch: string(ArchAMD64)},
 		VCPUs: []VCPUState{
-			newX86VCPUState(0, kvm.Regs{RIP: 0x1000}, kvm.Sregs{CR3: 0x2000}, kvm.MPState{State: kvm.MPStateRunnable}, nil),
+			newX86VCPUState(0, X86VCPUState{Regs: kvm.Regs{RIP: 0x1000}, Sregs: kvm.Sregs{CR3: 0x2000}, MPState: kvm.MPState{State: kvm.MPStateRunnable}}),
 		},
 		Arch: newX86SnapshotArchState(&X86MachineState{
 			Clock: kvm.ClockData{Clock: 42},

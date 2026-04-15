@@ -432,9 +432,12 @@ func applyTar(dir string, r io.Reader) error {
 				return err
 			}
 		case tar.TypeSymlink:
-			if _, err := resolveLayerLinkPath(dir, rel, hdr.Linkname); err != nil {
-				return err
-			}
+			// Symlinks are stored pointers resolved lazily by the guest
+			// relative to the link's own directory, so a legitimate link
+			// like `X -> ..` (seen in llvm-14 build symlinks) must not be
+			// rejected by a strict root-containment check. The symlink
+			// file itself is written at `target`, which was already
+			// validated to live inside root via resolveLayerEntryPath.
 			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
 				return err
 			}

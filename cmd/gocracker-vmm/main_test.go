@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"runtime/debug"
 	"testing"
 
 	"github.com/gocracker/gocracker/internal/vmmserver"
@@ -54,5 +55,17 @@ func TestRunVMMFlagError(t *testing.T) {
 	var stderr bytes.Buffer
 	if code := run([]string{"-bad-flag"}, &stderr); code != 2 {
 		t.Fatalf("run() code = %d, want 2", code)
+	}
+}
+
+// TestGCDisabledByInit pins the tuning decision that the VMM's short
+// lifetime makes GC net-negative on the critical boot path. SetGCPercent(-1)
+// returns the PREVIOUS value, so calling it with the same -1 tells us what
+// init() left behind. If anyone re-enables GC they'll break this and have
+// to delete the test consciously.
+func TestGCDisabledByInit(t *testing.T) {
+	prev := debug.SetGCPercent(-1)
+	if prev != -1 {
+		t.Fatalf("GC percent after init() = %d, want -1 (disabled)", prev)
 	}
 }

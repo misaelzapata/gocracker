@@ -51,7 +51,12 @@ func TestFindCompose_ResolvesNearestExistingAncestor(t *testing.T) {
 	}
 }
 
-func TestFindDockerfile_Ambiguous(t *testing.T) {
+func TestFindDockerfile_AmbiguousPicksLexSmallest(t *testing.T) {
+	// Previously returned an ambiguity error, which caused repos like
+	// eclipse-mosquitto (multiple tied Dockerfiles under docker/) to fall
+	// through to "no Dockerfile found". We now pick deterministically by
+	// lex-smallest path; callers wanting a specific variant can use --subdir
+	// or --dockerfile.
 	root := t.TempDir()
 	for _, dir := range []string{
 		filepath.Join(root, "services", "a"),
@@ -64,12 +69,13 @@ func TestFindDockerfile_Ambiguous(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	_, _, err := FindDockerfile(root)
-	if err == nil {
-		t.Fatal("expected ambiguity error")
+	path, _, err := FindDockerfile(root)
+	if err != nil {
+		t.Fatalf("FindDockerfile: %v", err)
 	}
-	if !strings.Contains(err.Error(), "ambiguous") {
-		t.Fatalf("unexpected error: %v", err)
+	want := filepath.Join(root, "services", "a", "Dockerfile")
+	if path != want {
+		t.Fatalf("path = %q, want %q", path, want)
 	}
 }
 
@@ -236,9 +242,10 @@ func TestFindCompose_AllVariantNames(t *testing.T) {
 	}
 }
 
-func TestFindCompose_AmbiguousSameDepth(t *testing.T) {
+func TestFindCompose_AmbiguousPicksLexSmallest(t *testing.T) {
+	// Ties between compose files are resolved deterministically by
+	// lex-smallest path (same policy as FindDockerfile).
 	root := t.TempDir()
-	// Two compose files at the same depth in sibling dirs
 	for _, dir := range []string{
 		filepath.Join(root, "svc-a"),
 		filepath.Join(root, "svc-b"),
@@ -250,12 +257,13 @@ func TestFindCompose_AmbiguousSameDepth(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	_, err := FindCompose(root)
-	if err == nil {
-		t.Fatal("expected ambiguity error")
+	path, err := FindCompose(root)
+	if err != nil {
+		t.Fatalf("FindCompose: %v", err)
 	}
-	if !strings.Contains(err.Error(), "ambiguous") {
-		t.Fatalf("unexpected error: %v", err)
+	want := filepath.Join(root, "svc-a", "docker-compose.yml")
+	if path != want {
+		t.Fatalf("path = %q, want %q", path, want)
 	}
 }
 
@@ -271,6 +279,13 @@ func TestDockerfileNameRank(t *testing.T) {
 		{"Dockerfile.production", 3, true},
 		{"Dockerfile.custom", len(dockerfileNames) + 1, true},
 		{"dockerfile.dev", len(dockerfileNames) + 1, true},
+		// Non-standard variants NOT supported by discovery — they would
+		// create ambiguity when multiple co-exist in one dir (e.g.
+		// chatwoot's rails.Dockerfile + vite.Dockerfile would tie with
+		// canonical docker/Dockerfile). Callers that want those patterns
+		// should point --subdir at the specific file path.
+		{"Dockerfile-envoy", 0, false},
+		{"deployment.Dockerfile", 0, false},
 		{"Makefile", 0, false},
 		{"README.md", 0, false},
 	}

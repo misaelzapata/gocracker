@@ -3,7 +3,6 @@
 package vmm
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -20,7 +19,6 @@ import (
 	"github.com/gocracker/gocracker/internal/uart"
 	"github.com/gocracker/gocracker/internal/virtio"
 	"github.com/gocracker/gocracker/internal/vsock"
-	"golang.org/x/sys/unix"
 )
 
 // Firecracker's AArch64 MMIO layout reserves:
@@ -102,26 +100,6 @@ func (vm *VM) ensureARM64GICLayout() (arm64layout.GICLayout, error) {
 // ---------------------------------------------------------------------------
 // setupDevices
 // ---------------------------------------------------------------------------
-
-// makeEventFDIRQFn creates an eventfd and returns an IRQ callback that writes
-// to it. Firecracker uses irqfd exclusively — writing a uint64(1) to the
-// eventfd causes KVM to inject the interrupt into the GIC without a VMexit.
-func (vm *VM) makeEventFDIRQFn() (int, func(bool), error) {
-	efd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
-	if err != nil {
-		return -1, nil, fmt.Errorf("eventfd: %w", err)
-	}
-	vm.irqEventFds = append(vm.irqEventFds, efd)
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], 1)
-	fn := func(assert bool) {
-		if !assert {
-			return
-		}
-		_, _ = unix.Write(efd, buf[:])
-	}
-	return efd, fn, nil
-}
 
 func (arm64MachineBackend) setupDevices(vm *VM) error {
 	mem := vm.kvmVM.Memory()

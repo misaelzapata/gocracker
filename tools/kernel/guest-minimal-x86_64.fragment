@@ -60,6 +60,34 @@
 # CONFIG_RD_LZMA is not set
 # CONFIG_RD_LZO is not set
 
+# -------- slow initcalls we don't hit in the microVM path --------
+# Measured under initcall_debug on a standard alpine boot: dropping these
+# saves ~25–30 ms of kernel init time with no loss of gocracker
+# functionality. virtio-blk is our only block path — SCSI, BLK_LOOP,
+# BLK_THROTTLING are pure overhead. IOMMU is a no-op in a microVM.
+# SUNRPC/NFS and XFS are filesystems we never mount. BPFILTER spawns a
+# user-mode helper at boot we have no use for.
+# CONFIG_SCSI is not set
+# CONFIG_SCSI_MOD is not set
+# CONFIG_SCSI_LOWLEVEL is not set
+# CONFIG_BLK_DEV_LOOP is not set
+# CONFIG_BLK_DEV_THROTTLING is not set
+# CONFIG_IOMMU_SUPPORT is not set
+# CONFIG_HUGETLBFS is not set
+# CONFIG_HUGETLB_PAGE is not set
+# CONFIG_SUNRPC is not set
+# CONFIG_NFS_FS is not set
+# CONFIG_NFS_V4 is not set
+# CONFIG_XFS_FS is not set
+# CONFIG_BPFILTER is not set
+# CONFIG_BPFILTER_UMH is not set
+# CONFIG_SQUASHFS is not set
+# CONFIG_PPS is not set
+# CONFIG_QUOTA is not set
+# CONFIG_QUOTACTL is not set
+# CONFIG_THERMAL is not set
+# CONFIG_WATCHDOG is not set
+
 # -------- re-assert the virtio + net + vsock + fs baseline (belt & braces) --
 CONFIG_VIRTIO=y
 CONFIG_VIRTIO_MMIO=y

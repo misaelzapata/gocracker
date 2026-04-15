@@ -148,6 +148,15 @@ func LaunchVMMWithTimings(cfg vmm.Config, opts VMMOptions) (vmm.Handle, vmm.Boot
 	if err != nil {
 		return nil, timings, nil, err
 	}
+	// Worker runs as opts.UID; MkdirTemp leaves the dir owned by root. The
+	// jailer bind-mounts it at /worker in the chroot, and the worker then
+	// needs to create /worker/vmm.sock — which fails with EACCES unless the
+	// dir is owned by the worker UID. Chown before the jailer spawns.
+	workerUID := firstNonNegative(opts.UID, os.Getuid())
+	workerGID := firstNonNegative(opts.GID, os.Getgid())
+	if err := os.Chown(runDir, workerUID, workerGID); err != nil && !os.IsPermission(err) {
+		return nil, timings, nil, fmt.Errorf("chown worker rundir %s to %d:%d: %w", runDir, workerUID, workerGID, err)
+	}
 	socketHostPath := filepath.Join(runDir, "vmm.sock")
 	jailerID := jailerInstanceID(runDir)
 
@@ -172,6 +181,14 @@ func LaunchVMMWithTimings(cfg vmm.Config, opts VMMOptions) (vmm.Handle, vmm.Boot
 			mode := "rw"
 			if drive.ReadOnly {
 				mode = "ro"
+			}
+			// Chown the drive image to the worker UID so the jailed VMM
+			// can open it rw. Silently skip on EPERM (cross-fs bind, or
+			// running non-root without CAP_CHOWN — test harness).
+			if !drive.ReadOnly {
+				if err := os.Chown(drive.Path, workerUID, workerGID); err != nil && !os.IsPermission(err) {
+					fmt.Fprintf(os.Stderr, "warn: chown drive for jailer %s: %v\n", drive.Path, err)
+				}
 			}
 			mounts = append(mounts, mode+":"+drive.Path+":"+target)
 			jailedDrive := vmm.DriveConfig{
@@ -219,8 +236,8 @@ func LaunchVMMWithTimings(cfg vmm.Config, opts VMMOptions) (vmm.Handle, vmm.Boot
 
 	jailerArgs := []string{
 		"--id", jailerID,
-		"--uid", fmt.Sprintf("%d", firstNonNegative(opts.UID, os.Getuid())),
-		"--gid", fmt.Sprintf("%d", firstNonNegative(opts.GID, os.Getgid())),
+		"--uid", fmt.Sprintf("%d", workerUID),
+		"--gid", fmt.Sprintf("%d", workerGID),
 		"--exec-file", vmmExec,
 	}
 	if opts.ChrootBase != "" {
@@ -390,12 +407,24 @@ func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, re
 	if err != nil {
 		return nil, nil, err
 	}
+	// The worker process runs as workerOpts.UID (typically 1000), but
+	// MkdirTemp was just called by root and left runDir with mode 0700/root.
+	// The jailer bind-mounts runDir at /worker inside the chroot; the worker
+	// then tries to `listen unix socket /worker/vmm.sock`, which fails with
+	// "permission denied" because it can't create files under a root-owned
+	// directory. Chown the dir to the configured worker UID/GID before the
+	// jailer spawns the worker.
+	workerUID := firstNonNegative(workerOpts.UID, os.Getuid())
+	workerGID := firstNonNegative(workerOpts.GID, os.Getgid())
+	if err := os.Chown(runDir, workerUID, workerGID); err != nil && !os.IsPermission(err) {
+		return nil, nil, fmt.Errorf("chown worker rundir %s to %d:%d: %w", runDir, workerUID, workerGID, err)
+	}
 	socketHostPath := filepath.Join(runDir, "vmm.sock")
 	jailerID := jailerInstanceID(runDir)
 	jailerArgs := []string{
 		"--id", jailerID,
-		"--uid", fmt.Sprintf("%d", firstNonNegative(workerOpts.UID, os.Getuid())),
-		"--gid", fmt.Sprintf("%d", firstNonNegative(workerOpts.GID, os.Getgid())),
+		"--uid", fmt.Sprintf("%d", workerUID),
+		"--gid", fmt.Sprintf("%d", workerGID),
 		"--exec-file", vmmExec,
 		"--mount", "rw:" + runDir + ":/worker",
 		"--mount", "rw:" + snapshotDir + ":/snapshot",

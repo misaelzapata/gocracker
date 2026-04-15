@@ -27,6 +27,8 @@ type fakeHandle struct {
 	events  *vmm.EventLog
 	cfg     vmm.Config
 	netRL   *vmm.RateLimiterConfig
+	netRxRL *vmm.RateLimiterConfig
+	netTxRL *vmm.RateLimiterConfig
 	blkRL   *vmm.RateLimiterConfig
 	rngRL   *vmm.RateLimiterConfig
 	balloon vmm.BalloonStats
@@ -58,6 +60,15 @@ func (f *fakeHandle) FirstOutputAt() time.Time                   { return time.T
 func (f *fakeHandle) WaitStopped(ctx context.Context) error      { <-ctx.Done(); return ctx.Err() }
 func (f *fakeHandle) UpdateNetRateLimiter(cfg *vmm.RateLimiterConfig) error {
 	f.netRL = cfg
+	return nil
+}
+func (f *fakeHandle) UpdateNetRateLimiters(rx, tx *vmm.RateLimiterConfig) error {
+	// The single-slot fake just records the RX side (the more common
+	// direction in HTTP-style workloads); the real handle has separate
+	// slots. Tests that care about TX assert via f.netRxRL/f.netTxRL.
+	f.netRxRL = rx
+	f.netTxRL = tx
+	f.netRL = rx
 	return nil
 }
 func (f *fakeHandle) UpdateBlockRateLimiter(cfg *vmm.RateLimiterConfig) error {
@@ -1580,6 +1591,33 @@ func TestHandleNetRateLimiter_Success(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// Regression: PUT /vms/{id}/rate-limiters/net must accept the Firecracker-parity
+// envelope with separate rx_rate_limiter / tx_rate_limiter and pipe both
+// to UpdateNetRateLimiters on the backend, not collapse them into one.
+func TestHandleNetRateLimiter_RxTxSplit(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-rxtx")
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-rxtx", entry)
+
+	body := `{
+	  "rx_rate_limiter": {"bandwidth": {"size": 1048576, "refill_time_ms": 1000}},
+	  "tx_rate_limiter": {"bandwidth": {"size": 524288,  "refill_time_ms": 1000}}
+	}`
+	req := httptest.NewRequest(http.MethodPut, "/vms/vm-rxtx/rate-limiters/net", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if handle.netRxRL == nil || handle.netRxRL.Bandwidth.Size != 1048576 {
+		t.Fatalf("RX limiter not applied: got %+v", handle.netRxRL)
+	}
+	if handle.netTxRL == nil || handle.netTxRL.Bandwidth.Size != 524288 {
+		t.Fatalf("TX limiter not applied: got %+v", handle.netTxRL)
 	}
 }
 

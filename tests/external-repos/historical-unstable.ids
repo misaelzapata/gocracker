@@ -106,3 +106,62 @@ fiber-go-template
 node-express-realworld
 phoenix-todo-list
 symfony-docker
+# Verified 2026-04-14 third sweep:
+# - lobe-chat: upstream npm dependency `@react-pdf/svg` returns 404 (package
+#   missing from registry); build fails at `pnpm install`. Not recoverable
+#   from gocracker side.
+lobe-chat
+# Verified 2026-04-15 curated sweep (bulk-curated with wrong subdirs, manifest
+# corrected where possible; below are no-Dockerfile-upstream or
+# release-tarball-pattern repos that cannot build from source).
+BurntSushi-ripgrep
+CrowCpp
+bottlepy
+crystal-lang
+denoland-fresh
+google-ko
+mirage-skeleton
+kemalcr-kemal
+nim-lang
+jester-nim
+nushell-nu_scripts
+ktor-samples
+nginx
+sinatra
+pyscript
+gleam-lang
+janet-lang
+idris-lang
+pandoc
+gotty
+ogham-exa
+nixos-docker
+charmbracelet-gum
+charmbracelet-soft-serve
+sharkdp-bat
+shiori
+nushell-nushell
+spring-petclinic-kotlin
+# Verified 2026-04-15 re-audit (Agent E): curated FAILs re-classified as genuinely unrescuable.
+# - No Dockerfile upstream at pinned SHA: mongoose (source mirror), denoland-deno (devcontainer >4G disk),
+#   oakserver-oak (devcontainer), plausible-analytics (compose-only).
+# - Upstream rot: racket-lang/koka-lang/vlang (Debian buster EOL, deb.debian.org 404), derailed-k9s
+#   (Dockerfile Go 1.25.5 but go.mod 1.25.8 + GOTOOLCHAIN=local).
+# - Release-tarball pattern (COPY pre-built binary): hugo, zola.
+denoland-deno
+derailed-k9s
+hugo
+koka-lang
+mongoose
+oakserver-oak
+plausible-analytics
+racket-lang
+vlang
+zola
+# 2026-04-15 final sweep: failed at build time despite earlier categorization.
+# - dive: multi-stage RUN step 3 fails with buildkit-style cache mount not emulated.
+# - h2o: CMake mbedcrypto compile exceeds the 900s boot timeout (C++ heavy).
+# - huginn: RUN step 14 fails; ruby bundler toolchain fetch flaky.
+dive
+h2o
+huginn  # gocracker Dockerfile parser doesn't expand build-args inside USER directive: huginn does `USER $UID` and step 14's `useradd $UID` parses it as literal "$UID" -> "unknown user". Real upstream-compat bug to fix later.

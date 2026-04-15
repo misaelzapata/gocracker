@@ -40,9 +40,10 @@ type RunOptions struct {
 	Image      string // OCI ref e.g. "ubuntu:22.04"
 	Dockerfile string // explicit path to a Dockerfile
 	Context    string // build context dir (used with Dockerfile)
-	RepoURL    string // git remote URL or local path — Dockerfile auto-detected
-	RepoRef    string // branch/tag/commit (default: repo default branch)
-	RepoSubdir string // subdir inside repo containing the Dockerfile
+	RepoURL        string // git remote URL or local path — Dockerfile auto-detected
+	RepoRef        string // branch/tag/commit (default: repo default branch)
+	RepoSubdir     string // subdir inside repo containing the Dockerfile
+	RepoDockerfile string // explicit Dockerfile path relative to RepoSubdir (skips name-based discovery); rescues non-canonical filenames like Dockerfile-envoy
 
 	// VM
 	MemMB       uint64
@@ -112,6 +113,13 @@ type RunOptions struct {
 	ChrootBase   string
 	UID          int
 	GID          int
+
+	// RootfsPersistent forces the guest to mount the rootfs read-write
+	// directly (no tmpfs overlay). Writes land on the per-VM disk file and
+	// survive VM shutdown, at the cost of a slower boot (copyDiskImage has
+	// to reflink/copy instead of hardlinking the template). Leave false for
+	// Docker-style ephemeral writes and fast boot.
+	RootfsPersistent bool
 }
 
 // RunResult is returned after a VM is started.
@@ -285,10 +293,19 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		if _, err := os.Stat(opts.SnapshotDir + "/snapshot.json"); err == nil {
 			gclog.Container.Info("restoring from snapshot", "dir", opts.SnapshotDir)
 			t0 := time.Now()
+			// OverrideID ensures the restored VM gets its caller-visible
+			// ID (opts.ID) instead of inheriting the snapshot's cfg.ID.
+			// Without this, the restored VM's internal cfg.ID collides
+			// with the original VM's cfg.ID (both derived from the same
+			// snapshot source). Although the API server tracks VMs by
+			// an external key, logs and any cfg.ID-keyed lookup get
+			// confused, and it becomes harder to distinguish original
+			// from restored in instrumentation.
 			vm, err := vmm.RestoreFromSnapshotWithOptions(opts.SnapshotDir, vmm.RestoreOptions{
 				ConsoleIn:       opts.ConsoleIn,
 				ConsoleOut:      opts.ConsoleOut,
 				OverrideVCPUs:   opts.CPUs,
+				OverrideID:      opts.ID,
 				OverrideX86Boot: opts.X86Boot,
 			})
 			if err == nil {
@@ -408,7 +425,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	// ---- Assemble kernel cmdline ----
 	cmdline := buildCmdlineWithPlan(opts, sharedFS, len(kernelModules) > 0)
 
-	bootDiskPath, cleanupRuntimeDisk, err := prepareBootDisk(workDir, diskPath, opts.ID)
+	bootDiskPath, cleanupRuntimeDisk, err := prepareBootDisk(workDir, diskPath, opts.ID, !opts.RootfsPersistent)
 	if err != nil {
 		return nil, fmt.Errorf("prepare boot disk: %w", err)
 	}
@@ -718,7 +735,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 	}
 	cmdline := buildCmdlineWithPlan(opts, sharedFS, len(kernelModules) > 0)
 
-	bootDiskPath, cleanupRuntimeDisk, err := prepareBootDisk(workDir, diskPath, opts.ID)
+	bootDiskPath, cleanupRuntimeDisk, err := prepareBootDisk(workDir, diskPath, opts.ID, !opts.RootfsPersistent)
 	if err != nil {
 		return nil, fmt.Errorf("prepare boot disk: %w", err)
 	}
@@ -1006,9 +1023,10 @@ type resolvedRepo struct {
 
 func resolveRepo(opts RunOptions, workDir string) (*resolvedRepo, error) {
 	result, err := repo.Resolve(repo.Source{
-		URL:    opts.RepoURL,
-		Ref:    opts.RepoRef,
-		Subdir: opts.RepoSubdir,
+		URL:        opts.RepoURL,
+		Ref:        opts.RepoRef,
+		Subdir:     opts.RepoSubdir,
+		Dockerfile: opts.RepoDockerfile,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("repo: %w", err)
@@ -1251,7 +1269,7 @@ func inspectCachedRunArtifacts(diskPath, configPath string) (oci.ImageConfig, bo
 	return oci.ImageConfig{}, false, fmt.Sprintf("image config unreadable: %v", err), nil
 }
 
-func prepareBootDisk(workDir, templateDiskPath, id string) (string, func(), error) {
+func prepareBootDisk(workDir, templateDiskPath, id string, overlay bool) (string, func(), error) {
 	runtimeDir := filepath.Join(workDir, "runs", sanitizeRuntimePathComponent(id))
 	if err := os.RemoveAll(runtimeDir); err != nil {
 		return "", nil, err
@@ -1260,7 +1278,7 @@ func prepareBootDisk(workDir, templateDiskPath, id string) (string, func(), erro
 		return "", nil, err
 	}
 	runtimeDiskPath := filepath.Join(runtimeDir, filepath.Base(templateDiskPath))
-	if err := copyDiskImage(templateDiskPath, runtimeDiskPath); err != nil {
+	if err := copyDiskImage(templateDiskPath, runtimeDiskPath, overlay); err != nil {
 		return "", nil, err
 	}
 	return runtimeDiskPath, delayedRemoveAll(runtimeDir, runtimeDiskRetention), nil
@@ -1292,14 +1310,27 @@ func sanitizeRuntimePathComponent(value string) string {
 	return sanitized
 }
 
-// copyDiskImage copies src to dst: hardlink → reflink → full copy.
-func copyDiskImage(src, dst string) error {
-	// Try hardlink first (same filesystem, instant).
-	if err := os.Link(src, dst); err == nil {
-		return nil
+// copyDiskImage provisions a per-VM disk at dst from the cached template at
+// src: hardlink (if safe) → reflink → full copy.
+//
+// Hardlinks share the inode with src. When the guest mounts the block device
+// read-write, a hardlinked runs/ file silently bleeds writes back into the
+// cached template and contaminates every future VM spawned from it — stale
+// /etc/shadow, lockfiles, leftover /marker files, etc. Hardlinks ARE safe
+// when the guest mounts the rootfs read-only and layers tmpfs on top (the
+// `--rootfs-overlay` opt-in path — see mountRootDisk() in internal/guest/init.go).
+// Callers signal that safety by passing overlay=true.
+func copyDiskImage(src, dst string, overlay bool) error {
+	if overlay {
+		// Hardlink is safe because the guest will never write to the
+		// backing file — writes go to a tmpfs upper layer.
+		if err := os.Link(src, dst); err == nil {
+			return nil
+		}
 	}
-
-	// Try reflink (CoW clone). FICLONE = 0x40049409 on Linux.
+	// Try reflink (CoW clone). FICLONE = 0x40049409 on Linux. Safe in both
+	// modes because it produces independent inodes that only share data
+	// pages until first write.
 	if err := tryReflink(src, dst); err == nil {
 		return nil
 	}
@@ -1433,6 +1464,12 @@ func buildCmdlineWithPlan(opts RunOptions, sharedFS sharedFSPlan, allowKernelMod
 	}
 	if hasMaterializedMounts(opts.Mounts) {
 		parts = append(parts, "gc.fs_sync=1")
+	}
+	if opts.RootfsPersistent {
+		// Tells guest init to mount /dev/vda read-write directly, no
+		// overlay. Writes persist on the per-VM disk file after VM
+		// shutdown, at the cost of a slower boot (see prepareBootDisk).
+		parts = append(parts, "gc.rootfs_overlay=off")
 	}
 
 	// Working dir

@@ -297,7 +297,17 @@ func translateCommand(cmd dfinstructions.Command) (Instruction, error) {
 		}
 		if len(c.FlagsUsed) > 0 {
 			for _, flag := range c.FlagsUsed {
-				if flag != "mount" {
+				switch flag {
+				case "mount":
+					// handled via translateRunMounts
+				case "security", "network":
+					// BuildKit-only hints. `security=insecure` requests a
+					// privileged build step (we already run in a privileged
+					// mount namespace, so no-op); `network=none|host|default`
+					// scopes network access. Accept-and-ignore instead of
+					// failing parse so repos like sickchill (rustup bootstrap
+					// under --security=insecure) build.
+				default:
 					return Instruction{}, fmt.Errorf("RUN flag %q is not supported yet", flag)
 				}
 			}
@@ -839,7 +849,11 @@ func (b *builder) step(instr Instruction) error {
 		if len(instr.Args) == 0 {
 			return fmt.Errorf("USER requires an argument")
 		}
-		b.user = instr.Args[0]
+		// Expand build-args / env so `USER $UID` and `USER ${USER}` work.
+		// Without this, the literal "$UID" gets passed to the runtime,
+		// which then can't resolve a user named "$UID" and fails on the
+		// first chown/su step. Repos like huginn rely on this.
+		b.user = b.expand(instr.Args[0])
 		b.config.User = b.user
 	case "EXPOSE":
 		for _, arg := range instr.Args {
@@ -1087,7 +1101,14 @@ func (b *builder) handleARG(args []string) error {
 		}
 		if len(kv) == 1 {
 			b.args[k] = ""
-			b.argExport[k] = false
+			// BuildKit/Docker semantics: a declared ARG (even with no
+			// default and no --build-arg) is exposed to subsequent RUN
+			// steps as an environment variable with an empty value. This
+			// is what makes patterns like `RUN set -eu; cargo build
+			// ${EXTRA_ARGS}` work under `set -u` when EXTRA_ARGS isn't
+			// passed. Without exporting, the shell sees an unset var and
+			// aborts.
+			b.argExport[k] = true
 			continue
 		}
 		if len(kv) == 2 {

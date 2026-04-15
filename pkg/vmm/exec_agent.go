@@ -44,6 +44,19 @@ func (b *execAgentBroker) listen(port uint32) (net.Conn, error) {
 }
 
 func (b *execAgentBroker) acquire() (net.Conn, error) {
+	// Fast path: in steady state the guest's serveExecAgent loop keeps
+	// exactly one conn queued here, so /exec is already ready to go. Skip
+	// the timer allocation + goroutine dance entirely in that case.
+	select {
+	case <-b.closed:
+		return nil, fmt.Errorf("exec agent broker is closed")
+	case conn := <-b.conns:
+		return conn, nil
+	default:
+	}
+	// Slow path: no conn queued (first /exec post-restore, or new VM
+	// before the guest has finished its first dial). Fall back to the
+	// bounded wait.
 	timer := time.NewTimer(execAgentAcquireTimeout)
 	defer timer.Stop()
 	select {

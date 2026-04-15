@@ -38,6 +38,9 @@ type RunOptions struct {
 	TapPrefix   string
 	X86Boot     vmm.X86BootMode
 	JailerMode  string
+	// RootfsPersistent forces rw rootfs mount in each service VM. See
+	// container.RunOptions.RootfsPersistent for semantics.
+	RootfsPersistent bool
 }
 
 type stackNetwork interface {
@@ -497,10 +500,11 @@ func (s *Stack) startService(name string, svc Service, ip, tapName string, hosts
 		Mounts:      toContainerMounts(volumes),
 		StaticIP:    s.network.GuestCIDR(ip),
 		Gateway:     s.network.GatewayIP(),
-		SnapshotDir: serviceSnapshotDir(opts.SnapshotDir, name),
-		JailerMode:  opts.JailerMode,
-		CacheDir:    opts.CacheDir,
-		ExecEnabled: true,
+		SnapshotDir:      serviceSnapshotDir(opts.SnapshotDir, name),
+		JailerMode:       opts.JailerMode,
+		CacheDir:         opts.CacheDir,
+		ExecEnabled:      true,
+		RootfsPersistent: opts.RootfsPersistent,
 	}
 	if supervised {
 		runOpts.PID1Mode = runtimecfg.PID1ModeSupervised
