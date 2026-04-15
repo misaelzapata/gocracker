@@ -230,6 +230,35 @@ type SnapshotRequest struct {
 	DestDir string `json:"dest_dir"`
 }
 
+// CloneRequest clones a running VM in-place (no second gocracker serve
+// required). The server snapshots the source to a scratch dir, restores as a
+// new VM with a fresh ID, and applies the per-instance overrides below. The
+// source VM is unaffected (it keeps running). Intended for sandbox-template
+// warm pools: publish one template VM, clone it per sandbox.
+type CloneRequest struct {
+	// Optional: where to drop the intermediate snapshot. If empty, the
+	// server uses a temp dir and deletes it after the clone completes.
+	// Set this if you want to publish the snapshot as a durable template
+	// for later /run snapshot_dir=… calls.
+	SnapshotDir string `json:"snapshot_dir,omitempty"`
+	// TapName / StaticIP / Gateway override the restored VM's network.
+	// Mutually exclusive with NetworkMode=auto.
+	TapName     string `json:"tap_name,omitempty"`
+	StaticIP    string `json:"static_ip,omitempty"`
+	Gateway     string `json:"gateway,omitempty"`
+	NetworkMode string `json:"network_mode,omitempty"`
+	// Virtiofs rebinds. Must be backend=virtiofs and the source VM must
+	// have been booted with a matching guest Target.
+	Mounts []container.Mount `json:"mounts,omitempty"`
+	// ExecEnabled for the clone (the source's exec is not forwarded).
+	ExecEnabled bool `json:"exec_enabled,omitempty"`
+	// Metadata merged onto the clone's VMInfo.
+	Metadata map[string]string `json:"metadata,omitempty"`
+	// Wait blocks the HTTP response until the clone is running. Defaults
+	// to true — clone's whole point is atomicity for the caller.
+	Wait *bool `json:"wait,omitempty"`
+}
+
 type VMInfo struct {
 	ID          string            `json:"id"`
 	State       string            `json:"state"`
@@ -394,6 +423,7 @@ func NewWithOptions(opts Options) *Server {
 	r.Post("/vms/{id}/stop", s.handleStopVM)
 	r.Post("/vms/{id}/pause", s.handleVMPause)
 	r.Post("/vms/{id}/resume", s.handleVMResume)
+	r.Post("/vms/{id}/clone", s.handleVMClone)
 	r.Post("/vms/{id}/migrate", s.handleMigrateVM)
 	r.Post("/vms/{id}/snapshot", s.handleSnapshot)
 	r.Get("/vms/{id}/events", s.handleVMEvents)
@@ -2101,6 +2131,118 @@ func (s *Server) handleVMResume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleVMClone snapshots the source VM and restores it as a new VM on the
+// same server in one HTTP call. The source stays running; the clone gets a
+// fresh ID. Callers can override tap/ip/gateway/mounts/network_mode to
+// differentiate the clone from its template.
+func (s *Server) handleVMClone(w http.ResponseWriter, r *http.Request) {
+	srcID := chi.URLParam(r, "id")
+	var req CloneRequest
+	if err := decodeJSONStrict(r, &req); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateNetworkMode(req.NetworkMode, req.StaticIP, req.Gateway); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	s.mu.RLock()
+	src, ok := s.vms[srcID]
+	s.mu.RUnlock()
+	if !ok {
+		apiErr(w, http.StatusNotFound, "VM not found")
+		return
+	}
+	if src.isPending() {
+		apiErr(w, http.StatusConflict, "source VM is still starting")
+		return
+	}
+
+	// Decide on the snapshot dir. If the caller did not provide one, use a
+	// scratch dir under /tmp and delete it after the clone returns.
+	snapDir := strings.TrimSpace(req.SnapshotDir)
+	retainSnap := snapDir != ""
+	if !retainSnap {
+		tmp, err := os.MkdirTemp("", "gocracker-clone-*")
+		if err != nil {
+			apiErr(w, http.StatusInternalServerError, fmt.Sprintf("create clone tmpdir: %v", err))
+			return
+		}
+		snapDir = tmp
+		defer os.RemoveAll(tmp)
+	} else {
+		if err := s.validateSnapshotPathForServer(snapDir, false); err != nil {
+			apiErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	if _, err := src.handle.TakeSnapshot(snapDir); err != nil {
+		apiErr(w, http.StatusInternalServerError, fmt.Sprintf("snapshot source: %v", err))
+		return
+	}
+
+	srcCfg := src.handle.VMConfig()
+	newID := fmt.Sprintf("gc-%d", time.Now().UnixNano()%100000)
+	opts := container.RunOptions{
+		ID:           newID,
+		KernelPath:   srcCfg.KernelPath,
+		TapName:      req.TapName,
+		NetworkMode:  normalizeNetworkMode(req.NetworkMode),
+		SnapshotDir:  snapDir,
+		StaticIP:     req.StaticIP,
+		Gateway:      req.Gateway,
+		Mounts:       append([]container.Mount(nil), req.Mounts...),
+		ExecEnabled:  req.ExecEnabled,
+		Metadata:     cloneMetadata(req.Metadata),
+		JailerMode:   s.jailerMode,
+		JailerBinary: s.jailerBinary,
+		VMMBinary:    s.vmmBinary,
+		ChrootBase:   s.chrootBaseDir,
+		UID:          s.uid,
+		GID:          s.gid,
+		CacheDir:     s.cacheDir,
+		X86Boot:      s.defaultX86Boot,
+	}
+
+	result, err := s.runFn(opts)
+	if err != nil {
+		apiErr(w, http.StatusInternalServerError, fmt.Sprintf("restore clone: %v", err))
+		return
+	}
+	if err := s.attachComposeStackResources(newID, opts, result); err != nil {
+		result.VM.Stop()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = result.VM.WaitStopped(stopCtx)
+		stopCancel()
+		result.Close()
+		apiErr(w, http.StatusInternalServerError, fmt.Sprintf("attach compose network: %v", err))
+		return
+	}
+	entry := s.newVMEntry(result.VM, result.Close)
+	entry.metadata = mergeMetadata(entry.metadata, map[string]string{
+		"guest_ip":     result.GuestIP,
+		"gateway":      result.Gateway,
+		"tap_name":     result.TapName,
+		"disk_path":    result.DiskPath,
+		"network_mode": opts.NetworkMode,
+		"cloned_from":  srcID,
+	})
+	s.registerVMEntry(result.ID, entry)
+
+	_ = json.NewEncoder(w).Encode(RunResponse{
+		ID:                   result.ID,
+		State:                "running",
+		Message:              fmt.Sprintf("cloned from %s", srcID),
+		TapName:              result.TapName,
+		GuestIP:              result.GuestIP,
+		Gateway:              result.Gateway,
+		NetworkMode:          opts.NetworkMode,
+		RestoredFromSnapshot: true,
+	})
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
