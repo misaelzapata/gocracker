@@ -50,7 +50,13 @@ type NetDevice struct {
 	cfg     netConfig
 	tapFd   *os.File
 	tapName string
-	rl      *RateLimiter
+	// Separate RX and TX rate limiters (Firecracker parity). RX is the
+	// host→guest direction (frames arriving on TAP, delivered to the
+	// guest's virtio RX queue). TX is guest→host (frames the guest
+	// writes to its virtio TX queue, forwarded out the TAP). Either may
+	// be nil meaning no limit.
+	rlRx *RateLimiter
+	rlTx *RateLimiter
 
 	// tapRawFd is a cached copy of the TAP kernel fd captured at
 	// construction; rxPump polls on this directly so calling *os.File.Fd()
@@ -92,8 +98,19 @@ func NewNetDevice(mem []byte, basePA uint64, irq uint8, mac net.HardwareAddr, ta
 	return d, nil
 }
 
+// SetRateLimiter applies the same limiter to both RX and TX. Kept for
+// backwards compatibility with callers that don't yet distinguish directions.
 func (d *NetDevice) SetRateLimiter(rl *RateLimiter) {
-	d.rl = rl
+	d.rlRx = rl
+	d.rlTx = rl
+}
+
+// SetRateLimiters applies separate RX (host→guest) and TX (guest→host)
+// limiters. Either argument may be nil for no limit on that direction.
+// This matches Firecracker's `rx_rate_limiter` / `tx_rate_limiter` split.
+func (d *NetDevice) SetRateLimiters(rx, tx *RateLimiter) {
+	d.rlRx = rx
+	d.rlTx = tx
 }
 
 // ActivateLink sets the link status to UP. Called by the transport when
@@ -176,8 +193,8 @@ func (d *NetDevice) transmit(q *Queue) {
 			}
 			pkt = append(pkt, buf...)
 		}
-		if d.rl != nil {
-			d.rl.Wait(uint64(len(pkt)), 1)
+		if d.rlTx != nil {
+			d.rlTx.Wait(uint64(len(pkt)), 1)
 		}
 		// Use the cached raw fd — calling (*os.File).Fd() here would
 		// re-enable blocking mode on the TAP fd (see openTAP) and let
@@ -261,8 +278,8 @@ func (d *NetDevice) deliverRXPacket(pkt []byte) (uint32, bool) {
 	if len(pkt) < netHeaderLen || !rxQ.Ready {
 		return 0, false
 	}
-	if d.rl != nil {
-		d.rl.Wait(uint64(len(pkt)), 1)
+	if d.rlRx != nil {
+		d.rlRx.Wait(uint64(len(pkt)), 1)
 	}
 
 	rxQ.mu.Lock()
