@@ -722,8 +722,16 @@ func TestSnapshotJSONRoundTrip(t *testing.T) {
 	if decoded.Config.MemMB != 128 {
 		t.Errorf("decoded MemMB = %d, want 128", decoded.Config.MemMB)
 	}
-	if decoded.Config.KernelPath != kernel {
-		t.Errorf("decoded KernelPath = %q, want %q", decoded.Config.KernelPath, kernel)
+	// rewriteSnapshotBundleWithConfig bundles the kernel into <snapDir>/artifacts/kernel
+	// so the snapshot dir stays self-contained (portable across hosts). The
+	// JSON therefore stores the bundled relative path, not the original
+	// absolute path the test booted with.
+	if decoded.Config.KernelPath != "artifacts/kernel" {
+		t.Errorf("decoded KernelPath = %q, want %q (bundled relative path)", decoded.Config.KernelPath, "artifacts/kernel")
+	}
+	bundled := filepath.Join(snapDir, decoded.Config.KernelPath)
+	if _, err := os.Stat(bundled); err != nil {
+		t.Errorf("bundled kernel %s not found: %v", bundled, err)
 	}
 	if decoded.Version != snap.Version {
 		t.Errorf("decoded Version = %d, want %d", decoded.Version, snap.Version)

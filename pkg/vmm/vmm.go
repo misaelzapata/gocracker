@@ -1053,16 +1053,23 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	if err != nil {
 		return nil, err
 	}
-	// Map the snapshot memory file directly into the guest memory region with
-	// MAP_PRIVATE. The restore path pays zero I/O up front: pages are faulted
-	// in lazily as the guest touches them, and dirty pages go to private COW
-	// pages so the snapshot file stays intact. On a 128 MiB guest this trades
-	// a ~60–100 ms read+copy for ~5–15 ms of mmap + page-table setup — the
-	// same trick Firecracker/Kata use to make pool-resume sandboxes look
-	// instant.
-	kvmVM, err := sys.CreateVMFromSnapshotFile(snap.MemFile, snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
-	if err != nil {
-		return nil, fmt.Errorf("cow restore: %w", err)
+	// Snapshots that include virtio-fs exports cannot use the MAP_PRIVATE COW
+	// fast path: virtiofsd needs a memfd it can mmap, and a file-backed
+	// PRIVATE mapping has no fd to share. Detect that case and fall back to
+	// the slower memfd-materialize path (one O(mem) read+copy at restore
+	// time, ~60-100 ms on a 128 MiB guest). Snapshots without virtio-fs keep
+	// today's instant lazy-fault restore.
+	var kvmVM *kvm.VM
+	if len(snap.Config.SharedFS) > 0 {
+		kvmVM, err = sys.CreateVMFromSnapshotFileMemfd(snap.MemFile, snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
+		if err != nil {
+			return nil, fmt.Errorf("memfd restore: %w", err)
+		}
+	} else {
+		kvmVM, err = sys.CreateVMFromSnapshotFile(snap.MemFile, snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
+		if err != nil {
+			return nil, fmt.Errorf("cow restore: %w", err)
+		}
 	}
 
 	m := &VM{

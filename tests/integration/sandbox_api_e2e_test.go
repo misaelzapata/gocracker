@@ -253,17 +253,25 @@ func TestE2ESandboxCloneInstall(t *testing.T) {
 // host dir; the clone rebinds the same guest target to a DIFFERENT host dir
 // and reads files only present in the new source.
 //
-// CURRENTLY SKIPPED: the restore fast path uses MAP_PRIVATE COW on the
-// snapshot memory file, but virtio-fs requires memfd-backed guest memory
-// (virtiofsd mmaps the same region). Snapshot + virtiofs + restore therefore
-// fails today at device activation with "virtio-fs requires memfd-backed
-// guest memory". Fixing it requires teaching the restore path to materialize
-// guest memory in a memfd when any virtio-fs device is present in the
-// snapshot, which is out of scope for this PR. The rebind *contract* is
-// covered by unit tests in pkg/vmm (TestApplySharedFSRebinds) and the
-// plumbing all the way down to vmmserver handleRestore is exercised there.
+// CURRENTLY SKIPPED (different reason from before this PR):
+// The memfd-backed restore path now activates correctly when the snapshot
+// contains a virtio-fs device (CreateVMFromSnapshotFileMemfd in
+// internal/kvm), and a fresh virtiofsd is spawned against the rebound
+// Source. What still fails end-to-end is the FUSE *session* state inside
+// the guest: the guest kernel's FUSE driver was frozen with file handles
+// pointing at the old virtiofsd's session, so first-touch of the rebound
+// mount returns EBADF. Making this fully transparent needs FUSE-session
+// migration on the virtiofsd side or a guest-cooperative umount/remount on
+// restore — both deeper than the API surface this PR adds.
+//
+// What IS verified: (a) the rebind plumbing — vmm.applySharedFSRebinds
+// correctly rewrites Source by guest Target and clears stale SocketPath
+// (TestApplySharedFSRebinds_* in pkg/vmm), (b) the memory-mode selection
+// (CreateVMFromSnapshotFileMemfd is reached when Config.SharedFS is
+// non-empty), (c) the API rejects materialized mounts on restore, (d)
+// virtiofs cold-boot still works (TestVirtioFSMountReflectsHostAndGuestWrites).
 func TestE2ESandboxCloneVirtiofsRebind(t *testing.T) {
-	t.Skip("virtio-fs + snapshot restore requires memfd-backed guest memory; tracked as pre-existing gap, not introduced by this PR")
+	t.Skip("memfd restore + virtiofsd respawn work; FUSE session re-attach across snapshot needs guest-side umount/remount, tracked as separate follow-up")
 	if os.Getenv("E2E") != "1" {
 		t.Skip("set E2E=1 to enable")
 	}
