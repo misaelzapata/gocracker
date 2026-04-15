@@ -42,13 +42,25 @@ const (
 
 	// Additional ioctls for full vCPU setup
 	kvmGetSupportedCPUID = uintptr(0xC008AE05) // system
+	kvmGetMSRs           = uintptr(0xC008AE88) // vcpu (IOWR; returns nmsrs read)
 	kvmSetMSRs           = uintptr(0x4008AE89) // vcpu
+	kvmGetFPU            = uintptr(0x81A0AE8C) // vcpu
 	kvmSetFPU            = uintptr(0x41A0AE8D) // vcpu
 	kvmGetLAPIC          = uintptr(0x8400AE8E) // vcpu
 	kvmSetLAPIC          = uintptr(0x4400AE8F) // vcpu
 	kvmGetMPState        = uintptr(0x8004AE98) // vcpu
 	kvmSetMPState        = uintptr(0x4004AE99) // vcpu
-	kvmKVMClockCtrl      = uintptr(0xAEAD) // vcpu
+	kvmGetVCPUEvents     = uintptr(0x8040AE9F) // vcpu (same nr 0x9F as VM-side GET_PIT2; vcpu fd disambiguates)
+	kvmSetVCPUEvents     = uintptr(0x4040AEA0) // vcpu
+	kvmGetDebugRegs      = uintptr(0x8080AEA1) // vcpu
+	kvmSetDebugRegs      = uintptr(0x4080AEA2) // vcpu
+	kvmSetTSCKHz         = uintptr(0xAEA2)     // vcpu (arg IS the khz)
+	kvmGetTSCKHz         = uintptr(0xAEA3)     // vcpu (return IS the khz)
+	kvmGetXSAVE          = uintptr(0x9000AEA4) // vcpu (4096 bytes)
+	kvmSetXSAVE          = uintptr(0x5000AEA5) // vcpu (4096 bytes)
+	kvmGetXCRS           = uintptr(0x8188AEA6) // vcpu (0x188 bytes)
+	kvmSetXCRS           = uintptr(0x4188AEA7) // vcpu
+	kvmKVMClockCtrl      = uintptr(0xAEAD)     // vcpu
 )
 
 const (
@@ -761,6 +773,320 @@ func (c *VCPU) KVMClockCtrl() error {
 	_, err := vmIoctl(c.fd, kvmKVMClockCtrl, 0)
 	if err != nil {
 		return fmt.Errorf("KVM_KVMCLOCK_CTRL: %w", err)
+	}
+	return nil
+}
+
+// MSREntry is one (Index, Data) pair as exchanged with KVM_GET_MSRS / KVM_SET_MSRS.
+// It mirrors struct kvm_msr_entry from <linux/kvm.h>.
+type MSREntry struct {
+	Index    uint32
+	Reserved uint32
+	Data     uint64
+}
+
+// maxMSREntries caps the per-call MSR batch. Firecracker's snapshot list is
+// well under 32; 256 is generous and keeps the on-stack buffer small.
+const maxMSREntries = 256
+
+// MSRIA32TSC is MSR_IA32_TSC. Must be restored BEFORE TSC_DEADLINE.
+const MSRIA32TSC uint32 = 0x10
+
+// MSRIA32TSCDeadline is MSR_IA32_TSC_DEADLINE. Deferred restore chunk —
+// set AFTER all other MSRs (and LAPIC) because KVM validates the write
+// against the LAPIC's current timer mode and the TSC offset. Without
+// this MSR a modern Linux guest captured mid-`hlt` never wakes after
+// restore, because its LAPIC timer deadline is lost.
+const MSRIA32TSCDeadline uint32 = 0x6E0
+
+// snapshotMSRIndices is the list of MSRs that must round-trip for a live
+// guest, matching Firecracker's vCPU snapshot set. TSC_DEADLINE is
+// intentionally absent here — callers should append `MSRIA32TSCDeadline`
+// as a final "deferred" chunk so the restore path writes it after TSC.
+var snapshotMSRIndices = []uint32{
+	0x174,      // IA32_SYSENTER_CS
+	0x175,      // IA32_SYSENTER_ESP
+	0x176,      // IA32_SYSENTER_EIP
+	MSRIA32TSC, // 0x10 — IA32_TSC (before TSC_DEADLINE below)
+	0x1A0,      // IA32_MISC_ENABLE
+	0xC0000080, // EFER
+	0xC0000081, // STAR
+	0xC0000082, // LSTAR
+	0xC0000083, // CSTAR
+	0xC0000084, // SYSCALL_MASK
+	0xC0000102, // KERNEL_GS_BASE
+	0x2FF,      // MTRRdefType
+	0xC0000103, // TSC_AUX
+	0x11,       // KVM_WALL_CLOCK (legacy)
+	0x12,       // KVM_SYSTEM_TIME (legacy)
+	0x4B564D00, // MSR_KVM_WALL_CLOCK_NEW
+	0x4B564D01, // MSR_KVM_SYSTEM_TIME_NEW
+	0x4B564D02, // MSR_KVM_ASYNC_PF_EN
+	0x4B564D03, // MSR_KVM_STEAL_TIME
+	0x4B564D04, // MSR_KVM_PV_EOI_EN
+	0x277,      // MSR_IA32_CR_PAT
+}
+
+// SnapshotMSRIndices returns the canonical list of MSRs gocracker captures
+// for snapshot/restore. Callers may extend or filter it.
+func SnapshotMSRIndices() []uint32 {
+	out := make([]uint32, len(snapshotMSRIndices))
+	copy(out, snapshotMSRIndices)
+	return out
+}
+
+// msrBuf is the variable-length kvm_msrs payload. Layout:
+// __u32 nmsrs; __u32 pad; struct kvm_msr_entry entries[nmsrs];
+type msrBuf struct {
+	Nmsrs   uint32
+	Pad     uint32
+	Entries [maxMSREntries]MSREntry
+}
+
+// GetMSRs reads the requested MSRs. The returned slice is in the same order
+// as `indices`, with each entry's Index preserved and Data populated.
+func (c *VCPU) GetMSRs(indices []uint32) ([]MSREntry, error) {
+	if len(indices) == 0 {
+		return nil, nil
+	}
+	if len(indices) > maxMSREntries {
+		return nil, fmt.Errorf("KVM_GET_MSRS: %d entries exceeds cap %d", len(indices), maxMSREntries)
+	}
+	var buf msrBuf
+	buf.Nmsrs = uint32(len(indices))
+	for i, idx := range indices {
+		buf.Entries[i] = MSREntry{Index: idx}
+	}
+	r, err := vmIoctl(c.fd, kvmGetMSRs, uintptr(unsafe.Pointer(&buf)))
+	if err != nil {
+		return nil, fmt.Errorf("KVM_GET_MSRS: %w", err)
+	}
+	n := min(int(r), len(indices))
+	out := make([]MSREntry, n)
+	copy(out, buf.Entries[:n])
+	return out, nil
+}
+
+// SetMSRs writes the given MSR entries. Returns an error if KVM accepts
+// fewer entries than requested (any rejected MSR is fatal for a restore).
+func (c *VCPU) SetMSRs(entries []MSREntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	if len(entries) > maxMSREntries {
+		return fmt.Errorf("KVM_SET_MSRS: %d entries exceeds cap %d", len(entries), maxMSREntries)
+	}
+	var buf msrBuf
+	buf.Nmsrs = uint32(len(entries))
+	copy(buf.Entries[:len(entries)], entries)
+	r, err := vmIoctl(c.fd, kvmSetMSRs, uintptr(unsafe.Pointer(&buf)))
+	if err != nil {
+		return fmt.Errorf("KVM_SET_MSRS: %w", err)
+	}
+	if int(r) != len(entries) {
+		return fmt.Errorf("KVM_SET_MSRS: kernel accepted %d of %d entries", int(r), len(entries))
+	}
+	return nil
+}
+
+// FPUState matches struct kvm_fpu (0x1A0 = 416 bytes).
+type FPUState struct {
+	FPR    [8][16]byte
+	FCW    uint16
+	FSW    uint16
+	FTWX   uint8
+	Pad1   uint8
+	FOP    uint16
+	LastIP uint64
+	LastDP uint64
+	XMM    [16][16]byte
+	MXCSR  uint32
+	Pad2   uint32
+}
+
+// GetFPU reads the legacy FPU state for this vCPU.
+func (c *VCPU) GetFPU() (FPUState, error) {
+	var s FPUState
+	if _, err := vmIoctl(c.fd, kvmGetFPU, uintptr(unsafe.Pointer(&s))); err != nil {
+		return FPUState{}, fmt.Errorf("KVM_GET_FPU: %w", err)
+	}
+	return s, nil
+}
+
+// SetFPUState restores the legacy FPU state for this vCPU.
+func (c *VCPU) SetFPUState(s FPUState) error {
+	if _, err := vmIoctl(c.fd, kvmSetFPU, uintptr(unsafe.Pointer(&s))); err != nil {
+		return fmt.Errorf("KVM_SET_FPU: %w", err)
+	}
+	return nil
+}
+
+// XSaveState matches struct kvm_xsave (4096 bytes; XSAVE area).
+type XSaveState [4096]byte
+
+// GetXSAVE reads the XSAVE area for this vCPU.
+func (c *VCPU) GetXSAVE() (XSaveState, error) {
+	var s XSaveState
+	if _, err := vmIoctl(c.fd, kvmGetXSAVE, uintptr(unsafe.Pointer(&s[0]))); err != nil {
+		return XSaveState{}, fmt.Errorf("KVM_GET_XSAVE: %w", err)
+	}
+	return s, nil
+}
+
+// SetXSAVE restores the XSAVE area for this vCPU.
+func (c *VCPU) SetXSAVE(s XSaveState) error {
+	if _, err := vmIoctl(c.fd, kvmSetXSAVE, uintptr(unsafe.Pointer(&s[0]))); err != nil {
+		return fmt.Errorf("KVM_SET_XSAVE: %w", err)
+	}
+	return nil
+}
+
+// XCR matches struct kvm_xcr (16 bytes).
+type XCR struct {
+	XCR      uint32
+	Reserved uint32
+	Value    uint64
+}
+
+// XCRsState matches struct kvm_xcrs (0x188 = 392 bytes).
+// __u32 nr_xcrs; __u32 flags; struct kvm_xcr xcrs[16]; __u64 padding[16];
+type XCRsState struct {
+	NrXCRs  uint32
+	Flags   uint32
+	XCRs    [16]XCR
+	Padding [16]uint64
+}
+
+// GetXCRS reads the extended control registers (XCR0/XCR1/...) for this vCPU.
+func (c *VCPU) GetXCRS() (XCRsState, error) {
+	var s XCRsState
+	if _, err := vmIoctl(c.fd, kvmGetXCRS, uintptr(unsafe.Pointer(&s))); err != nil {
+		return XCRsState{}, fmt.Errorf("KVM_GET_XCRS: %w", err)
+	}
+	return s, nil
+}
+
+// SetXCRS restores the extended control registers for this vCPU.
+func (c *VCPU) SetXCRS(s XCRsState) error {
+	if _, err := vmIoctl(c.fd, kvmSetXCRS, uintptr(unsafe.Pointer(&s))); err != nil {
+		return fmt.Errorf("KVM_SET_XCRS: %w", err)
+	}
+	return nil
+}
+
+// VCPUEventsException is the nested exception sub-struct of struct kvm_vcpu_events.
+type VCPUEventsException struct {
+	Injected      uint8
+	Nr            uint8
+	HasErrorCode  uint8
+	Pending       uint8
+	ErrorCode     uint32
+}
+
+// VCPUEventsInterrupt is the nested interrupt sub-struct of struct kvm_vcpu_events.
+type VCPUEventsInterrupt struct {
+	Injected uint8
+	Nr       uint8
+	Soft     uint8
+	Shadow   uint8
+}
+
+// VCPUEventsNMI is the nested nmi sub-struct of struct kvm_vcpu_events.
+type VCPUEventsNMI struct {
+	Injected uint8
+	Pending  uint8
+	Masked   uint8
+	Pad      uint8
+}
+
+// VCPUEventsSMI is the nested smi sub-struct of struct kvm_vcpu_events.
+type VCPUEventsSMI struct {
+	SMM          uint8
+	Pending      uint8
+	SMMInsideNMI uint8
+	LatchedInit  uint8
+}
+
+// VCPUEventsTripleFault is the nested triple_fault sub-struct.
+type VCPUEventsTripleFault struct {
+	Pending uint8
+}
+
+// VCPUEvents matches struct kvm_vcpu_events (64 bytes) from <asm/kvm.h>.
+// Captures pending exceptions/interrupts/NMIs, which is critical for timer
+// wake on restore — without this the guest can sit in HLT waiting for an
+// interrupt that was already pending at snapshot time.
+type VCPUEvents struct {
+	Exception            VCPUEventsException   // 8 bytes
+	Interrupt            VCPUEventsInterrupt   // 4 bytes
+	NMI                  VCPUEventsNMI         // 4 bytes
+	SIPIVector           uint32                // 4 bytes
+	Flags                uint32                // 4 bytes
+	SMI                  VCPUEventsSMI         // 4 bytes
+	TripleFault          VCPUEventsTripleFault // 1 byte
+	Reserved             [26]uint8
+	ExceptionHasPayload  uint8
+	ExceptionPayload     uint64
+}
+
+// GetVCPUEvents reads pending exception/interrupt/NMI state for this vCPU.
+func (c *VCPU) GetVCPUEvents() (VCPUEvents, error) {
+	var e VCPUEvents
+	if _, err := vmIoctl(c.fd, kvmGetVCPUEvents, uintptr(unsafe.Pointer(&e))); err != nil {
+		return VCPUEvents{}, fmt.Errorf("KVM_GET_VCPU_EVENTS: %w", err)
+	}
+	return e, nil
+}
+
+// SetVCPUEvents restores pending exception/interrupt/NMI state for this vCPU.
+func (c *VCPU) SetVCPUEvents(e VCPUEvents) error {
+	if _, err := vmIoctl(c.fd, kvmSetVCPUEvents, uintptr(unsafe.Pointer(&e))); err != nil {
+		return fmt.Errorf("KVM_SET_VCPU_EVENTS: %w", err)
+	}
+	return nil
+}
+
+// DebugRegs matches struct kvm_debugregs (0x80 = 128 bytes).
+type DebugRegs struct {
+	DB       [4]uint64
+	DR6      uint64
+	DR7      uint64
+	Flags    uint64
+	Reserved [9]uint64
+}
+
+// GetDebugRegs reads the hardware debug registers (DR0-DR3, DR6, DR7) for this vCPU.
+func (c *VCPU) GetDebugRegs() (DebugRegs, error) {
+	var d DebugRegs
+	if _, err := vmIoctl(c.fd, kvmGetDebugRegs, uintptr(unsafe.Pointer(&d))); err != nil {
+		return DebugRegs{}, fmt.Errorf("KVM_GET_DEBUGREGS: %w", err)
+	}
+	return d, nil
+}
+
+// SetDebugRegs restores the hardware debug registers for this vCPU.
+func (c *VCPU) SetDebugRegs(d DebugRegs) error {
+	if _, err := vmIoctl(c.fd, kvmSetDebugRegs, uintptr(unsafe.Pointer(&d))); err != nil {
+		return fmt.Errorf("KVM_SET_DEBUGREGS: %w", err)
+	}
+	return nil
+}
+
+// GetTSCKHz returns the vCPU's TSC frequency in kHz. KVM_GET_TSC_KHZ is
+// special: the ioctl return value is the frequency (or -errno).
+func (c *VCPU) GetTSCKHz() (uint32, error) {
+	r, err := vmIoctl(c.fd, kvmGetTSCKHz, 0)
+	if err != nil {
+		return 0, fmt.Errorf("KVM_GET_TSC_KHZ: %w", err)
+	}
+	return uint32(r), nil
+}
+
+// SetTSCKHz sets the vCPU's TSC frequency in kHz. KVM_SET_TSC_KHZ is special:
+// the ioctl arg IS the value, not a pointer.
+func (c *VCPU) SetTSCKHz(khz uint32) error {
+	if _, err := vmIoctl(c.fd, kvmSetTSCKHz, uintptr(khz)); err != nil {
+		return fmt.Errorf("KVM_SET_TSC_KHZ: %w", err)
 	}
 	return nil
 }

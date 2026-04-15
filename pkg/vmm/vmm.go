@@ -155,6 +155,13 @@ type Config struct {
 	MACAddr          net.HardwareAddr
 	Metadata         map[string]string  `json:"metadata,omitempty"`
 	NetRateLimiter   *RateLimiterConfig `json:"net_rate_limiter,omitempty"`
+	// RxNetRateLimiter / TxNetRateLimiter allow separate host→guest and
+	// guest→host shaping, matching Firecracker's `rx_rate_limiter` and
+	// `tx_rate_limiter` fields. If both are nil, NetRateLimiter (if set)
+	// applies to both directions. If either is set, it overrides the
+	// generic field for that direction.
+	RxNetRateLimiter *RateLimiterConfig `json:"rx_net_rate_limiter,omitempty"`
+	TxNetRateLimiter *RateLimiterConfig `json:"tx_net_rate_limiter,omitempty"`
 	BlockRateLimiter *RateLimiterConfig `json:"block_rate_limiter,omitempty"`
 	RNGRateLimiter   *RateLimiterConfig `json:"rng_rate_limiter,omitempty"`
 	VCPUs            int
@@ -587,13 +594,26 @@ func (m *VM) Events() EventSource { return m.events }
 func (m *VM) VMConfig() Config { return m.cfg }
 
 func (m *VM) UpdateNetRateLimiter(cfg *RateLimiterConfig) error {
+	// Single-bucket compatibility path: applies the same config to both
+	// RX and TX. New code should prefer UpdateNetRateLimiters.
+	return m.UpdateNetRateLimiters(cfg, cfg)
+}
+
+// UpdateNetRateLimiters applies separate RX (host→guest) and TX (guest→host)
+// token buckets at runtime. Either argument may be nil for no limit in that
+// direction. Matches Firecracker's split `rx_rate_limiter` / `tx_rate_limiter`.
+func (m *VM) UpdateNetRateLimiters(rx, tx *RateLimiterConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.netDev == nil {
 		return fmt.Errorf("virtio-net is not configured")
 	}
-	m.netDev.SetRateLimiter(buildRateLimiter(cfg))
-	m.cfg.NetRateLimiter = cloneRateLimiterConfig(cfg)
+	m.netDev.SetRateLimiters(buildRateLimiter(rx), buildRateLimiter(tx))
+	m.cfg.RxNetRateLimiter = cloneRateLimiterConfig(rx)
+	m.cfg.TxNetRateLimiter = cloneRateLimiterConfig(tx)
+	// Clear the legacy generic field when direction-specific ones are set
+	// so snapshot/restore round-trip stays coherent.
+	m.cfg.NetRateLimiter = nil
 	return nil
 }
 
@@ -802,6 +822,18 @@ func (m *VM) TakeSnapshotWithOptions(dir string, opts SnapshotOptions) (*Snapsho
 	m.mu.Unlock()
 	switch state {
 	case StateRunning:
+		// Send opShutdown to every active vsock conn BEFORE pausing the
+		// vCPUs. This gives the guest one last chance to drain the RX
+		// queue while it's still executing, so its blocked Read calls
+		// return immediately and the guest-side `serveExecAgent`/exec
+		// handlers close their sockets and loop back to the dial path.
+		// Post-restore, the guest will re-dial fresh against the new
+		// broker instead of sitting forever on a pipe whose host end
+		// disappeared with the old process. Matches Firecracker's
+		// "vsock connections do not survive snapshot/restore" contract.
+		if m.vsockDev != nil {
+			m.vsockDev.QuiesceForSnapshot()
+		}
 		if err := m.Pause(); err != nil {
 			return nil, err
 		}
@@ -839,12 +871,16 @@ func (m *VM) TakeSnapshotWithOptions(dir string, opts SnapshotOptions) (*Snapsho
 	}
 	snap.MemFile = "mem.bin"
 
-	metaFile := filepath.Join(dir, "snapshot.json")
-	data, _ := json.MarshalIndent(snap, "", "  ")
-	if err := os.WriteFile(metaFile, data, 0644); err != nil {
-		return nil, err
+	// Bundle kernel/initrd/disk into the snapshot dir so restore stays valid
+	// after the original VM's runtime dir (runs/<vm-id>/disk.ext4) is cleaned
+	// up. Without this, restore falls back to cold boot with
+	//   "open .../runs/<vm-id>/disk.ext4: no such file or directory"
+	bundled, err := rewriteSnapshotBundleWithConfig(dir, *snap, snap.Config)
+	if err != nil {
+		return nil, fmt.Errorf("bundle snapshot assets: %w", err)
 	}
-	gclog.VMM.Info("snapshot saved", "path", metaFile)
+	snap = bundled
+	gclog.VMM.Info("snapshot saved", "path", filepath.Join(dir, "snapshot.json"))
 	m.events.Emit(EventSnapshot, fmt.Sprintf("snapshot saved to %s", dir))
 
 	return snap, nil
@@ -1026,12 +1062,18 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		return nil, fmt.Errorf("post-create vcpus (restore): %w", err)
 	}
 	for i, vcpu := range m.vcpus {
+		// restoreVCPU already swallows the expected kvmclock-ctrl EINVAL
+		// inline (arch_x86.go:96) and returns nil in that case. Doing a
+		// second isIgnorableKVMClockCtrlError check here is WRONG: it was
+		// masking a real EINVAL from SetSregs (e.g. stale CR0/CR4 bits)
+		// as "kvmclock unsupported", so the vCPU resumed with garbage
+		// segment state, triple-faulted on its first KVM_RUN, emitted
+		// ExitShutdown, and cleanup closed the exec broker — surfacing to
+		// callers as "exec agent broker is closed" / "connection timed
+		// out". Let every non-nil error propagate so real failures are
+		// loud instead of silent.
 		if err := m.archBackend.restoreVCPU(sys, kvmVM, vcpu, vcpuStates[i]); err != nil {
-			if isIgnorableKVMClockCtrlError(err) {
-				gclog.VMM.Warn("kvmclock ctrl unsupported on host; continuing without explicit clock resume", "vcpu", i, "error", err)
-			} else {
-				return nil, err
-			}
+			return nil, fmt.Errorf("restore vcpu %d: %w", i, err)
 		}
 	}
 
@@ -1088,25 +1130,82 @@ func normalizeSnapshotVCPUStates(snap Snapshot) []VCPUState {
 }
 
 func captureVCPUState(vcpu *kvm.VCPU) (VCPUState, error) {
-	// Firecracker captures MP state first because it can affect interrupt
-	// delivery bookkeeping exposed by later ioctls.
-	mpState, err := vcpu.GetMPState()
-	if err != nil {
+	// Order matches Firecracker's VcpuGetState. MP_STATE first so any
+	// interrupt-delivery bookkeeping the kernel updates on later ioctls
+	// is already captured. Full set is required for a live restore:
+	// without MSRs the guest's syscall entry points (LSTAR/STAR) vanish
+	// and the first syscall triple-faults; without VCPU_EVENTS a guest
+	// captured mid-HLT never wakes from the pending timer; without
+	// XSAVE/XCRs AVX state is lost; without DEBUGREGS any active
+	// hw-breakpoint is zeroed.
+	x := X86VCPUState{}
+	var err error
+	if x.MPState, err = vcpu.GetMPState(); err != nil {
 		return VCPUState{}, fmt.Errorf("get mp_state vcpu %d: %w", vcpu.ID, err)
 	}
-	regs, err := vcpu.GetRegs()
-	if err != nil {
+	if x.Regs, err = vcpu.GetRegs(); err != nil {
 		return VCPUState{}, fmt.Errorf("get regs vcpu %d: %w", vcpu.ID, err)
 	}
-	sregs, err := vcpu.GetSregs()
-	if err != nil {
+	if x.Sregs, err = vcpu.GetSregs(); err != nil {
 		return VCPUState{}, fmt.Errorf("get sregs vcpu %d: %w", vcpu.ID, err)
 	}
 	lapic, err := vcpu.GetLAPIC()
 	if err != nil {
 		return VCPUState{}, fmt.Errorf("get lapic vcpu %d: %w", vcpu.ID, err)
 	}
-	return newX86VCPUState(vcpu.ID, regs, sregs, mpState, &lapic), nil
+	x.LAPIC = &lapic
+	msrs, err := vcpu.GetMSRs(kvm.SnapshotMSRIndices())
+	if err != nil {
+		return VCPUState{}, fmt.Errorf("get msrs vcpu %d: %w", vcpu.ID, err)
+	}
+	x.MSRs = msrs
+	// TSC_DEADLINE: capture separately so restore writes it after TSC is
+	// back in place. Apply Firecracker's zero-rewrite trick (see
+	// `fix_zero_tsc_deadline_msr` in their vcpu.rs): if the LAPIC wasn't
+	// armed at snapshot time the MSR reads 0, and writing 0 back means
+	// the guest's HLT is never woken by a timer. Substituting the current
+	// TSC makes the next post-restore "is deadline < TSC?" check true and
+	// fires the timer IRQ immediately.
+	tscD, err := vcpu.GetMSRs([]uint32{kvm.MSRIA32TSCDeadline})
+	if err == nil && len(tscD) == 1 {
+		x.TSCDeadline = tscD[0].Data
+		if x.TSCDeadline == 0 {
+			for _, m := range msrs {
+				if m.Index == kvm.MSRIA32TSC {
+					x.TSCDeadline = m.Data
+					break
+				}
+			}
+		}
+	}
+	fpu, err := vcpu.GetFPU()
+	if err != nil {
+		return VCPUState{}, fmt.Errorf("get fpu vcpu %d: %w", vcpu.ID, err)
+	}
+	x.FPU = &fpu
+	xsave, err := vcpu.GetXSAVE()
+	if err != nil {
+		return VCPUState{}, fmt.Errorf("get xsave vcpu %d: %w", vcpu.ID, err)
+	}
+	x.XSAVE = &xsave
+	xcrs, err := vcpu.GetXCRS()
+	if err == nil {
+		x.XCRs = &xcrs
+	}
+	events, err := vcpu.GetVCPUEvents()
+	if err != nil {
+		return VCPUState{}, fmt.Errorf("get vcpu_events vcpu %d: %w", vcpu.ID, err)
+	}
+	x.VCPUEvents = &events
+	dbg, err := vcpu.GetDebugRegs()
+	if err != nil {
+		return VCPUState{}, fmt.Errorf("get debugregs vcpu %d: %w", vcpu.ID, err)
+	}
+	x.DebugRegs = &dbg
+	if khz, err := vcpu.GetTSCKHz(); err == nil {
+		x.TSCKHz = khz
+	}
+	return newX86VCPUState(vcpu.ID, x), nil
 }
 
 func captureVMArchState(vm *VM) (*SnapshotArchState, error) {
@@ -1426,7 +1525,17 @@ func (m *VM) setupDevices() error {
 		if err != nil {
 			return fmt.Errorf("virtio-net: %w", err)
 		}
-		nd.SetRateLimiter(buildRateLimiter(m.cfg.NetRateLimiter))
+		// Per-direction limiters override the generic NetRateLimiter when
+		// set. If only NetRateLimiter is provided, we apply it to both.
+		rxCfg := m.cfg.RxNetRateLimiter
+		txCfg := m.cfg.TxNetRateLimiter
+		if rxCfg == nil {
+			rxCfg = m.cfg.NetRateLimiter
+		}
+		if txCfg == nil {
+			txCfg = m.cfg.NetRateLimiter
+		}
+		nd.SetRateLimiters(buildRateLimiter(rxCfg), buildRateLimiter(txCfg))
 		m.netDev = nd
 		m.transports = append(m.transports, nd.Transport)
 		slot++
@@ -1556,7 +1665,20 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 		if !interrupted {
 			switch vcpu.RunData.ExitReason {
 			case kvm.ExitHLT:
-				if len(m.vcpus) == 1 {
+				// A 1-vCPU guest executing `hlt` normally means
+				// "done" (no sibling thread can wake it) — this is
+				// Firecracker's behavior too (VcpuExit::Hlt →
+				// VcpuEmulation::Stopped). But when exec is enabled
+				// the VM is expected to stay alive idling between
+				// host-initiated exec calls; and a guest resumed
+				// from snapshot captured mid-`hlt` re-enters `hlt`
+				// on its first KVM_RUN. In both cases, stopping
+				// on HLT fires cleanup() → execBroker.close() and
+				// the next exec surfaces as "exec agent broker is
+				// closed". Keep the VM alive while exec is wired;
+				// the idle HLT will wake on the next device IRQ
+				// (vsock TX from the guest agent, timer tick, etc).
+				if len(m.vcpus) == 1 && m.execBroker == nil {
 					gclog.VMM.Info("guest HLT", "id", m.cfg.ID, "vcpu", vcpu.ID)
 					m.events.Emit(EventHalted, "guest HLT")
 					m.Stop()

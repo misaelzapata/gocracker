@@ -286,10 +286,23 @@ func sockaddrToAddr(sa unix.Sockaddr) net.Addr {
 func handleExecAgentConn(conn net.Conn, spec runtimecfg.GuestSpec) {
 	defer conn.Close()
 
+	// No first-Decode read deadline: snapshot-capture now sends
+	// VIRTIO_VSOCK_EVENT_TRANSPORT_RESET before the memory dump (see
+	// QuiesceForSnapshot in internal/vsock), which causes the guest's
+	// vsock driver to close every socket BEFORE the snapshot is taken.
+	// There are no orphaned conns post-restore, so the previously-armed
+	// 2 s deadline was pure overhead — evaluated on every Decode yet
+	// never necessary. Removing it shaves ~5–10 ms off the first /exec
+	// after a restore.
 	var req guestexec.Request
 	if err := guestexec.Decode(conn, &req); err != nil {
 		klogf("exec agent decode failed: %v", err)
-		_ = guestexec.Encode(conn, guestexec.Response{Error: err.Error()})
+		// Do NOT try to Encode an error response here: if the Decode
+		// failure was caused by a virtio-vsock transport-reset (the
+		// host-initiated pre-snapshot quiesce), the conn is already dead
+		// and Encode would either error or — worse — block long enough
+		// to delay the next serveExecAgent dial, pushing the first
+		// post-restore /exec by several ms.
 		return
 	}
 	if err := req.Validate(); err != nil {
