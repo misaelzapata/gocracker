@@ -2417,11 +2417,12 @@ func (s *Server) execGuestScript(id, script string) error {
 	return nil
 }
 
-// stopAndUnregisterVM best-effort tears down a VM we partially set up: used
-// when a post-restore step (re-IP, remount) fails and we need to avoid
-// leaking half-broken VMs in the registry. The registry entry is removed
-// whether or not the stop RPC succeeds so a retry with the same API ID is
-// not blocked.
+// stopAndUnregisterVM tears down a VM that we partially set up and drops
+// it from the registry. Used when a post-restore step (re-IP) fails: we do
+// not leave half-broken VMs discoverable via GET /vms, and we free the API
+// ID so the caller can retry. Returns the WaitStopped error if the guest
+// refuses to halt within 10 s — the registry entry is still removed so a
+// retry is never blocked.
 func (s *Server) stopAndUnregisterVM(id string) error {
 	s.mu.Lock()
 	v, ok := s.vms[id]
