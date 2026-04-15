@@ -271,13 +271,15 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto {
 		return nil, fmt.Errorf("invalid network mode %q", opts.NetworkMode)
 	}
-	// Fresh-subnet allocation only makes sense for cold boot. On restore the
-	// guest kernel is frozen with its original IP + gateway, so assigning a
-	// new subnet would just break the guest's network and lie to the caller.
-	// For restore we only need a tap name; the IP plan stays as whatever the
-	// snapshot had. If the caller explicitly set tap_name/static_ip/gateway
-	// on restore, they win — that lets callers drive the old manual path.
-	if opts.NetworkMode == NetworkModeAuto && opts.SnapshotDir == "" {
+	// network_mode=auto allocates a fresh tap + /30 + guest IP + gateway.
+	// On cold boot this drives the kernel cmdline so the guest comes up with
+	// the right address. On restore the guest kernel is already frozen with
+	// the template's IP, but we still allocate a fresh subnet here for two
+	// reasons: (1) sandboxes need their own tap/subnet to coexist with the
+	// template + sibling clones without colliding, (2) the API layer issues
+	// a post-restore re-IP exec when ExecEnabled to plumb the new addresses
+	// into the running guest.
+	if opts.NetworkMode == NetworkModeAuto {
 		var err error
 		autoNet, err = hostnet.NewAuto(opts.ID, opts.TapName)
 		if err != nil {
@@ -319,6 +321,17 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 				SharedFSRebinds:  buildSharedFSRebinds(opts.Mounts),
 			})
 			if err == nil {
+				// Activate the freshly-allocated host-side tap (assigns the
+				// gateway IP, brings link up, installs NAT) before we resume
+				// the guest. Without this, packets from the restored guest
+				// hit a tap with no host IP and no NAT.
+				if autoNet != nil {
+					if actErr := autoNet.Activate(); actErr != nil {
+						vm.Stop()
+						autoNet.Close()
+						return nil, fmt.Errorf("activate auto network on restore: %w", actErr)
+					}
+				}
 				if err := vm.Start(); err != nil {
 					return nil, err
 				}

@@ -392,6 +392,14 @@ func (s *System) CreateVMFromSnapshotFileMemfd(memFilePath string, memMB uint64,
 		return nil, fmt.Errorf("mmap restore memfd: %w", err)
 	}
 	_ = unix.Madvise(mem, unix.MADV_HUGEPAGE)
+	// Prefault the first 8 MiB: kernel text, page tables, vCPU stack live
+	// in the first few pages of guest RAM. Matches the COW-path heuristic
+	// so virtio-fs restores don't take a latency hit vs non-virtiofs ones.
+	if len(mem) >= 8<<20 {
+		_ = unix.Madvise(mem[:8<<20], unix.MADV_WILLNEED)
+	} else {
+		_ = unix.Madvise(mem, unix.MADV_WILLNEED)
+	}
 
 	// Stream snapshot bytes into the memfd. We could try MAP_PRIVATE-then-
 	// memcpy here, but a straight read into the already-mapped slice is just

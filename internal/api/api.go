@@ -21,6 +21,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/gocracker/gocracker/internal/firecrackerapi"
+	"github.com/gocracker/gocracker/internal/guestexec"
 	gclog "github.com/gocracker/gocracker/internal/log"
 	"github.com/gocracker/gocracker/internal/stacknet"
 	"github.com/gocracker/gocracker/pkg/container"
@@ -2203,12 +2204,22 @@ func (s *Server) handleVMClone(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	srcCfg := src.handle.VMConfig()
+	// Virtio-fs sessions are stateful on the FUSE protocol level: a guest
+	// kernel snapshotted with a live virtiofs mount holds FUSE FDs bound to
+	// the template's virtiofsd, and restoring against a fresh virtiofsd
+	// returns EBADF on first touch. When the caller asked to clone a VM
+	// that has virtiofs mounts, we require exec_enabled so the clone can
+	// remount each virtio-fs target against its new backend post-restore.
+	if len(srcCfg.SharedFS) > 0 && !req.ExecEnabled {
+		apiErr(w, http.StatusBadRequest, "cloning a VM with virtiofs mounts requires exec_enabled=true on the clone (the guest kernel re-initializes its FUSE session via an exec-driven remount after restore)")
+		return
+	}
+
 	if _, err := src.handle.TakeSnapshot(snapDir); err != nil {
 		apiErr(w, http.StatusInternalServerError, fmt.Sprintf("snapshot source: %v", err))
 		return
 	}
-
-	srcCfg := src.handle.VMConfig()
 	newID := fmt.Sprintf("gc-%d", time.Now().UnixNano()%100000)
 	// A clone running alongside its source cannot share the source's TAP —
 	// the TUN/TAP device is exclusive to one opener. When the caller did not
@@ -2264,6 +2275,33 @@ func (s *Server) handleVMClone(w http.ResponseWriter, r *http.Request) {
 	})
 	s.registerVMEntry(result.ID, entry)
 
+	// The clone inherits frozen network/FUSE state from the snapshot. For
+	// either to actually work, the guest has to be walked into the new
+	// world: eth0 re-IP'd onto the fresh tap/subnet, and each virtio-fs
+	// target re-mounted against the new virtiofsd. Both require exec; we
+	// fail the clone loudly if the caller skipped exec_enabled, so they
+	// don't end up with a silently-broken VM.
+	needExec := opts.NetworkMode == container.NetworkModeAuto || len(req.Mounts) > 0
+	if needExec && !req.ExecEnabled {
+		_ = s.stopAndUnregisterVM(result.ID)
+		apiErr(w, http.StatusBadRequest, "clone with network_mode=auto or virtiofs mounts requires exec_enabled=true (the clone needs to rewrite guest state)")
+		return
+	}
+	if opts.NetworkMode == container.NetworkModeAuto {
+		if err := s.execGuestReIP(result.ID, result.GuestIP, result.Gateway); err != nil {
+			_ = s.stopAndUnregisterVM(result.ID)
+			apiErr(w, http.StatusInternalServerError, fmt.Sprintf("post-restore re-IP: %v", err))
+			return
+		}
+	}
+	if len(result.VM.VMConfig().SharedFS) > 0 {
+		if err := s.execGuestRemountVirtiofs(result.ID, req.Mounts, result.VM.VMConfig().SharedFS); err != nil {
+			_ = s.stopAndUnregisterVM(result.ID)
+			apiErr(w, http.StatusInternalServerError, fmt.Sprintf("post-restore virtiofs remount: %v", err))
+			return
+		}
+	}
+
 	_ = json.NewEncoder(w).Encode(RunResponse{
 		ID:                   result.ID,
 		State:                "running",
@@ -2274,6 +2312,225 @@ func (s *Server) handleVMClone(w http.ResponseWriter, r *http.Request) {
 		NetworkMode:          opts.NetworkMode,
 		RestoredFromSnapshot: true,
 	})
+}
+
+// execGuestReIP plumbs new IP+gateway into a freshly-restored guest by
+// running a small iproute2 script over the exec agent. Idempotent (uses
+// `ip addr replace` and `ip route replace`); a guest without `ip` is a
+// no-op. Designed for the sandbox-clone flow where the guest kernel was
+// frozen with the template's old IP and we want it to use the per-clone
+// allocation.
+func (s *Server) execGuestReIP(id, guestIP, gateway string) error {
+	if strings.TrimSpace(guestIP) == "" || strings.TrimSpace(gateway) == "" {
+		return nil
+	}
+	cidr := guestIP
+	if !strings.Contains(cidr, "/") {
+		cidr = guestIP + "/30"
+	}
+	script := fmt.Sprintf(`set -e
+if ! command -v ip >/dev/null 2>&1; then exit 0; fi
+ip link set eth0 down 2>/dev/null || true
+ip addr flush dev eth0 2>/dev/null || true
+ip addr add %s dev eth0
+ip link set eth0 up
+ip route replace default via %s
+`, cidr, gateway)
+	return s.execGuestScript(id, script)
+}
+
+// execGuestUnmountVirtiofs umounts each virtio-fs target inside the guest.
+// Called on the source VM before a /clone-triggered snapshot so the
+// snapshot captures clean (dismounted) FUSE state, avoiding the EBADF
+// cascade described on execGuestRemountVirtiofs. If any target is busy
+// the fall-back `umount -l` (lazy) disconnects the mount immediately and
+// lets the kernel tear it down once the last FD closes; both paths leave
+// the guest in a consistent, remountable state.
+func (s *Server) execGuestUnmountVirtiofs(id string, snap []vmm.SharedFSConfig) error {
+	if len(snap) == 0 {
+		return nil
+	}
+	var script strings.Builder
+	script.WriteString("set -e\n")
+	wrote := false
+	for _, fs := range snap {
+		target := strings.TrimRight(fs.Target, "/")
+		if target == "" {
+			continue
+		}
+		// Try normal umount first so busy mounts surface as errors; only
+		// escalate to lazy if the target is still held (umount -l never
+		// fails unless the mount does not exist).
+		fmt.Fprintf(&script, "if mountpoint -q %s 2>/dev/null; then umount %s 2>/dev/null || umount -l %s; fi\n", target, target, target)
+		wrote = true
+	}
+	if !wrote {
+		return nil
+	}
+	return s.execGuestScript(id, script.String())
+}
+
+// execGuestRemountVirtiofs re-mounts each virtio-fs export inside the guest
+// so the new virtiofsd backend (rebound by /clone) takes over the FUSE
+// session cleanly. Without this the guest's frozen kernel keeps file
+// handles pointing at the template's now-dead virtiofsd and first-touch
+// returns EBADF. The script umounts (lazy if busy) then mounts; both the
+// tag and target come from the snapshot's own SharedFS so this works even
+// when the caller did not explicitly request a rebind.
+func (s *Server) execGuestRemountVirtiofs(id string, requested []container.Mount, snap []vmm.SharedFSConfig) error {
+	if len(snap) == 0 {
+		return nil
+	}
+	wantTargets := map[string]struct{}{}
+	for _, m := range requested {
+		if m.Backend == container.MountBackendVirtioFS {
+			wantTargets[strings.TrimRight(m.Target, "/")] = struct{}{}
+		}
+	}
+	var script strings.Builder
+	script.WriteString("set -e\n")
+	wrote := false
+	for _, fs := range snap {
+		target := strings.TrimRight(fs.Target, "/")
+		if target == "" || fs.Tag == "" {
+			continue
+		}
+		if len(wantTargets) > 0 {
+			if _, ok := wantTargets[target]; !ok {
+				continue
+			}
+		}
+		fmt.Fprintf(&script, "if mountpoint -q %s 2>/dev/null; then umount %s 2>/dev/null || umount -l %s; fi\n", target, target, target)
+		fmt.Fprintf(&script, "mkdir -p %s\n", target)
+		fmt.Fprintf(&script, `for i in 1 2 3 4 5 6 7 8 9 10; do
+  if mount -t virtiofs %s %s 2>/tmp/.mnt-err; then break; fi
+  sleep 0.5
+done
+`, fs.Tag, target)
+		fmt.Fprintf(&script, `if ! ls %s >/dev/null 2>/tmp/.ls-err; then
+  echo "mount %s ready-check failed: $(cat /tmp/.ls-err 2>/dev/null)" >&2
+  exit 91
+fi
+`, target, target)
+		wrote = true
+	}
+	if !wrote {
+		return nil
+	}
+	return s.execGuestScript(id, script.String())
+}
+
+// execGuestScript runs a shell script inside the guest synchronously via the
+// exec agent. Retries the vsock dial with exponential backoff up to 30 s:
+// immediately after a snapshot restore the guest exec agent's listener may
+// not have re-bound yet (the TRANSPORT_RESET event propagates on the first
+// kvm_run, the guest kernel sees ECONNRESET on its AF_VSOCK accept fd, and
+// the agent has to re-`listen` — all of which needs vCPU cycles). The
+// remaining RPC shares the outer deadline so slow dials don't collapse
+// the I/O budget to nothing.
+func (s *Server) execGuestScript(id, script string) error {
+	s.mu.RLock()
+	v, ok := s.vms[id]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("vm %s not registered", id)
+	}
+	if v.isPending() {
+		return fmt.Errorf("vm %s still pending", id)
+	}
+	dialer, ok := v.handle.(vmm.VsockDialer)
+	if !ok {
+		return fmt.Errorf("vm %s does not expose vsock", id)
+	}
+	cfg := v.handle.VMConfig()
+	if cfg.Exec == nil || !cfg.Exec.Enabled {
+		return fmt.Errorf("vm %s does not have exec enabled", id)
+	}
+	port := cfg.Exec.VsockPort
+	if port == 0 {
+		port = 1056
+	}
+
+	var conn net.Conn
+	var lastErr error
+	deadline := time.Now().Add(30 * time.Second)
+	backoff := 25 * time.Millisecond
+	const maxBackoff = 500 * time.Millisecond
+	for {
+		c, err := dialer.DialVsock(port)
+		if err == nil {
+			conn = c
+			break
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return fmt.Errorf("dial exec agent after %s: %w", 30*time.Second, lastErr)
+		}
+		time.Sleep(backoff)
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+	defer conn.Close()
+	// Cap the RPC deadline at what's left of the outer deadline, with a
+	// 2 s floor so a dial that consumed most of the 30 s still has room
+	// to write+read a short JSON blob.
+	rpcDeadline := deadline
+	if remaining := time.Until(deadline); remaining < 2*time.Second {
+		rpcDeadline = time.Now().Add(2 * time.Second)
+	}
+	if err := conn.SetDeadline(rpcDeadline); err != nil {
+		return err
+	}
+	req := guestexec.Request{
+		Mode:    guestexec.ModeExec,
+		Command: []string{"/bin/sh", "-lc", script},
+	}
+	if err := guestexec.Encode(conn, req); err != nil {
+		return fmt.Errorf("write exec request: %w", err)
+	}
+	var resp guestexec.Response
+	if err := guestexec.Decode(conn, &resp); err != nil {
+		return fmt.Errorf("read exec response: %w", err)
+	}
+	if !resp.OK {
+		return fmt.Errorf("exec failed: %s", resp.Error)
+	}
+	if resp.ExitCode != 0 {
+		return fmt.Errorf("exec exit=%d stdout=%q stderr=%q", resp.ExitCode, resp.Stdout, resp.Stderr)
+	}
+	return nil
+}
+
+// stopAndUnregisterVM best-effort tears down a VM we partially set up: used
+// when a post-restore step (re-IP, remount) fails and we need to avoid
+// leaking half-broken VMs in the registry. The registry entry is removed
+// whether or not the stop RPC succeeds so a retry with the same API ID is
+// not blocked.
+func (s *Server) stopAndUnregisterVM(id string) error {
+	s.mu.Lock()
+	v, ok := s.vms[id]
+	if ok {
+		delete(s.vms, id)
+	}
+	s.mu.Unlock()
+	if !ok || v == nil {
+		return nil
+	}
+	if v.isPending() {
+		return nil
+	}
+	v.handle.Stop()
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err := v.handle.WaitStopped(stopCtx)
+	stopCancel()
+	if v.cleanup != nil {
+		v.cleanup()
+	}
+	return err
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {

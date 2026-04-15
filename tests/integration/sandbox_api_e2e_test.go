@@ -180,10 +180,13 @@ func TestE2ESandboxCloneInstall(t *testing.T) {
 			install.ExitCode, install.Stdout, install.Stderr)
 	}
 
-	// Clone. Leave snapshot_dir empty so the server scratches its own.
+	// Clone with network_mode=auto so the server allocates a fresh /30 for
+	// the clone and re-IPs the guest (otherwise source + clone would both
+	// carry the template's frozen IP and collide on the host).
 	cloneCtx, cloneCancel := context.WithTimeout(context.Background(), 120*time.Second)
 	clone, err := client.CloneVM(cloneCtx, src.ID, internalapi.CloneRequest{
 		ExecEnabled: true,
+		NetworkMode: "auto",
 	})
 	cloneCancel()
 	if err != nil {
@@ -200,7 +203,7 @@ func TestE2ESandboxCloneInstall(t *testing.T) {
 		t.Fatalf("clone ID %q == source ID", clone.ID)
 	}
 
-	// Clone must have bc without re-installing.
+	// Clone must have bc without re-installing (disk state carried over).
 	cloneBC := waitForExecResponse(t, client, clone.ID, internalapi.ExecRequest{
 		Command: []string{"/bin/sh", "-lc", "echo '7*6' | bc && cat /tmp/src-marker"},
 	}, 30*time.Second)
@@ -209,6 +212,27 @@ func TestE2ESandboxCloneInstall(t *testing.T) {
 	}
 	if !strings.Contains(cloneBC.Stdout, "SOURCE-MARKER") {
 		t.Fatalf("clone missing source marker — snapshot did not capture disk state: stdout=%q", cloneBC.Stdout)
+	}
+
+	// Clone must have a working network after re-IP: eth0 must carry the
+	// new guest IP the response reports, and outbound must reach the new
+	// gateway (validated by pulling another apk package from the Alpine
+	// mirror — proves re-IP + re-route + NAT all work post-restore).
+	if clone.GuestIP == "" || clone.Gateway == "" {
+		t.Fatalf("clone response missing network fields: ip=%q gw=%q", clone.GuestIP, clone.Gateway)
+	}
+	ipResp := waitForExecResponse(t, client, clone.ID, internalapi.ExecRequest{
+		Command: []string{"/bin/sh", "-lc", "ip -4 addr show eth0"},
+	}, 15*time.Second)
+	expectedIP := strings.Split(clone.GuestIP, "/")[0]
+	if !strings.Contains(ipResp.Stdout, expectedIP) {
+		t.Fatalf("clone eth0 missing re-IP %q:\nstdout=%q\nstderr=%q", expectedIP, ipResp.Stdout, ipResp.Stderr)
+	}
+	netResp := waitForExecResponse(t, client, clone.ID, internalapi.ExecRequest{
+		Command: []string{"/bin/sh", "-lc", "apk add --no-cache file 2>&1 | tail -3 && echo clone-net-ok"},
+	}, 120*time.Second)
+	if !strings.Contains(netResp.Stdout, "clone-net-ok") {
+		t.Fatalf("clone outbound network broken (apk add failed after re-IP): stdout=%q stderr=%q", netResp.Stdout, netResp.Stderr)
 	}
 
 	// Source must still be alive and independent. Writing a post-clone file
@@ -248,30 +272,17 @@ func TestE2ESandboxCloneInstall(t *testing.T) {
 	}
 }
 
-// TestE2ESandboxCloneVirtiofsRebind exercises /clone with a virtiofs rebind:
-// the source VM is booted with a placeholder virtiofs export pointing at one
-// host dir; the clone rebinds the same guest target to a DIFFERENT host dir
-// and reads files only present in the new source.
-//
-// CURRENTLY SKIPPED (different reason from before this PR):
-// The memfd-backed restore path now activates correctly when the snapshot
-// contains a virtio-fs device (CreateVMFromSnapshotFileMemfd in
-// internal/kvm), and a fresh virtiofsd is spawned against the rebound
-// Source. What still fails end-to-end is the FUSE *session* state inside
-// the guest: the guest kernel's FUSE driver was frozen with file handles
-// pointing at the old virtiofsd's session, so first-touch of the rebound
-// mount returns EBADF. Making this fully transparent needs FUSE-session
-// migration on the virtiofsd side or a guest-cooperative umount/remount on
-// restore — both deeper than the API surface this PR adds.
-//
-// What IS verified: (a) the rebind plumbing — vmm.applySharedFSRebinds
-// correctly rewrites Source by guest Target and clears stale SocketPath
-// (TestApplySharedFSRebinds_* in pkg/vmm), (b) the memory-mode selection
-// (CreateVMFromSnapshotFileMemfd is reached when Config.SharedFS is
-// non-empty), (c) the API rejects materialized mounts on restore, (d)
-// virtiofs cold-boot still works (TestVirtioFSMountReflectsHostAndGuestWrites).
+// TestE2ESandboxCloneVirtiofsRebind covers the virtiofs rebind plumbing
+// against the Linux virtio-fs driver's queue-state snapshot limitation:
+// after restore, the guest driver's request-ID tracking does not match the
+// fresh virtiofsd, yielding "requests.0:id 0 is not a head!" in dmesg and
+// -EIO on the first FUSE op. Making this transparent needs FUSE-session
+// migration (on virtiofsd) or a coordinated device-reset + guest umount
+// hook; either is bigger than this PR. The rebind contract (host-side
+// Source rewrite + SocketPath clear + memfd-backed restore) is fully
+// covered by unit tests in pkg/vmm/sharedfs_rebind_test.go.
 func TestE2ESandboxCloneVirtiofsRebind(t *testing.T) {
-	t.Skip("memfd restore + virtiofsd respawn work; FUSE session re-attach across snapshot needs guest-side umount/remount, tracked as separate follow-up")
+	t.Skip("Linux virtio-fs driver's queue state does not survive snapshot+restore against a new virtiofsd; needs FUSE-session migration, tracked separately")
 	if os.Getenv("E2E") != "1" {
 		t.Skip("set E2E=1 to enable")
 	}
