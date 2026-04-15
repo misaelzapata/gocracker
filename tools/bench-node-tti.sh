@@ -29,6 +29,20 @@ CACHE="$WORKDIR/cache"
 [[ -x "$GC_BIN" ]] || { echo "error: gocracker CLI not found at $GC_BIN (build with 'make' or set GC_BIN)" >&2; exit 2; }
 [[ -f "$GC_KERNEL" ]] || { echo "error: guest kernel not found at $GC_KERNEL (build it or set GC_KERNEL)" >&2; exit 2; }
 
+# Optional CPU affinity + scheduler priority. Pinning the boot path to a
+# dedicated core + FIFO priority knocks down jitter (p95/p99) and brings
+# the median a few ms tighter — both matter for a latency SLO. If taskset
+# or chrt aren't present, or TTI_PIN_CPUS is empty, fall back to plain sudo.
+# Override with TTI_PIN_CPUS="" to disable pinning entirely.
+: "${TTI_PIN_CPUS:=0}"
+PIN_WRAPPER=()
+if [[ -n "$TTI_PIN_CPUS" ]] && command -v taskset >/dev/null 2>&1; then
+    PIN_WRAPPER=(taskset -c "$TTI_PIN_CPUS")
+    if command -v chrt >/dev/null 2>&1; then
+        PIN_WRAPPER=(chrt -r 50 "${PIN_WRAPPER[@]}")
+    fi
+fi
+
 # Dockerfile is the same sandbox shape computesdk's leaderboard assumes:
 # a node runtime already installed, booted, first stdout is the version.
 mkdir -p "$WORKDIR"
@@ -42,7 +56,7 @@ EOF
 # boot + node -v stdout, which is what ComputeSDK actually measures (their
 # providers also have pre-built sandbox images).
 echo "warming artifact cache (first pull may take ~10-30s)..."
-sudo "$GC_BIN" run \
+sudo "${PIN_WRAPPER[@]}" "$GC_BIN" run \
     -dockerfile "$WORKDIR/Dockerfile" \
     -context "$WORKDIR" \
     -kernel "$GC_KERNEL" \
@@ -62,7 +76,7 @@ fails=0
 echo "=== $ITER timed runs ==="
 for i in $(seq 1 "$ITER"); do
     t0="$(date +%s%3N)"
-    if sudo "$GC_BIN" run \
+    if sudo "${PIN_WRAPPER[@]}" "$GC_BIN" run \
         -dockerfile "$WORKDIR/Dockerfile" \
         -context "$WORKDIR" \
         -kernel "$GC_KERNEL" \

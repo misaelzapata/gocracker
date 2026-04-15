@@ -248,7 +248,7 @@ gocracker builds on Firecracker's proven security model and adds the developer e
 
 ## Boot-time benchmark
 
-I measured gocracker against Firecracker v1.10.1 on the same host, across the matrix of `{standard, minimal}` guest kernels × `{none, tap}` network × `{off, on}` TTY, 10 runs per cell (3 warmups), all driven through the same Firecracker REST API so the comparison is apples-to-apples at the VMM level.
+gocracker was benchmarked against Firecracker v1.10.1 on the same host, across the matrix of `{standard, minimal}` guest kernels × `{none, tap}` network × `{off, on}` TTY, 10 runs per cell (3 warmups), all driven through the same Firecracker REST API so the comparison is apples-to-apples at the VMM level.
 
 > **Note** — this section was re-measured on 2026-04-13 on the `perf/x86-slim-kernel-boot-bench` branch (commit preceding the README update). The earlier run is preserved in git history.
 
@@ -381,21 +381,23 @@ The Firecracker head-to-head above measures at the VMM level. [ComputeSDK's lead
 - **Warm artifact cache**: first iteration pulls/extracts once, subsequent timed runs boot from the cached ext4
 - **Rootfs mode**: default (read-only rootfs with tmpfs overlay) — matches Docker's ephemeral-writable-layer semantics and enables the hardlink fast-path in [pkg/container/container.go](pkg/container/container.go)
 
-### Results (10 timed runs after one warmup)
+### Results (10 timed runs after one warmup, CPU-pinned + FIFO scheduler)
 
 ```
-TTI 1: 227ms
-TTI 2: 234ms
-TTI 3: 240ms
-TTI 4: 234ms
-TTI 5: 245ms
-TTI 6: 207ms
-TTI 7: 240ms
-TTI 8: 283ms
-TTI 9: 226ms
-TTI 10: 245ms
-median = 237 ms, mean = 236 ms, p95 = 283 ms, min = 207 ms, max = 283 ms
+TTI 1: 211ms
+TTI 2: 220ms
+TTI 3: 216ms
+TTI 4: 208ms
+TTI 5: 217ms
+TTI 6: 220ms
+TTI 7: 215ms
+TTI 8: 229ms
+TTI 9: 219ms
+TTI 10: 218ms
+median = 218 ms, mean = 218 ms, p95 = 229 ms, min = 208 ms, max = 229 ms
 ```
+
+The bench pins `gocracker` to CPU 0 with `taskset -c 0` and SCHED_FIFO priority 50 via `chrt`. Override with `TTI_PIN_CPUS="0-3"` or `TTI_PIN_CPUS=""` to disable pinning. The VMM process itself also calls `mlockall(MCL_CURRENT)` in [cmd/gocracker-vmm/main.go](cmd/gocracker-vmm/main.go) so its working set stays resident; that drops p95 by ~50 ms and narrows the run-to-run spread from ~75 ms to ~20 ms.
 
 ### ComputeSDK leaderboard (reference)
 
@@ -414,7 +416,7 @@ For context, ComputeSDK publishes these medians on its own infrastructure and me
 | Runloop | 1,960 ms |
 | CodeSandbox | 3,790 ms |
 
-These numbers are **not directly comparable** to the 237 ms above — ComputeSDK runs each provider on the provider's own infrastructure (cloud VMs, different CPUs, their own network path). Our measurement is gocracker on an AMD Ryzen AI 9 HX 370 laptop with the bench harness in this repo. The shared piece is the workload: a `node:20-alpine` sandbox whose CMD is `node -v`, timed from the VM spawn to the first stdout byte.
+These numbers are **not directly comparable** to the 218 ms above — ComputeSDK runs each provider on the provider's own infrastructure (cloud VMs, different CPUs, their own network path). The measurement here was taken on an AMD Ryzen AI 9 HX 370 laptop with the bench harness in this repo. The shared piece is the workload: a `node:20-alpine` sandbox whose CMD is `node -v`, timed from the VM spawn to the first stdout byte.
 
 ## Snapshot-resume benchmark (head-to-head vs Firecracker)
 
@@ -422,10 +424,10 @@ gocracker's `POST /restore {resume:true}` maps the memory snapshot `MAP_PRIVATE`
 
 | VMM | min | p50 | p90 | mean | max |
 |---|---:|---:|---:|---:|---:|
-| Firecracker v1.10.1 | 1.39 ms | **1.71 ms** | 2.06 ms | 1.83 ms | 3.45 ms |
-| gocracker *(this branch)* | 1.50 ms | **2.69 ms** | 3.26 ms | 2.65 ms | 4.81 ms |
+| Firecracker v1.10.1 | 1.11 ms | **1.92 ms** | 2.25 ms | 1.93 ms | 2.59 ms |
+| gocracker *(this branch)* | 1.42 ms | **2.24 ms** | 2.87 ms | 2.20 ms | 3.15 ms |
 
-A ~1 ms p50 gap at the low end of the latency budget, from a pure-Go VMM against a C/Rust production VMM. The key wins that landed to get here:
+A ~0.3 ms p50 gap at the low end of the latency budget, from a pure-Go VMM against a C/Rust production VMM. The key wins that landed to get here:
 
 - **`MAP_PRIVATE` COW memory restore** — [internal/kvm/kvm.go](internal/kvm/kvm.go). Page-faults the snapshot file in lazily rather than reading+copying 128 MiB up front; saves ~60–100 ms.
 - **Single-call `/restore {resume:true}`** — [internal/vmmserver/server.go](internal/vmmserver/server.go). Snapshot-load and vCPU-resume in one HTTP round-trip; saves ~8 ms vs two-call load-then-start.
@@ -438,8 +440,10 @@ A ~1 ms p50 gap at the low end of the latency budget, from a pure-Go VMM against
 
 | scenario | gocracker | Firecracker v1.10.1 | notes |
 |---|---:|---:|---|
-| Cold boot (Node TTI) | **237 ms** p50 | — | `gocracker run` to first `node -v` stdout (ComputeSDK methodology) |
-| Snapshot-resume | **2.69 ms** p50 | 1.71 ms p50 | `POST /restore {resume:true}` RTT, 128 MiB guest, curl time_total |
+| Cold boot (Node TTI) | **218 ms** p50 | — | `gocracker run` to first `node -v` stdout (ComputeSDK methodology) |
+| Snapshot-resume | **2.24 ms** p50 | 1.92 ms p50 | `POST /restore {resume:true}` RTT, 128 MiB guest, curl time_total |
+
+Both benches run with the VMM pinned to a dedicated CPU (`taskset`) and boosted to SCHED_FIFO (`chrt -r 50`), with `mlockall(MCL_CURRENT)` locking the VMM's working set. The snapshot path deliberately does NOT set `MCL_FUTURE` because that would eager-fault the `MAP_PRIVATE` memory snapshot and turn a ~2 ms lazy-COW restore into ~30 ms.
 
 ### Reproducing
 
@@ -448,88 +452,6 @@ make build
 ./tools/bench-node-tti.sh               # 10 cold-boot TTI runs (default)
 ./tools/bench-node-tti.sh 50            # 50 runs
 GC_KERNEL=/path/to/vmlinux ./tools/bench-node-tti.sh
-```
-
-First run pulls `node:20-alpine` and builds the ext4 disk (~10–30 s). Every subsequent run hits the cache and measures only the boot path.
-
-## Time-to-Interactive vs commercial sandbox providers
-
-The above compares gocracker to Firecracker at the VMM level. [ComputeSDK's leaderboard](https://www.computesdk.com/benchmarks/) publishes a higher-level **Time-to-Interactive (TTI)** — the wall-clock time from `compute.sandbox.create()` returning to the first successful `runCommand("node -v")` stdout byte, against a pre-built sandbox image. [Their methodology doc](https://github.com/computesdk/benchmarks/blob/master/METHODOLOGY.md) specifies the exact test.
-
-[tools/bench-node-tti.sh](tools/bench-node-tti.sh) in this repo replicates it: a `node:20-alpine` Dockerfile with `CMD ["node","-v"]`, warm artifact cache standing in for their pre-built images, and `gocracker run ... --wait` timed to the first stdout byte starting with `v`.
-
-### Setup
-
-- **Host**: AMD Ryzen AI 9 HX 370 (24 threads), Linux 6.17, `/dev/kvm` available
-- **Guest kernel**: [artifacts/kernels/gocracker-guest-minimal-vmlinux](artifacts/kernels/gocracker-guest-minimal-vmlinux) (Linux 6.1.102, trimmed initcalls, `loglevel=4` default)
-- **Sandbox image**: `node:20-alpine` (cached locally after the first pull)
-- **VM shape**: 1 vCPU, 256 MiB RAM, ext4 rootfs, no network (the test doesn't need it)
-- **Optimisations this branch lands**: `loglevel=4` in `firecrackerBaseArgs`, per-fs discard-probe cache, slim minimal kernel, x86 `KVM_IRQFD` on every virtio device + 8250 UART, `debug.SetGCPercent(-1)` in `gocracker-vmm` at init
-
-### Results
-
-10 timed runs after a warm-up:
-
-```
-TTI 1: 269ms
-TTI 2: 247ms
-TTI 3: 252ms
-TTI 4: 247ms
-TTI 5: 252ms
-TTI 6: 250ms
-TTI 7: 258ms
-TTI 8: 243ms
-TTI 9: 253ms
-TTI 10: 257ms
-median = 252 ms, mean = 253 ms, p95 = 269 ms
-```
-
-### Against the ComputeSDK leaderboard
-
-| rank | provider | TTI median | Δ vs gocracker |
-|:---:|---|---:|---:|
-| 1 | Daytona | 100 ms | −152 (they serve from a pre-warmed snapshot pool) |
-| **2** | **gocracker** *(this branch)* | **252 ms** | — |
-| 3 | Vercel | 380 ms | **+128 ahead** |
-| 4 | Blaxel | 440 ms | **+188 ahead** |
-| 4 | E2B | 440 ms | **+188 ahead** |
-| 6 | Hopx | 1,050 ms | +798 |
-| 7 | Modal | 1,520 ms | +1,268 |
-| 8 | Cloudflare | 1,720 ms | +1,468 |
-| 9 | Namespace | 1,770 ms | +1,518 |
-| 10 | Runloop | 1,960 ms | +1,708 |
-| 11 | CodeSandbox | 3,790 ms | +3,538 |
-
-On the same workload ComputeSDK measures on its own, gocracker is **#2 of 11** — ahead of every commercial provider except Daytona, whose lead comes from serving sandboxes out of a pre-warmed snapshot pool rather than cold booting them each time.
-
-### Snapshot-resume (COW restore)
-
-Issue [#3](https://github.com/misaelzapata/gocracker/issues/3) is implemented: `/restore {resume:true}` maps the memory snapshot `MAP_PRIVATE` (lazy COW — no up-front read or copy), re-wires virtio devices, restores vCPU state, and resumes. Head-to-head vs Firecracker v1.10.1 on the same Ryzen AI 9 HX 370 host, 128 MiB guest, `alpine + sleep` rootfs, 20 fresh-process runs each, measured via `curl -w '%{time_total}'` (the request round-trip — excludes shell-process startup):
-
-| VMM | min | p50 | p90 | mean | max |
-|---|---:|---:|---:|---:|---:|
-| Firecracker v1.10.1 | 1.15 ms | **1.66 ms** | 2.16 ms | 1.72 ms | 2.87 ms |
-| gocracker *(this branch)* | 1.68 ms | **2.74 ms** | 3.35 ms | 2.79 ms | 3.54 ms |
-
-A ~1 ms gap at the low end of the latency budget, from a pure-Go VMM against a C/Rust production VMM. Optimisations that landed to get here:
-
-- **`MAP_PRIVATE` COW memory restore** — [`internal/kvm/kvm.go:CreateVMFromSnapshotFile`](internal/kvm/kvm.go). Page-faults the snapshot file in lazily rather than reading+copying 128 MiB up front; saves ~60–100 ms.
-- **Single-call `/restore {resume:true}`** — [`internal/vmmserver/server.go:handleRestore`](internal/vmmserver/server.go). Snapshot-load and vCPU-resume in one HTTP round-trip; saves ~8 ms vs two-call load-then-start.
-- **`SkipDiscardProbe` on restore** — [`internal/virtio/blk.go:NewBlockDeviceWithOptions`](internal/virtio/blk.go). Skips the `FALLOC_FL_PUNCH_HOLE` probe because the guest has already negotiated `VIRTIO_BLK_F_DISCARD` against the pre-snapshot `DeviceFeatures`; saves ~3 ms per writable drive.
-- **`postCreateVCPUs` in restore path** — [`pkg/vmm/vmm.go:restoreFromSnapshot`](pkg/vmm/vmm.go). Wires per-device `KVM_IRQFD` against the freshly-created vCPU GSIs so queue notifies don't take a reconfiguration VMexit on first use.
-- **`MADV_HUGEPAGE` + `MADV_WILLNEED`** on the first 8 MiB of the memory mapping — tells the kernel to serve hot early pages from 2 MiB TLB entries without page-fault stalls.
-- **Minimal restore response** — drops `Events[]` + `DeviceList[]` from the hot-path response body; callers who need them do a follow-up `GET /vm`.
-
-With this latency as a baseline, a pre-warmed pool of restored VMMs puts `compute.sandbox.create()` TTI in the 5–15 ms range — competitive with Daytona's snapshot-pool lead on the leaderboard above.
-
-### Reproducing
-
-```bash
-make gocracker
-./tools/bench-node-tti.sh               # 10 timed runs (default)
-./tools/bench-node-tti.sh 50            # 50 timed runs
-GC_KERNEL=/path/to/vmlinux ./tools/bench-node-tti.sh
-GC_BIN=/path/to/gocracker    ./tools/bench-node-tti.sh
 ```
 
 First run pulls `node:20-alpine` and builds the ext4 disk (~10–30 s). Every subsequent run hits the cache and measures only the boot path.
