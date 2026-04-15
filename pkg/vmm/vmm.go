@@ -906,14 +906,12 @@ func RestoreFromSnapshotWithConsole(dir string, consoleIn io.Reader, consoleOut 
 }
 
 type RestoreOptions struct {
-	ConsoleIn        io.Reader
-	ConsoleOut       io.Writer
-	OverrideVCPUs    int
-	OverrideID       string
-	OverrideTap      string
-	OverrideStaticIP string
-	OverrideGateway  string
-	OverrideX86Boot  X86BootMode
+	ConsoleIn       io.Reader
+	ConsoleOut      io.Writer
+	OverrideVCPUs   int
+	OverrideID      string
+	OverrideTap     string
+	OverrideX86Boot X86BootMode
 	// SharedFSRebinds remaps virtiofs exports present in the snapshot to new
 	// host source paths, keyed by the guest-side Target that the template
 	// mounted the tag at. The template must have already snapshotted with a
@@ -927,9 +925,8 @@ type RestoreOptions struct {
 // or the tag. Used by the sandbox-template flow to inject a per-instance
 // toolbox on top of a pre-provisioned virtiofs slot.
 type SharedFSRebind struct {
-	Target   string `json:"target"`
-	Source   string `json:"source"`
-	ReadOnly bool   `json:"read_only,omitempty"`
+	Target string `json:"target"`
+	Source string `json:"source"`
 }
 
 // RestoreFromSnapshotWithOptions creates a new VM restored from a snapshot
@@ -976,6 +973,9 @@ func applySharedFSRebinds(snap *Snapshot, rebinds []SharedFSRebind) error {
 func sharedFSTargets(cfgs []SharedFSConfig) []string {
 	out := make([]string, 0, len(cfgs))
 	for _, fs := range cfgs {
+		if fs.Target == "" {
+			continue
+		}
 		out = append(out, fs.Target)
 	}
 	return out

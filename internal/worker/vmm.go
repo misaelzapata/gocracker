@@ -468,8 +468,6 @@ func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, re
 	info, err := client.Restore(ctx, vmmserver.RestoreRequest{
 		SnapshotDir:     "/snapshot",
 		TapName:         opts.OverrideTap,
-		StaticIP:        opts.OverrideStaticIP,
-		Gateway:         opts.OverrideGateway,
 		VcpuCount:       opts.OverrideVCPUs,
 		X86Boot:         string(opts.OverrideX86Boot),
 		Resume:          resume,

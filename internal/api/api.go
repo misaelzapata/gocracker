@@ -196,7 +196,7 @@ type RunRequest struct {
 	// NetworkMode selects how gocracker provisions the guest NIC. "" or
 	// "none" keeps today's explicit behaviour (caller supplies tap_name /
 	// static_ip / gateway). "auto" makes the server allocate a fresh TAP
-	// + /31 guest/gateway pair via hostnet.AutoNetwork. When "auto" is set
+	// + /30 guest/gateway pair via hostnet.AutoNetwork. When "auto" is set
 	// the caller MUST leave static_ip and gateway empty.
 	NetworkMode string `json:"network_mode,omitempty"`
 
@@ -248,16 +248,15 @@ type CloneRequest struct {
 	StaticIP    string `json:"static_ip,omitempty"`
 	Gateway     string `json:"gateway,omitempty"`
 	NetworkMode string `json:"network_mode,omitempty"`
-	// Virtiofs rebinds. Must be backend=virtiofs and the source VM must
-	// have been booted with a matching guest Target.
+	// Mounts: reserved for future virtio-fs rebind once FUSE-session
+	// migration is available. Today /clone rejects VMs with live
+	// virtio-fs mounts at the API (400) to avoid silent hangs, so this
+	// field is validated but not acted on.
 	Mounts []container.Mount `json:"mounts,omitempty"`
 	// ExecEnabled for the clone (the source's exec is not forwarded).
 	ExecEnabled bool `json:"exec_enabled,omitempty"`
 	// Metadata merged onto the clone's VMInfo.
 	Metadata map[string]string `json:"metadata,omitempty"`
-	// Wait blocks the HTTP response until the clone is running. Defaults
-	// to true — clone's whole point is atomicity for the caller.
-	Wait *bool `json:"wait,omitempty"`
 }
 
 type VMInfo struct {

@@ -315,8 +315,6 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 				OverrideVCPUs:    opts.CPUs,
 				OverrideID:       opts.ID,
 				OverrideTap:      opts.TapName,
-				OverrideStaticIP: opts.StaticIP,
-				OverrideGateway:  opts.Gateway,
 				OverrideX86Boot:  opts.X86Boot,
 				SharedFSRebinds:  buildSharedFSRebinds(opts.Mounts),
 			})
@@ -646,14 +644,12 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		if _, err := os.Stat(filepath.Join(opts.SnapshotDir, "snapshot.json")); err == nil {
 			gclog.Container.Info("restoring from snapshot via worker", "dir", opts.SnapshotDir)
 			handle, cleanup, err := worker.LaunchRestoredVMM(opts.SnapshotDir, vmm.RestoreOptions{
-				OverrideTap:      opts.TapName,
-				OverrideStaticIP: opts.StaticIP,
-				OverrideGateway:  opts.Gateway,
-				OverrideVCPUs:    opts.CPUs,
-				OverrideX86Boot:  opts.X86Boot,
-				ConsoleIn:        opts.ConsoleIn,
-				ConsoleOut:       opts.ConsoleOut,
-				SharedFSRebinds:  buildSharedFSRebinds(opts.Mounts),
+				OverrideTap:     opts.TapName,
+				OverrideVCPUs:   opts.CPUs,
+				OverrideX86Boot: opts.X86Boot,
+				ConsoleIn:       opts.ConsoleIn,
+				ConsoleOut:      opts.ConsoleOut,
+				SharedFSRebinds: buildSharedFSRebinds(opts.Mounts),
 			}, worker.VMMOptions{
 				JailerBinary: opts.JailerBinary,
 				VMMBinary:    opts.VMMBinary,
@@ -1854,9 +1850,8 @@ func buildSharedFSRebinds(mounts []Mount) []vmm.SharedFSRebind {
 			continue
 		}
 		rebinds = append(rebinds, vmm.SharedFSRebind{
-			Target:   m.Target,
-			Source:   filepath.Clean(m.Source),
-			ReadOnly: m.ReadOnly,
+			Target: m.Target,
+			Source: filepath.Clean(m.Source),
 		})
 	}
 	return rebinds

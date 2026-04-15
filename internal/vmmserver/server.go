@@ -189,8 +189,6 @@ type SnapshotRequest struct {
 type RestoreRequest struct {
 	SnapshotDir     string               `json:"snapshot_dir"`
 	TapName         string               `json:"tap_name,omitempty"`
-	StaticIP        string               `json:"static_ip,omitempty"`
-	Gateway         string               `json:"gateway,omitempty"`
 	VcpuCount       int                  `json:"vcpu_count,omitempty"`
 	X86Boot         string               `json:"x86_boot,omitempty"`
 	Resume          bool                 `json:"resume"`
@@ -1027,12 +1025,10 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	vm, err := vmm.RestoreFromSnapshotWithOptions(req.SnapshotDir, vmm.RestoreOptions{
-		OverrideTap:      req.TapName,
-		OverrideStaticIP: req.StaticIP,
-		OverrideGateway:  req.Gateway,
-		OverrideVCPUs:    req.VcpuCount,
-		OverrideX86Boot:  mode,
-		SharedFSRebinds:  req.SharedFSRebinds,
+		OverrideTap:     req.TapName,
+		OverrideVCPUs:   req.VcpuCount,
+		OverrideX86Boot: mode,
+		SharedFSRebinds: req.SharedFSRebinds,
 	})
 	if err != nil {
 		apiErr(w, http.StatusBadRequest, err.Error())
