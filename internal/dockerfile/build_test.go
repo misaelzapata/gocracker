@@ -448,7 +448,8 @@ func main() {
 
 func TestBuild_ARGQuotedDefaultAndPlatformExpansion(t *testing.T) {
 	ctxDir := t.TempDir()
-	writeContextFile(t, ctxDir, "Dockerfile", "ARG ARCH=\"amd64\"\nFROM --platform=linux/$ARCH scratch\n")
+	arch := runtime.GOARCH
+	writeContextFile(t, ctxDir, "Dockerfile", "ARG ARCH=\""+arch+"\"\nFROM --platform=linux/$ARCH scratch\n")
 
 	result := buildFromContext(t, ctxDir)
 	if result.RootfsDir == "" {
@@ -609,12 +610,18 @@ func TestBuild_FromPlatformBuildPlatformAndTargetArch(t *testing.T) {
 
 func TestBuild_SkipsUnusedForeignPlatformStage(t *testing.T) {
 	ctxDir := t.TempDir()
+	// Use host arch for the used stage; pick the other arch for the unused/foreign stage.
+	hostArch := runtime.GOARCH
+	foreignArch := "amd64"
+	if hostArch == "amd64" {
+		foreignArch = "arm64"
+	}
 	writeContextFile(t, ctxDir, "Dockerfile", strings.Join([]string{
-		"FROM --platform=linux/arm64 scratch AS arm64",
-		"FROM --platform=linux/amd64 scratch AS amd64",
+		"FROM --platform=linux/" + foreignArch + " scratch AS foreign",
+		"FROM --platform=linux/" + hostArch + " scratch AS native",
 		"COPY artifact /artifact",
-		"FROM amd64",
-		"COPY --from=amd64 /artifact /artifact",
+		"FROM native",
+		"COPY --from=native /artifact /artifact",
 	}, "\n"))
 	writeContextFile(t, ctxDir, "artifact", "payload")
 

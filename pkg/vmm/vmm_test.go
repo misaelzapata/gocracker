@@ -194,10 +194,13 @@ func TestNewMachineArchBackendAMD64(t *testing.T) {
 	}
 }
 
-func TestNewMachineArchBackendARM64StillExplicitlyRejected(t *testing.T) {
+func TestNewMachineArchBackendARM64Supported(t *testing.T) {
 	backend, err := newMachineArchBackend(ArchARM64)
-	if err == nil {
-		t.Fatalf("newMachineArchBackend(arm64) error = nil, backend = %#v", backend)
+	if err != nil {
+		t.Fatalf("newMachineArchBackend(arm64) error = %v", err)
+	}
+	if backend == nil {
+		t.Fatal("newMachineArchBackend(arm64) = nil, want backend")
 	}
 }
 
