@@ -239,6 +239,9 @@ func fileSyscalls() []uintptr {
 		unix.SYS_RENAMEAT,
 		unix.SYS_RENAMEAT2,
 		unix.SYS_SYNCFS,
+		// copy_file_range: used by Go's io.Copy when both args are *os.File.
+		// Required for snapshot bundling (kernel/initrd/disk copy inside worker).
+		unix.SYS_COPY_FILE_RANGE,
 	}
 }
 

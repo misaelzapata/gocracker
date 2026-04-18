@@ -632,7 +632,12 @@ func (r *remoteVM) takeSnapshotViaExport(dir string) (*vmm.Snapshot, error) {
 	if err := copyTree(exportDir, dir); err != nil {
 		return nil, err
 	}
-	return vmm.RewriteSnapshotBundleWithConfig(dir, r.cfg)
+	// The worker already called TakeSnapshotWithOptions which bundled kernel/
+	// initrd/disk into the snapshot dir using its jail-relative paths and
+	// rewrote snapshot.json accordingly. Just parse and return — do NOT call
+	// RewriteSnapshotBundleWithConfig here because r.cfg carries jail paths
+	// (/worker/kernel, /worker/drives/0) that don't exist on the host.
+	return vmm.ReadSnapshot(dir)
 }
 
 func (r *remoteVM) State() vmm.State {

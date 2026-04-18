@@ -1022,6 +1022,17 @@ func sharedFSTargets(cfgs []SharedFSConfig) []string {
 	return out
 }
 
+// ReadSnapshot parses a snapshot directory's metadata file. Exported so
+// callers outside the package (e.g. worker proxy) can read a snapshot that
+// was already bundled inside a jailer and copied to a host-side directory.
+func ReadSnapshot(dir string) (*Snapshot, error) {
+	snap, err := readSnapshot(dir)
+	if err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
 func readSnapshot(dir string) (Snapshot, error) {
 	metaFile := filepath.Join(dir, "snapshot.json")
 	data, err := os.ReadFile(metaFile)

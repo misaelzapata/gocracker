@@ -88,7 +88,11 @@ func captureWarmSnapshot(handle vmm.Handle, opts RunOptions, key string) {
 	if _, hit := warmcache.Lookup(root, key); hit {
 		return
 	}
-	waitExecReady(handle, 2*time.Second)
+	// Use a fixed 1s wait instead of vsock probing for worker-backed VMs.
+	// The vsock probe via DialVsock creates an HTTP-upgraded connection that
+	// triggers subsequent state issues in the worker. A 1s wait is enough
+	// for the guest's exec agent to start listening after boot (~50ms).
+	time.Sleep(1 * time.Second)
 	if handle.State() != vmm.StateRunning {
 		return
 	}
