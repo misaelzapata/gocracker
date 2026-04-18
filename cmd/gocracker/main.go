@@ -237,6 +237,19 @@ func cmdRun(args []string) {
 		fmt.Println()
 		return
 	}
+	// --warm non-interactive path: wait for snapshot capture then exec CMD if provided.
+	if *warm {
+		waitWarmCapture(result)
+		cmd := effectiveCommandSlice(runOpts.Cmd, imageDefaultCmd(result.Config))
+		if len(cmd) > 0 {
+			if err := runWarmCmd(result.VM, cmd); err != nil {
+				stopVMAndWait(result.VM, 5*time.Second)
+				fatal(err.Error())
+			}
+		}
+		stopVMAndWait(result.VM, 5*time.Second)
+		return
+	}
 	if *wait {
 		waitVM(result.VM, nil)
 	}
@@ -1129,6 +1142,57 @@ func waitWarmCapture(r *container.RunResult) {
 		return
 	}
 	<-r.WarmDone
+}
+
+// imageDefaultCmd returns the effective command from an OCI image config
+// (entrypoint + cmd), or nil when the image has no default process.
+func imageDefaultCmd(cfg oci.ImageConfig) []string {
+	proc := runtimecfg.ResolveProcess(cfg.Entrypoint, cfg.Cmd)
+	if proc.IsZero() {
+		return nil
+	}
+	return append([]string{proc.Exec}, proc.Args...)
+}
+
+// runWarmCmd runs a one-shot exec command on a --warm VM (restored from
+// snapshot) via the vsock exec agent. Streams stdout/stderr to the terminal
+// and returns the guest exit code as an error when non-zero.
+func runWarmCmd(vm vmm.Handle, cmd []string) error {
+	if cfg := vm.VMConfig(); cfg.Exec == nil || !cfg.Exec.Enabled {
+		return fmt.Errorf("exec agent not available on this VM (exec not enabled)")
+	}
+	dialer, ok := vm.(vmm.VsockDialer)
+	if !ok {
+		return fmt.Errorf("exec agent not available on this VM (no vsock)")
+	}
+	conn, err := dialer.DialVsock(execVsockPort(vm.VMConfig()))
+	if err != nil {
+		return fmt.Errorf("exec agent dial: %w", err)
+	}
+	defer conn.Close()
+	if err := guestexec.Encode(conn, guestexec.Request{
+		Mode:    guestexec.ModeExec,
+		Command: cmd,
+	}); err != nil {
+		return fmt.Errorf("exec send: %w", err)
+	}
+	var resp guestexec.Response
+	if err := guestexec.Decode(conn, &resp); err != nil {
+		return fmt.Errorf("exec recv: %w", err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("%s", resp.Error)
+	}
+	if resp.Stdout != "" {
+		fmt.Print(resp.Stdout)
+	}
+	if resp.Stderr != "" {
+		fmt.Fprint(os.Stderr, resp.Stderr)
+	}
+	if resp.ExitCode != 0 {
+		return fmt.Errorf("exit code %d", resp.ExitCode)
+	}
+	return nil
 }
 
 func stopVMAndWait(vm vmm.Handle, timeout time.Duration) {

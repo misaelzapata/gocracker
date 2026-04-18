@@ -478,9 +478,16 @@ func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, re
 		cleanup()
 		return nil, nil, wrapSubprocessError(err, logBuf)
 	}
+	restoredCfg := vmm.Config{ID: info.ID, TapName: opts.OverrideTap}
+	if info.ExecEnabled {
+		restoredCfg.Exec = &vmm.ExecConfig{
+			Enabled:   true,
+			VsockPort: info.ExecVsockPort,
+		}
+	}
 	rvm := &remoteVM{
 		client:   client,
-		cfg:      vmm.Config{ID: info.ID, TapName: opts.OverrideTap},
+		cfg:      restoredCfg,
 		events:   vmm.NewEventLog(),
 		doneCh:   make(chan struct{}),
 		cleanup:  cleanup,
