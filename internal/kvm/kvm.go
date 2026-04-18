@@ -495,17 +495,21 @@ func (s *System) CreateVMFromSnapshotFile(memFilePath string, memMB uint64, gues
 		_ = f.Close()
 		return nil, fmt.Errorf("stat snapshot mem: %w", err)
 	}
+	_ = f.Close()
 	if uint64(fi.Size()) != memSize {
-		_ = f.Close()
 		return nil, fmt.Errorf("snapshot mem size %d does not match VM mem %d (%d MiB)", fi.Size(), memSize, memMB)
 	}
-
-	mem, err := unix.Mmap(int(f.Fd()), 0, int(memSize),
+	// MAP_PRIVATE: sparse holes read as zero (matching original MAP_ANONYMOUS
+	// state for non-dirty pages). Pages are faulted in lazily — O(1) restore.
+	var mem []byte
+	f2, err2 := os.OpenFile(memFilePath, os.O_RDONLY, 0)
+	if err2 != nil {
+		return nil, fmt.Errorf("open snapshot mem: %w", err2)
+	}
+	mem, err = unix.Mmap(int(f2.Fd()), 0, int(memSize),
 		unix.PROT_READ|unix.PROT_WRITE,
 		unix.MAP_PRIVATE)
-	// The mmap takes its own reference on the inode; closing the fd here is
-	// safe and keeps the VM's fd budget small.
-	_ = f.Close()
+	_ = f2.Close()
 	if err != nil {
 		return nil, fmt.Errorf("mmap snapshot mem PRIVATE: %w", err)
 	}
@@ -1468,3 +1472,4 @@ func vmIoctl(fd int, nr uintptr, arg uintptr) (uintptr, error) {
 	}
 	return r, nil
 }
+

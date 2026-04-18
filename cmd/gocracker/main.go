@@ -224,8 +224,13 @@ func cmdRun(args []string) {
 	}
 	result := mustRun(runOpts)
 	defer result.Close()
-	printResult(result)
 	if interactive.enabled {
+		// Drain warm-capture BEFORE printing result or opening the shell. The
+		// capture goroutine emits vsock-quiesce log lines and injects RST; doing
+		// this first keeps those internal logs grouped with the boot output and
+		// lets printResult + the shell prompt appear together, uninterrupted.
+		drainWarmDone(result)
+		printResult(result)
 		if err := runLocalInteractiveVM(result, resolveInteractiveRunCommand(result.Config, runOpts)); err != nil {
 			stopVMAndWait(result.VM, 15*time.Second)
 			fatal(err.Error())
@@ -235,8 +240,9 @@ func cmdRun(args []string) {
 		fmt.Println()
 		return
 	}
-	// --warm non-interactive path: wait for snapshot capture then exec CMD if provided.
+	// --warm non-interactive path: exec CMD if provided, wait for snapshot.
 	if *warm {
+		drainWarmDone(result)
 		cmd := effectiveCommandSlice(runOpts.Cmd, imageDefaultCmd(result.Config))
 		if len(cmd) > 0 {
 			if err := runWarmCmd(result.VM, cmd); err != nil {
@@ -250,6 +256,7 @@ func cmdRun(args []string) {
 	if *wait {
 		waitVM(result.VM, nil)
 	}
+	drainWarmDone(result)
 }
 
 // ---- repo ----
@@ -1181,6 +1188,17 @@ func runWarmCmd(vm vmm.Handle, cmd []string) error {
 		return fmt.Errorf("exit code %d", resp.ExitCode)
 	}
 	return nil
+}
+
+// drainWarmDone blocks until the background warmcache snapshot goroutine
+// completes. No-op when WarmDone is nil (not a --warm run or cache hit path).
+// MUST be called before any vm.Stop() to prevent the goroutine from touching
+// freed VM memory.
+func drainWarmDone(r *container.RunResult) {
+	if r == nil || r.WarmDone == nil {
+		return
+	}
+	<-r.WarmDone
 }
 
 func stopVMAndWait(vm vmm.Handle, timeout time.Duration) {

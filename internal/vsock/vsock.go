@@ -672,17 +672,19 @@ func (d *Device) QuiesceForSnapshot() {
 		"rx_baseline_avail", rxBaselineAvail,
 	)
 
-	if !rxPresent || !signalNeeded {
+	// The RX drain is only meaningful when we actually injected RST packets
+	// onto the RX queue (i.e. there were active connections). TRANSPORT_RESET
+	// goes to the event queue (index 2) which is independent — the RX avail
+	// index won't advance for an event-only signal, so we skip the drain when
+	// drained is empty to avoid an unconditional 250ms timeout on every
+	// snapshot of an idle VM.
+	if !rxPresent || len(drained) == 0 {
 		return
 	}
 
 	// Wait for the guest to process what we just enqueued. Evidence:
 	// the guest replenishes RX descriptors after consuming them, so the
-	// avail ring's idx advances. Bounded at 250 ms — the guest's RX
-	// work function runs in <1 ms under normal load, and if it hasn't
-	// run by 250 ms then either the vCPU is wedged (orthogonal problem)
-	// or signalling was truly lost (the snapshot will still be taken,
-	// and the guest-side Decode deadline below handles that case).
+	// avail ring's idx advances. Bounded at 250 ms.
 	drainDeadline := time.Now().Add(250 * time.Millisecond)
 	for time.Now().Before(drainDeadline) {
 		av, err := rxQ.AvailIdx()

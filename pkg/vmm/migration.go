@@ -252,6 +252,10 @@ func RewriteSnapshotBundleWithConfig(dir string, cfg Config) (*Snapshot, error) 
 }
 
 func rewriteSnapshotBundleWithConfig(dir string, snap Snapshot, cfg Config) (*Snapshot, error) {
+	return rewriteSnapshotBundleOpts(dir, snap, cfg, false)
+}
+
+func rewriteSnapshotBundleOpts(dir string, snap Snapshot, cfg Config, skipDisk bool) (*Snapshot, error) {
 	if snap.MemFile == "" {
 		snap.MemFile = "mem.bin"
 	}
@@ -263,9 +267,15 @@ func rewriteSnapshotBundleWithConfig(dir string, snap Snapshot, cfg Config) (*Sn
 	if snap.Config.InitrdPath, err = bundleAsset(dir, snap.Config.InitrdPath, "artifacts/initrd"); err != nil {
 		return nil, err
 	}
-	if snap.Config.DiskImage, err = bundleAsset(dir, snap.Config.DiskImage, "artifacts/disk.ext4"); err != nil {
-		return nil, err
+	if !skipDisk {
+		if snap.Config.DiskImage, err = bundleAsset(dir, snap.Config.DiskImage, "artifacts/disk.ext4"); err != nil {
+			return nil, err
+		}
 	}
+	// When skipDisk is true, snap.Config.DiskImage retains its original path
+	// (e.g. /worker/drives/0). The host-side takeSnapshotViaExport hardlinks
+	// the real disk into artifacts/disk.ext4 after exporting and rewrites
+	// snap.Config.DiskImage = "artifacts/disk.ext4".
 
 	metaFile := filepath.Join(dir, "snapshot.json")
 	data, err := json.MarshalIndent(snap, "", "  ")

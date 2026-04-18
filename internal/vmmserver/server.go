@@ -93,13 +93,14 @@ type BootSource struct {
 
 // MachineConfig matches the Firecracker machine-config payload.
 type MachineConfig struct {
-	VcpuCount      int                    `json:"vcpu_count"`
-	MemSizeMib     int                    `json:"mem_size_mib"`
-	RNGRateLimiter *vmm.RateLimiterConfig `json:"rng_rate_limiter,omitempty"`
-	VsockEnabled   bool                   `json:"vsock_enabled,omitempty"`
-	VsockGuestCID  uint32                 `json:"vsock_guest_cid,omitempty"`
-	ExecEnabled    bool                   `json:"exec_enabled,omitempty"`
-	ExecVsockPort  uint32                 `json:"exec_vsock_port,omitempty"`
+	VcpuCount       int                    `json:"vcpu_count"`
+	MemSizeMib      int                    `json:"mem_size_mib"`
+	RNGRateLimiter  *vmm.RateLimiterConfig `json:"rng_rate_limiter,omitempty"`
+	VsockEnabled    bool                   `json:"vsock_enabled,omitempty"`
+	VsockGuestCID   uint32                 `json:"vsock_guest_cid,omitempty"`
+	ExecEnabled     bool                   `json:"exec_enabled,omitempty"`
+	ExecVsockPort   uint32                 `json:"exec_vsock_port,omitempty"`
+	TrackDirtyPages bool                   `json:"track_dirty_pages,omitempty"`
 }
 
 type Balloon struct {
@@ -1345,6 +1346,7 @@ func (s *Server) startPrebootVM() error {
 				VsockPort: s.preboot.machineCfg.ExecVsockPort,
 			}
 		}
+		cfg.TrackDirtyPages = s.preboot.machineCfg.TrackDirtyPages
 	}
 	if s.preboot.balloon != nil {
 		cfg.Balloon = &vmm.BalloonConfig{

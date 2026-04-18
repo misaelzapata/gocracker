@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -88,18 +89,22 @@ type ReattachOptions struct {
 }
 
 type remoteVM struct {
-	client   *vmmserver.Client
-	cfg      vmm.Config
-	events   *vmm.EventLog
-	doneCh   chan struct{}
-	stopOnce sync.Once
-	doneOnce sync.Once
-	cleanup  func()
-	runDir   string
-	socket   string
-	pid      int
-	jailRoot string
-	created  time.Time
+	client      *vmmserver.Client
+	cfg         vmm.Config
+	events      *vmm.EventLog
+	doneCh      chan struct{}
+	stopOnce    sync.Once
+	doneOnce    sync.Once
+	cleanup     func()
+	runDir      string
+	socket      string
+	pid         int
+	jailRoot    string
+	created     time.Time
+	// hostDiskPath is the HOST-side path to the root disk image, kept so
+	// takeSnapshotViaExport can hardlink it directly without going through the
+	// jailer's bind-mount (which blocks hardlinks across mount points).
+	hostDiskPath string
 
 	mu            sync.RWMutex
 	state         vmm.State
@@ -298,13 +303,14 @@ func LaunchVMMWithTimings(cfg vmm.Config, opts VMMOptions) (vmm.Handle, vmm.Boot
 			X86Boot:         string(jailedCfg.X86Boot),
 		},
 		MachineConfig: &vmmserver.MachineConfig{
-			VcpuCount:      jailedCfg.VCPUs,
-			MemSizeMib:     int(jailedCfg.MemMB),
-			RNGRateLimiter: jailedCfg.RNGRateLimiter,
-			VsockEnabled:   jailedCfg.Vsock != nil && jailedCfg.Vsock.Enabled,
-			VsockGuestCID:  vsockGuestCID(jailedCfg.Vsock),
-			ExecEnabled:    jailedCfg.Exec != nil && jailedCfg.Exec.Enabled,
-			ExecVsockPort:  execVsockPort(jailedCfg.Exec),
+			VcpuCount:       jailedCfg.VCPUs,
+			MemSizeMib:      int(jailedCfg.MemMB),
+			RNGRateLimiter:  jailedCfg.RNGRateLimiter,
+			VsockEnabled:    jailedCfg.Vsock != nil && jailedCfg.Vsock.Enabled,
+			VsockGuestCID:   vsockGuestCID(jailedCfg.Vsock),
+			ExecEnabled:     jailedCfg.Exec != nil && jailedCfg.Exec.Enabled,
+			ExecVsockPort:   execVsockPort(jailedCfg.Exec),
+			TrackDirtyPages: jailedCfg.TrackDirtyPages,
 		},
 	}
 	if jailedCfg.Balloon != nil {
@@ -361,18 +367,20 @@ func LaunchVMMWithTimings(cfg vmm.Config, opts VMMOptions) (vmm.Handle, vmm.Boot
 	timings.VMMSetup = time.Since(tPreStart)
 	timings = timings.Sum()
 
+	hostDisk := cfg.DiskImage // original host path before jailing
 	rvm := &remoteVM{
-		client:   client,
-		cfg:      cfg,
-		events:   vmm.NewEventLog(),
-		doneCh:   make(chan struct{}),
-		cleanup:  cleanup,
-		runDir:   runDir,
-		socket:   socketHostPath,
-		pid:      cmd.Process.Pid,
-		jailRoot: jailRoot,
-		created:  time.Now(),
-		state:    vmm.StateCreated,
+		client:       client,
+		cfg:          cfg,
+		events:       vmm.NewEventLog(),
+		doneCh:       make(chan struct{}),
+		cleanup:      cleanup,
+		runDir:       runDir,
+		socket:       socketHostPath,
+		pid:          cmd.Process.Pid,
+		jailRoot:     jailRoot,
+		created:      time.Now(),
+		state:        vmm.StateCreated,
+		hostDiskPath: hostDisk,
 	}
 	go rvm.poll()
 	go func() {
@@ -632,11 +640,47 @@ func (r *remoteVM) takeSnapshotViaExport(dir string) (*vmm.Snapshot, error) {
 	if err := copyTree(exportDir, dir); err != nil {
 		return nil, err
 	}
-	// The worker already called TakeSnapshotWithOptions which bundled kernel/
-	// initrd/disk into the snapshot dir using its jail-relative paths and
-	// rewrote snapshot.json accordingly. Just parse and return — do NOT call
-	// RewriteSnapshotBundleWithConfig here because r.cfg carries jail paths
-	// (/worker/kernel, /worker/drives/0) that don't exist on the host.
+	// If the snapshot was taken with SkipDiskBundle=true (warmcache fast path),
+	// artifacts/disk.ext4 is missing. Hardlink it on the host from the original
+	// disk path — the worker can't do this itself because it lives inside a
+	// jailer bind-mount that blocks hardlinks across mount points.
+	diskDst := filepath.Join(dir, "artifacts", "disk.ext4")
+	if _, err := os.Stat(diskDst); os.IsNotExist(err) && r.hostDiskPath != "" {
+		if err := os.MkdirAll(filepath.Dir(diskDst), 0755); err != nil {
+			return nil, err
+		}
+		if err := os.Link(r.hostDiskPath, diskDst); err != nil {
+			// Same-FS hardlink failed (rare); rewrite snapshot.json to point
+			// at the absolute host path instead of copying the whole disk.
+			snap, rerr := vmm.ReadSnapshot(dir)
+			if rerr != nil {
+				return nil, rerr
+			}
+			snap.Config.DiskImage = r.hostDiskPath
+			data, jerr := json.MarshalIndent(snap, "", "  ")
+			if jerr != nil {
+				return nil, jerr
+			}
+			if werr := os.WriteFile(filepath.Join(dir, "snapshot.json"), data, 0644); werr != nil {
+				return nil, werr
+			}
+			return snap, nil
+		}
+		// Patch snapshot.json to reference the bundled disk.
+		snap, rerr := vmm.ReadSnapshot(dir)
+		if rerr != nil {
+			return nil, rerr
+		}
+		snap.Config.DiskImage = "artifacts/disk.ext4"
+		data, jerr := json.MarshalIndent(snap, "", "  ")
+		if jerr != nil {
+			return nil, jerr
+		}
+		if werr := os.WriteFile(filepath.Join(dir, "snapshot.json"), data, 0644); werr != nil {
+			return nil, werr
+		}
+		return snap, nil
+	}
 	return vmm.ReadSnapshot(dir)
 }
 

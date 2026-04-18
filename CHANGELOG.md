@@ -3,6 +3,39 @@
 All notable changes to gocracker will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased
+
+### Added
+- **Warm cache** (`--warm` / `GOCRACKER_WARM_CACHE=1`): captures a dirty-page
+  snapshot on the first cold boot and restores from it on subsequent runs.
+  Restore completes in ~5–7 ms via `MAP_PRIVATE` on a sparse `mem.bin`; only
+  the pages the guest actually touches are faulted in from disk.
+- `reIPGuest`: after a warm restore with `--net auto`, the guest's `eth0` is
+  automatically re-configured (flush + new CIDR + default route) via the exec
+  agent so outbound connectivity works through the new TAP's gateway.
+- `ComputeWarmCacheKey` exported from `pkg/container` for external tooling.
+- `waitExecReady` helper in warm-cache capture path to ensure the exec agent
+  is up before taking the snapshot.
+- `TrackDirtyPages` wired through the vmmserver/worker path so jailer-on VMs
+  can participate in the warm cache.
+
+### Fixed
+- Warm-cache captures on jailer-on VMs now hardlink the disk from the host path
+  instead of failing to copy across the jailer bind-mount boundary; bundle time
+  drops from ~1500 ms to <60 ms.
+- vsock `QuiesceForSnapshot` no longer waits 250 ms when there are no active
+  connections; the RX drain is skipped when no RST packets were enqueued.
+- `drainWarmDone` is called before `printResult` and before the interactive
+  shell opens, preventing snapshot-goroutine log lines from appearing between
+  the network info and the shell prompt.
+- Snapshot `mem.bin` uses a sparse file layout (one `WriteAt` per dirty run,
+  `ftruncate` to full size); clean pages are true file holes that read as zero
+  via `MAP_PRIVATE`, matching the original `MAP_ANONYMOUS` state without
+  copying any bytes.
+- `augmentDirtyBitmap` marks all non-zero pages as dirty before saving so
+  kernel-loaded pages (kernel image in guest RAM) are not silently zeroed out
+  on restore, preventing "Initramfs unpacking failed: broken padding" panics.
+
 ## 0.1.0 - 2026-04-10
 
 First public release. Complete KVM microVM runtime with multi-architecture support.

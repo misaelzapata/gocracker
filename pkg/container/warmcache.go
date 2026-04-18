@@ -1,7 +1,9 @@
 package container
 
 import (
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -44,6 +46,9 @@ func warmCacheInputsReady(opts RunOptions) bool {
 // computeWarmCacheKey builds a warmcache.Key from the run options. Returns
 // ok=false if any unavoidable I/O (currently: hashing the kernel binary)
 // fails — callers treat that as a cache miss and fall through to cold boot.
+// ComputeWarmCacheKey is the exported form used by external tools (e.g. pool-bench).
+func ComputeWarmCacheKey(opts RunOptions) (string, bool) { return computeWarmCacheKey(opts) }
+
 func computeWarmCacheKey(opts RunOptions) (string, bool) {
 	kHash, err := warmcache.HashFile(opts.KernelPath)
 	if err != nil {
@@ -88,11 +93,18 @@ func captureWarmSnapshot(handle vmm.Handle, opts RunOptions, key string) {
 	if _, hit := warmcache.Lookup(root, key); hit {
 		return
 	}
-	// Use a fixed 1s wait instead of vsock probing for worker-backed VMs.
-	// The vsock probe via DialVsock creates an HTTP-upgraded connection that
-	// triggers subsequent state issues in the worker. A 1s wait is enough
-	// for the guest's exec agent to start listening after boot (~50ms).
-	time.Sleep(1 * time.Second)
+	// Wait for the guest's exec agent to be ready. FirstOutputAt is set when
+	// the guest first writes to the serial console (~50ms); the exec agent
+	// starts listening on vsock ~100ms after that. Poll until first output
+	// is seen, then add a 150ms grace period. Total typical wait: ~200ms.
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if !handle.FirstOutputAt().IsZero() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(150 * time.Millisecond)
 	if handle.State() != vmm.StateRunning {
 		return
 	}
@@ -104,9 +116,29 @@ func captureWarmSnapshot(handle vmm.Handle, opts RunOptions, key string) {
 	defer os.RemoveAll(tmp)
 	// TakeSnapshot with Resume:true pauses briefly, snapshots, then resumes —
 	// the VM stays running and the caller's session is unaffected.
-	if _, err := handle.TakeSnapshot(tmp); err != nil {
+	snap, err := handle.TakeSnapshot(tmp)
+	if err != nil {
 		gclog.Container.Warn("warm-cache capture: snapshot", "error", err)
 		return
+	}
+	// The snapshot skipped disk bundling. Hardlink the runtime disk from the
+	// VM's config into the snapshot dir and rewrite snapshot.json accordingly
+	// so the restore can find it after the VM's runtime dir is cleaned up.
+	// For worker-backed VMs, takeSnapshotViaExport already did this.
+	if snap != nil && snap.Config.DiskImage != "" && !strings.HasPrefix(snap.Config.DiskImage, "artifacts/") {
+		artifactsDir := filepath.Join(tmp, "artifacts")
+		if err := os.MkdirAll(artifactsDir, 0755); err == nil {
+			diskDst := filepath.Join(artifactsDir, "disk.ext4")
+			if err := os.Link(snap.Config.DiskImage, diskDst); err != nil {
+				// Same-FS hardlink failed; rewrite to absolute path as fallback.
+				gclog.Container.Debug("warm-cache disk hardlink failed, using absolute path", "error", err)
+			} else {
+				snap.Config.DiskImage = "artifacts/disk.ext4"
+				if data, jerr := json.MarshalIndent(snap, "", "  "); jerr == nil {
+					_ = os.WriteFile(filepath.Join(tmp, "snapshot.json"), data, 0644)
+				}
+			}
+		}
 	}
 	if err := warmcache.Store(tmp, root, key); err != nil {
 		gclog.Container.Warn("warm-cache capture: store", "error", err)

@@ -24,6 +24,7 @@ import (
 	"github.com/gocracker/gocracker/internal/buildserver"
 	"github.com/gocracker/gocracker/internal/dockerfile"
 	"github.com/gocracker/gocracker/internal/guest"
+	"github.com/gocracker/gocracker/internal/guestexec"
 	"github.com/gocracker/gocracker/internal/hostguard"
 	"github.com/gocracker/gocracker/internal/hostnet"
 	gclog "github.com/gocracker/gocracker/internal/log"
@@ -149,6 +150,10 @@ type RunResult struct {
 	WorkerSocket string
 	Duration     time.Duration
 	Timings      vmm.BootTimings
+	// WarmDone is closed when the background warmcache snapshot goroutine
+	// completes. The caller MUST drain it BEFORE calling vm.Stop() — the
+	// goroutine accesses VM memory and must finish before the VM is freed.
+	WarmDone <-chan struct{}
 	cleanup func()
 }
 
@@ -357,6 +362,11 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 				if err := vm.Start(); err != nil {
 					return nil, err
 				}
+				if autoNet != nil && opts.ExecEnabled {
+					if ripErr := reIPGuest(vm, opts.StaticIP, opts.Gateway, 2*time.Second); ripErr != nil {
+						gclog.Container.Warn("restore re-IP failed", "error", ripErr)
+					}
+				}
 				gclog.Container.Info("restored", "duration", time.Since(t0).Round(time.Millisecond))
 				tap := opts.TapName
 				if tap == "" {
@@ -377,6 +387,27 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 				return result, nil
 			}
 			gclog.Container.Warn("snapshot restore failed, building fresh", "error", err)
+			// Close the autoNet TAP so the cold-boot retry can allocate a fresh
+			// one. Without this, NewAuto below fails with TUNSETIFF EBUSY.
+			if autoNet != nil {
+				autoNet.Close()
+				autoNet = nil
+				opts.TapName = ""
+				opts.StaticIP = ""
+				opts.Gateway = ""
+			}
+			// Clear SnapshotDir so the cold-boot path doesn't loop.
+			opts.SnapshotDir = ""
+			// Re-allocate autoNet for the fresh boot.
+			if opts.NetworkMode == NetworkModeAuto {
+				autoNet, err = hostnet.NewAuto(opts.ID, opts.TapName)
+				if err != nil {
+					return nil, fmt.Errorf("auto network (retry): %w", err)
+				}
+				opts.TapName = autoNet.TapName()
+				opts.StaticIP = autoNet.GuestCIDR()
+				opts.Gateway = autoNet.GatewayIP()
+			}
 		}
 	}
 
@@ -498,25 +529,26 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	tPreNew := time.Now()
 	timings.Orchestration = tPreNew.Sub(t0)
 	vm, err := vmm.New(vmm.Config{
-		ID:         opts.ID,
-		MemMB:      opts.MemMB,
-		Arch:       opts.Arch,
-		VCPUs:      opts.CPUs,
-		X86Boot:    opts.X86Boot,
-		KernelPath: opts.KernelPath,
-		InitrdPath: initrdPath,
-		Cmdline:    cmdline,
-		DiskImage:  bootDiskPath,
-		Drives:     runtimeDrives(bootDiskPath, opts),
-		TapName:    opts.TapName,
-		Metadata:   cloneStringMap(opts.Metadata),
-		SharedFS:   sharedFS.Exports,
-		Vsock:      buildVsockConfig(opts),
-		Exec:       buildExecConfig(opts),
-		Balloon:    cloneBalloonConfig(opts.Balloon),
-		MemoryHotplug: cloneMemoryHotplugConfig(opts.MemoryHotplug),
-		ConsoleOut: opts.ConsoleOut,
-		ConsoleIn:  opts.ConsoleIn,
+		ID:              opts.ID,
+		MemMB:           opts.MemMB,
+		Arch:            opts.Arch,
+		VCPUs:           opts.CPUs,
+		X86Boot:         opts.X86Boot,
+		KernelPath:      opts.KernelPath,
+		InitrdPath:      initrdPath,
+		Cmdline:         cmdline,
+		DiskImage:       bootDiskPath,
+		Drives:          runtimeDrives(bootDiskPath, opts),
+		TapName:         opts.TapName,
+		Metadata:        cloneStringMap(opts.Metadata),
+		SharedFS:        sharedFS.Exports,
+		Vsock:           buildVsockConfig(opts),
+		Exec:            buildExecConfig(opts),
+		Balloon:         cloneBalloonConfig(opts.Balloon),
+		MemoryHotplug:   cloneMemoryHotplugConfig(opts.MemoryHotplug),
+		ConsoleOut:      opts.ConsoleOut,
+		ConsoleIn:       opts.ConsoleIn,
+		TrackDirtyPages: warmCacheKeyLocal != "" && opts.WarmCapture,
 	})
 	if err != nil {
 		if autoNet != nil {
@@ -571,11 +603,14 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		"vmm_setup_ms", timings.VMMSetup.Milliseconds(),
 		"start_ms", timings.Start.Milliseconds(),
 		"guest_first_output_ms", timings.GuestFirstOutput.Milliseconds())
-	// Capture snapshot synchronously before returning — this guarantees the
-	// VM is alive while we snapshot and removes the TOCTOU race between the
-	// snapshot goroutine and any subsequent vm.Stop() call.
+	var warmDoneLocal <-chan struct{}
 	if warmCacheKeyLocal != "" {
-		captureWarmSnapshot(vm, opts, warmCacheKeyLocal)
+		ch := make(chan struct{})
+		warmDoneLocal = ch
+		go func() {
+			defer close(ch)
+			captureWarmSnapshot(vm, opts, warmCacheKeyLocal)
+		}()
 	}
 	return &RunResult{
 		VM:       vm,
@@ -587,6 +622,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		Gateway:  opts.Gateway,
 		Duration: bootDuration,
 		Timings:  timings,
+		WarmDone: warmDoneLocal,
 		cleanup:  cleanupFn,
 	}, nil
 }
@@ -707,6 +743,21 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 				ChrootBase:   opts.ChrootBase,
 			})
 			if err == nil {
+				if autoNet != nil {
+					if actErr := autoNet.Activate(); actErr != nil {
+						handle.Stop()
+						autoNet.Close()
+						if cleanup != nil {
+							cleanup()
+						}
+						return nil, fmt.Errorf("activate auto network on restore: %w", actErr)
+					}
+					if opts.ExecEnabled {
+						if ripErr := reIPGuest(handle, opts.StaticIP, opts.Gateway, 2*time.Second); ripErr != nil {
+							gclog.Container.Warn("restore re-IP failed", "error", ripErr)
+						}
+					}
+				}
 				tap := opts.TapName
 				if tap == "" {
 					tap = handle.VMConfig().TapName
@@ -835,25 +886,26 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 	}
 	t0 := time.Now()
 	handle, timings, cleanup, err := worker.LaunchVMMWithTimings(vmm.Config{
-		ID:         opts.ID,
-		MemMB:      opts.MemMB,
-		Arch:       opts.Arch,
-		VCPUs:      opts.CPUs,
-		X86Boot:    opts.X86Boot,
-		KernelPath: opts.KernelPath,
-		InitrdPath: initrdPath,
-		Cmdline:    cmdline,
-		DiskImage:  bootDiskPath,
-		Drives:     runtimeDrives(bootDiskPath, opts),
-		TapName:    opts.TapName,
-		Metadata:   cloneStringMap(opts.Metadata),
-		SharedFS:   sharedFS.Exports,
-		Vsock:      buildVsockConfig(opts),
-		Exec:       buildExecConfig(opts),
-		Balloon:    cloneBalloonConfig(opts.Balloon),
-		MemoryHotplug: cloneMemoryHotplugConfig(opts.MemoryHotplug),
-		ConsoleOut: opts.ConsoleOut,
-		ConsoleIn:  opts.ConsoleIn,
+		ID:              opts.ID,
+		MemMB:           opts.MemMB,
+		Arch:            opts.Arch,
+		VCPUs:           opts.CPUs,
+		X86Boot:         opts.X86Boot,
+		KernelPath:      opts.KernelPath,
+		InitrdPath:      initrdPath,
+		Cmdline:         cmdline,
+		DiskImage:       bootDiskPath,
+		Drives:          runtimeDrives(bootDiskPath, opts),
+		TapName:         opts.TapName,
+		Metadata:        cloneStringMap(opts.Metadata),
+		SharedFS:        sharedFS.Exports,
+		Vsock:           buildVsockConfig(opts),
+		Exec:            buildExecConfig(opts),
+		Balloon:         cloneBalloonConfig(opts.Balloon),
+		MemoryHotplug:   cloneMemoryHotplugConfig(opts.MemoryHotplug),
+		ConsoleOut:      opts.ConsoleOut,
+		ConsoleIn:       opts.ConsoleIn,
+		TrackDirtyPages: warmCacheKey != "" && opts.WarmCapture,
 	}, worker.VMMOptions{
 		JailerBinary: opts.JailerBinary,
 		VMMBinary:    opts.VMMBinary,
@@ -880,10 +932,17 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		}
 	}
 	// Auto-capture: if this was a cold boot and --warm / GOCRACKER_WARM_CACHE=1
-	// Capture snapshot synchronously before returning — guarantees VM is alive
-	// during TakeSnapshot and removes the race with any vm.Stop() after return.
+	// Fire snapshot capture in background — VM is returned to the caller
+	// immediately. The goroutine polls exec-ready (~150ms) then snapshots
+	// dirty pages (~50ms). Caller MUST drain WarmDone before stopping the VM.
+	var warmDone <-chan struct{}
 	if warmCacheKey != "" && opts.SnapshotDir == "" {
-		captureWarmSnapshot(handle, opts, warmCacheKey)
+		ch := make(chan struct{})
+		warmDone = ch
+		go func() {
+			defer close(ch)
+			captureWarmSnapshot(handle, opts, warmCacheKey)
+		}()
 	}
 	var cleanupOnce sync.Once
 	cleanupFn := cleanupRuntimeDisk
@@ -924,6 +983,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		WorkerSocket: workerSocket(handle),
 		Duration:     bootDuration,
 		Timings:      timings,
+		WarmDone:     warmDone,
 		cleanup:      cleanupFn,
 	}, nil
 }
@@ -1910,4 +1970,61 @@ func buildSharedFSRebinds(mounts []Mount) []vmm.SharedFSRebind {
 		})
 	}
 	return rebinds
+}
+
+// reIPGuest reconfigures eth0 inside a just-restored guest so it uses the
+// new host TAP's CIDR and gateway instead of the snapshot's frozen addresses.
+// Without this, warm restores with --net auto have no internet connectivity
+// because the guest routes to the old gateway that no longer exists on the
+// new TAP interface.
+func reIPGuest(handle vmm.Handle, newCIDR, newGateway string, timeout time.Duration) error {
+	if newCIDR == "" || newGateway == "" {
+		return nil
+	}
+	dialer, ok := handle.(vmm.VsockDialer)
+	if !ok {
+		return nil
+	}
+	cfg := handle.VMConfig()
+	if cfg.Exec == nil || !cfg.Exec.Enabled {
+		return nil
+	}
+	port := uint32(guestexec.DefaultVsockPort)
+	if cfg.Exec.VsockPort != 0 {
+		port = cfg.Exec.VsockPort
+	}
+	deadline := time.Now().Add(timeout)
+	var dialErr error
+	var conn interface {
+		io.ReadWriter
+		Close() error
+	}
+	for time.Now().Before(deadline) {
+		c, err := dialer.DialVsock(port)
+		if err == nil {
+			conn = c
+			break
+		}
+		dialErr = err
+		time.Sleep(10 * time.Millisecond)
+	}
+	if conn == nil {
+		return fmt.Errorf("exec agent not ready: %w", dialErr)
+	}
+	defer conn.Close()
+	script := fmt.Sprintf(
+		"ip addr flush dev eth0 && ip addr add %s dev eth0 && ip route add default via %s dev eth0",
+		newCIDR, newGateway)
+	req := guestexec.Request{Mode: guestexec.ModeExec, Command: []string{"/bin/sh", "-c", script}}
+	if err := guestexec.Encode(conn, req); err != nil {
+		return fmt.Errorf("re-IP encode: %w", err)
+	}
+	var resp guestexec.Response
+	if err := guestexec.Decode(conn, &resp); err != nil {
+		return fmt.Errorf("re-IP decode: %w", err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("re-IP guest: %s", resp.Error)
+	}
+	return nil
 }

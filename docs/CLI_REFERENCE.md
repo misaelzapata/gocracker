@@ -66,6 +66,7 @@ sudo gocracker run --dockerfile ./Dockerfile --context . --kernel ./vmlinux --me
 | `--hotplug-total-mib` | uint64 | `0` | Hotpluggable memory region total size in MiB |
 | `--hotplug-slot-mib` | uint64 | `0` | Hotpluggable memory slot size in MiB |
 | `--hotplug-block-mib` | uint64 | `0` | Hotpluggable memory block size in MiB |
+| `--warm` | bool | `false` | Enable warm-cache: capture a snapshot on first boot, restore from it on subsequent runs with the same image/kernel/config (see [Warm Cache](SNAPSHOTS.md#warm-cache)) |
 
 ---
 

@@ -204,6 +204,65 @@ backed restore) is implemented and covered by unit tests in
 `pkg/vmm/sharedfs_rebind_test.go`; what is not yet supported is migrating
 the guest-side FUSE session across the snapshot boundary.
 
+## Warm Cache
+
+The warm-cache feature captures a snapshot automatically on the first cold boot and
+restores from it on every subsequent `run` call with the same parameters — without
+any extra flags from the caller.
+
+### Enabling it
+
+```bash
+# Per-invocation:
+sudo gocracker run --image oven/bun:alpine --kernel ./vmlinux --warm
+
+# Process-wide (all `run` calls in the process use the cache):
+export GOCRACKER_WARM_CACHE=1
+sudo gocracker run --image oven/bun:alpine --kernel ./vmlinux
+```
+
+### How it works
+
+1. On the **first run** (`--warm` or `GOCRACKER_WARM_CACHE=1`), the VM boots
+   normally (cold boot, ~200 ms).  A background goroutine waits for the exec
+   agent to be ready (~150 ms after first console output), pauses the VM briefly,
+   captures dirty pages as a sparse `mem.bin`, then resumes the VM.  The snapshot
+   is stored under `~/.cache/gocracker/snapshots/<key>/`.
+2. On **subsequent runs**, the runtime detects the cache key match and restores
+   via `MAP_PRIVATE` on the sparse file — page-faults load only the pages the
+   current command actually touches, so the restore itself completes in **~5–7 ms**.
+3. If **`--net auto`** is used, the guest's `eth0` is automatically re-IP'd after
+   restore via the exec agent so it routes through the new TAP's gateway.
+
+### Cache key
+
+The key is a SHA-256 over: OCI image digest · kernel binary hash · kernel
+cmdline · memory (MiB) · vCPU count · architecture · network mode.  Any change
+to these fields produces a new key and a new cold boot.
+
+### Cache location
+
+```
+~/.cache/gocracker/snapshots/<key>/
+  snapshot.json   # vCPU + device state
+  mem.bin         # sparse guest RAM (only dirty pages occupy disk)
+  artifacts/
+    disk.ext4     # root disk (hardlink to the build cache — no copy cost)
+    kernel
+    initrd
+```
+
+Override with `XDG_CACHE_HOME`.
+
+### Limitations
+
+- Only OCI-image sources are cached.  Dockerfile and git-repo builds are skipped
+  because their rootfs is non-deterministic across rebuilds.
+- Block devices passed via `--drives` bypass the cache (drive content is not part
+  of the cache key).
+- Requires `--exec` / `ExecEnabled: true` — the exec agent provides the
+  "guest is ready" signal used to time the snapshot capture.
+
 ## Limitations
 
 - Same architecture only (x86-64 to x86-64, or ARM64 to ARM64).
