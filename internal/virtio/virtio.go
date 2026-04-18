@@ -61,8 +61,13 @@ const (
 	StatusDriver      = 2
 	StatusDriverOK    = 4
 	StatusFeaturesOK  = 8
+	StatusNeedsReset  = 64
 	StatusFailed      = 128
 )
+
+// InterruptStatConfig is the bit the guest sees in InterruptStat when the
+// device raises a config-change interrupt (virtio spec §4.2.2.5).
+const InterruptStatConfig = 0x2
 
 // DescFlags for virtqueue descriptors
 const (
@@ -137,6 +142,23 @@ func (q *Queue) Reset() {
 	q.DescAddr = 0
 	q.DriverAddr = 0
 	q.DeviceAddr = 0
+}
+
+// AvailIdx returns the guest driver's current avail.idx (the total
+// number of descriptors the driver has placed in the avail ring since
+// the queue was initialised — wraps at 0xFFFF). Used by devices that
+// need to verify the guest is still making progress without consuming
+// descriptors. Acquires q.mu.
+func (q *Queue) AvailIdx() (uint16, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.DriverAddr == 0 {
+		return 0, fmt.Errorf("avail ring not configured")
+	}
+	if _, _, err := q.checkedRange(q.DriverAddr+2, 2); err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint16(q.mem[q.off(q.DriverAddr+2):]), nil
 }
 
 // IterAvail calls fn for each new descriptor chain in the available ring.
@@ -346,6 +368,27 @@ func (q *Queue) readUsedIdx() (uint16, error) {
 		return 0, err
 	}
 	return binary.LittleEndian.Uint16(q.mem[q.off(q.DeviceAddr+2):]), nil
+}
+
+// UsedFlags returns the used ring flags (device-to-driver).
+// Bit 0 = VRING_USED_F_NO_NOTIFY: guest should not kick device.
+func (q *Queue) UsedFlags() (uint16, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if _, _, err := q.checkedRange(q.DeviceAddr, 2); err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint16(q.mem[q.off(q.DeviceAddr):]), nil
+}
+
+// AvailFlags returns the avail ring flags (driver-to-device).
+func (q *Queue) AvailFlags() (uint16, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if _, _, err := q.checkedRange(q.DriverAddr, 2); err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint16(q.mem[q.off(q.DriverAddr):]), nil
 }
 
 func (q *Queue) normalizedSize() (uint16, error) {

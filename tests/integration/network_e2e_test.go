@@ -140,16 +140,131 @@ func TestE2ENetworkStaticIP(t *testing.T) {
 	}
 }
 
-// TestE2ENetworkAutoMode documents that `net=auto` is a CLI-only feature today.
-// The HTTP RunRequest does not expose a NetworkMode field, so POST /run cannot
-// request the auto tap+NAT setup that `gocracker run --net auto` performs. We
-// emit an explicit skip so the gap is visible in CI output rather than
-// silently passing.
+// TestE2ENetworkAutoMode exercises the new network_mode=auto field on POST
+// /run: the server allocates a fresh TAP + /30 subnet via hostnet.AutoNetwork,
+// the guest gets a working eth0, and the response echoes tap/ip/gateway back
+// to the caller. This is what sandboxd uses so it does not have to pre-allocate
+// TAPs on the host.
 func TestE2ENetworkAutoMode(t *testing.T) {
 	if os.Getenv("E2E") != "1" {
 		t.Skip("set E2E=1 to enable")
 	}
-	t.Skipf("net=auto is not wired through POST /run today (internal/api/api.go RunRequest has no network_mode field); tracked as API gap — use the CLI's --net auto flag or TestE2ENetworkStaticIP for HTTP e2e coverage")
+	requirePrivilegedExecIntegration(t)
+	kernel := resolveE2EKernel(t)
+	bins := buildProjectBinaries(t)
+
+	addr := freeLocalAddr(t)
+	serverURL := "http://" + addr
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	stateDir := filepath.Join(t.TempDir(), "state")
+	snapDir := filepath.Join(t.TempDir(), "snap")
+	for _, d := range []string{cacheDir, stateDir, snapDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	serveCmd, serveLog := startE2EServe(t, bins, addr, cacheDir, stateDir, snapDir, kernel)
+	t.Cleanup(func() { stopCommand(t, serveCmd) })
+	waitForAPI(t, serverURL, 45*time.Second)
+
+	client := internalapi.NewClient(serverURL)
+	runCtx, runCancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer runCancel()
+
+	runResp, err := client.Run(runCtx, internalapi.RunRequest{
+		Image:       "alpine:3.20",
+		KernelPath:  kernel,
+		MemMB:       256,
+		DiskSizeMB:  256,
+		NetworkMode: "auto",
+		Cmd:         []string{"/bin/sh", "-lc", "sleep infinity"},
+		ExecEnabled: true,
+		Wait:        true,
+	})
+	if err != nil {
+		t.Fatalf("/run network_mode=auto: %v\nserve log:\n%s", err, serveLog.String())
+	}
+	t.Cleanup(func() { _ = client.StopVM(context.Background(), runResp.ID) })
+
+	// Response must echo the resolved network triplet back to the caller.
+	if runResp.State != "running" {
+		t.Fatalf("state=%q, want running (wait=true)\nserve log:\n%s", runResp.State, serveLog.String())
+	}
+	if runResp.NetworkMode != "auto" {
+		t.Fatalf("response network_mode=%q, want auto", runResp.NetworkMode)
+	}
+	if runResp.TapName == "" || runResp.GuestIP == "" || runResp.Gateway == "" {
+		t.Fatalf("response missing network fields: tap=%q ip=%q gw=%q",
+			runResp.TapName, runResp.GuestIP, runResp.Gateway)
+	}
+	if runResp.RestoredFromSnapshot {
+		t.Errorf("restored_from_snapshot=true but this is a fresh boot")
+	}
+
+	// Guest eth0 should carry the server-allocated IP.
+	resp := waitForExecResponse(t, client, runResp.ID, internalapi.ExecRequest{
+		Command: []string{"/bin/sh", "-lc", "ip -4 addr show eth0 || ip -4 addr"},
+	}, 60*time.Second)
+	out := resp.Stdout + resp.Stderr
+	if !strings.Contains(out, runResp.GuestIP) {
+		t.Fatalf("guest eth0 missing %s:\nexit=%d\nstdout=%q\nstderr=%q",
+			runResp.GuestIP, resp.ExitCode, resp.Stdout, resp.Stderr)
+	}
+
+	// GET /vms/{id} should surface the same network triplet as top-level fields.
+	infoCtx, infoCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	info, err := client.GetVM(infoCtx, runResp.ID)
+	infoCancel()
+	if err != nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if info.TapName != runResp.TapName || info.GuestIP != runResp.GuestIP || info.Gateway != runResp.Gateway {
+		t.Errorf("VMInfo mismatch: tap=%q/%q ip=%q/%q gw=%q/%q",
+			info.TapName, runResp.TapName, info.GuestIP, runResp.GuestIP, info.Gateway, runResp.Gateway)
+	}
+	if info.NetworkMode != "auto" {
+		t.Errorf("VMInfo network_mode=%q, want auto", info.NetworkMode)
+	}
+}
+
+// TestE2ENetworkAutoModeRejectsConflict ensures network_mode=auto with
+// explicit static_ip/gateway is rejected with 400.
+func TestE2ENetworkAutoModeRejectsConflict(t *testing.T) {
+	if os.Getenv("E2E") != "1" {
+		t.Skip("set E2E=1 to enable")
+	}
+	requirePrivilegedExecIntegration(t)
+	kernel := resolveE2EKernel(t)
+	bins := buildProjectBinaries(t)
+
+	addr := freeLocalAddr(t)
+	serverURL := "http://" + addr
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	stateDir := filepath.Join(t.TempDir(), "state")
+	snapDir := filepath.Join(t.TempDir(), "snap")
+	for _, d := range []string{cacheDir, stateDir, snapDir} {
+		_ = os.MkdirAll(d, 0755)
+	}
+	serveCmd, _ := startE2EServe(t, bins, addr, cacheDir, stateDir, snapDir, kernel)
+	t.Cleanup(func() { stopCommand(t, serveCmd) })
+	waitForAPI(t, serverURL, 45*time.Second)
+
+	client := internalapi.NewClient(serverURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := client.Run(ctx, internalapi.RunRequest{
+		Image:       "alpine:3.20",
+		KernelPath:  kernel,
+		NetworkMode: "auto",
+		StaticIP:    "10.0.42.2/24",
+		Gateway:     "10.0.42.1",
+	})
+	if err == nil {
+		t.Fatalf("expected 400 error for network_mode=auto + static_ip")
+	}
+	if !strings.Contains(err.Error(), "network_mode") && !strings.Contains(err.Error(), "exclusive") {
+		t.Errorf("error does not mention exclusivity: %v", err)
+	}
 }
 
 // createHostTap creates a tuntap interface, assigns the given CIDR to it, and

@@ -154,66 +154,6 @@ func TestEventLog_MultipleUnsubscribesDontCorrupt(t *testing.T) {
 	unsub3()
 }
 
-// --- ExecAgentBroker ---
-
-func TestExecAgentBroker_CloseBlocksListen(t *testing.T) {
-	broker := newExecAgentBroker(52)
-	broker.close()
-
-	// After close, listen should eventually return an error.
-	// The select may non-deterministically succeed on the conns channel
-	// if both cases are ready, so we retry.
-	var gotErr bool
-	for i := 0; i < 5; i++ {
-		_, err := broker.listen(52)
-		if err != nil {
-			gotErr = true
-			break
-		}
-		// drain any connection that landed
-		select {
-		case <-broker.conns:
-		default:
-		}
-	}
-	if !gotErr {
-		t.Fatal("expected error after close within 5 attempts")
-	}
-}
-
-func TestExecAgentBroker_CloseBlocksAcquire(t *testing.T) {
-	broker := newExecAgentBroker(52)
-	broker.close()
-
-	_, err := broker.acquire()
-	if err == nil {
-		t.Fatal("expected error after close")
-	}
-}
-
-func TestExecAgentBroker_CloseIdempotent(t *testing.T) {
-	broker := newExecAgentBroker(52)
-	broker.close()
-	broker.close() // should not panic
-}
-
-func TestExecAgentBroker_ListenBacklogFull(t *testing.T) {
-	broker := newExecAgentBroker(52)
-	defer broker.close()
-
-	// Fill the backlog (capacity 1)
-	_, err := broker.listen(52)
-	if err != nil {
-		t.Fatalf("first listen: %v", err)
-	}
-
-	// Second listen should fail with backlog full
-	_, err = broker.listen(52)
-	if err == nil {
-		t.Fatal("expected error for full backlog")
-	}
-}
-
 // --- VM state method tests (using minimal VM structs, no KVM) ---
 
 func TestVM_Uptime_NotStarted(t *testing.T) {

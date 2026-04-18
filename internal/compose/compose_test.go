@@ -1061,6 +1061,8 @@ type fakeHandleForComposeTest struct {
 
 func (f fakeHandleForComposeTest) Start() error                                      { return nil }
 func (f fakeHandleForComposeTest) Stop()                                             {}
+func (f fakeHandleForComposeTest) Pause() error                                      { return nil }
+func (f fakeHandleForComposeTest) Resume() error                                     { return nil }
 func (f fakeHandleForComposeTest) TakeSnapshot(string) (*vmm.Snapshot, error)        { return nil, nil }
 func (f fakeHandleForComposeTest) State() vmm.State                                  { return f.state }
 func (f fakeHandleForComposeTest) ID() string                                        { return "" }

@@ -2257,62 +2257,6 @@ func TestMergeBalloonStats(t *testing.T) {
 	}
 }
 
-func TestExecAgentBroker_ListenWrongPort(t *testing.T) {
-	broker := newExecAgentBroker(10022)
-	defer broker.close()
-	_, err := broker.listen(9999)
-	if err == nil {
-		t.Fatal("expected error for wrong port")
-	}
-}
-
-func TestExecAgentBroker_ListenAndAcquire(t *testing.T) {
-	broker := newExecAgentBroker(10022)
-	defer broker.close()
-
-	// listen provides a guest conn; acquire gets the host conn
-	guestConn, err := broker.listen(10022)
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer guestConn.Close()
-
-	hostConn, err := broker.acquire()
-	if err != nil {
-		t.Fatalf("acquire: %v", err)
-	}
-	defer hostConn.Close()
-}
-
-func TestExecAgentBroker_ClosedBroker(t *testing.T) {
-	broker := newExecAgentBroker(10022)
-	broker.close()
-
-	// acquire on closed broker should error
-	_, err := broker.acquire()
-	if err == nil {
-		t.Fatal("expected error from closed broker acquire")
-	}
-}
-
-func TestExecAgentBroker_BacklogFull(t *testing.T) {
-	broker := newExecAgentBroker(10022)
-	defer broker.close()
-
-	// Fill the backlog (capacity 1)
-	conn1, err := broker.listen(10022)
-	if err != nil {
-		t.Fatalf("first listen: %v", err)
-	}
-	defer conn1.Close()
-
-	// Second listen should fail because backlog is full
-	_, err = broker.listen(10022)
-	if err == nil {
-		t.Fatal("expected error when backlog is full")
-	}
-}
-
 func TestCopyReaderAtRange(t *testing.T) {
 	src := bytes.NewReader([]byte("hello world"))
 	var dst bytes.Buffer

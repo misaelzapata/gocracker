@@ -48,6 +48,8 @@ func newFakeHandle(id string) *fakeHandle {
 
 func (f *fakeHandle) Start() error                               { return nil }
 func (f *fakeHandle) Stop()                                      { f.state = vmm.StateStopped }
+func (f *fakeHandle) Pause() error                               { f.state = vmm.StatePaused; return nil }
+func (f *fakeHandle) Resume() error                              { f.state = vmm.StateRunning; return nil }
 func (f *fakeHandle) TakeSnapshot(string) (*vmm.Snapshot, error) { return &vmm.Snapshot{ID: f.id}, nil }
 func (f *fakeHandle) State() vmm.State                           { return f.state }
 func (f *fakeHandle) ID() string                                 { return f.id }

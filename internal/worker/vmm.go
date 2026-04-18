@@ -466,11 +466,12 @@ func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, re
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	info, err := client.Restore(ctx, vmmserver.RestoreRequest{
-		SnapshotDir: "/snapshot",
-		TapName:     opts.OverrideTap,
-		VcpuCount:   opts.OverrideVCPUs,
-		X86Boot:     string(opts.OverrideX86Boot),
-		Resume:      resume,
+		SnapshotDir:     "/snapshot",
+		TapName:         opts.OverrideTap,
+		VcpuCount:       opts.OverrideVCPUs,
+		X86Boot:         string(opts.OverrideX86Boot),
+		Resume:          resume,
+		SharedFSRebinds: opts.SharedFSRebinds,
 	})
 	if err != nil {
 		_ = cmd.Process.Kill()
@@ -558,6 +559,18 @@ func ReattachVMM(opts ReattachOptions) (vmm.Handle, func(), error) {
 }
 
 func (r *remoteVM) Start() error { return nil }
+
+func (r *remoteVM) Pause() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return r.client.Pause(ctx)
+}
+
+func (r *remoteVM) Resume() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return r.client.Resume(ctx)
+}
 
 func (r *remoteVM) Stop() {
 	r.stopOnce.Do(func() {

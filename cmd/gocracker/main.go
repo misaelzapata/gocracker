@@ -19,12 +19,15 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/gocracker/gocracker/internal/api"
 	internalapi "github.com/gocracker/gocracker/internal/api"
 	"github.com/gocracker/gocracker/internal/buildserver"
 	"github.com/gocracker/gocracker/internal/compose"
 	"github.com/gocracker/gocracker/internal/console"
 	"github.com/gocracker/gocracker/internal/guestexec"
+	"github.com/gocracker/gocracker/internal/hostguard"
 	"github.com/gocracker/gocracker/internal/jailer"
 	"github.com/gocracker/gocracker/internal/oci"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
@@ -736,6 +739,25 @@ func cmdServe(args []string) {
 		}
 	}
 
+	// One-shot capability probe for network_mode=auto. If the server cannot
+	// create TAP devices (no root, no CAP_NET_ADMIN), warn the operator so
+	// they catch the misconfiguration at boot instead of when the first
+	// /run request returns 403.
+	if !hostguard.HasNetAdmin() {
+		fmt.Fprintf(os.Stderr, "[serve] WARNING: network_mode=auto unavailable — process lacks root/CAP_NET_ADMIN; /run with network_mode=auto will return 403. Run as root or `setcap cap_net_admin+ep <binary>`.\n")
+	} else if os.Getuid() != 0 {
+		// Running as non-root with setcap cap_net_admin+ep. The effective
+		// capability is available to THIS process, but forked children (e.g.
+		// `ip addr add`, `ip link set`, `iptables`) will NOT inherit it unless
+		// we raise the ambient capability set. Ambient bits propagate to every
+		// exec'd child automatically, making delegate network setup work without
+		// requiring those utilities to have their own file capabilities.
+		// Silently ignore errors (ambient not supported on kernels < 4.3, or if
+		// the capability is not in the inheritable set — both fall back to the
+		// root path gracefully).
+		raiseAmbientNetAdmin()
+	}
+
 	kernelDirs := trustedKernelDirs.Values()
 	if len(kernelDirs) == 0 {
 		kernelDirs = defaultTrustedKernelDirs()
@@ -1404,6 +1426,34 @@ func defaultTrustedSnapshotDirs(stateDir string) []string {
 		out = append(out, abs)
 	}
 	return out
+}
+
+// raiseAmbientNetAdmin promotes CAP_NET_ADMIN to the ambient capability set so
+// that every child process exec'd by this server (ip, iptables, etc.) inherits
+// the capability automatically. This allows gocracker to run as a non-root user
+// with `setcap cap_net_admin+ep` while still delegating network setup to those
+// utilities.
+//
+// Steps:
+//  1. Add CAP_NET_ADMIN to the inheritable set (required by Linux before a cap
+//     can be raised to ambient).
+//  2. Call prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN).
+//
+// Errors are silently ignored: kernels < 4.3 don't have ambient caps, and any
+// failure means gocracker simply falls back to requiring root for sub-process
+// network operations.
+func raiseAmbientNetAdmin() {
+	hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	var data [2]unix.CapUserData
+	if err := unix.Capget(&hdr, &data[0]); err != nil {
+		return
+	}
+	// CAP_NET_ADMIN = 12; it fits in the low 32-bit word.
+	data[0].Inheritable |= 1 << unix.CAP_NET_ADMIN
+	if err := unix.Capset(&hdr, &data[0]); err != nil {
+		return
+	}
+	_ = unix.Prctl(unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_RAISE, unix.CAP_NET_ADMIN, 0, 0)
 }
 
 func isLoopbackTCPAddr(addr string) bool {

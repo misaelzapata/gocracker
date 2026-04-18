@@ -126,6 +126,84 @@ Flags:
 | `POST /migrations/finalize` | Pause, capture delta on source |
 | `POST /migrations/abort` | Cancel and resume source VM |
 
+## Sandbox template flow
+
+For warm-pool / sandbox-per-template patterns, a second `gocracker serve`
+is not needed — the `POST /vms/{id}/clone` endpoint snapshots a running
+source and restores it as a new VM on the same server in one atomic call.
+
+```
+  boot template (run)  →  install tools (exec)  →  clone per sandbox
+    ▲                                                    │
+    └─── source keeps running ───────────────────────────┘
+```
+
+Full walkthrough (network works end-to-end, package manager works in the
+clone, source stays usable):
+
+```bash
+# 1. Publish the template with network_mode=auto + exec (the two flags
+#    /clone needs later to re-IP the guest).
+TEMPLATE=$(curl -sS http://127.0.0.1:8080/run -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"image":"alpine:3.20","kernel_path":"/k/vmlinux","mem_mb":256,
+       "network_mode":"auto","exec_enabled":true,"wait":true,
+       "cmd":["/bin/sh","-lc","sleep infinity"]}' | jq -r .id)
+
+# 2. Install the toolbox on the template. Changes land on the ext4 disk
+#    and survive snapshot/restore.
+curl -sS http://127.0.0.1:8080/vms/$TEMPLATE/exec -X POST \
+  -d '{"command":["/bin/sh","-lc","apk add --no-cache bc && echo TEMPLATE-READY > /tmp/marker"]}'
+
+# 3. Clone. Source keeps running unchanged; the clone gets its own tap +
+#    fresh /30 subnet, eth0 is re-IP'd on the fly, and it inherits the
+#    template's disk including the pre-installed toolbox.
+CLONE=$(curl -sS http://127.0.0.1:8080/vms/$TEMPLATE/clone -X POST \
+  -d '{"exec_enabled":true,"network_mode":"auto"}' | jq -r .id)
+
+# 4. The clone has bc (from disk) AND working network (from re-IP).
+curl -sS http://127.0.0.1:8080/vms/$CLONE/exec -X POST \
+  -d '{"command":["/bin/sh","-lc","cat /tmp/marker && echo 2*21 | bc && apk add --no-cache file"]}'
+# → stdout: "TEMPLATE-READY\n42\n...ok-install"
+
+# 5. Optional: pause the template while idle, resume when another clone
+#    request arrives. Both /pause and /resume return 204.
+curl -sS -X POST http://127.0.0.1:8080/vms/$TEMPLATE/pause -d '{}'
+curl -sS -X POST http://127.0.0.1:8080/vms/$TEMPLATE/resume -d '{}'
+```
+
+Properties the clone guarantees:
+
+- Fresh VM ID (`gc-<random>`) and unique `tclone-<N>` tap so source +
+  siblings coexist without TUNSETIFF EBUSY.
+- Inherits the full source disk — no re-install cost per clone.
+- `network_mode=auto` on `/clone` re-IPs eth0 + the default route inside
+  the guest over exec, so outbound reaches the new gateway. Requires
+  `exec_enabled=true`; the endpoint returns 400 otherwise.
+- Metadata `cloned_from` points back at the source for observability.
+
+### Virtio-fs mounts on the source (not clonable today)
+
+`POST /vms/{id}/clone` returns 400 if the source VM holds live virtio-fs
+mounts. The Linux virtio-fs driver stores in-flight FUSE request IDs in its
+virtqueue; snapshot freezes that state while a fresh virtiofsd on the
+restored side starts at queue index 0, tripping the kernel assertion
+"requests.0:id 0 is not a head!" on first FUSE op. The endpoint refuses
+rather than silently hang.
+
+Workarounds for per-sandbox data:
+
+- **umount before snapshot**: take the snapshot with no active virtio-fs
+  mount (umount inside the guest first), then re-mount by hand after
+  restore. `TestE2ECloneRejectsActiveVirtiofs` guards the live-mount case.
+- **virtio-blk** (`drives` field on `/run`): attach a per-sandbox block
+  device. virtio-blk queues do not have the FUSE-session problem.
+
+The rebind *contract* (host-side Source rewrite + SocketPath clear + memfd-
+backed restore) is implemented and covered by unit tests in
+`pkg/vmm/sharedfs_rebind_test.go`; what is not yet supported is migrating
+the guest-side FUSE session across the snapshot boundary.
+
 ## Limitations
 
 - Same architecture only (x86-64 to x86-64, or ARM64 to ARM64).
@@ -133,6 +211,10 @@ Flags:
   correctly on all workloads.
 - The destination host must have the same (or newer) kernel and KVM capabilities.
 - Snapshot bundles include the full disk image; large disks produce large bundles.
+- Virtio-fs devices cannot be active through the MAP_PRIVATE restore path;
+  snapshots taken while a virtiofs export was mounted cannot be restored
+  today. Take the snapshot without virtiofs or materialize the mount if the
+  template needs to survive restore.
 
 ---
 

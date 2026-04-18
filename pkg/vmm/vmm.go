@@ -143,18 +143,18 @@ func validateMachineArch(arch MachineArch) error {
 
 // Config holds everything needed to create a VM.
 type Config struct {
-	MemMB            uint64
-	Arch             string `json:"arch,omitempty"`
-	KernelPath       string
-	InitrdPath       string
-	Cmdline          string
-	DiskImage        string
-	DiskRO           bool
-	Drives           []DriveConfig `json:"drives,omitempty"`
-	TapName          string
-	MACAddr          net.HardwareAddr
-	Metadata         map[string]string  `json:"metadata,omitempty"`
-	NetRateLimiter   *RateLimiterConfig `json:"net_rate_limiter,omitempty"`
+	MemMB          uint64
+	Arch           string `json:"arch,omitempty"`
+	KernelPath     string
+	InitrdPath     string
+	Cmdline        string
+	DiskImage      string
+	DiskRO         bool
+	Drives         []DriveConfig `json:"drives,omitempty"`
+	TapName        string
+	MACAddr        net.HardwareAddr
+	Metadata       map[string]string  `json:"metadata,omitempty"`
+	NetRateLimiter *RateLimiterConfig `json:"net_rate_limiter,omitempty"`
 	// RxNetRateLimiter / TxNetRateLimiter allow separate host→guest and
 	// guest→host shaping, matching Firecracker's `rx_rate_limiter` and
 	// `tx_rate_limiter` fields. If both are nil, NetRateLimiter (if set)
@@ -189,6 +189,11 @@ type ExecConfig struct {
 type SharedFSConfig struct {
 	Source string `json:"source"`
 	Tag    string `json:"tag"`
+	// Target is the guest-side mount point the template configured for this
+	// tag. Populated by the container runtime so the snapshot-restore path
+	// can re-identify the slot when a caller supplies SharedFSRebinds by
+	// guest Target (the caller doesn't know the server-generated Tag).
+	Target string `json:"target,omitempty"`
 	// SocketPath, when set, points to an already-listening virtiofsd unix socket.
 	// In that case the VM does not spawn virtiofsd; it connects to this socket
 	// instead. Used by the worker/jailer path so virtiofsd can run on the host
@@ -277,13 +282,20 @@ type VM struct {
 	blkDevs        []*virtio.BlockDevice
 	fsDevs         []*virtio.FSDevice
 	vsockDev       *vsock.Device
-	rtcDev         interface{ ReadBytes(uint16, []byte); WriteBytes(uint16, []byte) }
-	execBroker     *execAgentBroker
-	memDirty       *virtio.DirtyTracker
+	rtcDev         interface {
+		ReadBytes(uint16, []byte)
+		WriteBytes(uint16, []byte)
+	}
+	memDirty *virtio.DirtyTracker
 
 	startTime   time.Time
 	cleanupOnce sync.Once
 	stopOnce    sync.Once
+	// vsockDialMu protects against use-after-free when cleanup() races with
+	// in-flight DialVsock calls.  DialVsock holds a read lock for the entire
+	// dev.Dial call; cleanup() acquires the write lock before closing devices
+	// and unmapping guest RAM, so it blocks until any concurrent dial completes.
+	vsockDialMu sync.RWMutex
 	exitCode    int
 	events      *EventLog
 	pausedVCPUs map[int]struct{}
@@ -726,7 +738,50 @@ func (m *VM) UpdateBalloonStats(update BalloonStatsUpdate) error {
 	return nil
 }
 
+// KickVsockIRQ fires the virtio-vsock queue interrupt one additional time.
+// Must be called after RestoreFromSnapshot, before Start — the same pattern
+// Firecracker uses in kick_virtio_devices() before VcpuEvent::Resume.
+//
+// Rationale: QuiesceForSnapshot fires a TRANSPORT_RESET interrupt pre-pause.
+// If the LAPIC already had a pending interrupt at the same vector (ISR bit
+// set, EOI not yet written), KVM silently drops the edge-triggered injection
+// (known Linux KVM behaviour). The restored LAPIC state from mem.bin is
+// whatever was captured — which may or may not have an in-flight IRQ.
+// Kicking here hits a LAPIC that has just been reset from snapshot state but
+// whose vCPUs have not yet executed a single instruction: the injection is
+// guaranteed to succeed, and on the very first KVM_RUN the guest sees the
+// interrupt and drains the event queue containing TRANSPORT_RESET.
+func (m *VM) KickVsockIRQ() {
+	m.mu.Lock()
+	dev := m.vsockDev
+	m.mu.Unlock()
+	if dev == nil {
+		gclog.VMM.Info("KickVsockIRQ: no vsock device")
+		return
+	}
+	gclog.VMM.Info("KickVsockIRQ: firing", "id", m.cfg.ID)
+	dev.Transport.SetInterruptStat(1)
+	dev.Transport.SignalIRQ(true)
+	txQ := dev.Transport.Queue(1)
+	txUsedFlags := uint16(0xFFFF)
+	txLastAvail := uint16(0)
+	if txQ != nil {
+		txUsedFlags, _ = txQ.UsedFlags()
+		txLastAvail = txQ.LastAvail
+	}
+	gclog.VMM.Info("KickVsockIRQ: fired", "id", m.cfg.ID, "interrupt_stat", dev.Transport.InterruptStat(), "txUsedFlags", txUsedFlags, "txLastAvail", txLastAvail)
+	// Start periodic TX avail poller so we can detect if the guest
+	// silently adds entries to the TX vring without a QueueNotify kick.
+	dev.StartTXAvailPoller(45 * time.Second)
+}
+
 func (m *VM) DialVsock(port uint32) (net.Conn, error) {
+	// Hold the read lock for the entire Dial call.  cleanup() acquires the write
+	// lock before unmapping guest RAM, so this prevents a concurrent cleanup from
+	// freeing memory while sendPkt is reading the virtio TX queue.
+	m.vsockDialMu.RLock()
+	defer m.vsockDialMu.RUnlock()
+
 	m.mu.Lock()
 	if m.vsockDev == nil {
 		m.mu.Unlock()
@@ -738,12 +793,7 @@ func (m *VM) DialVsock(port uint32) (net.Conn, error) {
 		return nil, fmt.Errorf("cannot dial vsock while VM is in state %s", state)
 	}
 	dev := m.vsockDev
-	broker := m.execBroker
-	execCfg := m.cfg.Exec
 	m.mu.Unlock()
-	if broker != nil && execCfg != nil && execCfg.Enabled && port == execCfg.VsockPort {
-		return broker.acquire()
-	}
 	return dev.Dial(port)
 }
 
@@ -822,18 +872,14 @@ func (m *VM) TakeSnapshotWithOptions(dir string, opts SnapshotOptions) (*Snapsho
 	m.mu.Unlock()
 	switch state {
 	case StateRunning:
-		// Send opShutdown to every active vsock conn BEFORE pausing the
-		// vCPUs. This gives the guest one last chance to drain the RX
-		// queue while it's still executing, so its blocked Read calls
-		// return immediately and the guest-side `serveExecAgent`/exec
-		// handlers close their sockets and loop back to the dial path.
-		// Post-restore, the guest will re-dial fresh against the new
-		// broker instead of sitting forever on a pipe whose host end
-		// disappeared with the old process. Matches Firecracker's
-		// "vsock connections do not survive snapshot/restore" contract.
+		// QuiesceForSnapshot sends RST+TRANSPORT_RESET to all active vsock
+		// connections so the guest can drain its queues cleanly before pause.
+		// Not strictly required for correctness — after restore the host
+		// simply re-dials the guest listener — but avoids stale buffers.
 		if m.vsockDev != nil {
 			m.vsockDev.QuiesceForSnapshot()
 		}
+		time.Sleep(50 * time.Millisecond)
 		if err := m.Pause(); err != nil {
 			return nil, err
 		}
@@ -907,6 +953,21 @@ type RestoreOptions struct {
 	OverrideID      string
 	OverrideTap     string
 	OverrideX86Boot X86BootMode
+	// SharedFSRebinds remaps virtiofs exports present in the snapshot to new
+	// host source paths, keyed by the guest-side Target that the template
+	// mounted the tag at. The template must have already snapshotted with a
+	// SharedFS entry whose Target matches; empty list means "use the
+	// snapshot's own sources unchanged".
+	SharedFSRebinds []SharedFSRebind
+}
+
+// SharedFSRebind rewrites the Source behind a virtio-fs export that was
+// already present in the snapshot, without changing the MMIO device layout
+// or the tag. Used by the sandbox-template flow to inject a per-instance
+// toolbox on top of a pre-provisioned virtiofs slot.
+type SharedFSRebind struct {
+	Target string `json:"target"`
+	Source string `json:"source"`
 }
 
 // RestoreFromSnapshotWithOptions creates a new VM restored from a snapshot
@@ -917,6 +978,48 @@ func RestoreFromSnapshotWithOptions(dir string, opts RestoreOptions) (*VM, error
 		return nil, err
 	}
 	return restoreFromSnapshot(dir, snap, opts)
+}
+
+// applySharedFSRebinds overrides the Source (and clears any stale SocketPath)
+// of virtio-fs entries in the snapshot whose guest-side Target matches a
+// caller-supplied rebind. Templates that were not snapshotted with a matching
+// Target fail fast with a clear error. Empty rebinds leave the snapshot
+// untouched so existing callers keep today's behaviour.
+func applySharedFSRebinds(snap *Snapshot, rebinds []SharedFSRebind) error {
+	if snap == nil || len(rebinds) == 0 {
+		return nil
+	}
+	idx := make(map[string]int, len(snap.Config.SharedFS))
+	for i, fs := range snap.Config.SharedFS {
+		if fs.Target == "" {
+			continue
+		}
+		idx[fs.Target] = i
+	}
+	for _, rb := range rebinds {
+		i, ok := idx[rb.Target]
+		if !ok {
+			return fmt.Errorf("snapshot has no virtiofs slot for target %q (available targets: %v); template must be rebuilt with a matching virtiofs mount", rb.Target, sharedFSTargets(snap.Config.SharedFS))
+		}
+		snap.Config.SharedFS[i].Source = rb.Source
+		// SocketPath points at the template host's virtiofsd socket; it is
+		// stale on the restore host. Clearing it forces the vmm to spawn a
+		// fresh virtiofsd against the new Source (direct path) or requires
+		// the worker to re-populate it (worker path).
+		snap.Config.SharedFS[i].SocketPath = ""
+	}
+	return nil
+}
+
+func sharedFSTargets(cfgs []SharedFSConfig) []string {
+	out := make([]string, 0, len(cfgs))
+	for _, fs := range cfgs {
+		if fs.Target == "" {
+			continue
+		}
+		out = append(out, fs.Target)
+	}
+	return out
 }
 
 func readSnapshot(dir string) (Snapshot, error) {
@@ -954,6 +1057,9 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	if opts.OverrideTap != "" {
 		snap.Config.TapName = opts.OverrideTap
 	}
+	if err := applySharedFSRebinds(&snap, opts.SharedFSRebinds); err != nil {
+		return nil, err
+	}
 	if opts.OverrideX86Boot != "" {
 		mode, err := normalizeX86BootMode(opts.OverrideX86Boot)
 		if err != nil {
@@ -988,16 +1094,23 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	if err != nil {
 		return nil, err
 	}
-	// Map the snapshot memory file directly into the guest memory region with
-	// MAP_PRIVATE. The restore path pays zero I/O up front: pages are faulted
-	// in lazily as the guest touches them, and dirty pages go to private COW
-	// pages so the snapshot file stays intact. On a 128 MiB guest this trades
-	// a ~60–100 ms read+copy for ~5–15 ms of mmap + page-table setup — the
-	// same trick Firecracker/Kata use to make pool-resume sandboxes look
-	// instant.
-	kvmVM, err := sys.CreateVMFromSnapshotFile(snap.MemFile, snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
-	if err != nil {
-		return nil, fmt.Errorf("cow restore: %w", err)
+	// Snapshots that include virtio-fs exports cannot use the MAP_PRIVATE COW
+	// fast path: virtiofsd needs a memfd it can mmap, and a file-backed
+	// PRIVATE mapping has no fd to share. Detect that case and fall back to
+	// the slower memfd-materialize path (one O(mem) read+copy at restore
+	// time, ~60-100 ms on a 128 MiB guest). Snapshots without virtio-fs keep
+	// today's instant lazy-fault restore.
+	var kvmVM *kvm.VM
+	if len(snap.Config.SharedFS) > 0 {
+		kvmVM, err = sys.CreateVMFromSnapshotFileMemfd(snap.MemFile, snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
+		if err != nil {
+			return nil, fmt.Errorf("memfd restore: %w", err)
+		}
+	} else {
+		kvmVM, err = sys.CreateVMFromSnapshotFile(snap.MemFile, snap.Config.MemMB, guestRAMBase(snap.Config.Arch))
+		if err != nil {
+			return nil, fmt.Errorf("cow restore: %w", err)
+		}
 	}
 
 	m := &VM{
@@ -1541,20 +1654,17 @@ func (m *VM) setupDevices() error {
 		slot++
 	}
 
-	// virtio-vsock
+	// virtio-vsock — no listenFn needed: exec agent now listens inside the
+	// guest and the host dials in (Device.Dial) rather than the reverse.
 	if m.cfg.Vsock != nil && m.cfg.Vsock.Enabled {
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		var listenFn func(uint32) (net.Conn, error)
-		if m.cfg.Exec != nil && m.cfg.Exec.Enabled {
-			m.execBroker = newExecAgentBroker(m.cfg.Exec.VsockPort)
-			listenFn = m.execBroker.listen
-		}
 		_, irqFn, err := m.makeEventFDIRQFn()
 		if err != nil {
 			return fmt.Errorf("virtio-vsock irqfd: %w", err)
 		}
-		vsockDev := vsock.NewDevice(mem, base, irq, listenFn, m.memDirty, irqFn)
+		vsockDev := vsock.NewDevice(mem, base, irq, nil, m.memDirty, irqFn)
+		vsockDev.Label = m.cfg.ID
 		m.vsockDev = vsockDev
 		m.transports = append(m.transports, vsockDev.Transport)
 		slot++
@@ -1672,19 +1782,19 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 				// the VM is expected to stay alive idling between
 				// host-initiated exec calls; and a guest resumed
 				// from snapshot captured mid-`hlt` re-enters `hlt`
-				// on its first KVM_RUN. In both cases, stopping
-				// on HLT fires cleanup() → execBroker.close() and
-				// the next exec surfaces as "exec agent broker is
-				// closed". Keep the VM alive while exec is wired;
-				// the idle HLT will wake on the next device IRQ
-				// (vsock TX from the guest agent, timer tick, etc).
-				if len(m.vcpus) == 1 && m.execBroker == nil {
+				// on its first KVM_RUN. Keep the VM alive while exec
+				// is wired so the idle HLT wakes on the next device
+				// IRQ (vsock dial from the host, timer tick, etc).
+				if len(m.vcpus) == 1 && (m.cfg.Exec == nil || !m.cfg.Exec.Enabled) {
 					gclog.VMM.Info("guest HLT", "id", m.cfg.ID, "vcpu", vcpu.ID)
 					m.events.Emit(EventHalted, "guest HLT")
 					m.Stop()
 					return
 				}
-				time.Sleep(1 * time.Millisecond)
+				// With in-kernel IRQCHIP, re-entering KVM_RUN after HLT
+				// blocks the vCPU thread inside the kernel until the next
+				// interrupt (PIT, LAPIC timer, IPI). No userspace sleep
+				// needed — the kernel's kvm_vcpu_block handles it.
 
 			case kvm.ExitIO:
 				m.handleIO(vcpu)
@@ -1771,9 +1881,11 @@ func (m *VM) waitIfPaused(vcpuID int) bool {
 
 func (m *VM) cleanup() {
 	m.cleanupOnce.Do(func() {
-		if m.execBroker != nil {
-			m.execBroker.close()
-		}
+		// Block until any in-flight DialVsock call completes before freeing
+		// devices and guest RAM.  See vsockDialMu on the VM struct.
+		m.vsockDialMu.Lock()
+		defer m.vsockDialMu.Unlock()
+
 		if m.vsockDev != nil {
 			m.vsockDev.Close()
 		}
@@ -1963,6 +2075,19 @@ func (m *VM) handleMMIO(vcpu *kvm.VCPU) {
 		base := t.BasePA()
 		if mmio.PhysAddr >= base && mmio.PhysAddr < base+VirtioStride {
 			offset := uint32(mmio.PhysAddr - base)
+			// Debug: track vsock MMIO for restored VMs
+			if m.vsockDev != nil && t == m.vsockDev.Transport {
+				if offset == 0x50 || offset == 0x60 || offset == 0x64 {
+					txQ := m.vsockDev.Transport.Queue(1)
+					txUsedFlags := uint16(0xFFFF)
+					txAvailFlags := uint16(0xFFFF)
+					if txQ != nil {
+						txUsedFlags, _ = txQ.UsedFlags()
+						txAvailFlags, _ = txQ.AvailFlags()
+					}
+					gclog.VMM.Debug("[DBG-MMIO] vsock MMIO", "id", m.cfg.ID, "offset", fmt.Sprintf("0x%x", offset), "isWrite", mmio.IsWrite, "txUsedFlags", txUsedFlags, "txAvailFlags", txAvailFlags)
+				}
+			}
 			if mmio.IsWrite == 1 {
 				t.WriteBytes(offset, mmio.Data[:mmio.Len])
 			} else {

@@ -272,8 +272,29 @@ func rewriteSnapshotBundleWithConfig(dir string, snap Snapshot, cfg Config) (*Sn
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(metaFile, data, 0644); err != nil {
+	// Write with explicit fsync on the file and the parent dir: a crash
+	// between WriteFile and the next sync point otherwise leaves a half
+	// -written snapshot.json that a later restore happily picks up and
+	// feeds to the kernel. Crashing loudly here is strictly better than
+	// booting a corrupt template later.
+	f, err := os.OpenFile(metaFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
 		return nil, err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	if dirF, err := os.Open(dir); err == nil {
+		_ = dirF.Sync()
+		_ = dirF.Close()
 	}
 	return &snap, nil
 }
