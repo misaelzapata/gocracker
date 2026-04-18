@@ -228,18 +228,15 @@ func cmdRun(args []string) {
 	if interactive.enabled {
 		if err := runLocalInteractiveVM(result, resolveInteractiveRunCommand(result.Config, runOpts)); err != nil {
 			stopVMAndWait(result.VM, 15*time.Second)
-			waitWarmCapture(result)
 			fatal(err.Error())
 		}
 		stopVMAndWait(result.VM, 15*time.Second)
-		waitWarmCapture(result)
 		// Final newline to ensure the shell prompt redraws after VM stop messages.
 		fmt.Println()
 		return
 	}
 	// --warm non-interactive path: wait for snapshot capture then exec CMD if provided.
 	if *warm {
-		waitWarmCapture(result)
 		cmd := effectiveCommandSlice(runOpts.Cmd, imageDefaultCmd(result.Config))
 		if len(cmd) > 0 {
 			if err := runWarmCmd(result.VM, cmd); err != nil {
@@ -253,7 +250,6 @@ func cmdRun(args []string) {
 	if *wait {
 		waitVM(result.VM, nil)
 	}
-	waitWarmCapture(result)
 }
 
 // ---- repo ----
@@ -1135,14 +1131,6 @@ func openLocalExecStream(vm vmm.Handle, req internalapi.ExecRequest) (net.Conn, 
 	return conn, nil
 }
 
-// waitWarmCapture blocks until the background warm-cache snapshot goroutine
-// completes (or until the process would exit). No-op when WarmDone is nil.
-func waitWarmCapture(r *container.RunResult) {
-	if r == nil || r.WarmDone == nil {
-		return
-	}
-	<-r.WarmDone
-}
 
 // imageDefaultCmd returns the effective command from an OCI image config
 // (entrypoint + cmd), or nil when the image has no default process.

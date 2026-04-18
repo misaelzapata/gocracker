@@ -149,12 +149,7 @@ type RunResult struct {
 	WorkerSocket string
 	Duration     time.Duration
 	Timings      vmm.BootTimings
-	// WarmDone is closed by the background snapshot-capture goroutine when
-	// the warmcache entry has been committed (or when capture was skipped).
-	// Non-nil only when WarmCapture was active and this was a cold boot.
-	// The caller MUST wait on it before the process exits: <-result.WarmDone.
-	WarmDone <-chan struct{}
-	cleanup  func()
+	cleanup func()
 }
 
 const (
@@ -576,14 +571,11 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		"vmm_setup_ms", timings.VMMSetup.Milliseconds(),
 		"start_ms", timings.Start.Milliseconds(),
 		"guest_first_output_ms", timings.GuestFirstOutput.Milliseconds())
-	var warmDoneLocal <-chan struct{}
+	// Capture snapshot synchronously before returning — this guarantees the
+	// VM is alive while we snapshot and removes the TOCTOU race between the
+	// snapshot goroutine and any subsequent vm.Stop() call.
 	if warmCacheKeyLocal != "" {
-		ch := make(chan struct{})
-		warmDoneLocal = ch
-		go func() {
-			defer close(ch)
-			captureWarmSnapshot(vm, opts, warmCacheKeyLocal)
-		}()
+		captureWarmSnapshot(vm, opts, warmCacheKeyLocal)
 	}
 	return &RunResult{
 		VM:       vm,
@@ -595,7 +587,6 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		Gateway:  opts.Gateway,
 		Duration: bootDuration,
 		Timings:  timings,
-		WarmDone: warmDoneLocal,
 		cleanup:  cleanupFn,
 	}, nil
 }
@@ -889,18 +880,10 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		}
 	}
 	// Auto-capture: if this was a cold boot and --warm / GOCRACKER_WARM_CACHE=1
-	// is active, fire a background goroutine to snapshot the VM as soon as the
-	// exec agent signals "guest ready". Returns a WarmDone channel in RunResult
-	// that the caller MUST drain before exiting — otherwise the process may die
-	// before the snapshot is committed (goroutine killed on exit).
-	var warmDone <-chan struct{}
+	// Capture snapshot synchronously before returning — guarantees VM is alive
+	// during TakeSnapshot and removes the race with any vm.Stop() after return.
 	if warmCacheKey != "" && opts.SnapshotDir == "" {
-		ch := make(chan struct{})
-		warmDone = ch
-		go func() {
-			defer close(ch)
-			captureWarmSnapshot(handle, opts, warmCacheKey)
-		}()
+		captureWarmSnapshot(handle, opts, warmCacheKey)
 	}
 	var cleanupOnce sync.Once
 	cleanupFn := cleanupRuntimeDisk
@@ -941,7 +924,6 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		WorkerSocket: workerSocket(handle),
 		Duration:     bootDuration,
 		Timings:      timings,
-		WarmDone:     warmDone,
 		cleanup:      cleanupFn,
 	}, nil
 }
