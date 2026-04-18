@@ -3,8 +3,11 @@ package container
 import (
 	"os"
 	"strings"
+	"time"
 
+	"github.com/gocracker/gocracker/internal/guestexec"
 	gclog "github.com/gocracker/gocracker/internal/log"
+	"github.com/gocracker/gocracker/pkg/vmm"
 	"github.com/gocracker/gocracker/pkg/warmcache"
 )
 
@@ -47,7 +50,16 @@ func computeWarmCacheKey(opts RunOptions) (string, bool) {
 		gclog.Container.Debug("warm-cache key: kernel hash failed", "path", opts.KernelPath, "error", err)
 		return "", false
 	}
-	cmdline := strings.Join(append(append([]string{}, opts.Entrypoint...), opts.Cmd...), " ")
+	// When WarmCapture is set the snapshot is taken in InteractiveExec mode
+	// (idle exec agent, no CMD running), so it is CMD-agnostic. Exclude the
+	// user CMD from the key so every CMD reuses the same cached snapshot.
+	// Without WarmCapture (plain GOCRACKER_WARM_CACHE=1 lookup), keep the
+	// CMD in the key for safety — the snapshot was captured with a specific
+	// CMD frozen in the kernel cmdline.
+	var cmdline string
+	if !opts.WarmCapture {
+		cmdline = strings.Join(append(append([]string{}, opts.Entrypoint...), opts.Cmd...), " ")
+	}
 	return warmcache.Key(warmcache.KeyInput{
 		ImageDigest: opts.Image,
 		KernelHash:  kHash,
@@ -56,4 +68,72 @@ func computeWarmCacheKey(opts RunOptions) (string, bool) {
 		VCPUs:       opts.CPUs,
 		Arch:        opts.Arch,
 	}), true
+}
+
+// captureWarmSnapshot takes a snapshot of a freshly cold-booted VM and stores
+// it in the warmcache so subsequent runs with identical parameters skip the
+// cold-boot path entirely. Always runs in a goroutine — errors are logged and
+// silently discarded so they never affect the caller's RunResult.
+//
+// Only exec-enabled VMs are snapshotted: the exec agent provides a reliable
+// "guest is ready" signal, and these VMs idle between commands so TakeSnapshot
+// is safe. One-shot VMs (no exec) may have already stopped by the time this
+// goroutine runs, and a snapshot of a stopping VM is not useful.
+func captureWarmSnapshot(handle vmm.Handle, opts RunOptions, key string) {
+	if !opts.ExecEnabled {
+		return
+	}
+	root := warmcache.DefaultRoot()
+	if _, hit := warmcache.Lookup(root, key); hit {
+		return
+	}
+	waitExecReady(handle, 2*time.Second)
+	if handle.State() != vmm.StateRunning {
+		return
+	}
+	tmp, err := os.MkdirTemp("", "gocracker-warmsnap-*")
+	if err != nil {
+		gclog.Container.Warn("warm-cache capture: mktemp", "error", err)
+		return
+	}
+	defer os.RemoveAll(tmp)
+	// TakeSnapshot with Resume:true pauses briefly, snapshots, then resumes —
+	// the VM stays running and the caller's session is unaffected.
+	if _, err := handle.TakeSnapshot(tmp); err != nil {
+		gclog.Container.Warn("warm-cache capture: snapshot", "error", err)
+		return
+	}
+	if err := warmcache.Store(tmp, root, key); err != nil {
+		gclog.Container.Warn("warm-cache capture: store", "error", err)
+		return
+	}
+	gclog.Container.Info("warm-cache stored", "key", key[:12])
+}
+
+// waitExecReady polls the vsock exec port until the guest agent accepts a
+// connection or the timeout expires. A successful dial (immediately closed)
+// proves the in-guest exec agent is up and the snapshot will be taken at a
+// stable point. Silently returns on timeout or when exec is not configured.
+func waitExecReady(handle vmm.Handle, timeout time.Duration) {
+	dialer, ok := handle.(vmm.VsockDialer)
+	if !ok {
+		return
+	}
+	cfg := handle.VMConfig()
+	if cfg.Exec == nil || !cfg.Exec.Enabled {
+		return
+	}
+	port := uint32(guestexec.DefaultVsockPort)
+	if cfg.Exec.VsockPort != 0 {
+		port = cfg.Exec.VsockPort
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		conn, err := dialer.DialVsock(port)
+		if err == nil {
+			conn.Close()
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }

@@ -167,6 +167,7 @@ func cmdRun(args []string) {
 	ttyMode := fs.String("tty", "auto", "Console mode: auto, off, or force")
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
 	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs read-write directly (writes survive VM stop; slower boot). Default: Docker-style tmpfs overlay.")
+	warm := fs.Bool("warm", false, "Auto snapshot-cache: restore from snapshot on cache hit (~3 ms); snapshot after cold boot on miss so next run is fast.")
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
@@ -196,12 +197,15 @@ func cmdRun(args []string) {
 		PID1Mode:        pid1ModeForCLIWait(*wait),
 		ID:              *id,
 		CacheDir:        *cacheDir,
-		ExecEnabled:     interactive.enabled,
-		InteractiveExec: interactive.enabled,
+		// --warm: boot in InteractiveExec (idle exec agent, no CMD as PID 1)
+		// so the snapshot is CMD-agnostic and any subsequent CMD can reuse it.
+		ExecEnabled:     interactive.enabled || *warm,
+		InteractiveExec: interactive.enabled || *warm,
 		JailerMode:      *jailerMode,
 		ConsoleOut:      consoleOut,
 		ConsoleIn:       consoleIn,
 		RootfsPersistent: *rootfsPersistent,
+		WarmCapture:     *warm,
 	}
 	if *balloonTargetMiB > 0 || *balloonDeflateOnOOM || *balloonStatsIntervalS > 0 || strings.TrimSpace(*balloonAuto) != "" {
 		runOpts.Balloon = &vmm.BalloonConfig{
@@ -224,9 +228,11 @@ func cmdRun(args []string) {
 	if interactive.enabled {
 		if err := runLocalInteractiveVM(result, resolveInteractiveRunCommand(result.Config, runOpts)); err != nil {
 			stopVMAndWait(result.VM, 15*time.Second)
+			waitWarmCapture(result)
 			fatal(err.Error())
 		}
 		stopVMAndWait(result.VM, 15*time.Second)
+		waitWarmCapture(result)
 		// Final newline to ensure the shell prompt redraws after VM stop messages.
 		fmt.Println()
 		return
@@ -234,6 +240,7 @@ func cmdRun(args []string) {
 	if *wait {
 		waitVM(result.VM, nil)
 	}
+	waitWarmCapture(result)
 }
 
 // ---- repo ----
@@ -1113,6 +1120,15 @@ func openLocalExecStream(vm vmm.Handle, req internalapi.ExecRequest) (net.Conn, 
 		return nil, fmt.Errorf("%s", ack.Error)
 	}
 	return conn, nil
+}
+
+// waitWarmCapture blocks until the background warm-cache snapshot goroutine
+// completes (or until the process would exit). No-op when WarmDone is nil.
+func waitWarmCapture(r *container.RunResult) {
+	if r == nil || r.WarmDone == nil {
+		return
+	}
+	<-r.WarmDone
 }
 
 func stopVMAndWait(vm vmm.Handle, timeout time.Duration) {

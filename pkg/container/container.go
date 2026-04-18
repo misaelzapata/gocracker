@@ -121,6 +121,15 @@ type RunOptions struct {
 	// to reflink/copy instead of hardlinking the template). Leave false for
 	// Docker-style ephemeral writes and fast boot.
 	RootfsPersistent bool
+
+	// WarmCapture enables the automatic snapshot-cache flow:
+	//   - On cache HIT:  restore from snapshot instead of cold-booting (~3 ms).
+	//   - On cache MISS: cold-boot as normal, then take a snapshot and store it
+	//     in the warmcache so the NEXT run hits the fast path.
+	// The cache key covers (image digest, kernel sha256, cmdline, mem, vCPUs,
+	// arch) so it is safe to enable permanently — any parameter change misses.
+	// Equivalent to setting GOCRACKER_WARM_CACHE=1 but applies per-call.
+	WarmCapture bool
 }
 
 // RunResult is returned after a VM is started.
@@ -140,7 +149,12 @@ type RunResult struct {
 	WorkerSocket string
 	Duration     time.Duration
 	Timings      vmm.BootTimings
-	cleanup      func()
+	// WarmDone is closed by the background snapshot-capture goroutine when
+	// the warmcache entry has been committed (or when capture was skipped).
+	// Non-nil only when WarmCapture was active and this was a cold boot.
+	// The caller MUST wait on it before the process exits: <-result.WarmDone.
+	WarmDone <-chan struct{}
+	cleanup  func()
 }
 
 const (
@@ -289,6 +303,20 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		opts.TapName = autoNet.TapName()
 		opts.StaticIP = autoNet.GuestCIDR()
 		opts.Gateway = autoNet.GatewayIP()
+	}
+
+	// Warm-cache lookup for --jailer off path (mirrors runViaWorker logic).
+	var warmCacheKeyLocal string
+	if opts.SnapshotDir == "" && (warmCacheEnabled() || opts.WarmCapture) && warmCacheInputsReady(opts) {
+		if key, ok := computeWarmCacheKey(opts); ok {
+			warmCacheKeyLocal = key
+			if dir, hit := warmcache.Lookup(warmcache.DefaultRoot(), key); hit {
+				gclog.Container.Info("warm-cache hit", "key", key[:12], "dir", dir)
+				opts.SnapshotDir = dir
+			} else {
+				gclog.Container.Debug("warm-cache miss", "key", key[:12])
+			}
+		}
 	}
 
 	// ---- Fast path: snapshot restore ----
@@ -548,6 +576,15 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		"vmm_setup_ms", timings.VMMSetup.Milliseconds(),
 		"start_ms", timings.Start.Milliseconds(),
 		"guest_first_output_ms", timings.GuestFirstOutput.Milliseconds())
+	var warmDoneLocal <-chan struct{}
+	if warmCacheKeyLocal != "" {
+		ch := make(chan struct{})
+		warmDoneLocal = ch
+		go func() {
+			defer close(ch)
+			captureWarmSnapshot(vm, opts, warmCacheKeyLocal)
+		}()
+	}
 	return &RunResult{
 		VM:       vm,
 		DiskPath: bootDiskPath,
@@ -558,6 +595,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		Gateway:  opts.Gateway,
 		Duration: bootDuration,
 		Timings:  timings,
+		WarmDone: warmDoneLocal,
 		cleanup:  cleanupFn,
 	}, nil
 }
@@ -635,19 +673,16 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		opts.Gateway = autoNet.GatewayIP()
 	}
 
-	// Opportunistic warm-cache lookup. When GOCRACKER_WARM_CACHE=1 is set and
-	// the caller did not already pass an explicit --snapshot dir, consult the
-	// per-image snapshot cache in XDG_CACHE_HOME. A hit rewrites opts.SnapshotDir
-	// so the existing fast-restore branch below picks it up; a miss leaves the
-	// options untouched and we fall through to cold boot.
-	//
-	// Auto-capture on cold boot is NOT wired yet — users must populate the
-	// cache manually with `gocracker snapshot` + rename into Dir(root, key).
-	// That's the intentional MVP: ship the read side so snapshot-resume
-	// becomes the default when a cache entry exists, and add auto-capture in
-	// a follow-up once guest-ready timing is sorted.
-	if opts.SnapshotDir == "" && warmCacheEnabled() && warmCacheInputsReady(opts) {
+	// Opportunistic warm-cache lookup. Active when GOCRACKER_WARM_CACHE=1 or
+	// opts.WarmCapture is set (the --warm flag). On a hit, rewrite SnapshotDir
+	// so the fast-restore branch below serves this run in ~3 ms instead of
+	// ~200 ms. On a miss, fall through to cold boot; after the VM is up the
+	// captureWarmSnapshot helper will snapshot it and store the entry so the
+	// next run is a hit.
+	var warmCacheKey string
+	if opts.SnapshotDir == "" && (warmCacheEnabled() || opts.WarmCapture) && warmCacheInputsReady(opts) {
 		if key, ok := computeWarmCacheKey(opts); ok {
+			warmCacheKey = key
 			if dir, hit := warmcache.Lookup(warmcache.DefaultRoot(), key); hit {
 				gclog.Container.Info("warm-cache hit", "key", key[:12], "dir", dir)
 				opts.SnapshotDir = dir
@@ -853,6 +888,20 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 			return nil, fmt.Errorf("activate auto network: %w", err)
 		}
 	}
+	// Auto-capture: if this was a cold boot and --warm / GOCRACKER_WARM_CACHE=1
+	// is active, fire a background goroutine to snapshot the VM as soon as the
+	// exec agent signals "guest ready". Returns a WarmDone channel in RunResult
+	// that the caller MUST drain before exiting — otherwise the process may die
+	// before the snapshot is committed (goroutine killed on exit).
+	var warmDone <-chan struct{}
+	if warmCacheKey != "" && opts.SnapshotDir == "" {
+		ch := make(chan struct{})
+		warmDone = ch
+		go func() {
+			defer close(ch)
+			captureWarmSnapshot(handle, opts, warmCacheKey)
+		}()
+	}
 	var cleanupOnce sync.Once
 	cleanupFn := cleanupRuntimeDisk
 	if autoNet != nil || cleanup != nil {
@@ -892,6 +941,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		WorkerSocket: workerSocket(handle),
 		Duration:     bootDuration,
 		Timings:      timings,
+		WarmDone:     warmDone,
 		cleanup:      cleanupFn,
 	}, nil
 }
