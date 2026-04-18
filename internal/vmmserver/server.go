@@ -93,13 +93,14 @@ type BootSource struct {
 
 // MachineConfig matches the Firecracker machine-config payload.
 type MachineConfig struct {
-	VcpuCount      int                    `json:"vcpu_count"`
-	MemSizeMib     int                    `json:"mem_size_mib"`
-	RNGRateLimiter *vmm.RateLimiterConfig `json:"rng_rate_limiter,omitempty"`
-	VsockEnabled   bool                   `json:"vsock_enabled,omitempty"`
-	VsockGuestCID  uint32                 `json:"vsock_guest_cid,omitempty"`
-	ExecEnabled    bool                   `json:"exec_enabled,omitempty"`
-	ExecVsockPort  uint32                 `json:"exec_vsock_port,omitempty"`
+	VcpuCount       int                    `json:"vcpu_count"`
+	MemSizeMib      int                    `json:"mem_size_mib"`
+	RNGRateLimiter  *vmm.RateLimiterConfig `json:"rng_rate_limiter,omitempty"`
+	VsockEnabled    bool                   `json:"vsock_enabled,omitempty"`
+	VsockGuestCID   uint32                 `json:"vsock_guest_cid,omitempty"`
+	ExecEnabled     bool                   `json:"exec_enabled,omitempty"`
+	ExecVsockPort   uint32                 `json:"exec_vsock_port,omitempty"`
+	TrackDirtyPages bool                   `json:"track_dirty_pages,omitempty"`
 }
 
 type Balloon struct {
@@ -169,6 +170,10 @@ type VMInfo struct {
 	// transmitted a byte on the serial console. Populated from the VMM's
 	// UART as soon as the guest prints anything; zero until then.
 	FirstOutputAt time.Time `json:"first_output_at,omitempty"`
+	// ExecEnabled / ExecVsockPort are populated in the /restore response
+	// so callers can wire exec without a follow-up GET /vm.
+	ExecEnabled   bool   `json:"exec_enabled,omitempty"`
+	ExecVsockPort uint32 `json:"exec_vsock_port,omitempty"`
 }
 
 // ConfigureAndStartRequest bundles all pre-boot configuration with InstanceStart.
@@ -200,9 +205,11 @@ type RestoreRequest struct {
 // not pay to serialise Events/Devices. Callers that need the full view should
 // issue a follow-up GET /vm.
 type restoreResponse struct {
-	ID    string `json:"id"`
-	State string `json:"state"`
-	MemMB uint64 `json:"mem_mb"`
+	ID            string `json:"id"`
+	State         string `json:"state"`
+	MemMB         uint64 `json:"mem_mb"`
+	ExecEnabled   bool   `json:"exec_enabled,omitempty"`
+	ExecVsockPort uint32 `json:"exec_vsock_port,omitempty"`
 }
 
 // New creates a server with default options.
@@ -1051,11 +1058,16 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 	// view can issue a GET /vm afterwards; they rarely do, because the VM ID
 	// is stable and Events can be streamed over SSE.
 	cfg := vm.VMConfig()
-	_ = json.NewEncoder(w).Encode(restoreResponse{
+	resp := restoreResponse{
 		ID:    vm.ID(),
 		State: vm.State().String(),
 		MemMB: cfg.MemMB,
-	})
+	}
+	if cfg.Exec != nil && cfg.Exec.Enabled {
+		resp.ExecEnabled = true
+		resp.ExecVsockPort = cfg.Exec.VsockPort
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
@@ -1334,6 +1346,7 @@ func (s *Server) startPrebootVM() error {
 				VsockPort: s.preboot.machineCfg.ExecVsockPort,
 			}
 		}
+		cfg.TrackDirtyPages = s.preboot.machineCfg.TrackDirtyPages
 	}
 	if s.preboot.balloon != nil {
 		cfg.Balloon = &vmm.BalloonConfig{

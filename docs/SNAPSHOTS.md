@@ -138,44 +138,130 @@ source and restores it as a new VM on the same server in one atomic call.
     └─── source keeps running ───────────────────────────┘
 ```
 
-Typical sequence:
+Full walkthrough (network works end-to-end, package manager works in the
+clone, source stays usable):
 
-1. Boot a template VM with `network_mode=auto` and `exec_enabled=true`.
-2. Install the toolbox (`apk add …`, `pip install …`, stage binaries). The
-   disk is ext4; changes stay in the VM until clone.
-3. Optionally `POST /vms/{id}/pause` while you wait for a clone request;
-   pause freezes vCPUs without tearing down state.
-4. For each sandbox: `POST /vms/{templateID}/clone` with per-instance
-   overrides (`tap_name`, `mounts` for virtiofs toolbox injection,
-   `metadata`). The clone:
-   - Gets a fresh ID and its own tap (`tclone-<N>` auto-minted when the
-     caller does not override) so source and clone run concurrently.
-   - Inherits the source's disk via snapshot restore — no re-install needed.
-   - Reports `restored_from_snapshot=true`; metadata `cloned_from` points
-     back at the source.
-5. Stop the source when you're done provisioning or keep it as a live
-   template for future clones.
+```bash
+# 1. Publish the template with network_mode=auto + exec (the two flags
+#    /clone needs later to re-IP the guest).
+TEMPLATE=$(curl -sS http://127.0.0.1:8080/run -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"image":"alpine:3.20","kernel_path":"/k/vmlinux","mem_mb":256,
+       "network_mode":"auto","exec_enabled":true,"wait":true,
+       "cmd":["/bin/sh","-lc","sleep infinity"]}' | jq -r .id)
 
-### Virtiofs toolbox injection on clone
+# 2. Install the toolbox on the template. Changes land on the ext4 disk
+#    and survive snapshot/restore.
+curl -sS http://127.0.0.1:8080/vms/$TEMPLATE/exec -X POST \
+  -d '{"command":["/bin/sh","-lc","apk add --no-cache bc && echo TEMPLATE-READY > /tmp/marker"]}'
 
-When the template boots with a `backend=virtiofs` mount pointing at a
-placeholder directory, `POST /vms/{id}/clone` accepts `mounts` with the same
-guest `target` and a different host `source`. The server rewrites the
-snapshot's shared-FS export by matching guest target, keeps the tag (so the
-guest kernel's frozen mount continues to find its device), and spawns a
-fresh virtiofsd against the new source.
+# 3. Clone. Source keeps running unchanged; the clone gets its own tap +
+#    fresh /30 subnet, eth0 is re-IP'd on the fly, and it inherits the
+#    template's disk including the pre-installed toolbox.
+CLONE=$(curl -sS http://127.0.0.1:8080/vms/$TEMPLATE/clone -X POST \
+  -d '{"exec_enabled":true,"network_mode":"auto"}' | jq -r .id)
 
-**Convention**: the template must snapshot with a matching virtiofs mount
-point. Restoring with a target the template never mounted returns 400
-(`snapshot has no virtiofs slot for target …`).
+# 4. The clone has bc (from disk) AND working network (from re-IP).
+curl -sS http://127.0.0.1:8080/vms/$CLONE/exec -X POST \
+  -d '{"command":["/bin/sh","-lc","cat /tmp/marker && echo 2*21 | bc && apk add --no-cache file"]}'
+# → stdout: "TEMPLATE-READY\n42\n...ok-install"
 
-**Known limitation**: the snapshot restore fast path uses MAP_PRIVATE COW on
-the memory file, which is incompatible with virtio-fs's memfd requirement.
-The rebind plumbing + validation is in place (covered by unit tests in
-`pkg/vmm/sharedfs_rebind_test.go`), but end-to-end guest I/O through the
-rebound export needs the restore path to materialize guest memory in a memfd
-when any virtio-fs device is present. Tracked as a follow-up gap separate
-from the rest of the sandbox API.
+# 5. Optional: pause the template while idle, resume when another clone
+#    request arrives. Both /pause and /resume return 204.
+curl -sS -X POST http://127.0.0.1:8080/vms/$TEMPLATE/pause -d '{}'
+curl -sS -X POST http://127.0.0.1:8080/vms/$TEMPLATE/resume -d '{}'
+```
+
+Properties the clone guarantees:
+
+- Fresh VM ID (`gc-<random>`) and unique `tclone-<N>` tap so source +
+  siblings coexist without TUNSETIFF EBUSY.
+- Inherits the full source disk — no re-install cost per clone.
+- `network_mode=auto` on `/clone` re-IPs eth0 + the default route inside
+  the guest over exec, so outbound reaches the new gateway. Requires
+  `exec_enabled=true`; the endpoint returns 400 otherwise.
+- Metadata `cloned_from` points back at the source for observability.
+
+### Virtio-fs mounts on the source (not clonable today)
+
+`POST /vms/{id}/clone` returns 400 if the source VM holds live virtio-fs
+mounts. The Linux virtio-fs driver stores in-flight FUSE request IDs in its
+virtqueue; snapshot freezes that state while a fresh virtiofsd on the
+restored side starts at queue index 0, tripping the kernel assertion
+"requests.0:id 0 is not a head!" on first FUSE op. The endpoint refuses
+rather than silently hang.
+
+Workarounds for per-sandbox data:
+
+- **umount before snapshot**: take the snapshot with no active virtio-fs
+  mount (umount inside the guest first), then re-mount by hand after
+  restore. `TestE2ECloneRejectsActiveVirtiofs` guards the live-mount case.
+- **virtio-blk** (`drives` field on `/run`): attach a per-sandbox block
+  device. virtio-blk queues do not have the FUSE-session problem.
+
+The rebind *contract* (host-side Source rewrite + SocketPath clear + memfd-
+backed restore) is implemented and covered by unit tests in
+`pkg/vmm/sharedfs_rebind_test.go`; what is not yet supported is migrating
+the guest-side FUSE session across the snapshot boundary.
+
+## Warm Cache
+
+The warm-cache feature captures a snapshot automatically on the first cold boot and
+restores from it on every subsequent `run` call with the same parameters — without
+any extra flags from the caller.
+
+### Enabling it
+
+```bash
+# Per-invocation:
+sudo gocracker run --image oven/bun:alpine --kernel ./vmlinux --warm
+
+# Process-wide (all `run` calls in the process use the cache):
+export GOCRACKER_WARM_CACHE=1
+sudo gocracker run --image oven/bun:alpine --kernel ./vmlinux
+```
+
+### How it works
+
+1. On the **first run** (`--warm` or `GOCRACKER_WARM_CACHE=1`), the VM boots
+   normally (cold boot, ~200 ms).  A background goroutine waits for the exec
+   agent to be ready (~150 ms after first console output), pauses the VM briefly,
+   captures dirty pages as a sparse `mem.bin`, then resumes the VM.  The snapshot
+   is stored under `~/.cache/gocracker/snapshots/<key>/`.
+2. On **subsequent runs**, the runtime detects the cache key match and restores
+   via `MAP_PRIVATE` on the sparse file — page-faults load only the pages the
+   current command actually touches, so the restore itself completes in **~5–7 ms**.
+3. If **`--net auto`** is used, the guest's `eth0` is automatically re-IP'd after
+   restore via the exec agent so it routes through the new TAP's gateway.
+
+### Cache key
+
+The key is a SHA-256 over: OCI image digest · kernel binary hash · kernel
+cmdline · memory (MiB) · vCPU count · architecture · network mode.  Any change
+to these fields produces a new key and a new cold boot.
+
+### Cache location
+
+```
+~/.cache/gocracker/snapshots/<key>/
+  snapshot.json   # vCPU + device state
+  mem.bin         # sparse guest RAM (only dirty pages occupy disk)
+  artifacts/
+    disk.ext4     # root disk (hardlink to the build cache — no copy cost)
+    kernel
+    initrd
+```
+
+Override with `XDG_CACHE_HOME`.
+
+### Limitations
+
+- Only OCI-image sources are cached.  Dockerfile and git-repo builds are skipped
+  because their rootfs is non-deterministic across rebuilds.
+- Block devices passed via `--drives` bypass the cache (drive content is not part
+  of the cache key).
+- Requires `--exec` / `ExecEnabled: true` — the exec agent provides the
+  "guest is ready" signal used to time the snapshot capture.
 
 ## Limitations
 

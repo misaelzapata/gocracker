@@ -252,6 +252,10 @@ func RewriteSnapshotBundleWithConfig(dir string, cfg Config) (*Snapshot, error) 
 }
 
 func rewriteSnapshotBundleWithConfig(dir string, snap Snapshot, cfg Config) (*Snapshot, error) {
+	return rewriteSnapshotBundleOpts(dir, snap, cfg, false)
+}
+
+func rewriteSnapshotBundleOpts(dir string, snap Snapshot, cfg Config, skipDisk bool) (*Snapshot, error) {
 	if snap.MemFile == "" {
 		snap.MemFile = "mem.bin"
 	}
@@ -263,9 +267,15 @@ func rewriteSnapshotBundleWithConfig(dir string, snap Snapshot, cfg Config) (*Sn
 	if snap.Config.InitrdPath, err = bundleAsset(dir, snap.Config.InitrdPath, "artifacts/initrd"); err != nil {
 		return nil, err
 	}
-	if snap.Config.DiskImage, err = bundleAsset(dir, snap.Config.DiskImage, "artifacts/disk.ext4"); err != nil {
-		return nil, err
+	if !skipDisk {
+		if snap.Config.DiskImage, err = bundleAsset(dir, snap.Config.DiskImage, "artifacts/disk.ext4"); err != nil {
+			return nil, err
+		}
 	}
+	// When skipDisk is true, snap.Config.DiskImage retains its original path
+	// (e.g. /worker/drives/0). The host-side takeSnapshotViaExport hardlinks
+	// the real disk into artifacts/disk.ext4 after exporting and rewrites
+	// snap.Config.DiskImage = "artifacts/disk.ext4".
 
 	metaFile := filepath.Join(dir, "snapshot.json")
 	data, err := json.MarshalIndent(snap, "", "  ")
@@ -569,6 +579,15 @@ func copyFile(dst, src string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
+	// Try hardlink first: instant, zero extra space, works when src/dst are
+	// on the same filesystem (which is always true for /tmp-to-/tmp copies in
+	// the warmcache path). Snapshot assets are read-only after bundling so
+	// sharing an inode with the original is safe. Falls back on EXDEV (cross
+	// filesystem) or other errors.
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -581,12 +600,8 @@ func copyFile(dst, src string) error {
 	}
 	defer out.Close()
 
-	// Try FICLONE first: on btrfs/xfs/overlayfs this creates a reflink —
-	// a copy-on-write clone that completes in microseconds instead of
-	// streaming every byte. Matters a lot when snapshotting a VM with a
-	// multi-GB disk.ext4: 1 GB io.Copy is ~1 s on NVMe; FICLONE is ~200 µs.
-	// Falls back to io.Copy if the filesystem doesn't support it (ext4,
-	// tmpfs, cross-fs copies).
+	// Try FICLONE: on btrfs/xfs/overlayfs creates a reflink (COW clone,
+	// microseconds). Falls back to io.Copy on ext4/tmpfs.
 	if err := unix.IoctlFileClone(int(out.Fd()), int(in.Fd())); err == nil {
 		return out.Sync()
 	}

@@ -1,31 +1,35 @@
 # Manual Smoke Pack
 
-Este folder deja una validacion manual reproducible para `gocracker` sin depender de Docker Engine para correr las VMs.
+English version. For the original Spanish text, see
+[`README-ES.md`](README-ES.md).
 
-Los scripts viven en el repo, pero los logs y artefactos se escriben en:
+This folder provides a reproducible manual validation pack for `gocracker`
+without depending on Docker Engine to run the VMs.
+
+The scripts live in the repository, but logs and artifacts are written to:
 
 ```bash
 /tmp/gocracker-manual-smoke/<timestamp>
 ```
 
-## Prerrequisitos
+## Prerequisites
 
-- Linux con `/dev/kvm`
-- `GOCRACKER_KERNEL` apuntando a un guest kernel valido. Recomendado:
+- Linux with `/dev/kvm`
+- `GOCRACKER_KERNEL` pointing to a valid guest kernel. Recommended:
   - `./tools/build-guest-kernel.sh`
   - `GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux`
-- `sudo -v` ya ejecutado antes de correr el pack
+- `sudo -v` already run before launching the pack
 - `debugfs`
 - `script`
 - `timeout`
 - `curl`
 - `ip`
 - `pgrep`
-- red saliente para pulls de registry
+- outbound network access for registry pulls
 
-## Verificacion Recomendada
+## Recommended Validation Flow
 
-Primero corre la base automatizada:
+First run the automated baseline:
 
 ```bash
 ./tools/build-guest-kernel.sh
@@ -33,30 +37,30 @@ go test ./...
 GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux go test -tags integration ./tests/integration/...
 ```
 
-Luego corre la matriz manual:
+Then run the manual matrix:
 
 ```bash
 sudo -v
 GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux tests/manual-smoke/run_all.sh
 ```
 
-El script:
+The script:
 
-- compila `./gocracker`
-- valida prerequisitos
-- ejecuta la matriz por grupos
-- deja un log por caso
-- termina con exit code `0` solo si todo pasa
+- builds `./gocracker`
+- validates prerequisites
+- runs the matrix by group
+- writes one log per case
+- exits with code `0` only if everything passes
 
-## Casos Disponibles
+## Available Cases
 
-- `images`: `alpine:latest`, `busybox:latest`, `ubuntu:22.04`, `nginx:latest`, override con `python:3.11-slim`
+- `images`: `alpine:latest`, `busybox:latest`, `ubuntu:22.04`, `nginx:latest`, plus an override with `python:3.11-slim`
 - `dockerfiles`: `tests/examples/hello-world`, `tests/examples/static-site`, `tests/examples/python-api`
-- `extras`: fixture shell-form y fixture `USER`
-- `compose`: fixture con `ports`, fixture con `depends_on: service_healthy`, fixture con bind volume + sync-back, y fixture TODO + PostgreSQL
-- `exec`: `compose exec` directo sobre `serve`, sin keys ni usuario
+- `extras`: shell-form fixture and `USER` fixture
+- `compose`: fixture with `ports`, fixture with `depends_on: service_healthy`, fixture with bind volume + sync-back, and TODO + PostgreSQL fixture
+- `exec`: direct `compose exec` over `serve`, without keys or user setup
 
-Por defecto corre todo. Para limitar grupos:
+By default it runs everything. To limit the groups:
 
 ```bash
 GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
@@ -64,7 +68,7 @@ SMOKE_CASES=images,dockerfiles \
 tests/manual-smoke/run_all.sh
 ```
 
-Variables utiles:
+Useful variables:
 
 ```bash
 GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux
@@ -73,54 +77,58 @@ SMOKE_LOG_DIR=/tmp/gocracker-manual-smoke/custom-run
 SMOKE_CASES=all
 ```
 
-## Auth De Registry
+## Registry Auth
 
-### Sin login
+### Without login
 
-La matriz publica normal funciona sin login. Ese es el camino por defecto.
+The normal public matrix works without login. That is the default path.
 
-### Login opcional
+### Optional login
 
-Solo hace falta login para imagenes privadas o si pegas rate limits del registry.
+Login is only needed for private images or if you hit registry rate limits.
 
-`gocracker` no necesita Docker Engine para correr, pero el camino mas simple para dejar credenciales compatibles es escribir un `config.json` estilo Docker:
+`gocracker` does not need Docker Engine to run, but the easiest compatible way
+to provide credentials is still writing a Docker-style `config.json`:
 
 ```bash
 docker login
 ```
 
-Si no quieres usar `docker login`, puedes poblar manualmente `~/.docker/config.json` con las credenciales del registry.
+If you do not want to use `docker login`, you can populate
+`~/.docker/config.json` manually with the registry credentials.
 
-### Nota importante con `sudo`
+### Important note when using `sudo`
 
-Los casos del smoke pack usan `sudo ./gocracker ...`. Eso significa que, si hace falta auth, las credenciales tambien deben existir para root.
+The smoke pack cases use `sudo ./gocracker ...`. That means if auth is needed,
+the credentials must also exist for root.
 
-La forma mas directa es:
+The simplest way is:
 
 ```bash
 sudo docker login
 ```
 
-o dejar el archivo en:
+or place the file at:
 
 ```bash
 /root/.docker/config.json
 ```
 
-## Revisar Fallos
+## Reviewing Failures
 
-Cada caso deja:
+Each case leaves:
 
-- log serial: `/tmp/gocracker-manual-smoke/<timestamp>/<case>.log`
-- la ruta real del `disk.ext4` reportada por `gocracker run`
+- serial log: `/tmp/gocracker-manual-smoke/<timestamp>/<case>.log`
+- the real `disk.ext4` path reported by `gocracker run`
 
-Los logs quedan en:
+Logs are stored under:
 
 ```bash
 /tmp/gocracker-manual-smoke/<timestamp>
 ```
 
-El disco real ya no debe asumirse como `/tmp/gocracker-<case-id>/disk.ext4`. Se resuelve desde el log del caso:
+The real disk path should no longer be assumed to live at
+`/tmp/gocracker-<case-id>/disk.ext4`. Resolve it from the case log instead:
 
 ```bash
 log=/tmp/gocracker-manual-smoke/<timestamp>/<case-id>.log
@@ -128,20 +136,20 @@ disk=$(grep -o '/tmp/gocracker-[^[:space:]]*/disk.ext4' "$log" | tail -n1)
 echo "$disk"
 ```
 
-Para inspeccionar un archivo dentro del disco:
+To inspect a file inside the disk:
 
 ```bash
 debugfs -R "cat /result.txt" "$disk"
 debugfs -R "stat /work/runtime-user.txt" "$disk"
 ```
 
-Para revisar rapido un log:
+To quickly inspect a log:
 
 ```bash
 tail -n 80 /tmp/gocracker-manual-smoke/<timestamp>/<case-id>.log
 ```
 
-Los fixtures extras viven en:
+Extra fixtures live in:
 
 - `tests/manual-smoke/fixtures/shellform/Dockerfile`
 - `tests/manual-smoke/fixtures/user/Dockerfile`
@@ -151,16 +159,16 @@ Los fixtures extras viven en:
 - `tests/manual-smoke/fixtures/compose-todo-postgres/docker-compose.yml`
 - `tests/manual-smoke/fixtures/compose-exec/docker-compose.yml`
 
-## Cobertura Compose
+## Compose Coverage
 
-El grupo `compose` valida tres cosas practicas:
+The `compose` group validates four practical scenarios:
 
-- `compose-basic`: levanta un servicio HTTP, publica `18080:8080` y verifica la respuesta con `curl`
-- `compose-health`: usa `depends_on.condition: service_healthy` y no da por levantado el stack hasta que el servicio web responde
-- `compose-volume`: monta `./data:/data`, detiene el stack limpiamente y valida que el archivo sincronizado vuelva al host
-- `compose-todo-postgres`: levanta `postgres` + una app TODO, crea una tarea real por HTTP y comprueba que se leyó de vuelta desde PostgreSQL
+- `compose-basic`: starts an HTTP service, publishes `18080:8080`, and verifies the response with `curl`
+- `compose-health`: uses `depends_on.condition: service_healthy` and does not treat the stack as ready until the web service responds
+- `compose-volume`: mounts `./data:/data`, shuts the stack down cleanly, and validates that the synced file made it back to the host
+- `compose-todo-postgres`: starts `postgres` plus a TODO app, creates a real task over HTTP, and verifies that it can be read back from PostgreSQL
 
-Si quieres correr solo Compose:
+If you want to run only Compose:
 
 ```bash
 sudo -v
@@ -169,7 +177,7 @@ SMOKE_CASES=compose \
 tests/manual-smoke/run_all.sh
 ```
 
-Para probar un caso real de app + base de datos fuera del harness completo:
+To test a real app + database case outside the full harness:
 
 ```bash
 cd /home/misael/Desktop/projects/gocracker
@@ -184,7 +192,7 @@ sudo env GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
   --wait
 ```
 
-En otra terminal:
+In another terminal:
 
 ```bash
 curl -fsS http://127.0.0.1:18081/health
@@ -194,16 +202,17 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 curl -fsS http://127.0.0.1:18081/api/todos
 ```
 
-Si el ultimo request devuelve el item creado, la app y PostgreSQL se hablaron bien dentro de la red Compose.
+If the last request returns the created item, the app and PostgreSQL are
+communicating correctly inside the Compose network.
 
-Notas operativas nuevas:
+New operational notes:
 
-- El cache compartido ahora vive por default en `/tmp/gocracker/cache`; si repites una corrida normal deberías ver `artifact cache hit`, `reusing cached disk`, y `reusing cached initrd` sin configuración extra.
-- Si quieres que la stack quede visible en la API, arranca `serve` y usa `compose --server http://127.0.0.1:8080`.
-- En `compose --server`, el netns/TAP y los published ports ahora quedan del lado de `serve`; el comando cliente puede terminar y los puertos siguen vivos mientras la stack siga arriba.
-- Los healthchecks Compose ahora corren dentro del guest via exec-agent, así que `CMD` y `CMD-SHELL` pueden usar binarios y scripts locales del contenedor en vez de depender de traducciones host-side.
-- `compose exec --server ...` solo necesita reachability al API server; no necesita IP guest, `ports: 22`, usuario ni claves.
-- Ejemplo real con `compose --server` + `compose exec`:
+- Shared cache now lives by default in `/tmp/gocracker/cache`; if you repeat a normal run you should see `artifact cache hit`, `reusing cached disk`, and `reusing cached initrd` without extra setup.
+- If you want the stack to remain visible in the API, start `serve` and use `compose --server http://127.0.0.1:8080`.
+- In `compose --server`, the netns/TAP and published ports now live on the `serve` side; the client command can exit and the ports remain alive while the stack stays up.
+- Compose healthchecks now run inside the guest through the exec agent, so `CMD` and `CMD-SHELL` can use container-local binaries and scripts instead of depending on host-side translations.
+- `compose exec --server ...` only needs reachability to the API server; it does not need a guest IP, `ports: 22`, a user, or SSH keys.
+- Real example with `compose --server` + `compose exec`:
 
 ```bash
 ./gocracker serve --addr :8080 --cache-dir /tmp/gocracker/cache
@@ -222,7 +231,7 @@ curl 'http://127.0.0.1:8080/vms?orchestrator=compose&stack=compose-exec&service=
   debug -- echo compose-exec-ok
 ```
 
-- Ejemplo real con `/run` + API exec:
+- Real example with `/run` + API exec:
 
 ```bash
 ./gocracker serve --addr :8080 --cache-dir /tmp/gocracker/cache
@@ -242,7 +251,7 @@ curl -fsS -X POST http://127.0.0.1:8080/vms/<vm-id>/exec \
   -d '{"command":["echo","api-exec-ok"]}'
 ```
 
-Para correr solo estos checks manuales:
+To run only these manual checks:
 
 ```bash
 sudo -v

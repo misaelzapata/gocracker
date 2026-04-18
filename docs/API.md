@@ -154,6 +154,13 @@ Request body fields: `image`, `dockerfile`, `context`, `vcpu_count`, `mem_mb`,
 `snapshot_dir`, `static_ip`, `gateway`, `network_mode`, `cache_dir`,
 `metadata`, `exec_enabled`, `balloon`, `memory_hotplug`, `wait`.
 
+**Permission**: `network_mode=auto` requires the `gocracker serve` process
+to hold root or `CAP_NET_ADMIN` (TAP devices cannot be created otherwise).
+The server probes this at startup and logs a warning; `/run` and `/clone`
+return **403** with an actionable message if the capability is missing.
+Run with `sudo` or `setcap cap_net_admin+ep ./gocracker` to enable it, or
+pre-create a TAP and pass explicit `tap_name` / `static_ip` / `gateway`.
+
 **`network_mode`** selects how the guest NIC is provisioned:
 - `""` / `"none"` — use `tap_name` / `static_ip` / `gateway` exactly as supplied
   (today's behaviour).
@@ -219,23 +226,49 @@ curl -s -X POST http://localhost:8080/vms/vm-abc123/resume -d '{}'
 ### POST /vms/{id}/clone -- In-place snapshot+restore
 
 Snapshots the source VM and restores it as a new VM on the same server in one
-atomic call. The source stays running. The clone gets a fresh ID and can
-override the restored network / virtiofs mounts / exec_enabled. Useful for
-sandbox-pool warm-starts without standing up a second `gocracker serve`.
+atomic call. The source stays running. The clone gets a fresh ID, a
+server-minted `tclone-<N>` tap (unique per clone), and, when
+`network_mode=auto` and `exec_enabled=true`, eth0 is re-addressed inside
+the guest post-restore so the clone has working outbound networking. Useful
+for sandbox-pool warm-starts without standing up a second `gocracker serve`.
 
 ```bash
 curl -s -X POST http://localhost:8080/vms/vm-abc123/clone \
+  -H 'Content-Type: application/json' \
   -d '{
     "exec_enabled": true,
-    "mounts": [{"source":"/opt/toolbox","target":"/opt/gc","backend":"virtiofs"}]
+    "network_mode": "auto"
   }'
 ```
 
-Fields: `snapshot_dir` (optional, set to persist the snapshot), `tap_name` /
-`static_ip` / `gateway` / `network_mode`, `mounts` (virtiofs-only on restore),
-`exec_enabled`, `metadata`, `wait` (default true). Response mirrors `/run`
-with `restored_from_snapshot=true`. Metadata key `cloned_from` on the new VM
-points back at the source.
+Response:
+
+```json
+{
+  "id": "gc-49501",
+  "state": "running",
+  "message": "cloned from vm-abc123",
+  "tap_name": "tclone-49501",
+  "guest_ip": "198.18.137.2",
+  "gateway": "198.18.137.1",
+  "network_mode": "auto",
+  "restored_from_snapshot": true
+}
+```
+
+Fields: `snapshot_dir` (optional; if set, the snapshot persists at that
+path and can later be restored via `/run snapshot_dir=…`), `tap_name` /
+`static_ip` / `gateway` (explicit network override, mutually exclusive with
+`network_mode=auto`), `network_mode` (`"auto"` requires `exec_enabled=true`
+so the clone can re-IP), `exec_enabled`, `metadata`. Metadata key
+`cloned_from` on the new VM points back at the source.
+
+**Virtio-fs mounts on the source**: `/clone` returns 400 if the source VM
+holds live virtio-fs mounts (`shared_fs` entries). The Linux virtio-fs
+driver's in-flight queue state cannot currently be migrated to a fresh
+virtiofsd, so the endpoint refuses rather than silently hang. Workarounds:
+umount the virtio-fs target on the source before cloning, OR use virtio-blk
+(`drives`) for per-sandbox state instead of virtio-fs.
 
 ### POST /vms/{id}/snapshot -- Take snapshot
 

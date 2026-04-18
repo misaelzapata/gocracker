@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"expvar"
 	"fmt"
 	"io"
 	"net"
@@ -22,10 +23,22 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/gocracker/gocracker/internal/firecrackerapi"
 	"github.com/gocracker/gocracker/internal/guestexec"
+	"github.com/gocracker/gocracker/internal/hostguard"
 	gclog "github.com/gocracker/gocracker/internal/log"
 	"github.com/gocracker/gocracker/internal/stacknet"
 	"github.com/gocracker/gocracker/pkg/container"
 	"github.com/gocracker/gocracker/pkg/vmm"
+)
+
+// Per-phase cold-start latency expvars. Each counter accumulates milliseconds
+// and a paired _count so callers can compute means. Read via GET /debug/vars.
+var (
+	coldPhaseOrchestrationMsSum = expvar.NewInt("cold_phase_orchestration_ms_sum")
+	coldPhaseVMMSetupMsSum      = expvar.NewInt("cold_phase_vmm_setup_ms_sum")
+	coldPhaseKernelBootMsSum    = expvar.NewInt("cold_phase_kernel_boot_ms_sum")
+	coldPhaseFirstOutputMsSum   = expvar.NewInt("cold_phase_first_output_ms_sum")
+	coldPhaseTotalMsSum         = expvar.NewInt("cold_phase_total_ms_sum")
+	coldPhaseCount              = expvar.NewInt("cold_phase_count")
 )
 
 // Server is the gocracker API server. Manages multiple VM instances.
@@ -138,7 +151,7 @@ type NetworkInterface struct {
 	IfaceID       string                 `json:"iface_id"`
 	HostDevName   string                 `json:"host_dev_name"`
 	GuestMAC      string                 `json:"guest_mac,omitempty"`
-	RateLimiter   *vmm.RateLimiterConfig `json:"rate_limiter,omitempty"`     // legacy: applied to both RX and TX
+	RateLimiter   *vmm.RateLimiterConfig `json:"rate_limiter,omitempty"`    // legacy: applied to both RX and TX
 	RxRateLimiter *vmm.RateLimiterConfig `json:"rx_rate_limiter,omitempty"` // Firecracker-parity: host→guest only
 	TxRateLimiter *vmm.RateLimiterConfig `json:"tx_rate_limiter,omitempty"` // Firecracker-parity: guest→host only
 }
@@ -389,6 +402,14 @@ func NewWithOptions(opts Options) *Server {
 		})
 	})
 
+	// Expvar debug endpoint — surfaces per-phase cold-start latency counters.
+	r.Get("/debug/vars", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		expvar.Do(func(kv expvar.KeyValue) {})
+		expvarHandler := expvar.Handler()
+		expvarHandler.ServeHTTP(w, r)
+	})
+
 	// ---- Firecracker-compatible endpoints ----
 	r.Get("/", s.handleInstanceInfo)
 	r.Put("/boot-source", s.handleBootSource)
@@ -431,6 +452,7 @@ func NewWithOptions(opts Options) *Server {
 	r.Get("/vms/{id}/logs", s.handleVMLogs)
 	r.Post("/vms/{id}/exec", s.handleVMExec)
 	r.Post("/vms/{id}/exec/stream", s.handleVMExecStream)
+	r.Post("/vms/{id}/exec/stream/resize", s.handleVMExecStreamResize)
 	r.Get("/vms/{id}/vsock/connect", s.handleVMVsockConnect)
 	r.Put("/vms/{id}/rate-limiters/net", s.handleVMNetRateLimiter)
 	r.Put("/vms/{id}/rate-limiters/block", s.handleVMBlockRateLimiter)
@@ -979,7 +1001,11 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, 400, "kernel_path is required")
 		return
 	}
-	if req.Image == "" && req.Dockerfile == "" {
+	// When restoring from a snapshot the rootfs is already baked in, so
+	// image/dockerfile are not needed for the build step. Only require one
+	// of them when snapshot_dir is absent.
+	restoringFromSnapshot := strings.TrimSpace(req.SnapshotDir) != ""
+	if !restoringFromSnapshot && req.Image == "" && req.Dockerfile == "" {
 		apiErr(w, 400, "exactly one of image or dockerfile is required")
 		return
 	}
@@ -991,7 +1017,9 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Dockerfile != "" {
+	// Only validate the dockerfile path when we are actually going to build
+	// from it (i.e., no snapshot_dir — snapshot restores ignore the dockerfile).
+	if req.Dockerfile != "" && !restoringFromSnapshot {
 		if err := s.validateWorkPathForServer(req.Dockerfile, "dockerfile"); err != nil {
 			apiErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -1005,7 +1033,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if strings.TrimSpace(req.SnapshotDir) != "" {
+	if restoringFromSnapshot {
 		if err := s.validateSnapshotPathForServer(req.SnapshotDir, true); err != nil {
 			apiErr(w, http.StatusBadRequest, err.Error())
 			return
@@ -1043,6 +1071,10 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateNetworkMode(req.NetworkMode, req.StaticIP, req.Gateway); err != nil {
 		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if normalizeNetworkMode(req.NetworkMode) == container.NetworkModeAuto && !hostguard.HasNetAdmin() {
+		apiErr(w, http.StatusForbidden, "network_mode=auto requires the gocracker serve process to have root or CAP_NET_ADMIN (TAP creation fails otherwise). Run with sudo, `setcap cap_net_admin+ep` on the binary, or pre-create a TAP and pass tap_name/static_ip/gateway explicitly.")
 		return
 	}
 
@@ -1168,6 +1200,19 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			apiErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		// Update per-phase expvar counters for cold-start profiling.
+		// Only record on a fresh boot (not a snapshot restore) so the
+		// counters reflect real kernel-boot latency.
+		// These are read by tools/bench-cold-start.sh via GET /debug/vars.
+		if opts.SnapshotDir == "" {
+			t := result.Timings
+			coldPhaseOrchestrationMsSum.Add(t.Orchestration.Milliseconds())
+			coldPhaseVMMSetupMsSum.Add(t.VMMSetup.Milliseconds())
+			coldPhaseKernelBootMsSum.Add(t.Start.Milliseconds())
+			coldPhaseFirstOutputMsSum.Add(t.GuestFirstOutput.Milliseconds())
+			coldPhaseTotalMsSum.Add(t.Total.Milliseconds())
+			coldPhaseCount.Add(1)
+		}
 		if err := s.attachComposeStackResources(id, opts, result); err != nil {
 			gclog.API.Error("compose network attach failed", "id", id, "error", err)
 			result.VM.Stop()
@@ -1187,6 +1232,11 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			"network_mode": opts.NetworkMode,
 		})
 		s.registerVMEntry(result.ID, entry)
+		if strings.TrimSpace(opts.SnapshotDir) != "" && opts.NetworkMode == container.NetworkModeAuto && req.ExecEnabled {
+			if err := s.execGuestReIP(result.ID, result.GuestIP, result.Gateway); err != nil {
+				gclog.API.Warn("post-restore re-IP failed", "id", result.ID, "error", err)
+			}
+		}
 		json.NewEncoder(w).Encode(RunResponse{
 			ID:                   result.ID,
 			State:                "running",
@@ -1227,6 +1277,11 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			"network_mode": opts.NetworkMode,
 		})
 		s.registerVMEntry(result.ID, entry)
+		if strings.TrimSpace(opts.SnapshotDir) != "" && opts.NetworkMode == container.NetworkModeAuto && req.ExecEnabled {
+			if err := s.execGuestReIP(result.ID, result.GuestIP, result.Gateway); err != nil {
+				gclog.API.Warn("post-restore re-IP failed (async)", "id", result.ID, "error", err)
+			}
+		}
 	}()
 
 	s.registerVMEntry(id, newPendingVMEntry(id, opts))
@@ -2171,6 +2226,10 @@ func (s *Server) handleVMClone(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if normalizeNetworkMode(req.NetworkMode) == container.NetworkModeAuto && !hostguard.HasNetAdmin() {
+		apiErr(w, http.StatusForbidden, "network_mode=auto requires the gocracker serve process to have root or CAP_NET_ADMIN (TAP creation fails otherwise). Run with sudo, `setcap cap_net_admin+ep` on the binary, or override tap_name/static_ip/gateway explicitly.")
+		return
+	}
 
 	s.mu.RLock()
 	src, ok := s.vms[srcID]
@@ -2320,17 +2379,35 @@ func (s *Server) execGuestReIP(id, guestIP, gateway string) error {
 	if !strings.Contains(cidr, "/") {
 		cidr = guestIP + "/30"
 	}
-	script := fmt.Sprintf(`set -e
-if ! command -v ip >/dev/null 2>&1; then exit 0; fi
-ip link set eth0 down 2>/dev/null || true
-ip addr flush dev eth0 2>/dev/null || true
-ip addr add %s dev eth0
-ip link set eth0 up
-ip route replace default via %s
+	gclog.API.Info("[DBG-REIP] starting re-IP", "id", id, "cidr", cidr, "gw", gateway)
+	// Do NOT bring eth0 down/up. After snapshot restore the virtio-net
+	// driver is already live; triggering a link-down/up causes the driver
+	// to re-negotiate features with the host device, which blocks
+	// indefinitely until the host virtio-net backend is ready to respond.
+	// Flushing and re-adding the address while the link stays UP is
+	// sufficient: the IP is an L3 label, the TAP/MAC is unchanged.
+	//
+	// Run the ip commands inside a detached background subshell so the
+	// exec agent returns immediately. On some snapshot restores the
+	// virtio-net TX ring is momentarily stalled (pending descriptors from
+	// the snapshot's final network activity haven't been ack'd yet).
+	// When that happens, `ip addr add` blocks indefinitely because the
+	// kernel's GARP goes through the TX ring. busybox `timeout` is no
+	// help: it sends SIGTERM, which a D-state process ignores, so timeout
+	// itself also hangs in wait(). The background approach decouples the
+	// exec-agent RPC from the TX-ring drain — the IP is assigned once the
+	// kernel resumes (typically sub-second), while WaitForExecReady can
+	// proceed immediately.
+	script := fmt.Sprintf(`
+command -v ip >/dev/null 2>&1 || exit 0
+(
+  ip addr flush dev eth0 2>/dev/null || true
+  ip addr add %s dev eth0 2>/dev/null || true
+  ip route replace default via %s 2>/dev/null || true
+) &
 `, cidr, gateway)
 	return s.execGuestScript(id, script)
 }
-
 
 // execGuestScript runs a shell script inside the guest synchronously via the
 // exec agent. Retries the vsock dial with exponential backoff up to 30 s:
@@ -2341,6 +2418,8 @@ ip route replace default via %s
 // remaining RPC shares the outer deadline so slow dials don't collapse
 // the I/O budget to nothing.
 func (s *Server) execGuestScript(id, script string) error {
+	scriptStart := time.Now()
+	gclog.API.Info("[DBG-SCRIPT] enter", "id", id, "scriptLen", len(script))
 	s.mu.RLock()
 	v, ok := s.vms[id]
 	s.mu.RUnlock()
@@ -2368,13 +2447,18 @@ func (s *Server) execGuestScript(id, script string) error {
 	deadline := time.Now().Add(30 * time.Second)
 	backoff := 25 * time.Millisecond
 	const maxBackoff = 500 * time.Millisecond
+	attemptN := 0
 	for {
+		attemptN++
+		gclog.API.Debug("exec agent acquire attempt", "id", id, "attempt", attemptN, "elapsed_ms", time.Since(deadline.Add(-30*time.Second)).Milliseconds())
 		c, err := dialer.DialVsock(port)
 		if err == nil {
+			gclog.API.Debug("exec agent acquire success", "id", id, "attempt", attemptN, "elapsed_ms", time.Since(deadline.Add(-30*time.Second)).Milliseconds())
 			conn = c
 			break
 		}
 		lastErr = err
+		gclog.API.Debug("exec agent acquire failed", "id", id, "attempt", attemptN, "err", err, "elapsed_ms", time.Since(deadline.Add(-30*time.Second)).Milliseconds())
 		if time.Now().After(deadline) {
 			return fmt.Errorf("dial exec agent after %s: %w", 30*time.Second, lastErr)
 		}
@@ -2394,6 +2478,7 @@ func (s *Server) execGuestScript(id, script string) error {
 	if remaining := time.Until(deadline); remaining < 2*time.Second {
 		rpcDeadline = time.Now().Add(2 * time.Second)
 	}
+	gclog.API.Info("[DBG-SCRIPT] conn acquired, setting deadline", "id", id, "rpcDeadline_s", time.Until(rpcDeadline).Seconds(), "elapsed_ms", time.Since(scriptStart).Milliseconds())
 	if err := conn.SetDeadline(rpcDeadline); err != nil {
 		return err
 	}
@@ -2401,13 +2486,17 @@ func (s *Server) execGuestScript(id, script string) error {
 		Mode:    guestexec.ModeExec,
 		Command: []string{"/bin/sh", "-lc", script},
 	}
+	gclog.API.Info("[DBG-SCRIPT] about to Encode request", "id", id, "elapsed_ms", time.Since(scriptStart).Milliseconds())
 	if err := guestexec.Encode(conn, req); err != nil {
 		return fmt.Errorf("write exec request: %w", err)
 	}
+	gclog.API.Info("[DBG-SCRIPT] Encode done, about to Decode response", "id", id, "elapsed_ms", time.Since(scriptStart).Milliseconds())
 	var resp guestexec.Response
 	if err := guestexec.Decode(conn, &resp); err != nil {
+		gclog.API.Error("[DBG-SCRIPT] Decode FAILED", "id", id, "err", err, "elapsed_ms", time.Since(scriptStart).Milliseconds())
 		return fmt.Errorf("read exec response: %w", err)
 	}
+	gclog.API.Info("[DBG-SCRIPT] Decode done OK", "id", id, "resp_ok", resp.OK, "exit", resp.ExitCode, "stdout", resp.Stdout, "stderr", resp.Stderr, "elapsed_ms", time.Since(scriptStart).Milliseconds())
 	if !resp.OK {
 		return fmt.Errorf("exec failed: %s", resp.Error)
 	}

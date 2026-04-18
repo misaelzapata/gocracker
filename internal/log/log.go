@@ -40,12 +40,18 @@ func init() {
 // Init configures the global slog default and all component loggers.
 // If json is true, output is JSON (for API/daemon mode);
 // otherwise Firecracker-style colored text.
+//
+// Default level is INFO. Set GOCRACKER_LOG=debug to enable debug output.
 func Init(json bool) {
+	level := slog.LevelInfo
+	if os.Getenv("GOCRACKER_LOG") == "debug" {
+		level = slog.LevelDebug
+	}
 	var handler slog.Handler
 	if json {
-		handler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+		handler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level})
 	} else {
-		handler = &cliHandler{w: os.Stderr, level: slog.LevelDebug}
+		handler = &cliHandler{w: os.Stderr, level: level}
 	}
 	slog.SetDefault(slog.New(handler))
 

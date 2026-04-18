@@ -14,6 +14,11 @@ const (
 	ModeMemoryStats = "memory_stats"
 	ModeMemoryHotplugGet    = "memory_hotplug_get"
 	ModeMemoryHotplugUpdate = "memory_hotplug_update"
+	// ModeResize applies TIOCSWINSZ to the currently active PTY master inside
+	// the guest. The host sends this via a short-lived separate vsock connection
+	// when the user resizes the terminal window mid-session. Columns and Rows
+	// from the Request are used; Command is not required.
+	ModeResize = "resize"
 )
 
 type Config struct {
@@ -71,6 +76,11 @@ func (r Request) Validate() error {
 		}
 		if r.MemoryHotplugTotalBytes == 0 {
 			return fmt.Errorf("memory_hotplug_total_bytes is required")
+		}
+		return nil
+	case ModeResize:
+		if r.Columns <= 0 || r.Rows <= 0 {
+			return fmt.Errorf("resize requires columns > 0 and rows > 0")
 		}
 		return nil
 	default:

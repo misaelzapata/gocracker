@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -81,7 +82,7 @@ func TestRunExecCommand(t *testing.T) {
 		}),
 	}
 
-	resp, err := runExecCommand(entry, ExecRequest{Command: []string{"echo", "ok"}, Env: []string{"A=B"}, WorkDir: "/tmp"})
+	resp, err := runExecCommand(context.Background(), entry, ExecRequest{Command: []string{"echo", "ok"}, Env: []string{"A=B"}, WorkDir: "/tmp"})
 	if err != nil {
 		t.Fatalf("runExecCommand() error = %v", err)
 	}
@@ -98,7 +99,7 @@ func TestRunExecCommandGuestError(t *testing.T) {
 			_ = guestexec.Encode(conn, guestexec.Response{Error: "guest failed"})
 		}),
 	}
-	if _, err := runExecCommand(entry, ExecRequest{Command: []string{"false"}}); err == nil || err.Error() != "guest failed" {
+	if _, err := runExecCommand(context.Background(), entry, ExecRequest{Command: []string{"false"}}); err == nil || err.Error() != "guest failed" {
 		t.Fatalf("runExecCommand() err = %v", err)
 	}
 }

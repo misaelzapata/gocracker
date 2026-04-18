@@ -4,7 +4,6 @@ package vmm
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"time"
 	"unsafe"
@@ -13,8 +12,8 @@ import (
 	"github.com/gocracker/gocracker/internal/fdt"
 	"github.com/gocracker/gocracker/internal/kvm"
 	"github.com/gocracker/gocracker/internal/loader"
-	"github.com/gocracker/gocracker/internal/rtc"
 	gclog "github.com/gocracker/gocracker/internal/log"
+	"github.com/gocracker/gocracker/internal/rtc"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
 	"github.com/gocracker/gocracker/internal/uart"
 	"github.com/gocracker/gocracker/internal/virtio"
@@ -186,12 +185,8 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 		if err != nil {
 			return fmt.Errorf("virtio-vsock eventfd: %w", err)
 		}
-		var listenFn func(uint32) (net.Conn, error)
-		if vm.cfg.Exec != nil && vm.cfg.Exec.Enabled {
-			vm.execBroker = newExecAgentBroker(vm.cfg.Exec.VsockPort)
-			listenFn = vm.execBroker.listen
-		}
-		vsockDev := vsock.NewDevice(mem, base, irq, listenFn, vm.memDirty, irqFn)
+		vsockDev := vsock.NewDevice(mem, base, irq, nil, vm.memDirty, irqFn)
+		vsockDev.Label = vm.cfg.ID
 		vm.vsockDev = vsockDev
 		vm.transports = append(vm.transports, vsockDev.Transport)
 		slot++

@@ -22,7 +22,7 @@ import (
 
 // embeddedInitSentinel forces rebuilds of the guest package when the embedded
 // init payload is regenerated out-of-band via go:generate.
-const embeddedInitSentinel = "2026-04-09T18:35:00-03:00"
+const embeddedInitSentinel = "2026-04-16T17:37:00-03:00"
 
 const moduleManifestPath = "/etc/gocracker/modules.list"
 

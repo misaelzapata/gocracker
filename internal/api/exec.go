@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,7 +30,7 @@ func (s *Server) handleVMExec(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, http.StatusNotFound, "VM not found")
 		return
 	}
-	resp, err := runExecCommand(entry, req)
+	resp, err := runExecCommand(r.Context(), entry, req)
 	if err != nil {
 		apiErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -111,6 +112,51 @@ func (s *Server) handleVMExecStream(w http.ResponseWriter, r *http.Request) {
 	go proxyExecStream(clientConn, agentConn)
 }
 
+func (s *Server) handleVMExecStreamResize(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var body struct {
+		Columns int `json:"columns"`
+		Rows    int `json:"rows"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		apiErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if body.Columns <= 0 || body.Rows <= 0 {
+		apiErr(w, http.StatusBadRequest, "columns and rows must be > 0")
+		return
+	}
+	entry, ok := s.lookupVMEntry(id)
+	if !ok {
+		apiErr(w, http.StatusNotFound, "VM not found")
+		return
+	}
+	conn, err := newExecAgentConn(entry)
+	if err != nil {
+		apiErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	defer conn.Close()
+	if err := guestexec.Encode(conn, guestexec.Request{
+		Mode:    guestexec.ModeResize,
+		Columns: body.Columns,
+		Rows:    body.Rows,
+	}); err != nil {
+		apiErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	var resp guestexec.Response
+	if err := guestexec.Decode(conn, &resp); err != nil {
+		apiErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if resp.Error != "" {
+		apiErr(w, http.StatusBadGateway, resp.Error)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) lookupVMEntry(id string) (*vmEntry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -118,12 +164,20 @@ func (s *Server) lookupVMEntry(id string) (*vmEntry, bool) {
 	return entry, ok
 }
 
-func runExecCommand(entry *vmEntry, req ExecRequest) (ExecResponse, error) {
+func runExecCommand(ctx context.Context, entry *vmEntry, req ExecRequest) (ExecResponse, error) {
 	conn, err := newExecAgentConn(entry)
 	if err != nil {
 		return ExecResponse{}, err
 	}
 	defer conn.Close()
+
+	// Close the vsock connection when the caller's context is cancelled (e.g.
+	// the HTTP client disconnected). Without this, server-side goroutines pile
+	// up blocked in guestexec.Decode while holding references into guest RAM;
+	// when the VM is later stopped and guest memory is unmapped, those goroutines
+	// cause a SIGSEGV in the virtio queue reader.
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
 
 	if err := guestexec.Encode(conn, guestexec.Request{
 		Mode:    guestexec.ModeExec,

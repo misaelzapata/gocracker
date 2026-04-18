@@ -1,6 +1,7 @@
 package hostnet
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/vishvananda/netlink"
 )
@@ -160,8 +162,8 @@ func (n *AutoNetwork) enableIPv4Forwarding() error {
 func (n *AutoNetwork) addFirewallRules() error {
 	rules := [][]string{
 		{"-t", "nat", "-A", "POSTROUTING", "-o", n.upstreamIfName, "-s", n.GuestIP(), "-j", "MASQUERADE"},
-		{"-A", "FORWARD", "-i", n.tapName, "-o", n.upstreamIfName, "-j", "ACCEPT"},
-		{"-A", "FORWARD", "-i", n.upstreamIfName, "-o", n.tapName, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
+		{"-I", "FORWARD", "1", "-i", n.tapName, "-o", n.upstreamIfName, "-j", "ACCEPT"},
+		{"-I", "FORWARD", "1", "-i", n.upstreamIfName, "-o", n.tapName, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
 	}
 	for _, rule := range rules {
 		if err := n.runIPTables(rule...); err != nil {
@@ -245,7 +247,19 @@ func runIP(args ...string) error {
 }
 
 func selectAutoSubnet(project string) (*net.IPNet, error) {
-	occupied, err := occupiedIPv4Networks()
+	// Retry up to 10 times on ErrDumpInterrupted: the kernel returns this when
+	// a concurrent route-table modification races with our netlink dump. A
+	// short backoff (2ms, 4ms, 8ms, …) is enough to let the other writer
+	// finish. 10 attempts (max ~1s cumulative wait) handles heavy concurrency.
+	var occupied []*net.IPNet
+	var err error
+	for attempt := range 10 {
+		occupied, err = occupiedIPv4Networks()
+		if err == nil || !errors.Is(err, netlink.ErrDumpInterrupted) {
+			break
+		}
+		time.Sleep(time.Duration(2<<attempt) * time.Millisecond) // 2,4,8,16,32,64,128,256,512,1024 ms
+	}
 	if err != nil {
 		return nil, fmt.Errorf("list occupied networks: %w", err)
 	}
