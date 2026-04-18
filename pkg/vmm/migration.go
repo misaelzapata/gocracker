@@ -569,6 +569,15 @@ func copyFile(dst, src string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
+	// Try hardlink first: instant, zero extra space, works when src/dst are
+	// on the same filesystem (which is always true for /tmp-to-/tmp copies in
+	// the warmcache path). Snapshot assets are read-only after bundling so
+	// sharing an inode with the original is safe. Falls back on EXDEV (cross
+	// filesystem) or other errors.
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -581,12 +590,8 @@ func copyFile(dst, src string) error {
 	}
 	defer out.Close()
 
-	// Try FICLONE first: on btrfs/xfs/overlayfs this creates a reflink —
-	// a copy-on-write clone that completes in microseconds instead of
-	// streaming every byte. Matters a lot when snapshotting a VM with a
-	// multi-GB disk.ext4: 1 GB io.Copy is ~1 s on NVMe; FICLONE is ~200 µs.
-	// Falls back to io.Copy if the filesystem doesn't support it (ext4,
-	// tmpfs, cross-fs copies).
+	// Try FICLONE: on btrfs/xfs/overlayfs creates a reflink (COW clone,
+	// microseconds). Falls back to io.Copy on ext4/tmpfs.
 	if err := unix.IoctlFileClone(int(out.Fd()), int(in.Fd())); err == nil {
 		return out.Sync()
 	}

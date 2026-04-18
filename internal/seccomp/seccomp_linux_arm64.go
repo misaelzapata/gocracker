@@ -235,6 +235,8 @@ func fileSyscalls() []uintptr {
 		unix.SYS_RENAMEAT,
 		unix.SYS_RENAMEAT2,
 		unix.SYS_SYNCFS,
+		unix.SYS_COPY_FILE_RANGE,
+		unix.SYS_LINKAT,
 	}
 }
 

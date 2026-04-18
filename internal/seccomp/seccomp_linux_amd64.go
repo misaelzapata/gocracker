@@ -242,6 +242,8 @@ func fileSyscalls() []uintptr {
 		// copy_file_range: used by Go's io.Copy when both args are *os.File.
 		// Required for snapshot bundling (kernel/initrd/disk copy inside worker).
 		unix.SYS_COPY_FILE_RANGE,
+		// linkat: used by os.Link for hardlink-based snapshot asset bundling.
+		unix.SYS_LINKAT,
 	}
 }
 

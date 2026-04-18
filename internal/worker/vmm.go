@@ -1263,6 +1263,12 @@ func copyTree(srcDir, dstDir string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
 			}
+			// Hardlink first: instant and zero-copy on same filesystem.
+			// Snapshot assets are read-only after bundling so sharing an
+			// inode is safe. Falls back to full read/write copy on EXDEV.
+			if err := os.Link(path, target); err == nil {
+				return nil
+			}
 			data, err := os.ReadFile(path)
 			if err != nil {
 				return err
