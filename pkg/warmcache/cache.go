@@ -43,6 +43,7 @@ type KeyInput struct {
 	MemMB       uint64
 	VCPUs       int
 	Arch        string // "amd64" | "arm64"
+	NetworkMode string // "" (none) | "auto" — affects virtio-net presence in snapshot
 }
 
 // Key returns the canonical hex SHA-256 of the input. Two KeyInputs with
@@ -56,6 +57,7 @@ func Key(in KeyInput) string {
 		fmt.Sprintf("mem=%d", in.MemMB),
 		fmt.Sprintf("vcpus=%d", in.VCPUs),
 		"arch=" + in.Arch,
+		"net=" + in.NetworkMode,
 	}
 	sort.Strings(parts)
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))

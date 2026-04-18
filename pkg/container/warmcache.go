@@ -67,6 +67,7 @@ func computeWarmCacheKey(opts RunOptions) (string, bool) {
 		MemMB:       opts.MemMB,
 		VCPUs:       opts.CPUs,
 		Arch:        opts.Arch,
+		NetworkMode: opts.NetworkMode,
 	}), true
 }
 
