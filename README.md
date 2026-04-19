@@ -485,6 +485,19 @@ Measured on `a1.metal` Graviton, Ubuntu 24.04, Alpine 3.20 guest, `--net auto --
 
 Cold-boot time here is dominated by OCI pull + ext4 build (~3 s for the alpine rootfs); the actual kernel-to-init boot is ~150 ms. Warm restore stays ~linear in vCPU count because VGIC state is O(vCPU) (one redistributor frame + 9 ICC sysregs each).
 
+### Per-primitive RTT benchmark ([tools/bench-rtt](tools/bench-rtt/main.go))
+
+Unlike the end-to-end TTI and snapshot-resume benchmarks above, `bench-rtt` isolates each primitive on the warm-cache hot path so a regression can be attributed to a specific code path. Measured on a Ryzen AI 9 HX 370 laptop, N=50 iterations after 3 warmups:
+
+| primitive | p50 | p90 | max | notes |
+|---|---:|---:|---:|---|
+| pause (`vm.Pause()`) | **10.3 ms** | 10.7 ms | 20.3 ms | floor is the 10 ms `time.Sleep` polling loop inside `(*VM).Pause()` — an architectural cost, not measurement noise. |
+| resume (`vm.Resume()`) | **<1 µs** | <4 µs | 55 µs | near-instant — no vCPU state round-trip. |
+| snapshot capture (`vm.TakeSnapshot()`) | **174 ms** | 240 ms | 1102 ms | max is a first-iteration outlier (dirty-bitmap cold start). |
+| snapshot restore (`vmm.RestoreFromSnapshotWithOptions → vm.Start`) | **1.44 ms** | 3.26 ms | 7.81 ms | consistent with the Firecracker-parity snapshot-resume RTT above. |
+| warmcache lookup hit | **3.6 µs** | 4.9 µs | 20 µs | `pkg/warmcache.Lookup()` — hashes + stats the snapshot dir. |
+| warmcache lookup miss | **1.2 µs** | 1.8 µs | 4 µs | early-out when the directory does not exist. |
+
 ### Reproducing
 
 ```bash
@@ -492,6 +505,13 @@ make build
 ./tools/bench-node-tti.sh               # 10 cold-boot TTI runs (default)
 ./tools/bench-node-tti.sh 50            # 50 runs
 GC_KERNEL=/path/to/vmlinux ./tools/bench-node-tti.sh
+
+# Per-primitive RTT — isolates pause, snapshot capture/restore, warmcache
+# lookup. Useful for regression-hunting after touching pkg/vmm or pkg/container.
+sudo go run ./tools/bench-rtt \
+  -image alpine:3.20 \
+  -kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux \
+  -iter 50 -warmups 3 -output /tmp/bench-rtt.json
 ```
 
 First run pulls `node:20-alpine` and builds the ext4 disk (~10–30 s). Every subsequent run hits the cache and measures only the boot path.
