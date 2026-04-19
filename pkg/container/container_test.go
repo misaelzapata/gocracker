@@ -1816,11 +1816,15 @@ func TestWaitFirstOutput_Timeout(t *testing.T) {
 
 func TestWaitFirstOutput_NegativeDuration(t *testing.T) {
 	startedAt := time.Now()
-	// firstOutputAt is before startedAt
+	// firstOutputAt is before startedAt — common on ARM64 where the guest
+	// writes its first UART byte before vm.Start() returns. waitFirstOutput
+	// returns time.Microsecond (rather than the sentinel 0) so the metric
+	// is not confused with "no output received"; the test verifies output
+	// was recorded as ~instant, not that it returned literal zero.
 	h := &mockHandle{firstOutputAt: startedAt.Add(-100 * time.Millisecond)}
 	d := waitFirstOutput(h, startedAt, time.Second)
-	if d != 0 {
-		t.Fatalf("waitFirstOutput with negative duration = %v, want 0", d)
+	if d != time.Microsecond {
+		t.Fatalf("waitFirstOutput with negative duration = %v, want %v", d, time.Microsecond)
 	}
 }
 

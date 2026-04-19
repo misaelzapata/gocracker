@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -195,12 +196,24 @@ func TestNewMachineArchBackendAMD64(t *testing.T) {
 }
 
 func TestNewMachineArchBackendARM64Supported(t *testing.T) {
+	// The arm64 backend is registered via a package init() under
+	// //go:build arm64 — it only exists when the binary is compiled for
+	// aarch64. On an amd64 build (e.g. CI unit job), the factory is nil
+	// and newMachineArchBackend returns a "not available in this build"
+	// error. That is the correct cross-arch behaviour: tests assert the
+	// backend is available ONLY when the build target matches.
 	backend, err := newMachineArchBackend(ArchARM64)
-	if err != nil {
-		t.Fatalf("newMachineArchBackend(arm64) error = %v", err)
+	if runtime.GOARCH == "arm64" {
+		if err != nil {
+			t.Fatalf("newMachineArchBackend(arm64) on arm64 host error = %v", err)
+		}
+		if backend == nil {
+			t.Fatal("newMachineArchBackend(arm64) on arm64 host = nil, want backend")
+		}
+		return
 	}
-	if backend == nil {
-		t.Fatal("newMachineArchBackend(arm64) = nil, want backend")
+	if err == nil {
+		t.Fatalf("newMachineArchBackend(arm64) on %s build should error, got backend %#v", runtime.GOARCH, backend)
 	}
 }
 
