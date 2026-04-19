@@ -469,6 +469,22 @@ A ~0.3 ms p50 gap at the low end of the latency budget, from a pure-Go VMM again
 
 Both benches run with the VMM pinned to a dedicated CPU (`taskset`) and boosted to SCHED_FIFO (`chrt -r 50`), with `mlockall(MCL_CURRENT)` locking the VMM's working set. The snapshot path deliberately does NOT set `MCL_FUTURE` because that would eager-fault the `MAP_PRIVATE` memory snapshot and turn a ~2 ms lazy-COW restore into ~30 ms.
 
+### ARM64 warm-cache benchmark
+
+`gocracker run ... --warm` captures a snapshot on first run and restores from it on every subsequent run with identical parameters. The ARM64 port round-trips the full vCPU register set (including SP_EL1, ELR_EL1, SPSR[0], V0-V31 FPSIMD, FPSR/FPCR, MPState, KVM_REG_ARM_TIMER_*), plus the entire VGICv3 state (distributor + per-vCPU redistributor + ICC_* CPU sysregs, with IC-then-IS ordered writes), so multi-vCPU guests resume with IRQ delivery and scheduler state intact — not just vCPU 0.
+
+Measured on `a1.metal` Graviton, Ubuntu 24.04, Alpine 3.20 guest, `--net auto --cmd nproc`, wall-clock end-to-end and the pure `restoreFromSnapshot → vm.Start()` phase (from the `[container] restored duration=...` log):
+
+| vCPUs | cold boot | warm restore (total) | pure restore |
+|---:|---:|---:|---:|
+| 1 | 5.28 s | **293 ms** | 87 ms |
+| 2 | 5.31 s | **288 ms** | 82 ms |
+| 4 | 5.24 s | **310 ms** | 105 ms |
+| 8 | 5.28 s | **290 ms** | 96 ms |
+| 16 | 5.41 s | **330 ms** | 117 ms |
+
+Cold-boot time here is dominated by OCI pull + ext4 build (~3 s for the alpine rootfs); the actual kernel-to-init boot is ~150 ms. Warm restore stays ~linear in vCPU count because VGIC state is O(vCPU) (one redistributor frame + 9 ICC sysregs each).
+
 ### Reproducing
 
 ```bash

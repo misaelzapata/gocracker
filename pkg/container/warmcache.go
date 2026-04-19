@@ -93,18 +93,12 @@ func captureWarmSnapshot(handle vmm.Handle, opts RunOptions, key string) {
 	if _, hit := warmcache.Lookup(root, key); hit {
 		return
 	}
-	// Wait for the guest's exec agent to be ready. FirstOutputAt is set when
-	// the guest first writes to the serial console (~50ms); the exec agent
-	// starts listening on vsock ~100ms after that. Poll until first output
-	// is seen, then add a 150ms grace period. Total typical wait: ~200ms.
-	deadline := time.Now().Add(1500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if !handle.FirstOutputAt().IsZero() {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	time.Sleep(150 * time.Millisecond)
+	// Wait for the guest's exec agent to actually accept a vsock connection.
+	// This is the authoritative "VM is ready" signal: a successful dial proves
+	// the virtio-vsock driver probed, queues are ready, and AF_VSOCK listen is
+	// bound on 10022. FirstOutputAt is unreliable on ARM64 where the UART TX
+	// path may not be exercised early enough.
+	waitExecReady(handle, 5*time.Second)
 	if handle.State() != vmm.StateRunning {
 		return
 	}

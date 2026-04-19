@@ -1244,6 +1244,14 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	if err := m.archBackend.postCreateVCPUs(m); err != nil {
 		return nil, fmt.Errorf("post-create vcpus (restore): %w", err)
 	}
+	// Restore vCPU register state BEFORE VGIC state. On ARM64 with multi-
+	// vCPU (>=3), the VGIC per-vcpu CPU_SYSREGS (ICC_*) writes land on the
+	// ICC register shadows inside KVM which check validity against the
+	// vCPU's already-initialised ICC_SRE_EL1 / ICC_CTLR_EL1. Writing VGIC
+	// state first means those checks run against architectural reset
+	// defaults and partially succeed — leaving secondaries with an ICC
+	// interface whose SRE bit disagrees with the guest's view. Firecracker
+	// orders restore as: vcpu_fd.restore_state → vm.restore_state(gic).
 	for i, vcpu := range m.vcpus {
 		// restoreVCPU already swallows the expected kvmclock-ctrl EINVAL
 		// inline (arch_x86.go:96) and returns nil in that case. Doing a
@@ -1258,6 +1266,12 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		if err := m.archBackend.restoreVCPU(sys, kvmVM, vcpu, vcpuStates[i]); err != nil {
 			return nil, fmt.Errorf("restore vcpu %d: %w", i, err)
 		}
+	}
+	// VGIC state restored AFTER vCPU state — see note above.
+	// On x86 this is a no-op; IRQCHIP state was already applied in the
+	// earlier restoreVMState call.
+	if err := m.archBackend.restoreVMStatePostIRQ(m, snap.Arch); err != nil {
+		return nil, fmt.Errorf("restore vm arch state (post-irq): %w", err)
 	}
 
 	// Restore device state
@@ -2145,19 +2159,6 @@ func (m *VM) handleMMIO(vcpu *kvm.VCPU) {
 		base := t.BasePA()
 		if mmio.PhysAddr >= base && mmio.PhysAddr < base+VirtioStride {
 			offset := uint32(mmio.PhysAddr - base)
-			// Debug: track vsock MMIO for restored VMs
-			if m.vsockDev != nil && t == m.vsockDev.Transport {
-				if offset == 0x50 || offset == 0x60 || offset == 0x64 {
-					txQ := m.vsockDev.Transport.Queue(1)
-					txUsedFlags := uint16(0xFFFF)
-					txAvailFlags := uint16(0xFFFF)
-					if txQ != nil {
-						txUsedFlags, _ = txQ.UsedFlags()
-						txAvailFlags, _ = txQ.AvailFlags()
-					}
-					gclog.VMM.Debug("[DBG-MMIO] vsock MMIO", "id", m.cfg.ID, "offset", fmt.Sprintf("0x%x", offset), "isWrite", mmio.IsWrite, "txUsedFlags", txUsedFlags, "txAvailFlags", txAvailFlags)
-				}
-			}
 			if mmio.IsWrite == 1 {
 				t.WriteBytes(offset, mmio.Data[:mmio.Len])
 			} else {

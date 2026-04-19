@@ -178,6 +178,13 @@ func (x86MachineBackend) restoreVMState(kvmVM *kvm.VM, arch *SnapshotArchState) 
 	return restoreVMArchState(kvmVM, arch)
 }
 
+// restoreVMStatePostIRQ is a no-op on x86: the in-kernel IRQCHIP state was
+// already restored in restoreVMState (called before vCPU creation), and x86
+// has no device-attr-based IRQ controller that needs a post-creation phase.
+func (x86MachineBackend) restoreVMStatePostIRQ(_ *VM, _ *SnapshotArchState) error {
+	return nil
+}
+
 func (x86MachineBackend) handleExit(_ *VM, _ *kvm.VCPU) (handled bool, stop bool, err error) {
 	return false, false, nil
 }
