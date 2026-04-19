@@ -15,7 +15,8 @@ import (
 const (
 	kvmCreateDevice  = uintptr(0xC00CAEE0) // _IOWR(KVMIO, 0xE0, kvm_create_device)
 	kvmSetDeviceAttr = uintptr(0x4018AEE1) // _IOW(KVMIO, 0xE1, kvm_device_attr)
-	kvmGetDeviceAttr = uintptr(0xC018AEE2) // _IOWR(KVMIO, 0xE2, kvm_device_attr)
+	kvmGetDeviceAttr = uintptr(0x4018AEE2) // _IOW(KVMIO, 0xE2, kvm_device_attr)
+	kvmHasDeviceAttr = uintptr(0x4018AEE3) // _IOW(KVMIO, 0xE3, kvm_device_attr)
 )
 
 // GIC device types and attribute constants from Linux include/uapi/linux/kvm.h.
@@ -24,12 +25,25 @@ const (
 	kvmDevTypeArmVGICv3 = 7
 
 	// Attribute groups (shared between v2 and v3)
-	kvmDevArmVGICGrpAddr   = 0
-	kvmDevArmVGICGrpNrIRQs = 3
-	kvmDevArmVGICGrpCtrl   = 4
+	kvmDevArmVGICGrpAddr         = 0
+	kvmDevArmVGICGrpDistRegs     = 1  // GICv2 distributor / GICv3 distributor
+	kvmDevArmVGICGrpCPURegs      = 2  // GICv2 CPU interface (not used on v3)
+	kvmDevArmVGICGrpNrIRQs       = 3
+	kvmDevArmVGICGrpCtrl         = 4
+	kvmDevArmVGICGrpRedistRegs   = 5 // GICv3 redistributor registers
+	kvmDevArmVGICGrpCPUSysregs   = 6 // GICv3 ICC_* sysregs
+	kvmDevArmVGICGrpLevelInfo    = 7 // per-IRQ line level
 
 	// Control attributes
-	kvmDevArmVGICCtrlInit = 0
+	kvmDevArmVGICCtrlInit               = 0
+	kvmDevArmVGICSavePendingTables      = 1 // GICv3: flush redistributor pending tables to guest memory before save
+
+	// Attr encoding helpers — for DIST_REGS / REDIST_REGS / CPU_SYSREGS the
+	// "attr" u64 carries both the vCPU index (for per-vCPU regions) and the
+	// offset into that region. Matches KVM_DEV_ARM_VGIC_V3_MPIDR_SHIFT etc.
+	kvmDevArmVGICV3MPIDRShift = 32
+	kvmDevArmVGICV3MPIDRMask  = uint64(0xFFFFFFFF) << 32
+	kvmDevArmVGICOffsetMask   = uint64(0xFFFFFFFF)
 )
 
 type kvmCreateDeviceData struct {
@@ -205,6 +219,91 @@ func setDeviceAttr(fd int, group uint32, attr uint64, addrPtr unsafe.Pointer) er
 	}
 	return nil
 }
+
+func getDeviceAttr(fd int, group uint32, attr uint64, addrPtr unsafe.Pointer) error {
+	da := kvmDeviceAttr{
+		Group: group,
+		Attr:  attr,
+		Addr:  uint64(uintptr(addrPtr)),
+	}
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), kvmGetDeviceAttr, uintptr(unsafe.Pointer(&da)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// GetU32Attr reads a 32-bit GIC device attribute. Thin wrapper around
+// KVM_GET_DEVICE_ATTR for callers in the vmm package (GIC snapshot/restore).
+func (g *GICDevice) GetU32Attr(group uint32, attr uint64) (uint32, error) {
+	if g == nil || g.fd < 0 {
+		return 0, errors.New("GIC device is closed")
+	}
+	var v uint32
+	if err := getDeviceAttr(g.fd, group, attr, unsafe.Pointer(&v)); err != nil {
+		return 0, fmt.Errorf("KVM_GET_DEVICE_ATTR(group=%d,attr=%#x): %w", group, attr, err)
+	}
+	return v, nil
+}
+
+// SetU32Attr writes a 32-bit GIC device attribute.
+func (g *GICDevice) SetU32Attr(group uint32, attr uint64, value uint32) error {
+	if g == nil || g.fd < 0 {
+		return errors.New("GIC device is closed")
+	}
+	v := value
+	if err := setDeviceAttr(g.fd, group, attr, unsafe.Pointer(&v)); err != nil {
+		return fmt.Errorf("KVM_SET_DEVICE_ATTR(group=%d,attr=%#x): %w", group, attr, err)
+	}
+	return nil
+}
+
+// GetU64Attr reads a 64-bit GIC device attribute.
+func (g *GICDevice) GetU64Attr(group uint32, attr uint64) (uint64, error) {
+	if g == nil || g.fd < 0 {
+		return 0, errors.New("GIC device is closed")
+	}
+	var v uint64
+	if err := getDeviceAttr(g.fd, group, attr, unsafe.Pointer(&v)); err != nil {
+		return 0, fmt.Errorf("KVM_GET_DEVICE_ATTR(group=%d,attr=%#x): %w", group, attr, err)
+	}
+	return v, nil
+}
+
+// SetU64Attr writes a 64-bit GIC device attribute.
+func (g *GICDevice) SetU64Attr(group uint32, attr uint64, value uint64) error {
+	if g == nil || g.fd < 0 {
+		return errors.New("GIC device is closed")
+	}
+	v := value
+	if err := setDeviceAttr(g.fd, group, attr, unsafe.Pointer(&v)); err != nil {
+		return fmt.Errorf("KVM_SET_DEVICE_ATTR(group=%d,attr=%#x): %w", group, attr, err)
+	}
+	return nil
+}
+
+// CallCtrl invokes a control operation on the GIC device (e.g. flushing
+// pending tables to guest memory before snapshot).
+func (g *GICDevice) CallCtrl(attr uint64) error {
+	if g == nil || g.fd < 0 {
+		return errors.New("GIC device is closed")
+	}
+	if err := setDeviceAttr(g.fd, kvmDevArmVGICGrpCtrl, attr, nil); err != nil {
+		return fmt.Errorf("KVM_SET_DEVICE_ATTR(ctrl=%d): %w", attr, err)
+	}
+	return nil
+}
+
+// VGIC group/attribute constants re-exported for pkg/vmm snapshot code.
+const (
+	VGICGrpDistRegs          = kvmDevArmVGICGrpDistRegs
+	VGICGrpRedistRegs        = kvmDevArmVGICGrpRedistRegs
+	VGICGrpCPUSysregs        = kvmDevArmVGICGrpCPUSysregs
+	VGICGrpLevelInfo         = kvmDevArmVGICGrpLevelInfo
+	VGICCtrlSavePendingTable = kvmDevArmVGICSavePendingTables
+	VGICV3MPIDRShift         = kvmDevArmVGICV3MPIDRShift
+	VGICOffsetMask           = kvmDevArmVGICOffsetMask
+)
 
 func (g *GICDevice) Close() error {
 	if g.fd >= 0 {

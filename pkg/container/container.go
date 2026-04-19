@@ -161,8 +161,12 @@ const (
 	runtimeDiskRetention    = time.Minute
 	runArtifactCacheVersion = 2
 
-	// firstOutputWaitMax is how long to wait for the guest's first UART byte.
-	firstOutputWaitMax = 3 * time.Second
+	// firstOutputWaitMax is how long to wait for the guest's first UART byte
+	// (for the guest_first_output_ms metric). 500 ms is the upper-bound on
+	// ARM64 first-byte latency with our kernel; x86 comes in under 50 ms.
+	// Bounded short enough that a broken boot still reports "started" within
+	// half a second; not a gate on anything functional.
+	firstOutputWaitMax = 500 * time.Millisecond
 )
 
 // waitFirstOutput polls for the guest's first UART output, returning the
@@ -176,7 +180,10 @@ func waitFirstOutput(h vmm.Handle, startedAt time.Time, maxWait time.Duration) t
 		if at := h.FirstOutputAt(); !at.IsZero() {
 			d := at.Sub(startedAt)
 			if d < 0 {
-				return 0
+				// Guest wrote to the UART before vm.Start() returned — common on
+				// ARM64 where vCPU setup overlaps early kernel output. Report as
+				// ~instant instead of the sentinel zero.
+				return time.Microsecond
 			}
 			return d
 		}
@@ -359,6 +366,12 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 						return nil, fmt.Errorf("activate auto network on restore: %w", actErr)
 					}
 				}
+				// Re-fire the virtio-vsock queue IRQ before resuming: on ARM64
+				// the TRANSPORT_RESET event queued by QuiesceForSnapshot can be
+				// lost across the GIC reset, and without the kick the guest's
+				// vsock driver never drains the event — subsequent host dials
+				// to the exec agent time out because the guest never responds.
+				vm.KickVsockIRQ()
 				if err := vm.Start(); err != nil {
 					return nil, err
 				}
@@ -548,7 +561,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		MemoryHotplug:   cloneMemoryHotplugConfig(opts.MemoryHotplug),
 		ConsoleOut:      opts.ConsoleOut,
 		ConsoleIn:       opts.ConsoleIn,
-		TrackDirtyPages: warmCacheKeyLocal != "" && opts.WarmCapture,
+		TrackDirtyPages: warmCacheKeyLocal != "" && opts.WarmCapture && runtime.GOARCH != "arm64",
 	})
 	if err != nil {
 		if autoNet != nil {
@@ -905,7 +918,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		MemoryHotplug:   cloneMemoryHotplugConfig(opts.MemoryHotplug),
 		ConsoleOut:      opts.ConsoleOut,
 		ConsoleIn:       opts.ConsoleIn,
-		TrackDirtyPages: warmCacheKey != "" && opts.WarmCapture,
+		TrackDirtyPages: warmCacheKey != "" && opts.WarmCapture && runtime.GOARCH != "arm64",
 	}, worker.VMMOptions{
 		JailerBinary: opts.JailerBinary,
 		VMMBinary:    opts.VMMBinary,

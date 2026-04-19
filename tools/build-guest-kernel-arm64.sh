@@ -108,8 +108,11 @@ detect_source_dir() {
 
 source_tree_complete() {
   local dir="$1"
+  # Headers-only packages have arch/arm64/Makefile but lack actual C source.
+  # Require kernel/fork.c as proof we have the full tree.
   [[ -f "$dir/scripts/Makefile.extrawarn" ]] &&
-    [[ -f "$dir/arch/arm64/Makefile" ]]
+    [[ -f "$dir/arch/arm64/Makefile" ]] &&
+    [[ -f "$dir/kernel/fork.c" ]]
 }
 
 detect_kernel_version() {
@@ -137,14 +140,14 @@ download_full_source() {
   local extracted="$ARTIFACT_SOURCE_DIR/linux-${version}"
   local url="https://cdn.kernel.org/pub/linux/kernel/v${version%%.*}.x/linux-${version}.tar.xz"
   if [[ ! -f "$archive" ]]; then
-    echo "Downloading linux-${version} source..."
+    echo "Downloading linux-${version} source..." >&2
     mkdir -p "$ARTIFACT_ARCHIVE_DIR"
-    curl -L --fail --output "$archive" "$url"
+    curl -L --fail --output "$archive" "$url" >&2
   fi
   if [[ ! -d "$extracted" ]]; then
-    echo "Extracting linux-${version}..."
+    echo "Extracting linux-${version}..." >&2
     mkdir -p "$ARTIFACT_SOURCE_DIR"
-    tar -C "$ARTIFACT_SOURCE_DIR" -xf "$archive"
+    tar -C "$ARTIFACT_SOURCE_DIR" -xf "$archive" >&2
   fi
   [[ -d "$extracted" ]] || fail "downloaded source tree not found: $extracted"
   echo "$extracted"
@@ -182,13 +185,29 @@ echo "  jobs:        $JOBS"
 # Start with base config
 cp "$BASE_CONFIG" "$BUILD_DIR/.config"
 
-# Merge our fragment
+# Merge our fragment using -m so merge_config.sh stays in olddefconfig mode
+# (works with headers-only source trees).  After the merge we patch any option
+# that the base had as =m but we require as =y by overwriting it directly;
+# make olddefconfig then validates the result without needing alldefconfig.
 if [[ -x "$SOURCE_DIR/scripts/kconfig/merge_config.sh" ]]; then
   ARCH=$ARCH "$SOURCE_DIR/scripts/kconfig/merge_config.sh" -m -O "$BUILD_DIR" "$BUILD_DIR/.config" "$ARM64_FRAGMENT"
 else
-  # Fallback: append fragment and let olddefconfig resolve
   cat "$ARM64_FRAGMENT" >> "$BUILD_DIR/.config"
 fi
+
+# Force built-in for options that the base may have as =m.
+# This handles base configs (Ubuntu/Debian AWS kernels) that ship many
+# drivers as modules even when our fragment says =y.
+for opt in \
+  CONFIG_VSOCKETS \
+  CONFIG_VIRTIO_VSOCKETS \
+  CONFIG_VIRTIO_VSOCKETS_COMMON \
+  CONFIG_OVERLAY_FS \
+  CONFIG_HW_RANDOM_VIRTIO \
+  CONFIG_RTC_DRV_PL031 \
+; do
+  sed -i "s|^${opt}=m|${opt}=y|; s|^# ${opt} is not set|${opt}=y|" "$BUILD_DIR/.config"
+done
 
 # Build
 MAKE_ARGS=(

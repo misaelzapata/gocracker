@@ -1,8 +1,8 @@
 # External Repo Sweep
 
-Este folder deja un harness reproducible para validar repos externos con `gocracker`. El flujo recomendado actual ya no es “barrer todo de una vez”, sino correr casos de a uno con `run_one.sh`, supervisando cleanup y espacio libre entre corridas.
+Este folder deja un harness reproducible para validar repos externos con `gocracker`. Hay **un único entrypoint**, [`sweep.py`](sweep.py), que corre contra una lista de ids (una por línea). Los wrappers de bash históricos (`run_one.sh`, `run_all.sh`, `run_historical_pass.sh`, `run_historical_tty.sh`, `run_compose_tty.sh`, `run_fixed_50.sh`) + el tool Go `cmd/gocracker-sweep/` se removieron el 2026-04-19 — pasaban `--server <url>` al CLI `gocracker repo`, flag que nunca existió, lo que hacía colapsar toda la matriz a `FAIL exit status 2` por parse error. `sweep.py` corre `gocracker repo` local (sin `--server`), con concurrencia configurable, cleanup per-caso y reintento ante rate-limit de Docker Hub.
 
-Los scripts viven en el repo, pero los logs, clones cacheados y reportes se escriben fuera del worktree:
+Los resultados se escriben fuera del worktree:
 
 ```bash
 /tmp/gocracker-external-repos/<timestamp>   # logs y reportes
@@ -38,53 +38,52 @@ El exit code del runner es `0` solo si no hay `FAIL`.
 
 ## Uso
 
-Flujo recomendado, un repo por vez:
+Setup único (build + kernel + sudo cred):
 
 ```bash
 cd /home/misael/Desktop/projects/gocracker
 ./tools/build-guest-kernel.sh
+go build -o gocracker ./cmd/gocracker
 sudo -v
-GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux tests/external-repos/run_one.sh traefik-whoami
 ```
 
-Baseline historico:
+### Un solo repo
 
 ```bash
-tests/external-repos/historical-pass.ids
-tests/external-repos/historical-unstable.ids
-tests/external-repos/historical-tty.ids
-tests/external-repos/compose-tty.ids
+echo "traefik-whoami" > /tmp/ids.txt
+sudo -E python3 tests/external-repos/sweep.py /tmp/ids.txt --concurrency 1
 ```
 
-- `historical-pass.ids` es la lista base de casos que antes dieron `PASS`
-- `historical-unstable.ids` separa casos historicos que hoy ya no son un gate reproducible por drift upstream o Dockerfiles release-shaped
-- `historical-tty.ids` es el subconjunto dockerfile/service que valida guest + PTY real
-- `compose-tty.ids` fija pares `repo-id + service` para validar guest + PTY via `compose exec`
-- `ollama-ollama` hoy vive en `historical-unstable.ids` porque el caso ya supero regresiones reales del extractor/builder, pero su stage CUDA sigue siendo demasiado pesado para el gate manual estable
-
-Corrida completa o barridos amplios:
+### Regression gate (historical-pass minus historical-unstable)
 
 ```bash
-cd /home/misael/Desktop/projects/gocracker
-./tools/build-guest-kernel.sh
-sudo -v
-GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux tests/external-repos/run_all.sh
+comm -23 \
+  <(grep -v '^#' tests/external-repos/historical-pass.ids | sort -u) \
+  <(grep -v '^#' tests/external-repos/historical-unstable.ids | sort -u) \
+  > /tmp/gate-ids.txt
+
+sudo -E python3 tests/external-repos/sweep.py /tmp/gate-ids.txt \
+  --concurrency 3 --boot-timeout 900 \
+  --log-dir /tmp/gate-logs \
+  --results /tmp/gate-results.tsv \
+  --summary /tmp/gate-summary.txt
 ```
 
-Ese camino queda como secundario mientras se cierran regresiones; para validacion real de regresion usamos el flujo manual caso-por-caso.
+### Listas de ids disponibles
 
-Gates reproducibles recomendados antes del `fixed-50`:
+- `historical-pass.ids`: 115 casos que dieron `PASS` en la revalidación del 2026-04-14
+- `historical-unstable.ids`: 113 excluidos del gate (upstream drift, release-tarball pattern, build >15min, etc.)
+- `historical-tty.ids`: subconjunto dockerfile/service que valida guest + PTY real
+- `compose-tty.ids`: pares `repo-id + service` para validar guest + PTY vía `compose exec`
+- `curated-50.ids`: 50 repos adicionales curados pendientes de validación inicial
+- `manifest.tsv`: TSV completo con `id, kind, url, ref, path, stack, mode, probe_type, probe_target, probe_expect, mem_mb, disk_mb, notes, dockerfile`
 
-```bash
-GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
-  tests/external-repos/run_historical_pass.sh
+Orden recomendado cuando validás cambios en `pkg/vmm`, `pkg/container`, `internal/oci`:
 
-GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
-  tests/external-repos/run_historical_tty.sh
-
-GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
-  tests/external-repos/run_compose_tty.sh
-```
+1. `go test ./... -tags integration` (unit + integration)
+2. `sweep.py historical-pass.ids` con `--exclude` de `historical-unstable.ids`
+3. (opcional) `sweep.py historical-tty.ids`
+4. (opcional) `sweep.py compose-tty.ids`
 
 Snapshot manual documentado al 2026-04-06:
 
@@ -101,9 +100,9 @@ Casos revalidados uno por uno:
 | --- | --- | --- | --- |
 | guest smoke one-shot | `PASS` | `sudo -n ./gocracker run --image alpine:3.20 --kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux --cmd 'echo alpine-ok' --wait --tty off` | imprime `alpine-ok` y termina limpio |
 | guest smoke con PTY | `PASS` | `sudo -n ./gocracker run --image alpine:3.20 --kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux --wait --tty force` | aparece prompt; `_`, backspace, `Ctrl-C` y `exit` funcionan sobre la PTY del exec-agent |
-| `distribution-registry` | `PASS` | `GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux EXT_REPO_IDS=distribution-registry tests/external-repos/run_historical_tty.sh` | termina con `PASS distribution-registry` |
-| `actual-server-compose` | `PASS` | `GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux EXT_REPO_IDS=actual-server-compose tests/external-repos/run_compose_tty.sh` | termina con `PASS actual-server-compose` |
-| `go-gitea-gitea` | `Pending rerun` | `GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux EXT_REPO_IDS=go-gitea-gitea tests/external-repos/run_historical_tty.sh` | al 2026-04-06 seguia en `make backend` y todavia no habia llegado a boot del guest |
+| `distribution-registry` | `PASS` | `echo distribution-registry \| sudo -E python3 tests/external-repos/sweep.py /dev/stdin --concurrency 1` | termina con `PASS distribution-registry` |
+| `actual-server-compose` | `PASS` | `echo actual-server-compose \| sudo -E python3 tests/external-repos/sweep.py /dev/stdin --concurrency 1` | termina con `PASS actual-server-compose` |
+| `go-gitea-gitea` | `Pending rerun` | `echo go-gitea-gitea \| sudo -E python3 tests/external-repos/sweep.py /dev/stdin --concurrency 1` | al 2026-04-06 seguia en `make backend` y todavia no habia llegado a boot del guest |
 
 Las secuencias crudas `\x1b[1;1R` y `\x1b[?2004h/l` cuentan como ruido de terminal, no como output valido del guest. Los gates TTY ahora las filtran y, si reaparecen en transcript, el caso debe considerarse fallido.
 Al 2026-04-09, el camino interactivo nuevo quedo cubierto por integration tests privilegiados para `run`, `compose exec`, healthchecks Compose in-guest y aislamiento/cleanup por stack:
@@ -115,18 +114,10 @@ Al 2026-04-09, el camino interactivo nuevo quedo cubierto por integration tests 
 - `TestCLIComposeServeHealthcheckExecBinary`
 - `TestComposeStackIsolationAndCleanup`
 
-Orden recomendado:
-
-1. smoke minimo del guest
-2. `run_historical_pass.sh`
-3. `run_historical_tty.sh`
-4. `run_compose_tty.sh`
-5. `run_fixed_50.sh`
-
 Listar la muestra versionada:
 
 ```bash
-tests/external-repos/run_one.sh --list
+awk -F'\t' '$1 !~ /^#/ && NF {print $1}' tests/external-repos/manifest.tsv
 ```
 
 ## Variables Utiles

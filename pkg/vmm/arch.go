@@ -18,6 +18,11 @@ type machineArchBackend interface {
 	restoreVCPU(*kvm.System, *kvm.VM, *kvm.VCPU, VCPUState) error
 	captureVMState(*VM) (*SnapshotArchState, error)
 	restoreVMState(*kvm.VM, *SnapshotArchState) error
+	// restoreVMStatePostIRQ runs AFTER postCreateVCPUs, so the interrupt
+	// controller (x86 IRQCHIP already up, arm64 VGIC just created) exists.
+	// Needed on ARM64 because the VGIC cannot be restored before it is
+	// created; no-op on x86.
+	restoreVMStatePostIRQ(*VM, *SnapshotArchState) error
 	handleExit(*VM, *kvm.VCPU) (handled bool, stop bool, err error)
 	deviceList(*VM) []DeviceInfo
 	consoleOutput(*VM) []byte

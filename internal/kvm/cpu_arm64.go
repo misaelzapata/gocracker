@@ -12,10 +12,13 @@ const (
 	kvmSetOneReg          = uintptr(0x4010AEAC) // _IOW(KVMIO, 0xAC, struct kvm_one_reg{u64,u64}=16 bytes)
 	kvmArmVCPUInit        = uintptr(0x4020AEAE)
 	kvmArmPreferredTarget = uintptr(0x8020AEAF)
+	kvmGetRegList         = uintptr(0xC008AEB0) // _IOWR(KVMIO, 0xB0, struct kvm_reg_list{u64 n, u64 reg[]})
 
 	kvmRegArm64     = 0x6000000000000000
 	kvmRegSizeU64   = 0x0030000000000000
 	kvmRegArmCore   = 0x0010 << 16
+	kvmRegArmCoproc = 0x000000000FFF0000 // mask isolating the "coproc" field
+	kvmRegArmSysreg = 0x0013 << 16       // identifies an aarch64 system register
 	arm64PSTATEEL1h = 0x3c5
 
 	KVMArmVCPUPowerOff = 0 // KVM_ARM_VCPU_POWER_OFF — secondary vCPUs start halted
@@ -105,6 +108,117 @@ func (vcpu *VCPU) GetOneReg64(id uint64) (uint64, error) {
 		return 0, fmt.Errorf("KVM_GET_ONE_REG(%#x): %w", id, err)
 	}
 	return val, nil
+}
+
+// IsARM64Sysreg reports whether a KVM ONE_REG id refers to an aarch64 system
+// register (as opposed to a core reg, coproc, SIMD/FP, etc.).
+func IsARM64Sysreg(id uint64) bool {
+	return id&kvmRegArmCoproc == kvmRegArmSysreg
+}
+
+// IsARM64CoreReg reports whether a KVM ONE_REG id is a "core" register
+// (struct user_pt_regs + extensions like sp_el1, elr_el1, spsr, FPSIMD).
+// These are captured/restored explicitly by the vmm package and must NOT
+// double-capture when iterating the full GetRegList set.
+func IsARM64CoreReg(id uint64) bool {
+	return id&kvmRegArmCoproc == kvmRegArmCore
+}
+
+// ARM64RegSize extracts the size field from a KVM ONE_REG id. The value
+// matches the KVM_REG_SIZE_U* width.
+func ARM64RegSize(id uint64) uint64 {
+	return id & (0xFF << 52)
+}
+
+const (
+	ARM64RegSizeU32  = uint64(0x0020) << 48 // 0x0020000000000000
+	ARM64RegSizeU64  = uint64(0x0030) << 48 // 0x0030000000000000
+	ARM64RegSizeU128 = uint64(0x0040) << 48 // 0x0040000000000000
+)
+
+// GetOneReg128 reads a 128-bit KVM ONE_REG (used for aarch64 SIMD vregs
+// V0..V31). Returns the register value as a [16]byte (little-endian,
+// vreg[0] is the low 64 bits).
+func (vcpu *VCPU) GetOneReg128(id uint64) ([16]byte, error) {
+	var val [16]byte
+	reg := OneReg{
+		ID:   id,
+		Addr: uint64(uintptr(unsafe.Pointer(&val[0]))),
+	}
+	if _, err := vmIoctl(vcpu.fd, kvmGetOneReg, uintptr(unsafe.Pointer(&reg))); err != nil {
+		return val, fmt.Errorf("KVM_GET_ONE_REG(%#x): %w", id, err)
+	}
+	return val, nil
+}
+
+// SetOneReg128 writes a 128-bit KVM ONE_REG.
+func (vcpu *VCPU) SetOneReg128(id uint64, val [16]byte) error {
+	v := val
+	reg := OneReg{
+		ID:   id,
+		Addr: uint64(uintptr(unsafe.Pointer(&v[0]))),
+	}
+	if _, err := vmIoctl(vcpu.fd, kvmSetOneReg, uintptr(unsafe.Pointer(&reg))); err != nil {
+		return fmt.Errorf("KVM_SET_ONE_REG(%#x): %w", id, err)
+	}
+	return nil
+}
+
+// GetOneReg32 reads a 32-bit KVM ONE_REG (used for FPCR/FPSR).
+func (vcpu *VCPU) GetOneReg32(id uint64) (uint32, error) {
+	var val uint32
+	reg := OneReg{
+		ID:   id,
+		Addr: uint64(uintptr(unsafe.Pointer(&val))),
+	}
+	if _, err := vmIoctl(vcpu.fd, kvmGetOneReg, uintptr(unsafe.Pointer(&reg))); err != nil {
+		return 0, fmt.Errorf("KVM_GET_ONE_REG(%#x): %w", id, err)
+	}
+	return val, nil
+}
+
+// SetOneReg32 writes a 32-bit KVM ONE_REG.
+func (vcpu *VCPU) SetOneReg32(id uint64, value uint32) error {
+	val := value
+	reg := OneReg{
+		ID:   id,
+		Addr: uint64(uintptr(unsafe.Pointer(&val))),
+	}
+	if _, err := vmIoctl(vcpu.fd, kvmSetOneReg, uintptr(unsafe.Pointer(&reg))); err != nil {
+		return fmt.Errorf("KVM_SET_ONE_REG(%#x): %w", id, err)
+	}
+	return nil
+}
+
+// GetRegList returns every KVM ONE_REG id that this vCPU currently exposes.
+// Used during snapshot capture to enumerate the full sysreg set without
+// hardcoding the list — the exact set depends on kernel version and host CPU.
+//
+// Implementation follows the two-call protocol: first call with n=0 returns
+// E2BIG and populates n with the required size; second call allocates the
+// right-sized buffer and fills it.
+func (vcpu *VCPU) GetRegList() ([]uint64, error) {
+	var probe struct {
+		N uint64
+	}
+	_, err := vmIoctl(vcpu.fd, kvmGetRegList, uintptr(unsafe.Pointer(&probe)))
+	// The first call is expected to fail with E2BIG when n=0 — the kernel
+	// writes the real count into probe.N and returns -1. Any other error is
+	// fatal; a nil error with probe.N==0 means there are no regs (also ok).
+	if err != nil && probe.N == 0 {
+		return nil, fmt.Errorf("KVM_GET_REG_LIST probe: %w", err)
+	}
+	if probe.N == 0 {
+		return nil, nil
+	}
+	buf := make([]uint64, 1+probe.N)
+	buf[0] = probe.N
+	if _, err := vmIoctl(vcpu.fd, kvmGetRegList, uintptr(unsafe.Pointer(&buf[0]))); err != nil {
+		return nil, fmt.Errorf("KVM_GET_REG_LIST: %w", err)
+	}
+	ids := make([]uint64, probe.N)
+	copy(ids, buf[1:])
+	return ids, nil
 }
 
 func (vcpu *VCPU) SetupARM64Boot(entryPoint, dtbAddr uint64) error {
