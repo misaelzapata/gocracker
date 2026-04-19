@@ -2379,7 +2379,6 @@ func (s *Server) execGuestReIP(id, guestIP, gateway string) error {
 	if !strings.Contains(cidr, "/") {
 		cidr = guestIP + "/30"
 	}
-	gclog.API.Info("[DBG-REIP] starting re-IP", "id", id, "cidr", cidr, "gw", gateway)
 	// Do NOT bring eth0 down/up. After snapshot restore the virtio-net
 	// driver is already live; triggering a link-down/up causes the driver
 	// to re-negotiate features with the host device, which blocks
@@ -2418,8 +2417,6 @@ command -v ip >/dev/null 2>&1 || exit 0
 // remaining RPC shares the outer deadline so slow dials don't collapse
 // the I/O budget to nothing.
 func (s *Server) execGuestScript(id, script string) error {
-	scriptStart := time.Now()
-	gclog.API.Info("[DBG-SCRIPT] enter", "id", id, "scriptLen", len(script))
 	s.mu.RLock()
 	v, ok := s.vms[id]
 	s.mu.RUnlock()
@@ -2447,18 +2444,13 @@ func (s *Server) execGuestScript(id, script string) error {
 	deadline := time.Now().Add(30 * time.Second)
 	backoff := 25 * time.Millisecond
 	const maxBackoff = 500 * time.Millisecond
-	attemptN := 0
 	for {
-		attemptN++
-		gclog.API.Debug("exec agent acquire attempt", "id", id, "attempt", attemptN, "elapsed_ms", time.Since(deadline.Add(-30*time.Second)).Milliseconds())
 		c, err := dialer.DialVsock(port)
 		if err == nil {
-			gclog.API.Debug("exec agent acquire success", "id", id, "attempt", attemptN, "elapsed_ms", time.Since(deadline.Add(-30*time.Second)).Milliseconds())
 			conn = c
 			break
 		}
 		lastErr = err
-		gclog.API.Debug("exec agent acquire failed", "id", id, "attempt", attemptN, "err", err, "elapsed_ms", time.Since(deadline.Add(-30*time.Second)).Milliseconds())
 		if time.Now().After(deadline) {
 			return fmt.Errorf("dial exec agent after %s: %w", 30*time.Second, lastErr)
 		}
@@ -2478,7 +2470,6 @@ func (s *Server) execGuestScript(id, script string) error {
 	if remaining := time.Until(deadline); remaining < 2*time.Second {
 		rpcDeadline = time.Now().Add(2 * time.Second)
 	}
-	gclog.API.Info("[DBG-SCRIPT] conn acquired, setting deadline", "id", id, "rpcDeadline_s", time.Until(rpcDeadline).Seconds(), "elapsed_ms", time.Since(scriptStart).Milliseconds())
 	if err := conn.SetDeadline(rpcDeadline); err != nil {
 		return err
 	}
@@ -2486,17 +2477,13 @@ func (s *Server) execGuestScript(id, script string) error {
 		Mode:    guestexec.ModeExec,
 		Command: []string{"/bin/sh", "-lc", script},
 	}
-	gclog.API.Info("[DBG-SCRIPT] about to Encode request", "id", id, "elapsed_ms", time.Since(scriptStart).Milliseconds())
 	if err := guestexec.Encode(conn, req); err != nil {
 		return fmt.Errorf("write exec request: %w", err)
 	}
-	gclog.API.Info("[DBG-SCRIPT] Encode done, about to Decode response", "id", id, "elapsed_ms", time.Since(scriptStart).Milliseconds())
 	var resp guestexec.Response
 	if err := guestexec.Decode(conn, &resp); err != nil {
-		gclog.API.Error("[DBG-SCRIPT] Decode FAILED", "id", id, "err", err, "elapsed_ms", time.Since(scriptStart).Milliseconds())
 		return fmt.Errorf("read exec response: %w", err)
 	}
-	gclog.API.Info("[DBG-SCRIPT] Decode done OK", "id", id, "resp_ok", resp.OK, "exit", resp.ExitCode, "stdout", resp.Stdout, "stderr", resp.Stderr, "elapsed_ms", time.Since(scriptStart).Milliseconds())
 	if !resp.OK {
 		return fmt.Errorf("exec failed: %s", resp.Error)
 	}
