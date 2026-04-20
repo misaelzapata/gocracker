@@ -205,6 +205,10 @@ type RunRequest struct {
 	ExecEnabled   bool                     `json:"exec_enabled,omitempty"`
 	Balloon       *Balloon                 `json:"balloon,omitempty"`
 	MemoryHotplug *vmm.MemoryHotplugConfig `json:"memory_hotplug,omitempty"`
+	// VsockUDSPath asks the VMM to expose its vsock device as a
+	// Firecracker-style Unix Domain Socket at this absolute path. Empty =
+	// HTTP /vms/{id}/vsock/connect remains the only host→guest dial path.
+	VsockUDSPath string `json:"vsock_uds_path,omitempty"`
 
 	// NetworkMode selects how gocracker provisions the guest NIC. "" or
 	// "none" keeps today's explicit behaviour (caller supplies tap_name /
@@ -1126,6 +1130,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		Metadata:      cloneMetadata(req.Metadata),
 		ExecEnabled:   req.ExecEnabled,
 		MemoryHotplug: cloneMemoryHotplug(req.MemoryHotplug),
+		VsockUDSPath:  req.VsockUDSPath,
 	}
 	if req.Balloon != nil {
 		opts.Balloon = &vmm.BalloonConfig{
