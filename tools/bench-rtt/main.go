@@ -197,6 +197,9 @@ func main() {
 				return 0, err
 			}
 			defer c.Close()
+			// Guard against a stalled server: without a deadline a hung
+			// UDS listener would lock the whole benchmark.
+			_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 			if _, err := fmt.Fprintf(c, "CONNECT %d\n", execPort); err != nil {
 				return 0, err
 			}
@@ -205,8 +208,10 @@ func main() {
 			if err != nil {
 				return 0, err
 			}
-			if !strings.HasPrefix(line, "OK") {
-				return 0, fmt.Errorf("unexpected handshake: %q", strings.TrimRight(line, "\r\n"))
+			// Exact match — HasPrefix("OK") would accept "OKAY" or any
+			// stray prefix collision.
+			if got := strings.TrimRight(line, "\r\n"); got != "OK" {
+				return 0, fmt.Errorf("unexpected handshake: %q", got)
 			}
 			return time.Since(t), nil
 		}))

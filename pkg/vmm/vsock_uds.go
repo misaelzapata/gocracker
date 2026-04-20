@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // udsListener exposes a VM's vsock device as a Firecracker-style Unix
@@ -56,8 +57,18 @@ func newUDSListener(path string, dialer VsockDialer) (*udsListener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, fmt.Errorf("uds listener: mkdir parent: %w", err)
 	}
-	// Best-effort removal of a stale socket file from a previous crash.
-	_ = os.Remove(path)
+	// Best-effort removal of a stale socket file from a previous crash,
+	// but only when the existing path is actually a socket — refuse to
+	// clobber a regular file or a directory pointed at by a mistaken
+	// UDSPath config, otherwise the user loses arbitrary data.
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("uds listener: %q exists and is not a socket (mode=%s); refusing to overwrite", path, info.Mode())
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("uds listener: remove stale socket %s: %w", path, err)
+		}
+	}
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, fmt.Errorf("uds listener: listen: %w", err)
@@ -113,11 +124,31 @@ func (u *udsListener) run() {
 	}
 }
 
+// Handshake hardening constants. The CONNECT line is never more than
+// ~20 bytes ("CONNECT <uint32>\n"), so 64 bytes is generous + bounded.
+// The deadline keeps a slow/stuck client from parking a goroutine
+// forever in the pre-bridge phase.
+const (
+	handshakeMaxBytes = 64
+	handshakeTimeout  = 3 * time.Second
+)
+
 func (u *udsListener) handleConn(c net.Conn) {
 	defer c.Close()
-	br := bufio.NewReader(c)
+	// Deadline + size cap for the CONNECT handshake only. After we
+	// transition to bridging (OK response sent), the deadline is
+	// cleared so long-lived streams aren't killed by it.
+	_ = c.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	br := bufio.NewReaderSize(c, handshakeMaxBytes+1)
 	line, err := br.ReadString('\n')
 	if err != nil {
+		if errors.Is(err, bufio.ErrBufferFull) {
+			_, _ = c.Write([]byte("FAILURE malformed_request\n"))
+		}
+		return
+	}
+	if len(line) > handshakeMaxBytes {
+		_, _ = c.Write([]byte("FAILURE malformed_request\n"))
 		return
 	}
 	port, perr := parseConnect(line)
@@ -134,6 +165,10 @@ func (u *udsListener) handleConn(c net.Conn) {
 	if _, err := c.Write([]byte("OK\n")); err != nil {
 		return
 	}
+	// Handshake done — clear the deadline so long-lived bridges aren't
+	// killed by it. From here on the bridge io.Copy loops carry the
+	// lifetime of the client connection.
+	_ = c.SetReadDeadline(time.Time{})
 	// Forward any bytes the client pipelined after CONNECT\n.
 	if buffered := br.Buffered(); buffered > 0 {
 		b, _ := br.Peek(buffered)

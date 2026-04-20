@@ -1154,55 +1154,58 @@ func TestDevice_HandleResponse_NoPending(t *testing.T) {
 }
 
 // TestStartTXAvailPoller_StopsOnClose verifies the fix for a SIGSEGV
-// observed at VM shutdown: the 45s TX avail poller goroutine kept running
-// after Device.Close() and tried to read AvailIdx() from guest RAM that
-// had already been unmapped by the VMM cleanup path. Close() now signals
-// the poller via closeCh and the goroutine exits promptly.
+// observed at VM shutdown: the 45s TX avail poller goroutine kept
+// running after Device.Close() and tried to read AvailIdx() from guest
+// RAM that had already been unmapped by the VMM cleanup path. Close()
+// now signals the poller via closeCh and the goroutine exits promptly.
+//
+// Asserts via a goroutine-count baseline: if the poller fails to stop
+// on Close, NumGoroutine stays +1 above baseline forever (or until the
+// 1h ticker deadline) and the test fails — matching exactly the hung
+// goroutine in production before the fix.
 func TestStartTXAvailPoller_StopsOnClose(t *testing.T) {
-	// Build a Device wired up far enough for StartTXAvailPoller to
-	// resolve its TX queue. We need a real Transport, which needs a real
-	// memory-backed slice and base PA. Use NewDevice so closeCh is
-	// initialized the same way production does.
-	mem := make([]byte, 1<<20) // 1 MiB backing for virtio queues
+	// Settle the runtime, capture baseline goroutine count.
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+
+	mem := make([]byte, 1<<20)
 	d := NewDevice(mem, 0, 0, nil, nil, func(bool) {})
 	d.Label = "test"
 
-	// StartTXAvailPoller uses a 500ms ticker; the goroutine is born idle
-	// until the first tick. We pass a long duration so the deadline does
-	// NOT trigger before our Close().
+	// Long duration so the poller goroutine survives solely via closeCh,
+	// not via the ticker deadline expiry (which would mask a broken
+	// close signal).
 	d.StartTXAvailPoller(1 * time.Hour)
 
-	// Give the goroutine time to enter its select and tick at least once.
+	// Confirm the goroutine is actually running.
 	time.Sleep(600 * time.Millisecond)
+	if runtime.NumGoroutine() <= baseline {
+		t.Fatalf("poller goroutine did not start: baseline=%d current=%d",
+			baseline, runtime.NumGoroutine())
+	}
 
-	// Close the device and measure how fast the poller exits. Before the
-	// fix, the goroutine only stopped at the 1h deadline.
 	done := make(chan struct{})
 	go func() {
 		d.Close()
-		// Wait briefly after Close returns so the poller observes closeCh
-		// and exits; we time that tail via a deadline.
 		close(done)
 	}()
 	select {
 	case <-done:
-		// Close returned; the poller may still be mid-select. Poll the
-		// closed state to confirm the goroutine saw the signal.
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close() did not return within 2 seconds")
 	}
 
-	// Give the poller up to 1 second to react to the closed channel.
-	// Without the fix this would NEVER happen within the test timeout.
-	// We detect exit indirectly: a second Close() must be a no-op (it
-	// checks d.closed) and the goroutine should have finished — use
-	// runtime.GC as a yield point and assert by timing.
-	deadline := time.Now().Add(1 * time.Second)
+	// The poller must exit within a short deadline after Close(). Poll
+	// until the goroutine count returns to baseline, or fail.
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		runtime.Gosched()
-		time.Sleep(20 * time.Millisecond)
+		runtime.GC()
+		if runtime.NumGoroutine() <= baseline {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	// If we got here without a panic, the poller either saw closeCh and
-	// exited, or it's still idle waiting on a ticker that will never
-	// trigger (safe). Either way, no SIGSEGV on freed memory.
+	t.Fatalf("TX poller did not exit within 3s of Close: baseline=%d current=%d",
+		baseline, runtime.NumGoroutine())
 }

@@ -51,6 +51,22 @@ func TestResolveWorkerHostSidePath(t *testing.T) {
 			guestPath: "/workerx/vm.sock",
 			want:      "/srv/jailer/abc/root/workerx/vm.sock",
 		},
+		{
+			// Path traversal must NOT escape into RunDir via the /worker
+			// prefix. filepath.Clean reduces "/worker/../x" to "/x" so
+			// the prefix check misses and we fall back to JailRoot — no
+			// leaking outside the chroot.
+			name:      "traversal escapes /worker/ into JailRoot path",
+			meta:      WorkerMetadata{JailRoot: "/srv/jailer/abc/root", RunDir: "/tmp/wkr"},
+			guestPath: "/worker/../etc/passwd",
+			want:      "/srv/jailer/abc/root/etc/passwd",
+		},
+		{
+			name:      "traversal at jail root stays under JailRoot",
+			meta:      WorkerMetadata{JailRoot: "/srv/jailer/abc/root"},
+			guestPath: "/../../etc/passwd",
+			want:      "/srv/jailer/abc/root/etc/passwd",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -76,6 +92,20 @@ func TestResolveHostSidePath(t *testing.T) {
 		{"empty guest path, no jail", "", "", ""},
 		{"guest path with dashes and uuids", "/srv/jailer/gocracker-vmm/jail-xyz/root", "/run/gocracker/sandboxes/a1b2c3d4-e5f6.sock", "/srv/jailer/gocracker-vmm/jail-xyz/root/run/gocracker/sandboxes/a1b2c3d4-e5f6.sock"},
 		{"jail root with trailing slash", "/srv/jailer/gocracker-vmm/abc/root/", "/run/gocracker/vm.sock", "/srv/jailer/gocracker-vmm/abc/root/run/gocracker/vm.sock"},
+		{
+			// Traversal in guestPath is cleaned before being treated as
+			// relative under jailRoot, so it cannot escape the chroot.
+			"traversal does not escape jail root",
+			"/srv/jailer/abc/root",
+			"/../../etc/passwd",
+			"/srv/jailer/abc/root/etc/passwd",
+		},
+		{
+			"traversal mid-path",
+			"/srv/jailer/abc/root",
+			"/run/../../etc/passwd",
+			"/srv/jailer/abc/root/etc/passwd",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

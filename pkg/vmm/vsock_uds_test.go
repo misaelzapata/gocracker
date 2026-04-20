@@ -206,20 +206,57 @@ func TestUDSListener_StaleSocketRemovedOnStart(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(path, []byte("stale"), 0o644); err != nil {
-		t.Fatalf("write stale: %v", err)
+	// Leave an actual stale socket file (as happens on crash) and
+	// verify newUDSListener removes it cleanly.
+	staleLn, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("stage stale socket: %v", err)
 	}
+	staleLn.Close()
 	l, err := newUDSListener(path, &mockDialer{})
 	if err != nil {
-		t.Fatalf("newUDSListener over stale file: %v", err)
+		t.Fatalf("newUDSListener over stale socket: %v", err)
 	}
 	t.Cleanup(func() { l.Close() })
-	// New socket should be listenable.
 	c, err := net.Dial("unix", path)
 	if err != nil {
 		t.Fatalf("dial new socket: %v", err)
 	}
 	c.Close()
+}
+
+// TestUDSListener_RefusesNonSocketPath guards the safety check Copilot
+// flagged: a misconfigured UDSPath pointing at a regular file or
+// directory must NOT be silently clobbered.
+func TestUDSListener_RefusesNonSocketPath(t *testing.T) {
+	t.Run("regular file", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "important.data")
+		if err := os.WriteFile(path, []byte("user data"), 0o600); err != nil {
+			t.Fatalf("stage file: %v", err)
+		}
+		if _, err := newUDSListener(path, &mockDialer{}); err == nil {
+			t.Fatal("expected refuse, got nil")
+		}
+		// Original file still there, unmodified.
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("regular file was clobbered: %v", err)
+		}
+		if string(data) != "user data" {
+			t.Fatalf("regular file contents changed: %q", data)
+		}
+	})
+	t.Run("directory", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "a-dir")
+		if err := os.Mkdir(path, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if _, err := newUDSListener(path, &mockDialer{}); err == nil {
+			t.Fatal("expected refuse, got nil")
+		}
+	})
 }
 
 func TestUDSListener_Permissions(t *testing.T) {

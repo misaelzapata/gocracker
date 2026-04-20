@@ -96,60 +96,11 @@ func TestE2EUDS_DialAndExchange(t *testing.T) {
 		t.Fatalf("uds path not created within 15s: %s\nserve log:\n%s", udsPath, serveLog.String())
 	}
 
-	// Dial the UDS and hand-shake.
-	conn, err := net.Dial("unix", udsPath)
-	if err != nil {
-		t.Fatalf("dial uds: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-	if _, err := fmt.Fprintf(conn, "CONNECT %d\n", 12346); err != nil {
-		t.Fatalf("write CONNECT: %v", err)
-	}
-	br := bufio.NewReader(conn)
-	// Retry the handshake briefly — in-guest listener may race with our
-	// dial on fresh boots.
-	var handshake string
-	dialDeadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(dialDeadline) {
-		line, rerr := br.ReadString('\n')
-		if rerr != nil {
-			conn.Close()
-			time.Sleep(300 * time.Millisecond)
-			conn, err = net.Dial("unix", udsPath)
-			if err != nil {
-				continue
-			}
-			_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-			if _, werr := fmt.Fprintf(conn, "CONNECT %d\n", 12346); werr != nil {
-				continue
-			}
-			br = bufio.NewReader(conn)
-			continue
-		}
-		handshake = strings.TrimRight(line, "\r\n")
-		if handshake == "OK" {
-			break
-		}
-		if strings.HasPrefix(handshake, "FAILURE") {
-			// The in-guest listener may not be bound yet; retry.
-			conn.Close()
-			time.Sleep(300 * time.Millisecond)
-			conn, err = net.Dial("unix", udsPath)
-			if err != nil {
-				continue
-			}
-			_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-			if _, werr := fmt.Fprintf(conn, "CONNECT %d\n", 12346); werr != nil {
-				continue
-			}
-			br = bufio.NewReader(conn)
-			continue
-		}
-	}
-	if handshake != "OK" {
-		t.Fatalf("handshake = %q, want OK\nserve log:\n%s", handshake, serveLog.String())
-	}
+	// Dial the UDS and hand-shake, retrying briefly while the in-guest
+	// listener binds on fresh boots. connectUDS closes any failed
+	// attempts itself and only returns the final successful pair.
+	conn, br := connectUDS(t, udsPath, 12346, 30*time.Second, &serveLog)
+	t.Cleanup(func() { conn.Close() })
 
 	// Exchange ping/echo with the in-guest listener.
 	if _, err := io.WriteString(conn, "ping\n"); err != nil {
@@ -361,3 +312,42 @@ func TestE2EUDS_HTTPEndpointStillWorks(t *testing.T) {
 	}
 }
 
+// connectUDS retries dial + CONNECT handshake until OK or deadline.
+// Every failed attempt's socket is closed before the next dial so the
+// test never leaks file descriptors. Returns the final, still-open
+// connection and its bufio.Reader on success; fails the test otherwise.
+func connectUDS(t *testing.T, path string, port uint32, timeout time.Duration, serveLog *lockedBuffer) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		c, err := net.Dial("unix", path)
+		if err != nil {
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, werr := fmt.Fprintf(c, "CONNECT %d\n", port); werr != nil {
+			c.Close()
+			continue
+		}
+		br := bufio.NewReader(c)
+		line, rerr := br.ReadString('\n')
+		if rerr != nil {
+			c.Close()
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		got := strings.TrimRight(line, "\r\n")
+		if got == "OK" {
+			// Handshake done — clear the deadline so the caller isn't
+			// fighting the short handshake deadline during streaming.
+			_ = c.SetDeadline(time.Time{})
+			return c, br
+		}
+		c.Close()
+		time.Sleep(300 * time.Millisecond)
+	}
+	t.Fatalf("connectUDS: never got OK handshake for %s port %d\nserve:\n%s",
+		path, port, serveLog.String())
+	return nil, nil
+}

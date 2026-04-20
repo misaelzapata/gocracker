@@ -15,15 +15,21 @@ const WorkerJailBindMount = "/worker"
 // creates at /foo actually live at <jailRoot>/foo on the host. When not
 // jailed, the host path is identical to the internal path.
 //
-// jailRoot is WorkerMetadata.JailRoot ("" when not jailed).
+// guestPath is cleaned before use and joined as a RELATIVE path under
+// jailRoot so that traversal (e.g. "/../etc/passwd") cannot escape the
+// chroot in the host-side result. jailRoot is WorkerMetadata.JailRoot
+// ("" when not jailed).
 func ResolveHostSidePath(jailRoot, guestPath string) string {
 	if guestPath == "" {
 		return ""
 	}
+	clean := filepath.Clean(guestPath)
 	if jailRoot == "" {
-		return guestPath
+		return clean
 	}
-	return filepath.Join(jailRoot, guestPath)
+	// TrimLeft so filepath.Join treats clean as relative; otherwise Join
+	// followed by path traversal would produce a path outside jailRoot.
+	return filepath.Join(jailRoot, strings.TrimLeft(clean, string(filepath.Separator)))
 }
 
 // ResolveWorkerHostSidePath is jailer-aware AND worker-bind-mount aware.
@@ -38,17 +44,20 @@ func ResolveWorkerHostSidePath(meta WorkerMetadata, guestPath string) string {
 	if guestPath == "" {
 		return ""
 	}
+	// Clean first so "/worker/../x" resolves to "/x" and does NOT match
+	// the /worker prefix (would otherwise escape RunDir on the host).
+	clean := filepath.Clean(guestPath)
 	if meta.JailRoot == "" {
-		return guestPath
+		return clean
 	}
 	if meta.RunDir != "" {
 		prefix := WorkerJailBindMount + "/"
-		if strings.HasPrefix(guestPath, prefix) {
-			return filepath.Join(meta.RunDir, strings.TrimPrefix(guestPath, WorkerJailBindMount))
+		if strings.HasPrefix(clean, prefix) {
+			return filepath.Join(meta.RunDir, strings.TrimPrefix(clean, WorkerJailBindMount))
 		}
-		if guestPath == WorkerJailBindMount {
+		if clean == WorkerJailBindMount {
 			return meta.RunDir
 		}
 	}
-	return filepath.Join(meta.JailRoot, guestPath)
+	return filepath.Join(meta.JailRoot, strings.TrimLeft(clean, string(filepath.Separator)))
 }
