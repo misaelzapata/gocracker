@@ -85,6 +85,8 @@ type Device struct {
 	listenFn     func(port uint32) (net.Conn, error)
 	mem          []byte
 	closed       bool
+	closeCh      chan struct{}
+	closeOnce    sync.Once
 	rxWG         sync.WaitGroup
 	Label        string // optional VM identifier for debug logs
 }
@@ -98,6 +100,7 @@ func NewDevice(mem []byte, basePA uint64, irq uint8, listenFn func(uint32) (net.
 		pending:      make(map[uint32]*pendingConn),
 		nextHostPort: 1024,
 		listenFn:     listenFn,
+		closeCh:      make(chan struct{}),
 	}
 	d.Transport = virtio.NewTransport(d, mem, basePA, irq, dirty, irqFn)
 	return d
@@ -329,6 +332,15 @@ func (d *Device) StartTXAvailPoller(duration time.Duration) {
 		for {
 			select {
 			case <-ticker.C:
+				// Device.Close() races with guest RAM unmap in the VMM
+				// cleanup path; re-check closed under d.mu before reading
+				// from mmap'd memory.
+				d.mu.Lock()
+				if d.closed {
+					d.mu.Unlock()
+					return
+				}
+				d.mu.Unlock()
 				avIdx, err := txQ.AvailIdx()
 				if err != nil {
 					continue
@@ -347,6 +359,9 @@ func (d *Device) StartTXAvailPoller(duration time.Duration) {
 				} else {
 					gclog.VMM.Debug("[DBG-POLL] TX avail check", "vm", d.Label, "availIdx", avIdx, "lastAvail", txQ.LastAvail, "rx", rxAvail)
 				}
+			case <-d.closeCh:
+				gclog.VMM.Debug("[DBG-POLL] TX poller stopped (device closed)", "vm", d.Label)
+				return
 			case <-deadline:
 				gclog.VMM.Debug("[DBG-POLL] TX poller stopped", "vm", d.Label)
 				return
@@ -765,6 +780,11 @@ func (d *Device) Close() {
 		return
 	}
 	d.closed = true
+	d.closeOnce.Do(func() {
+		if d.closeCh != nil {
+			close(d.closeCh)
+		}
+	})
 	conns := make([]*Connection, 0, len(d.conns))
 	for _, c := range d.conns {
 		conns = append(conns, c)
