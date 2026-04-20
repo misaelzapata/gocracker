@@ -1038,6 +1038,12 @@ type RestoreOptions struct {
 	OverrideID      string
 	OverrideTap     string
 	OverrideX86Boot X86BootMode
+	// OverrideVsockUDSPath replaces the snapshot's Vsock.UDSPath. Empty
+	// means "use whatever the snapshot serialized"; callers that change
+	// OverrideID or restore on a different host typically pass this so the
+	// resulting socket lands at a valid, unambiguous path. Set to "-" to
+	// explicitly disable the UDS listener at restore time.
+	OverrideVsockUDSPath string
 	// SharedFSRebinds remaps virtiofs exports present in the snapshot to new
 	// host source paths, keyed by the guest-side Target that the template
 	// mounted the tag at. The template must have already snapshotted with a
@@ -1092,6 +1098,28 @@ func applySharedFSRebinds(snap *Snapshot, rebinds []SharedFSRebind) error {
 		// fresh virtiofsd against the new Source (direct path) or requires
 		// the worker to re-populate it (worker path).
 		snap.Config.SharedFS[i].SocketPath = ""
+	}
+	return nil
+}
+
+// applyVsockUDSPathOverride mutates the snapshot's Vsock.UDSPath based on
+// RestoreOptions.OverrideVsockUDSPath. Empty = no change; "-" = clear
+// (disable UDS at restore); anything else = new absolute path, which is
+// validated before being accepted.
+func applyVsockUDSPathOverride(snap *Snapshot, override string) error {
+	if override == "" {
+		return nil
+	}
+	if snap == nil || snap.Config.Vsock == nil {
+		return fmt.Errorf("OverrideVsockUDSPath: snapshot has no vsock device")
+	}
+	if override == "-" {
+		snap.Config.Vsock.UDSPath = ""
+		return nil
+	}
+	snap.Config.Vsock.UDSPath = override
+	if err := snap.Config.Vsock.Validate(); err != nil {
+		return fmt.Errorf("OverrideVsockUDSPath: %w", err)
 	}
 	return nil
 }
@@ -1152,6 +1180,9 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	}
 	if opts.OverrideTap != "" {
 		snap.Config.TapName = opts.OverrideTap
+	}
+	if err := applyVsockUDSPathOverride(&snap, opts.OverrideVsockUDSPath); err != nil {
+		return nil, err
 	}
 	if err := applySharedFSRebinds(&snap, opts.SharedFSRebinds); err != nil {
 		return nil, err

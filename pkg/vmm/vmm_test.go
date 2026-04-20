@@ -1448,6 +1448,76 @@ func TestVsockConfig_Validate(t *testing.T) {
 	}
 }
 
+func TestApplyVsockUDSPathOverride(t *testing.T) {
+	cases := []struct {
+		name      string
+		snap      *Snapshot
+		override  string
+		wantPath  string
+		wantError bool
+	}{
+		{
+			name:     "empty override is a no-op",
+			snap:     &Snapshot{Config: Config{Vsock: &VsockConfig{Enabled: true, UDSPath: "/orig/vm.sock"}}},
+			override: "",
+			wantPath: "/orig/vm.sock",
+		},
+		{
+			name:     "dash clears the path",
+			snap:     &Snapshot{Config: Config{Vsock: &VsockConfig{Enabled: true, UDSPath: "/orig/vm.sock"}}},
+			override: "-",
+			wantPath: "",
+		},
+		{
+			name:     "absolute path replaces",
+			snap:     &Snapshot{Config: Config{Vsock: &VsockConfig{Enabled: true, UDSPath: "/orig/vm.sock"}}},
+			override: "/new/vm.sock",
+			wantPath: "/new/vm.sock",
+		},
+		{
+			name:     "sets on previously-empty path",
+			snap:     &Snapshot{Config: Config{Vsock: &VsockConfig{Enabled: true}}},
+			override: "/new/vm.sock",
+			wantPath: "/new/vm.sock",
+		},
+		{
+			name:      "relative override is rejected",
+			snap:      &Snapshot{Config: Config{Vsock: &VsockConfig{Enabled: true, UDSPath: "/orig/vm.sock"}}},
+			override:  "relative/vm.sock",
+			wantError: true,
+		},
+		{
+			name:      "no vsock in snapshot",
+			snap:      &Snapshot{Config: Config{Vsock: nil}},
+			override:  "/new/vm.sock",
+			wantError: true,
+		},
+		{
+			name:      "nil snapshot",
+			snap:      nil,
+			override:  "/new/vm.sock",
+			wantError: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := applyVsockUDSPathOverride(tc.snap, tc.override)
+			if tc.wantError {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := tc.snap.Config.Vsock.UDSPath; got != tc.wantPath {
+				t.Fatalf("UDSPath = %q, want %q", got, tc.wantPath)
+			}
+		})
+	}
+}
+
 func TestVsockConfig_DefaultUDSPath(t *testing.T) {
 	cases := []struct {
 		name     string
