@@ -187,6 +187,24 @@ type Config struct {
 type VsockConfig struct {
 	Enabled  bool   `json:"enabled,omitempty"`
 	GuestCID uint32 `json:"guest_cid,omitempty"`
+	UDSPath  string `json:"uds_path,omitempty"`
+}
+
+func (c *VsockConfig) Validate() error {
+	if c == nil {
+		return nil
+	}
+	if c.UDSPath != "" && !filepath.IsAbs(c.UDSPath) {
+		return fmt.Errorf("vsock: uds_path must be absolute, got %q", c.UDSPath)
+	}
+	return nil
+}
+
+func defaultUDSPath(vmID, stateDir string) string {
+	if vmID == "" || stateDir == "" {
+		return ""
+	}
+	return filepath.Join(stateDir, "sandboxes", vmID+".sock")
 }
 
 type ExecConfig struct {
@@ -290,6 +308,7 @@ type VM struct {
 	blkDevs        []*virtio.BlockDevice
 	fsDevs         []*virtio.FSDevice
 	vsockDev       *vsock.Device
+	udsListener    *udsListener
 	rtcDev         interface {
 		ReadBytes(uint16, []byte)
 		WriteBytes(uint16, []byte)
@@ -560,6 +579,13 @@ func (m *VM) Pause() error {
 			return fmt.Errorf("vm stopped while pausing")
 		}
 		if paused == vcpuCount {
+			// Close any active UDS bridges so clients observe the pause as
+			// EOF and reconnect after Resume. The listener itself stays up,
+			// accepting new connections that will block on DialVsock until
+			// the guest resumes.
+			if m.udsListener != nil {
+				m.udsListener.closeAllBridges()
+			}
 			m.events.Emit(EventPaused, fmt.Sprintf("%d vCPU(s) paused", vcpuCount))
 			return nil
 		}
@@ -980,7 +1006,14 @@ fullWrite:
 	// after the original VM's runtime dir (runs/<vm-id>/disk.ext4) is cleaned
 	// up. Without this, restore falls back to cold boot with
 	//   "open .../runs/<vm-id>/disk.ext4: no such file or directory"
-	bundled, err := rewriteSnapshotBundleWithConfig(dir, *snap, snap.Config)
+	//
+	// Honour opts.SkipDiskBundle the same way the dirty-pages path above does.
+	// When the caller is the worker proxy (takeSnapshotViaExport), it will
+	// hardlink the root disk on the host side AFTER the RPC returns — inside
+	// the jail link(2) returns EXDEV across the read-only /worker bind-mount
+	// and falls back to a ~2 GB full copy that dominates warm-capture latency
+	// (~17 s on ARM64 EC2).
+	bundled, err := rewriteSnapshotBundleOpts(dir, *snap, snap.Config, opts.SkipDiskBundle)
 	if err != nil {
 		return nil, fmt.Errorf("bundle snapshot assets: %w", err)
 	}
@@ -1012,6 +1045,12 @@ type RestoreOptions struct {
 	OverrideID      string
 	OverrideTap     string
 	OverrideX86Boot X86BootMode
+	// OverrideVsockUDSPath replaces the snapshot's Vsock.UDSPath. Empty
+	// means "use whatever the snapshot serialized"; callers that change
+	// OverrideID or restore on a different host typically pass this so the
+	// resulting socket lands at a valid, unambiguous path. Set to "-" to
+	// explicitly disable the UDS listener at restore time.
+	OverrideVsockUDSPath string
 	// SharedFSRebinds remaps virtiofs exports present in the snapshot to new
 	// host source paths, keyed by the guest-side Target that the template
 	// mounted the tag at. The template must have already snapshotted with a
@@ -1066,6 +1105,28 @@ func applySharedFSRebinds(snap *Snapshot, rebinds []SharedFSRebind) error {
 		// fresh virtiofsd against the new Source (direct path) or requires
 		// the worker to re-populate it (worker path).
 		snap.Config.SharedFS[i].SocketPath = ""
+	}
+	return nil
+}
+
+// applyVsockUDSPathOverride mutates the snapshot's Vsock.UDSPath based on
+// RestoreOptions.OverrideVsockUDSPath. Empty = no change; "-" = clear
+// (disable UDS at restore); anything else = new absolute path, which is
+// validated before being accepted.
+func applyVsockUDSPathOverride(snap *Snapshot, override string) error {
+	if override == "" {
+		return nil
+	}
+	if snap == nil || snap.Config.Vsock == nil {
+		return fmt.Errorf("OverrideVsockUDSPath: snapshot has no vsock device")
+	}
+	if override == "-" {
+		snap.Config.Vsock.UDSPath = ""
+		return nil
+	}
+	snap.Config.Vsock.UDSPath = override
+	if err := snap.Config.Vsock.Validate(); err != nil {
+		return fmt.Errorf("OverrideVsockUDSPath: %w", err)
 	}
 	return nil
 }
@@ -1126,6 +1187,9 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	}
 	if opts.OverrideTap != "" {
 		snap.Config.TapName = opts.OverrideTap
+	}
+	if err := applyVsockUDSPathOverride(&snap, opts.OverrideVsockUDSPath); err != nil {
+		return nil, err
 	}
 	if err := applySharedFSRebinds(&snap, opts.SharedFSRebinds); err != nil {
 		return nil, err
@@ -1752,6 +1816,10 @@ func (m *VM) setupDevices() error {
 		m.vsockDev = vsockDev
 		m.transports = append(m.transports, vsockDev.Transport)
 		slot++
+
+		if err := attachVsockUDSListener(m); err != nil {
+			return err
+		}
 	}
 
 	// virtio-blk
@@ -1965,6 +2033,15 @@ func (m *VM) waitIfPaused(vcpuID int) bool {
 
 func (m *VM) cleanup() {
 	m.cleanupOnce.Do(func() {
+		// The UDS listener holds bufio/io.Copy goroutines that call
+		// DialVsock; close it FIRST (without holding vsockDialMu) so those
+		// goroutines exit and release their read locks. Then take the
+		// write lock and tear devices down.
+		if m.udsListener != nil {
+			_ = m.udsListener.Close()
+			m.udsListener = nil
+		}
+
 		// Block until any in-flight DialVsock call completes before freeing
 		// devices and guest RAM.  See vsockDialMu on the VM struct.
 		m.vsockDialMu.Lock()

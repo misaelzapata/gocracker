@@ -9,6 +9,7 @@ import (
 
 	"github.com/gocracker/gocracker/internal/guestexec"
 	gclog "github.com/gocracker/gocracker/internal/log"
+	toolboxspec "github.com/gocracker/gocracker/internal/toolbox/spec"
 	"github.com/gocracker/gocracker/pkg/vmm"
 	"github.com/gocracker/gocracker/pkg/warmcache"
 )
@@ -66,13 +67,14 @@ func computeWarmCacheKey(opts RunOptions) (string, bool) {
 		cmdline = strings.Join(append(append([]string{}, opts.Entrypoint...), opts.Cmd...), " ")
 	}
 	return warmcache.Key(warmcache.KeyInput{
-		ImageDigest: opts.Image,
-		KernelHash:  kHash,
-		Cmdline:     cmdline,
-		MemMB:       opts.MemMB,
-		VCPUs:       opts.CPUs,
-		Arch:        opts.Arch,
-		NetworkMode: opts.NetworkMode,
+		ImageDigest:    opts.Image,
+		KernelHash:     kHash,
+		Cmdline:        cmdline,
+		MemMB:          opts.MemMB,
+		VCPUs:          opts.CPUs,
+		Arch:           opts.Arch,
+		NetworkMode:    opts.NetworkMode,
+		ToolboxVersion: toolboxspec.Version,
 	}), true
 }
 

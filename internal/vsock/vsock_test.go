@@ -3,7 +3,9 @@ package vsock
 import (
 	"encoding/binary"
 	"net"
+	"runtime"
 	"testing"
+	"time"
 )
 
 func TestMarshalParseHdr_Roundtrip(t *testing.T) {
@@ -1149,4 +1151,63 @@ func TestDevice_HandleResponse_NoPending(t *testing.T) {
 	hdr := &pktHdr{SrcPort: 100, DstPort: 200}
 	// Should not panic when no pending connection exists
 	d.handleResponse(hdr, nil)
+}
+
+// TestStartTXAvailPoller_StopsOnClose verifies the fix for a SIGSEGV
+// observed at VM shutdown: the 45s TX avail poller goroutine kept
+// running after Device.Close() and tried to read AvailIdx() from guest
+// RAM that had already been unmapped by the VMM cleanup path.
+//
+// Close() now *blocks* on d.rxWG until the poller goroutine has fully
+// exited. This test asserts that contract: Close() returning implies
+// the goroutine is gone. We check NumGoroutine both immediately and,
+// to absorb runtime scheduling jitter around the wg.Done ↔ goroutine
+// termination handoff, with a short polling tail — but the polling
+// window is deliberately short (250ms) because anything more suggests
+// the WaitGroup wiring regressed back to the old async-exit behavior
+// that the closeCh-only fix had.
+func TestStartTXAvailPoller_StopsOnClose(t *testing.T) {
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+
+	mem := make([]byte, 1<<20)
+	d := NewDevice(mem, 0, 0, nil, nil, func(bool) {})
+	d.Label = "test"
+
+	// Long duration so the poller survives only via closeCh/WG, never
+	// via ticker deadline expiry (which would mask a broken close).
+	d.StartTXAvailPoller(1 * time.Hour)
+
+	time.Sleep(600 * time.Millisecond)
+	if runtime.NumGoroutine() <= baseline {
+		t.Fatalf("poller goroutine did not start: baseline=%d current=%d",
+			baseline, runtime.NumGoroutine())
+	}
+
+	done := make(chan struct{})
+	go func() {
+		d.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() did not return within 2 seconds")
+	}
+
+	// Short window: with the WG contract in place the goroutine has
+	// already executed defer d.rxWG.Done() and returned before Close()
+	// unblocked. The only slack here is the runtime's accounting of
+	// terminated goroutines — at most a few ms in practice.
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		if runtime.NumGoroutine() <= baseline {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("TX poller did not exit within 250ms of Close (WaitGroup regression?): baseline=%d current=%d",
+		baseline, runtime.NumGoroutine())
 }

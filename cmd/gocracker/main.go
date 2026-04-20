@@ -168,6 +168,7 @@ func cmdRun(args []string) {
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
 	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs read-write directly (writes survive VM stop; slower boot). Default: Docker-style tmpfs overlay.")
 	warm := fs.Bool("warm", false, "Auto snapshot-cache: restore from snapshot on cache hit (~3 ms); snapshot after cold boot on miss so next run is fast.")
+	vsockUDSPath := fs.String("vsock-uds-path", "", "Absolute path for the VM's Firecracker-style vsock UDS. Clients dial it and send \"CONNECT <port>\\n\" to reach a guest vsock port. Empty = no UDS (HTTP /vms/{id}/vsock/connect still works).")
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
@@ -206,6 +207,7 @@ func cmdRun(args []string) {
 		ConsoleIn:       consoleIn,
 		RootfsPersistent: *rootfsPersistent,
 		WarmCapture:     *warm,
+		VsockUDSPath:    *vsockUDSPath,
 	}
 	if *balloonTargetMiB > 0 || *balloonDeflateOnOOM || *balloonStatsIntervalS > 0 || strings.TrimSpace(*balloonAuto) != "" {
 		runOpts.Balloon = &vmm.BalloonConfig{

@@ -237,6 +237,11 @@ func fileSyscalls() []uintptr {
 		unix.SYS_SYNCFS,
 		unix.SYS_COPY_FILE_RANGE,
 		unix.SYS_LINKAT,
+		// UDS listener (attachVsockUDSListener) uses os.Chmod after bind
+		// to tighten socket perms to 0660. Without fchmodat the jailed
+		// VMM traps to seccomp and its whole configure-and-start RPC
+		// fails with a cryptic EOF at the client.
+		unix.SYS_FCHMODAT,
 	}
 }
 

@@ -726,6 +726,37 @@ func TestBuildVsockConfig_MemoryHotplug(t *testing.T) {
 	}
 }
 
+func TestBuildVsockConfig_UDSPathOnlyEnablesVsock(t *testing.T) {
+	// Just setting VsockUDSPath (no exec, no balloon, no hotplug) should
+	// still produce a Vsock config so the listener has a device to dial.
+	cfg := buildVsockConfig(RunOptions{VsockUDSPath: "/run/gocracker/vm.sock"})
+	if cfg == nil || !cfg.Enabled {
+		t.Fatal("expected vsock config when UDSPath is set")
+	}
+	if cfg.UDSPath != "/run/gocracker/vm.sock" {
+		t.Fatalf("UDSPath = %q, want %q", cfg.UDSPath, "/run/gocracker/vm.sock")
+	}
+}
+
+func TestBuildVsockConfig_UDSPathWithExec(t *testing.T) {
+	cfg := buildVsockConfig(RunOptions{
+		ExecEnabled:  true,
+		VsockUDSPath: "/run/gocracker/vm.sock",
+	})
+	if cfg == nil || !cfg.Enabled || cfg.UDSPath != "/run/gocracker/vm.sock" {
+		t.Fatalf("unexpected cfg: %+v", cfg)
+	}
+}
+
+func TestBuildVsockConfig_EmptyUDSPath_NoEnable(t *testing.T) {
+	// Empty UDSPath alone doesn't enable vsock — preserves the pre-existing
+	// contract that vsock requires ExecEnabled / balloon / hotplug.
+	cfg := buildVsockConfig(RunOptions{VsockUDSPath: ""})
+	if cfg != nil {
+		t.Fatal("empty UDSPath alone should not enable vsock")
+	}
+}
+
 func TestBuildExecConfig_Disabled(t *testing.T) {
 	cfg := buildExecConfig(RunOptions{})
 	if cfg != nil {

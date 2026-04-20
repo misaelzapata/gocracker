@@ -31,6 +31,8 @@ import (
 	"github.com/gocracker/gocracker/internal/oci"
 	"github.com/gocracker/gocracker/internal/repo"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
+	toolboxembed "github.com/gocracker/gocracker/internal/toolbox/embed"
+	toolboxspec "github.com/gocracker/gocracker/internal/toolbox/spec"
 	"github.com/gocracker/gocracker/internal/worker"
 	"github.com/gocracker/gocracker/pkg/vmm"
 	"github.com/gocracker/gocracker/pkg/warmcache"
@@ -101,6 +103,12 @@ type RunOptions struct {
 	// InteractiveExec boots the guest into an idle supervisor so the CLI can
 	// attach a PTY over the exec agent instead of running the image process as PID 1.
 	InteractiveExec bool
+	// VsockUDSPath, when set, tells the VMM to expose its vsock device as a
+	// Firecracker-style Unix Domain Socket at this absolute path. Clients
+	// outside the VMM (sandboxd, CLI, socat) dial the path and send
+	// "CONNECT <port>\n" to reach a guest vsock port. Setting this path
+	// implies vsock is enabled.
+	VsockUDSPath string
 
 	// Additional create-time block devices exposed after the root disk.
 	Drives []vmm.DriveConfig
@@ -151,10 +159,32 @@ type RunResult struct {
 	Duration     time.Duration
 	Timings      vmm.BootTimings
 	// WarmDone is closed when the background warmcache snapshot goroutine
-	// completes. The caller MUST drain it BEFORE calling vm.Stop() — the
-	// goroutine accesses VM memory and must finish before the VM is freed.
+	// completes. The goroutine accesses VM memory and must finish before the
+	// VM is freed, so RunResult.Close() automatically drains it before
+	// running user cleanup. Callers that want a deterministic "snapshot is
+	// persisted" signal (e.g. the CLI happy path) can still wait on this
+	// channel directly before issuing vm.Stop().
 	WarmDone <-chan struct{}
 	cleanup func()
+}
+
+// Close releases all host-side resources tied to the run: it first drains the
+// background warm-cache capture goroutine (if any) to avoid a use-after-free
+// on guest RAM, then runs the registered cleanup (TAP teardown, runtime disk
+// cleanup schedule, etc.). Safe to call multiple times; no-op after the first.
+func (r *RunResult) Close() {
+	if r == nil {
+		return
+	}
+	if r.WarmDone != nil {
+		<-r.WarmDone
+		r.WarmDone = nil
+	}
+	if r.cleanup != nil {
+		c := r.cleanup
+		r.cleanup = nil
+		c()
+	}
 }
 
 const (
@@ -194,12 +224,6 @@ func waitFirstOutput(h vmm.Handle, startedAt time.Time, maxWait time.Duration) t
 	}
 }
 
-func (r *RunResult) Close() {
-	if r == nil || r.cleanup == nil {
-		return
-	}
-	r.cleanup()
-}
 
 const (
 	NetworkModeNone = ""
@@ -488,6 +512,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		}
 
 		injectHostCACerts(rootfsDir)
+		injectToolboxBinary(rootfsDir)
 		if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 			return nil, fmt.Errorf("ext4: %w", err)
 		}
@@ -651,12 +676,13 @@ func trimCIDR(value string) string {
 }
 
 func buildVsockConfig(opts RunOptions) *vmm.VsockConfig {
-	if !opts.ExecEnabled && !guestAgentRequired(opts.Balloon, opts.MemoryHotplug) {
+	if !opts.ExecEnabled && !guestAgentRequired(opts.Balloon, opts.MemoryHotplug) && opts.VsockUDSPath == "" {
 		return nil
 	}
 	return &vmm.VsockConfig{
 		Enabled:  true,
 		GuestCID: 0,
+		UDSPath:  opts.VsockUDSPath,
 	}
 }
 
@@ -855,6 +881,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 			return nil, fmt.Errorf("write runtime spec: %w", err)
 		}
 		injectHostCACerts(rootfsDir)
+		injectToolboxBinary(rootfsDir)
 		if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 			return nil, fmt.Errorf("ext4: %w", err)
 		}
@@ -1092,6 +1119,7 @@ func buildLocal(opts BuildOptions) (*BuildResult, error) {
 	}
 
 	injectHostCACerts(rootfsDir)
+	injectToolboxBinary(rootfsDir)
 	if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 		return nil, fmt.Errorf("ext4: %w", err)
 	}
@@ -1162,6 +1190,7 @@ func buildViaWorker(opts BuildOptions) (*BuildResult, error) {
 		return nil, err
 	}
 	injectHostCACerts(rootfsDir)
+	injectToolboxBinary(rootfsDir)
 	if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 		return nil, fmt.Errorf("ext4: %w", err)
 	}
@@ -1315,6 +1344,35 @@ func writeRuntimeSpecToRootfs(rootfsDir string, spec runtimecfg.GuestSpec) error
 		return err
 	}
 	return os.WriteFile(hostPath, data, 0644)
+}
+
+// injectToolboxBinary writes the embedded toolbox agent binary into the
+// guest rootfs at toolboxembed.Path. Every disk gocracker builds gets
+// the agent for free — there is no opt-out and no per-image config.
+//
+// Why baked, not bootstrapped: feat/sandboxes-v2 used a runtime.Exec +
+// base64 upload flow to install the agent post-boot, which introduced a
+// ~200 ms race window that then required EnsureToolbox-on-lease,
+// ToolboxVersion stamps, and event-refill workarounds. PLAN_SANDBOXD §1
+// table row 1 makes the lesson explicit. Baking eliminates the entire
+// failure class.
+//
+// Best-effort: if the embedded binary is empty (e.g. a host arch we
+// don't ship a binary for) the disk boots without the agent — old
+// /vms/{id}/exec on vsock 10022 still works. We emit no warning here
+// because the disk-build path is hot; callers that need to confirm
+// the agent is reachable should dial vsock 10023 directly.
+func injectToolboxBinary(rootfsDir string) {
+	if len(toolboxembed.Binary) == 0 {
+		return
+	}
+	guestPath := filepath.Join(rootfsDir, toolboxspec.BinaryPath)
+	if err := os.MkdirAll(filepath.Dir(guestPath), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(guestPath, toolboxembed.Binary, 0o755)
+	versionPath := filepath.Join(rootfsDir, toolboxspec.VersionFilePath)
+	_ = os.WriteFile(versionPath, []byte(toolboxspec.Version+"\n"), 0o644)
 }
 
 // injectHostCACerts copies the host's CA certificate bundle into the guest
@@ -2025,8 +2083,11 @@ func reIPGuest(handle vmm.Handle, newCIDR, newGateway string, timeout time.Durat
 		return fmt.Errorf("exec agent not ready: %w", dialErr)
 	}
 	defer conn.Close()
+	// `ip route add default` fails with "File exists" when the guest was
+	// restored from a snapshot whose rootfs already configured a default
+	// route — use `route replace` so the call is idempotent.
 	script := fmt.Sprintf(
-		"ip addr flush dev eth0 && ip addr add %s dev eth0 && ip route add default via %s dev eth0",
+		"ip addr flush dev eth0 && ip addr add %s dev eth0 && ip route replace default via %s dev eth0",
 		newCIDR, newGateway)
 	req := guestexec.Request{Mode: guestexec.ModeExec, Command: []string{"/bin/sh", "-c", script}}
 	if err := guestexec.Encode(conn, req); err != nil {

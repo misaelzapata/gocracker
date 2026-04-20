@@ -205,6 +205,10 @@ type RunRequest struct {
 	ExecEnabled   bool                     `json:"exec_enabled,omitempty"`
 	Balloon       *Balloon                 `json:"balloon,omitempty"`
 	MemoryHotplug *vmm.MemoryHotplugConfig `json:"memory_hotplug,omitempty"`
+	// VsockUDSPath asks the VMM to expose its vsock device as a
+	// Firecracker-style Unix Domain Socket at this absolute path. Empty =
+	// HTTP /vms/{id}/vsock/connect remains the only host→guest dial path.
+	VsockUDSPath string `json:"vsock_uds_path,omitempty"`
 
 	// NetworkMode selects how gocracker provisions the guest NIC. "" or
 	// "none" keeps today's explicit behaviour (caller supplies tap_name /
@@ -286,6 +290,10 @@ type VMInfo struct {
 	GuestIP     string            `json:"guest_ip,omitempty"`
 	Gateway     string            `json:"gateway,omitempty"`
 	NetworkMode string            `json:"network_mode,omitempty"`
+	// VsockUDSPath is the host-visible path (already jailer-resolved) where
+	// the VM's Firecracker-style vsock UDS is listening. Empty when the VM
+	// did not configure a UDS. Clients dial it and send "CONNECT <port>\n".
+	VsockUDSPath string `json:"vsock_uds_path,omitempty"`
 }
 
 type APIError struct {
@@ -1122,6 +1130,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		Metadata:      cloneMetadata(req.Metadata),
 		ExecEnabled:   req.ExecEnabled,
 		MemoryHotplug: cloneMemoryHotplug(req.MemoryHotplug),
+		VsockUDSPath:  req.VsockUDSPath,
 	}
 	if req.Balloon != nil {
 		opts.Balloon = &vmm.BalloonConfig{
@@ -1751,20 +1760,37 @@ func (s *Server) buildVMInfo(entry *vmEntry) VMInfo {
 		id = entry.apiID
 	}
 	return VMInfo{
-		ID:          id,
-		State:       entry.handle.State().String(),
-		Uptime:      entry.handle.Uptime().Round(time.Second).String(),
-		MemMB:       cfg.MemMB,
-		Arch:        defaultVMArch(cfg.Arch),
-		Kernel:      cfg.KernelPath,
-		Events:      events,
-		Devices:     entry.handle.DeviceList(),
-		Metadata:    metadata,
-		TapName:     metadata["tap_name"],
-		GuestIP:     metadata["guest_ip"],
-		Gateway:     metadata["gateway"],
-		NetworkMode: metadata["network_mode"],
+		ID:           id,
+		State:        entry.handle.State().String(),
+		Uptime:       entry.handle.Uptime().Round(time.Second).String(),
+		MemMB:        cfg.MemMB,
+		Arch:         defaultVMArch(cfg.Arch),
+		Kernel:       cfg.KernelPath,
+		Events:       events,
+		Devices:      entry.handle.DeviceList(),
+		Metadata:     metadata,
+		TapName:      metadata["tap_name"],
+		GuestIP:      metadata["guest_ip"],
+		Gateway:      metadata["gateway"],
+		NetworkMode:  metadata["network_mode"],
+		VsockUDSPath: vsockUDSPathForInfo(entry, &cfg),
 	}
+}
+
+// vsockUDSPathForInfo resolves the host-visible UDS path for a VM. When
+// jailed, the path serialized in VsockConfig.UDSPath is as-seen from
+// inside the jail; we use WorkerMetadata to translate that into the
+// host-side path, including the /worker bind-mount convention the worker
+// uses to give the VMM a writable directory.
+func vsockUDSPathForInfo(entry *vmEntry, cfg *vmm.Config) string {
+	if cfg == nil || cfg.Vsock == nil || cfg.Vsock.UDSPath == "" {
+		return ""
+	}
+	var meta vmm.WorkerMetadata
+	if wb, ok := entry.handle.(vmm.WorkerBacked); ok {
+		meta = wb.WorkerMetadata()
+	}
+	return vmm.ResolveWorkerHostSidePath(meta, cfg.Vsock.UDSPath)
 }
 
 func defaultVMArch(raw string) string {

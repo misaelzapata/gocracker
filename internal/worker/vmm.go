@@ -308,6 +308,7 @@ func LaunchVMMWithTimings(cfg vmm.Config, opts VMMOptions) (vmm.Handle, vmm.Boot
 			RNGRateLimiter:  jailedCfg.RNGRateLimiter,
 			VsockEnabled:    jailedCfg.Vsock != nil && jailedCfg.Vsock.Enabled,
 			VsockGuestCID:   vsockGuestCID(jailedCfg.Vsock),
+			VsockUDSPath:    vsockUDSPath(jailedCfg.Vsock),
 			ExecEnabled:     jailedCfg.Exec != nil && jailedCfg.Exec.Enabled,
 			ExecVsockPort:   execVsockPort(jailedCfg.Exec),
 			TrackDirtyPages: jailedCfg.TrackDirtyPages,
@@ -631,7 +632,15 @@ func (r *remoteVM) takeSnapshotViaExport(dir string) (*vmm.Snapshot, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if _, err := r.client.Snapshot(ctx, vmmserver.SnapshotRequest{DestDir: "/worker/snapshot-export"}); err != nil {
+	// SkipDiskBundle=true: the in-jail VMM can't reliably hardlink the root
+	// disk into artifacts/disk.ext4 (link(2) across the read-only /worker
+	// bind-mount returns EXDEV, forcing a 2 GB full copy that used to
+	// dominate warm-capture latency on ARM64). The host-side hardlink a
+	// few lines below handles that instead.
+	if _, err := r.client.Snapshot(ctx, vmmserver.SnapshotRequest{
+		DestDir:        "/worker/snapshot-export",
+		SkipDiskBundle: true,
+	}); err != nil {
 		return nil, err
 	}
 	if err := os.RemoveAll(dir); err != nil {
@@ -661,7 +670,11 @@ func (r *remoteVM) takeSnapshotViaExport(dir string) (*vmm.Snapshot, error) {
 			if jerr != nil {
 				return nil, jerr
 			}
-			if werr := os.WriteFile(filepath.Join(dir, "snapshot.json"), data, 0644); werr != nil {
+			// Use the same fsync-file + fsync-dir pattern as
+			// rewriteSnapshotBundleOpts; without it a crash between write and
+			// the next sync leaves a half-written snapshot.json that a later
+			// restore feeds to the kernel.
+			if werr := vmm.WriteSnapshotJSON(dir, data); werr != nil {
 				return nil, werr
 			}
 			return snap, nil
@@ -676,7 +689,7 @@ func (r *remoteVM) takeSnapshotViaExport(dir string) (*vmm.Snapshot, error) {
 		if jerr != nil {
 			return nil, jerr
 		}
-		if werr := os.WriteFile(filepath.Join(dir, "snapshot.json"), data, 0644); werr != nil {
+		if werr := vmm.WriteSnapshotJSON(dir, data); werr != nil {
 			return nil, werr
 		}
 		return snap, nil
@@ -1244,6 +1257,13 @@ func vsockGuestCID(cfg *vmm.VsockConfig) uint32 {
 		return 0
 	}
 	return cfg.GuestCID
+}
+
+func vsockUDSPath(cfg *vmm.VsockConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.UDSPath
 }
 
 func execVsockPort(cfg *vmm.ExecConfig) uint32 {
