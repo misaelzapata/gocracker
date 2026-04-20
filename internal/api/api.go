@@ -1777,18 +1777,20 @@ func (s *Server) buildVMInfo(entry *vmEntry) VMInfo {
 	}
 }
 
-// vsockUDSPathForInfo resolves the host-visible UDS path for a VM: when
-// jailed, the path serialized in VsockConfig.UDSPath points inside the
-// chroot, so we prepend the jail root reported by WorkerMetadata.
+// vsockUDSPathForInfo resolves the host-visible UDS path for a VM. When
+// jailed, the path serialized in VsockConfig.UDSPath is as-seen from
+// inside the jail; we use WorkerMetadata to translate that into the
+// host-side path, including the /worker bind-mount convention the worker
+// uses to give the VMM a writable directory.
 func vsockUDSPathForInfo(entry *vmEntry, cfg *vmm.Config) string {
 	if cfg == nil || cfg.Vsock == nil || cfg.Vsock.UDSPath == "" {
 		return ""
 	}
-	jailRoot := ""
+	var meta vmm.WorkerMetadata
 	if wb, ok := entry.handle.(vmm.WorkerBacked); ok {
-		jailRoot = wb.WorkerMetadata().JailRoot
+		meta = wb.WorkerMetadata()
 	}
-	return vmm.ResolveHostSidePath(jailRoot, cfg.Vsock.UDSPath)
+	return vmm.ResolveWorkerHostSidePath(meta, cfg.Vsock.UDSPath)
 }
 
 func defaultVMArch(raw string) string {

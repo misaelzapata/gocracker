@@ -2038,7 +2038,7 @@ func TestHandleGetVM_VsockUDSPath_NoJailer(t *testing.T) {
 	}
 }
 
-func TestHandleGetVM_VsockUDSPath_Jailed(t *testing.T) {
+func TestHandleGetVM_VsockUDSPath_JailedNonBind(t *testing.T) {
 	srv := New()
 	cfg := vmm.Config{
 		ID: "vm-jailed",
@@ -2051,6 +2051,7 @@ func TestHandleGetVM_VsockUDSPath_Jailed(t *testing.T) {
 	meta := vmm.WorkerMetadata{
 		Kind:     "worker",
 		JailRoot: "/srv/jailer/gocracker-vmm/abc/root",
+		RunDir:   "/tmp/worker-abc",
 	}
 	handle := newFakeWorkerHandle("vm-jailed", cfg, meta)
 	entry := srv.newVMEntry(handle, nil)
@@ -2058,7 +2059,38 @@ func TestHandleGetVM_VsockUDSPath_Jailed(t *testing.T) {
 	srv.registerVMEntry("vm-jailed", entry)
 
 	info := srv.buildVMInfo(entry)
+	// Non-bind path inside jail resolves under JailRoot.
 	want := "/srv/jailer/gocracker-vmm/abc/root/run/gocracker/vm.sock"
+	if info.VsockUDSPath != want {
+		t.Fatalf("VsockUDSPath = %q, want %q", info.VsockUDSPath, want)
+	}
+}
+
+func TestHandleGetVM_VsockUDSPath_JailedWorkerBind(t *testing.T) {
+	// UDS under the /worker bind-mount: the API must resolve to the
+	// bind-source (RunDir), NOT <JailRoot>/worker/... — the latter is
+	// hidden by the private mount namespace used by the jailer.
+	srv := New()
+	cfg := vmm.Config{
+		ID: "vm-jailed-bind",
+		Vsock: &vmm.VsockConfig{
+			Enabled:  true,
+			GuestCID: 3,
+			UDSPath:  "/worker/vm.sock",
+		},
+	}
+	meta := vmm.WorkerMetadata{
+		Kind:     "worker",
+		JailRoot: "/srv/jailer/gocracker-vmm/abc/root",
+		RunDir:   "/tmp/worker-abc",
+	}
+	handle := newFakeWorkerHandle("vm-jailed-bind", cfg, meta)
+	entry := srv.newVMEntry(handle, nil)
+	entry.kind = "worker"
+	srv.registerVMEntry("vm-jailed-bind", entry)
+
+	info := srv.buildVMInfo(entry)
+	want := "/tmp/worker-abc/vm.sock"
 	if info.VsockUDSPath != want {
 		t.Fatalf("VsockUDSPath = %q, want %q", info.VsockUDSPath, want)
 	}
