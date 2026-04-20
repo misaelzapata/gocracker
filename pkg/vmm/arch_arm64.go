@@ -222,6 +222,10 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 		vm.vsockDev = vsockDev
 		vm.transports = append(vm.transports, vsockDev.Transport)
 		slot++
+
+		if err := attachVsockUDSListener(vm); err != nil {
+			return err
+		}
 	}
 
 	// virtio-blk

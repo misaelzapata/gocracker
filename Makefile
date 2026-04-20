@@ -4,7 +4,7 @@ CMD      := ./cmd/gocracker
 TARGET_GOOS ?= linux
 TARGET_GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: all build build-amd64 build-arm64 generate tidy test coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed
+.PHONY: all build build-amd64 build-arm64 generate tidy test test-uds coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed
 
 all: build
 
@@ -36,6 +36,14 @@ tidy:
 
 test:
 	go test ./...
+
+## Unit tests for the Firecracker-style UDS (vsock) feature, under the
+## race detector, repeated 10x to surface ordering bugs and goroutine
+## leaks. Keep this tight — runs in <10s locally and is cheap for CI.
+test-uds:
+	go test -race -count=10 \
+	  -run 'VsockConfig|ResolveHostSidePath|ResolveWorkerHostSidePath|UDSListener|ParseConnect|SanitizeReason|VM_Cleanup|ApplyVsockUDSPathOverride|StartTXAvailPoller_StopsOnClose|HandleGetVM_VsockUDSPath|BuildVsockConfig_UDSPath' \
+	  ./pkg/vmm/... ./pkg/container/... ./internal/vsock/... ./internal/api/...
 
 coverage:
 	chmod +x ./tools/coverage-repo.sh && ./tools/coverage-repo.sh

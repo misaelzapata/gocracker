@@ -2008,6 +2008,117 @@ func TestHandleGetVM_Success(t *testing.T) {
 	}
 }
 
+func TestHandleGetVM_VsockUDSPath_NotSet(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-nouds")
+	handle.cfg.Vsock = &vmm.VsockConfig{Enabled: true, GuestCID: 3}
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-nouds", entry)
+
+	info := srv.buildVMInfo(entry)
+	if info.VsockUDSPath != "" {
+		t.Fatalf("VsockUDSPath = %q, want empty when no UDSPath set", info.VsockUDSPath)
+	}
+}
+
+func TestHandleGetVM_VsockUDSPath_NoJailer(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-uds")
+	handle.cfg.Vsock = &vmm.VsockConfig{
+		Enabled:  true,
+		GuestCID: 3,
+		UDSPath:  "/run/gocracker/vm-uds.sock",
+	}
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-uds", entry)
+
+	info := srv.buildVMInfo(entry)
+	if info.VsockUDSPath != "/run/gocracker/vm-uds.sock" {
+		t.Fatalf("VsockUDSPath = %q, want /run/gocracker/vm-uds.sock", info.VsockUDSPath)
+	}
+}
+
+func TestHandleGetVM_VsockUDSPath_JailedNonBind(t *testing.T) {
+	srv := New()
+	cfg := vmm.Config{
+		ID: "vm-jailed",
+		Vsock: &vmm.VsockConfig{
+			Enabled:  true,
+			GuestCID: 3,
+			UDSPath:  "/run/gocracker/vm.sock",
+		},
+	}
+	meta := vmm.WorkerMetadata{
+		Kind:     "worker",
+		JailRoot: "/srv/jailer/gocracker-vmm/abc/root",
+		RunDir:   "/tmp/worker-abc",
+	}
+	handle := newFakeWorkerHandle("vm-jailed", cfg, meta)
+	entry := srv.newVMEntry(handle, nil)
+	entry.kind = "worker"
+	srv.registerVMEntry("vm-jailed", entry)
+
+	info := srv.buildVMInfo(entry)
+	// Non-bind path inside jail resolves under JailRoot.
+	want := "/srv/jailer/gocracker-vmm/abc/root/run/gocracker/vm.sock"
+	if info.VsockUDSPath != want {
+		t.Fatalf("VsockUDSPath = %q, want %q", info.VsockUDSPath, want)
+	}
+}
+
+func TestHandleGetVM_VsockUDSPath_JailedWorkerBind(t *testing.T) {
+	// UDS under the /worker bind-mount: the API must resolve to the
+	// bind-source (RunDir), NOT <JailRoot>/worker/... — the latter is
+	// hidden by the private mount namespace used by the jailer.
+	srv := New()
+	cfg := vmm.Config{
+		ID: "vm-jailed-bind",
+		Vsock: &vmm.VsockConfig{
+			Enabled:  true,
+			GuestCID: 3,
+			UDSPath:  "/worker/vm.sock",
+		},
+	}
+	meta := vmm.WorkerMetadata{
+		Kind:     "worker",
+		JailRoot: "/srv/jailer/gocracker-vmm/abc/root",
+		RunDir:   "/tmp/worker-abc",
+	}
+	handle := newFakeWorkerHandle("vm-jailed-bind", cfg, meta)
+	entry := srv.newVMEntry(handle, nil)
+	entry.kind = "worker"
+	srv.registerVMEntry("vm-jailed-bind", entry)
+
+	info := srv.buildVMInfo(entry)
+	want := "/tmp/worker-abc/vm.sock"
+	if info.VsockUDSPath != want {
+		t.Fatalf("VsockUDSPath = %q, want %q", info.VsockUDSPath, want)
+	}
+}
+
+func TestHandleGetVM_VsockUDSPath_JSONField(t *testing.T) {
+	srv := New()
+	handle := newFakeHandle("vm-json")
+	handle.cfg.Vsock = &vmm.VsockConfig{
+		Enabled:  true,
+		GuestCID: 3,
+		UDSPath:  "/run/gocracker/vm-json.sock",
+	}
+	entry := srv.newVMEntry(handle, nil)
+	srv.registerVMEntry("vm-json", entry)
+
+	req := httptest.NewRequest(http.MethodGet, "/vms/vm-json", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"vsock_uds_path":"/run/gocracker/vm-json.sock"`) {
+		t.Fatalf("response missing vsock_uds_path field: %s", body)
+	}
+}
+
 func TestHandleVMVsockConnect_MissingPort(t *testing.T) {
 	srv := New()
 	handle := newFakeHandle("vm-vsock")
