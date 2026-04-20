@@ -224,6 +224,15 @@ func startToolboxSupervisor() {
 				"--vsock-port", strconv.FormatUint(uint64(toolboxspec.VsockPort), 10))
 			cmd.Stdout = kmsg
 			cmd.Stderr = kmsg
+			// Init's own env is whatever the kernel passed (typically
+			// empty). The toolbox needs PATH so the processes it
+			// spawns can resolve common binaries (echo, sh, sleep,
+			// etc.) via exec.LookPath. Without this every /exec call
+			// fails with "executable file not found in $PATH".
+			cmd.Env = append(os.Environ(),
+				"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+				"HOME=/root",
+			)
 			klogf("toolbox supervisor: starting attempt=%d", attempt)
 			err := cmd.Run()
 			klogf("toolbox supervisor: exited attempt=%d err=%v", attempt, err)

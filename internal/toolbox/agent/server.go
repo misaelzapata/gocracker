@@ -61,6 +61,11 @@ func Handler() http.Handler {
 	mux.HandleFunc("DELETE /secrets/{name}", handleDeleteSecret)
 	mux.HandleFunc("GET /secrets", handleListSecrets)
 	mux.Handle("/proxy/http/", http.HandlerFunc(handleHTTPProxy))
+	// /exec is the framed-binary data plane (PLAN_SANDBOXD §4). Unlike
+	// the other JSON endpoints above, this hijacks the conn after the
+	// handshake JSON and switches to the binary frame protocol — see
+	// internal/toolbox/agent/exec.go and frame.go.
+	mux.HandleFunc("POST /exec", handleExec)
 	return mux
 }
 
