@@ -431,3 +431,109 @@ func TestSanitizeReason(t *testing.T) {
 		t.Fatalf("sanitizeReason did not cap length: len=%d", len(got))
 	}
 }
+
+// TestVM_Cleanup_ClosesUDSListener verifies that cleanup() closes the UDS
+// listener and removes the socket file, without needing a full VM with
+// KVM. All other device fields stay nil; cleanup's nil-guards handle that.
+func TestVM_Cleanup_ClosesUDSListener(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vm.sock")
+	l, err := newUDSListener(path, &mockDialer{})
+	if err != nil {
+		t.Fatalf("newUDSListener: %v", err)
+	}
+	go l.run()
+
+	vm := &VM{udsListener: l}
+	vm.cleanup()
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("socket file should be removed after cleanup, stat err=%v", err)
+	}
+	if vm.udsListener != nil {
+		t.Fatal("udsListener should be cleared after cleanup")
+	}
+	// Second cleanup must be a no-op (cleanupOnce + nil listener).
+	vm.cleanup()
+}
+
+// TestVM_Cleanup_NilUDSListener ensures cleanup does not panic when no
+// UDS listener was ever attached.
+func TestVM_Cleanup_NilUDSListener(t *testing.T) {
+	vm := &VM{}
+	vm.cleanup()
+}
+
+// TestVM_Cleanup_WhileHandlersInDial verifies that cleanup() does not
+// deadlock when UDS handlers are executing DialVsock at the moment of
+// cleanup. The invariant: udsListener.Close() runs before vsockDialMu is
+// acquired, so handlers with in-flight DialVsock calls finish (the real
+// Device.Dial has dialTimeout=15s, so they always return eventually),
+// their RLocks release, and cleanup proceeds to WLock. This models the
+// realistic shutdown race — not the pathological "dialer blocks forever"
+// scenario, which cannot happen in production.
+func TestVM_Cleanup_WhileHandlersInDial(t *testing.T) {
+	// Dialer takes a realistic amount of time, then returns an error —
+	// mirroring a dev.Dial that times out because the guest didn't
+	// respond.
+	dialer := &mockDialer{
+		respond: func(port uint32) (net.Conn, error) {
+			time.Sleep(80 * time.Millisecond)
+			return nil, errors.New("simulated vsock dial timeout")
+		},
+	}
+	path := filepath.Join(t.TempDir(), "vm.sock")
+	l, err := newUDSListener(path, dialer)
+	if err != nil {
+		t.Fatalf("newUDSListener: %v", err)
+	}
+	go l.run()
+
+	// Fan out 10 concurrent clients; each drives a handler into DialVsock.
+	for i := 0; i < 10; i++ {
+		go func() {
+			c, err := net.Dial("unix", path)
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			_, _ = c.Write([]byte("CONNECT 10023\n"))
+			_, _ = io.ReadAll(c)
+		}()
+	}
+	time.Sleep(30 * time.Millisecond) // let handlers enter the dialer
+
+	vm := &VM{udsListener: l}
+	done := make(chan struct{})
+	go func() {
+		vm.cleanup()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// cleanup returned; handlers finished within the dialer's own
+		// time budget; no deadlock between udsListener.Close() and
+		// vsockDialMu.Lock().
+	case <-time.After(3 * time.Second):
+		t.Fatal("cleanup deadlocked with handlers mid-DialVsock")
+	}
+}
+
+// TestVM_Cleanup_Idempotent ensures cleanup runs exactly once regardless
+// of how many times it is called.
+func TestVM_Cleanup_Idempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vm.sock")
+	l, err := newUDSListener(path, &mockDialer{})
+	if err != nil {
+		t.Fatalf("newUDSListener: %v", err)
+	}
+	go l.run()
+
+	vm := &VM{udsListener: l}
+	for i := 0; i < 5; i++ {
+		vm.cleanup()
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("socket not removed: %v", err)
+	}
+}

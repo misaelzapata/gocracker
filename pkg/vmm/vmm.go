@@ -308,6 +308,7 @@ type VM struct {
 	blkDevs        []*virtio.BlockDevice
 	fsDevs         []*virtio.FSDevice
 	vsockDev       *vsock.Device
+	udsListener    *udsListener
 	rtcDev         interface {
 		ReadBytes(uint16, []byte)
 		WriteBytes(uint16, []byte)
@@ -1770,6 +1771,15 @@ func (m *VM) setupDevices() error {
 		m.vsockDev = vsockDev
 		m.transports = append(m.transports, vsockDev.Transport)
 		slot++
+
+		if m.cfg.Vsock.UDSPath != "" {
+			listener, err := newUDSListener(m.cfg.Vsock.UDSPath, m)
+			if err != nil {
+				return fmt.Errorf("vsock uds listener: %w", err)
+			}
+			m.udsListener = listener
+			go listener.run()
+		}
 	}
 
 	// virtio-blk
@@ -1983,6 +1993,15 @@ func (m *VM) waitIfPaused(vcpuID int) bool {
 
 func (m *VM) cleanup() {
 	m.cleanupOnce.Do(func() {
+		// The UDS listener holds bufio/io.Copy goroutines that call
+		// DialVsock; close it FIRST (without holding vsockDialMu) so those
+		// goroutines exit and release their read locks. Then take the
+		// write lock and tear devices down.
+		if m.udsListener != nil {
+			_ = m.udsListener.Close()
+			m.udsListener = nil
+		}
+
 		// Block until any in-flight DialVsock call completes before freeing
 		// devices and guest RAM.  See vsockDialMu on the VM struct.
 		m.vsockDialMu.Lock()
