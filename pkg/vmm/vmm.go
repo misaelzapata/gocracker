@@ -579,6 +579,13 @@ func (m *VM) Pause() error {
 			return fmt.Errorf("vm stopped while pausing")
 		}
 		if paused == vcpuCount {
+			// Close any active UDS bridges so clients observe the pause as
+			// EOF and reconnect after Resume. The listener itself stays up,
+			// accepting new connections that will block on DialVsock until
+			// the guest resumes.
+			if m.udsListener != nil {
+				m.udsListener.closeAllBridges()
+			}
 			m.events.Emit(EventPaused, fmt.Sprintf("%d vCPU(s) paused", vcpuCount))
 			return nil
 		}

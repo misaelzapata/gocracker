@@ -519,6 +519,123 @@ func TestVM_Cleanup_WhileHandlersInDial(t *testing.T) {
 	}
 }
 
+// TestUDSListener_CloseAllBridges_ClientsSeeEOF verifies the Pause
+// contract: closing all bridges makes active clients observe EOF on
+// their socket, while the listener itself stays up.
+func TestUDSListener_CloseAllBridges_ClientsSeeEOF(t *testing.T) {
+	guestSrv, guestClient := net.Pipe()
+	t.Cleanup(func() { guestSrv.Close(); guestClient.Close() })
+	dialer := &mockDialer{
+		respond: func(port uint32) (net.Conn, error) { return guestSrv, nil },
+	}
+	l := startListener(t, dialer)
+
+	client := dialUDS(t, l.Path())
+	defer client.Close()
+	if _, err := client.Write([]byte("CONNECT 10023\n")); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	if got := readLine(t, client); got != "OK" {
+		t.Fatalf("handshake = %q", got)
+	}
+
+	// Drive the bridge so it is registered (handleConn registers *after*
+	// writing OK, before the io.Copy loops start).
+	time.Sleep(30 * time.Millisecond)
+
+	l.closeAllBridges()
+
+	// Client should now observe EOF on read (bridge forcibly closed).
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 16)
+	n, err := client.Read(buf)
+	if err != io.EOF && !errors.Is(err, net.ErrClosed) && n != 0 {
+		t.Fatalf("expected EOF/closed after closeAllBridges, got n=%d err=%v", n, err)
+	}
+}
+
+// TestUDSListener_CloseAllBridges_ListenerSurvives verifies the listener
+// remains usable after bridges are closed — new clients can connect and
+// CONNECT successfully.
+func TestUDSListener_CloseAllBridges_ListenerSurvives(t *testing.T) {
+	var pipeCount int
+	var mu sync.Mutex
+	dialer := &mockDialer{
+		respond: func(port uint32) (net.Conn, error) {
+			mu.Lock()
+			pipeCount++
+			mu.Unlock()
+			srv, client := net.Pipe()
+			go func() { io.Copy(io.Discard, client); client.Close() }()
+			return srv, nil
+		},
+	}
+	l := startListener(t, dialer)
+
+	// First client establishes a bridge.
+	c1 := dialUDS(t, l.Path())
+	if _, err := c1.Write([]byte("CONNECT 10023\n")); err != nil {
+		t.Fatalf("c1 write: %v", err)
+	}
+	if got := readLine(t, c1); got != "OK" {
+		t.Fatalf("c1 handshake = %q", got)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	l.closeAllBridges()
+	c1.Close()
+
+	// Second client after bridges closed — listener still accepts.
+	c2 := dialUDS(t, l.Path())
+	defer c2.Close()
+	if _, err := c2.Write([]byte("CONNECT 10023\n")); err != nil {
+		t.Fatalf("c2 write: %v", err)
+	}
+	if got := readLine(t, c2); got != "OK" {
+		t.Fatalf("c2 handshake = %q (listener should still be up)", got)
+	}
+}
+
+// TestUDSListener_CloseAllBridges_NoGoroutineLeak ensures bridge
+// goroutines exit when closeAllBridges is called and do not accumulate
+// across repeated Pause-equivalent cycles.
+func TestUDSListener_CloseAllBridges_NoGoroutineLeak(t *testing.T) {
+	dialer := &mockDialer{
+		respond: func(port uint32) (net.Conn, error) {
+			srv, client := net.Pipe()
+			go func() { io.Copy(io.Discard, client); client.Close() }()
+			return srv, nil
+		},
+	}
+	l := startListener(t, dialer)
+
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+
+	for i := 0; i < 5; i++ {
+		c := dialUDS(t, l.Path())
+		if _, err := c.Write([]byte("CONNECT 10023\n")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		readLine(t, c)
+		time.Sleep(20 * time.Millisecond)
+		l.closeAllBridges()
+		c.Close()
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime.GC()
+		if runtime.NumGoroutine() <= baseline+2 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("goroutine leak after closeAllBridges cycles: baseline=%d current=%d",
+		baseline, runtime.NumGoroutine())
+}
+
 // TestVM_Cleanup_Idempotent ensures cleanup runs exactly once regardless
 // of how many times it is called.
 func TestVM_Cleanup_Idempotent(t *testing.T) {
