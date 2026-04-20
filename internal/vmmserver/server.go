@@ -29,6 +29,7 @@ type VM interface {
 	Pause() error
 	Resume() error
 	TakeSnapshot(string) (*vmm.Snapshot, error)
+	TakeSnapshotWithOptions(string, vmm.SnapshotOptions) (*vmm.Snapshot, error)
 	State() vmm.State
 	ID() string
 	Uptime() time.Duration
@@ -189,6 +190,13 @@ type ConfigureAndStartRequest struct {
 
 type SnapshotRequest struct {
 	DestDir string `json:"dest_dir"`
+	// SkipDiskBundle tells the in-jail VMM not to bundle the root disk into
+	// <DestDir>/artifacts/disk.ext4. The caller (worker proxy) is expected
+	// to hardlink the disk on the host side afterwards — the jailed process
+	// cannot do it itself because the disk is a read-only bind-mount across
+	// which link(2) returns EXDEV, falling back to a full ~2 GB copy that
+	// dominates warm-capture latency on ARM64.
+	SkipDiskBundle bool `json:"skip_disk_bundle,omitempty"`
 }
 
 type RestoreRequest struct {
@@ -1004,7 +1012,10 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		apiErr(w, http.StatusBadRequest, "dest_dir is required")
 		return
 	}
-	snap, err := vm.TakeSnapshot(req.DestDir)
+	snap, err := vm.TakeSnapshotWithOptions(req.DestDir, vmm.SnapshotOptions{
+		Resume:         true,
+		SkipDiskBundle: req.SkipDiskBundle,
+	})
 	if err != nil {
 		apiErr(w, http.StatusBadRequest, err.Error())
 		return

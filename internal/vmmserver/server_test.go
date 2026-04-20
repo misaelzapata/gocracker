@@ -59,6 +59,10 @@ func (f *fakeVM) TakeSnapshot(dir string) (*vmm.Snapshot, error) {
 	return &vmm.Snapshot{Version: 2, ID: f.cfg.ID, Timestamp: time.Now(), MemFile: filepath.Join(dir, "mem.bin")}, nil
 }
 
+func (f *fakeVM) TakeSnapshotWithOptions(dir string, _ vmm.SnapshotOptions) (*vmm.Snapshot, error) {
+	return f.TakeSnapshot(dir)
+}
+
 func (f *fakeVM) State() vmm.State {
 	switch {
 	case f.stopped:

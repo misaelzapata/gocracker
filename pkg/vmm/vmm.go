@@ -1006,7 +1006,14 @@ fullWrite:
 	// after the original VM's runtime dir (runs/<vm-id>/disk.ext4) is cleaned
 	// up. Without this, restore falls back to cold boot with
 	//   "open .../runs/<vm-id>/disk.ext4: no such file or directory"
-	bundled, err := rewriteSnapshotBundleWithConfig(dir, *snap, snap.Config)
+	//
+	// Honour opts.SkipDiskBundle the same way the dirty-pages path above does.
+	// When the caller is the worker proxy (takeSnapshotViaExport), it will
+	// hardlink the root disk on the host side AFTER the RPC returns — inside
+	// the jail link(2) returns EXDEV across the read-only /worker bind-mount
+	// and falls back to a ~2 GB full copy that dominates warm-capture latency
+	// (~17 s on ARM64 EC2).
+	bundled, err := rewriteSnapshotBundleOpts(dir, *snap, snap.Config, opts.SkipDiskBundle)
 	if err != nil {
 		return nil, fmt.Errorf("bundle snapshot assets: %w", err)
 	}
