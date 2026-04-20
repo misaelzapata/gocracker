@@ -661,7 +661,11 @@ func (r *remoteVM) takeSnapshotViaExport(dir string) (*vmm.Snapshot, error) {
 			if jerr != nil {
 				return nil, jerr
 			}
-			if werr := os.WriteFile(filepath.Join(dir, "snapshot.json"), data, 0644); werr != nil {
+			// Use the same fsync-file + fsync-dir pattern as
+			// rewriteSnapshotBundleOpts; without it a crash between write and
+			// the next sync leaves a half-written snapshot.json that a later
+			// restore feeds to the kernel.
+			if werr := vmm.WriteSnapshotJSON(dir, data); werr != nil {
 				return nil, werr
 			}
 			return snap, nil
@@ -676,7 +680,7 @@ func (r *remoteVM) takeSnapshotViaExport(dir string) (*vmm.Snapshot, error) {
 		if jerr != nil {
 			return nil, jerr
 		}
-		if werr := os.WriteFile(filepath.Join(dir, "snapshot.json"), data, 0644); werr != nil {
+		if werr := vmm.WriteSnapshotJSON(dir, data); werr != nil {
 			return nil, werr
 		}
 		return snap, nil

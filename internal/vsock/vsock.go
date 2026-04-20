@@ -605,7 +605,7 @@ func (d *Device) QuiesceForSnapshot() {
 			rstFailed++
 		}
 	}
-	gclog.VMM.Info("vsock quiesce rst injected",
+	gclog.VMM.Debug("vsock quiesce rst injected",
 		"injected", rstInjected,
 		"failed", rstFailed,
 		"total_conns", len(drained),
@@ -647,7 +647,7 @@ func (d *Device) QuiesceForSnapshot() {
 	// We then wait (bounded) for the rxPump goroutines to exit, which
 	// guarantees the opShutdown landed before we proceed to Pause.
 	var rxWG sync.WaitGroup
-	gclog.VMM.Info("vsock quiesce closing conns", "count", len(drained))
+	gclog.VMM.Debug("vsock quiesce closing conns", "count", len(drained))
 	for _, c := range drained {
 		rxWG.Add(1)
 		go func(conn net.Conn) {
@@ -660,12 +660,12 @@ func (d *Device) QuiesceForSnapshot() {
 	go func() { rxWG.Wait(); close(waitDone) }()
 	select {
 	case <-waitDone:
-		gclog.VMM.Info("vsock quiesce rxPumps all closed")
+		gclog.VMM.Debug("vsock quiesce rxPumps all closed")
 	case <-time.After(200 * time.Millisecond):
 		gclog.VMM.Warn("vsock quiesce rxPump close timeout")
 	}
 
-	gclog.VMM.Info("vsock quiesce signaled",
+	gclog.VMM.Debug("vsock quiesce signaled",
 		"conns", len(drained),
 		"rx_present", rxPresent,
 		"event_present", eventQ != nil && eventQ.Ready,
@@ -692,7 +692,7 @@ func (d *Device) QuiesceForSnapshot() {
 			break
 		}
 		if uint16(av-rxBaselineAvail) > 0 {
-			gclog.VMM.Info("vsock quiesce drained",
+			gclog.VMM.Debug("vsock quiesce drained",
 				"delta", uint16(av-rxBaselineAvail),
 				"elapsed_ms", time.Since(drainDeadline.Add(-250*time.Millisecond)).Milliseconds(),
 			)

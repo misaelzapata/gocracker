@@ -277,36 +277,45 @@ func rewriteSnapshotBundleOpts(dir string, snap Snapshot, cfg Config, skipDisk b
 	// the real disk into artifacts/disk.ext4 after exporting and rewrites
 	// snap.Config.DiskImage = "artifacts/disk.ext4".
 
-	metaFile := filepath.Join(dir, "snapshot.json")
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return nil, err
 	}
-	// Write with explicit fsync on the file and the parent dir: a crash
-	// between WriteFile and the next sync point otherwise leaves a half
-	// -written snapshot.json that a later restore happily picks up and
-	// feeds to the kernel. Crashing loudly here is strictly better than
-	// booting a corrupt template later.
+	if err := WriteSnapshotJSON(dir, data); err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
+// WriteSnapshotJSON writes data to <dir>/snapshot.json with fsync on the file
+// and the parent directory. A crash between WriteFile and the next sync point
+// otherwise leaves a half-written snapshot.json that a later restore happily
+// picks up and feeds to the kernel. Crashing loudly here is strictly better
+// than booting a corrupt template later. Exposed so the worker proxy (which
+// patches snapshot.json after host-side hardlinking) can reuse the same
+// durability guarantees.
+func WriteSnapshotJSON(dir string, data []byte) error {
+	metaFile := filepath.Join(dir, "snapshot.json")
 	f, err := os.OpenFile(metaFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
-		return nil, err
+		return err
 	}
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
-		return nil, err
+		return err
 	}
 	if err := f.Close(); err != nil {
-		return nil, err
+		return err
 	}
 	if dirF, err := os.Open(dir); err == nil {
 		_ = dirF.Sync()
 		_ = dirF.Close()
 	}
-	return &snap, nil
+	return nil
 }
 
 func captureSnapshotState(m *VM) (*Snapshot, error) {

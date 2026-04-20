@@ -151,10 +151,32 @@ type RunResult struct {
 	Duration     time.Duration
 	Timings      vmm.BootTimings
 	// WarmDone is closed when the background warmcache snapshot goroutine
-	// completes. The caller MUST drain it BEFORE calling vm.Stop() — the
-	// goroutine accesses VM memory and must finish before the VM is freed.
+	// completes. The goroutine accesses VM memory and must finish before the
+	// VM is freed, so RunResult.Close() automatically drains it before
+	// running user cleanup. Callers that want a deterministic "snapshot is
+	// persisted" signal (e.g. the CLI happy path) can still wait on this
+	// channel directly before issuing vm.Stop().
 	WarmDone <-chan struct{}
 	cleanup func()
+}
+
+// Close releases all host-side resources tied to the run: it first drains the
+// background warm-cache capture goroutine (if any) to avoid a use-after-free
+// on guest RAM, then runs the registered cleanup (TAP teardown, runtime disk
+// cleanup schedule, etc.). Safe to call multiple times; no-op after the first.
+func (r *RunResult) Close() {
+	if r == nil {
+		return
+	}
+	if r.WarmDone != nil {
+		<-r.WarmDone
+		r.WarmDone = nil
+	}
+	if r.cleanup != nil {
+		c := r.cleanup
+		r.cleanup = nil
+		c()
+	}
 }
 
 const (
@@ -194,12 +216,6 @@ func waitFirstOutput(h vmm.Handle, startedAt time.Time, maxWait time.Duration) t
 	}
 }
 
-func (r *RunResult) Close() {
-	if r == nil || r.cleanup == nil {
-		return
-	}
-	r.cleanup()
-}
 
 const (
 	NetworkModeNone = ""
@@ -2025,8 +2041,11 @@ func reIPGuest(handle vmm.Handle, newCIDR, newGateway string, timeout time.Durat
 		return fmt.Errorf("exec agent not ready: %w", dialErr)
 	}
 	defer conn.Close()
+	// `ip route add default` fails with "File exists" when the guest was
+	// restored from a snapshot whose rootfs already configured a default
+	// route — use `route replace` so the call is idempotent.
 	script := fmt.Sprintf(
-		"ip addr flush dev eth0 && ip addr add %s dev eth0 && ip route add default via %s dev eth0",
+		"ip addr flush dev eth0 && ip addr add %s dev eth0 && ip route replace default via %s dev eth0",
 		newCIDR, newGateway)
 	req := guestexec.Request{Mode: guestexec.ModeExec, Command: []string{"/bin/sh", "-c", script}}
 	if err := guestexec.Encode(conn, req); err != nil {
