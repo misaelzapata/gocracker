@@ -319,28 +319,28 @@ func (d *Device) handleDisconnect(hdr *pktHdr) {
 // queue's avail idx every 500ms for duration, logging when the guest
 // adds entries that weren't picked up by HandleQueueNotify. This detects
 // if the guest is writing to the TX vring without kicking the host.
+//
+// Tracked under d.rxWG so Close()'s wg.Wait() blocks until the poller
+// has fully exited. Without this, there's a narrow race: poller enters
+// the ticker case → Close marks closed + returns → caller unmaps guest
+// RAM → poller calls txQ.AvailIdx() against freed memory → SIGSEGV.
+// Copilot flagged this on PR #9; the earlier closeCh fix narrowed the
+// window but only the WaitGroup actually closes it.
 func (d *Device) StartTXAvailPoller(duration time.Duration) {
 	txQ := d.Transport.Queue(1)
 	rxQ := d.Transport.Queue(0)
 	if txQ == nil {
 		return
 	}
+	d.rxWG.Add(1)
 	go func() {
+		defer d.rxWG.Done()
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
 		deadline := time.After(duration)
 		for {
 			select {
 			case <-ticker.C:
-				// Device.Close() races with guest RAM unmap in the VMM
-				// cleanup path; re-check closed under d.mu before reading
-				// from mmap'd memory.
-				d.mu.Lock()
-				if d.closed {
-					d.mu.Unlock()
-					return
-				}
-				d.mu.Unlock()
 				avIdx, err := txQ.AvailIdx()
 				if err != nil {
 					continue
