@@ -187,6 +187,24 @@ type Config struct {
 type VsockConfig struct {
 	Enabled  bool   `json:"enabled,omitempty"`
 	GuestCID uint32 `json:"guest_cid,omitempty"`
+	UDSPath  string `json:"uds_path,omitempty"`
+}
+
+func (c *VsockConfig) Validate() error {
+	if c == nil {
+		return nil
+	}
+	if c.UDSPath != "" && !filepath.IsAbs(c.UDSPath) {
+		return fmt.Errorf("vsock: uds_path must be absolute, got %q", c.UDSPath)
+	}
+	return nil
+}
+
+func defaultUDSPath(vmID, stateDir string) string {
+	if vmID == "" || stateDir == "" {
+		return ""
+	}
+	return filepath.Join(stateDir, "sandboxes", vmID+".sock")
 }
 
 type ExecConfig struct {

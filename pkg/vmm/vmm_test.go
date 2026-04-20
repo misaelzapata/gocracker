@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -1391,6 +1392,82 @@ func TestVsockConfigJSON(t *testing.T) {
 	}
 	if !restored.Enabled || restored.GuestCID != 5 {
 		t.Fatalf("VsockConfig mismatch: %+v", restored)
+	}
+}
+
+func TestVsockConfig_UDSPath_JSON(t *testing.T) {
+	t.Run("present", func(t *testing.T) {
+		cfg := VsockConfig{Enabled: true, GuestCID: 3, UDSPath: "/var/run/gocracker/sandboxes/vm-1.sock"}
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		if !strings.Contains(string(data), `"uds_path":"/var/run/gocracker/sandboxes/vm-1.sock"`) {
+			t.Fatalf("uds_path not in marshaled output: %s", data)
+		}
+		var restored VsockConfig
+		if err := json.Unmarshal(data, &restored); err != nil {
+			t.Fatalf("json.Unmarshal: %v", err)
+		}
+		if restored.UDSPath != cfg.UDSPath {
+			t.Fatalf("UDSPath round-trip mismatch: got %q want %q", restored.UDSPath, cfg.UDSPath)
+		}
+	})
+	t.Run("omitted", func(t *testing.T) {
+		cfg := VsockConfig{Enabled: true, GuestCID: 3}
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		if strings.Contains(string(data), "uds_path") {
+			t.Fatalf("omitempty failed, marshaled=%s", data)
+		}
+	})
+}
+
+func TestVsockConfig_Validate(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     *VsockConfig
+		wantErr bool
+	}{
+		{"nil config", nil, false},
+		{"empty uds path", &VsockConfig{Enabled: true, GuestCID: 3}, false},
+		{"absolute uds path", &VsockConfig{Enabled: true, GuestCID: 3, UDSPath: "/run/gocracker/vm.sock"}, false},
+		{"relative uds path", &VsockConfig{Enabled: true, GuestCID: 3, UDSPath: "run/gocracker/vm.sock"}, true},
+		{"dot-relative uds path", &VsockConfig{Enabled: true, GuestCID: 3, UDSPath: "./vm.sock"}, true},
+		{"bare filename", &VsockConfig{Enabled: true, GuestCID: 3, UDSPath: "vm.sock"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.cfg.Validate()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() err=%v, wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestVsockConfig_DefaultUDSPath(t *testing.T) {
+	cases := []struct {
+		name     string
+		vmID     string
+		stateDir string
+		want     string
+	}{
+		{"normal", "vm-1", "/var/run/gocracker", "/var/run/gocracker/sandboxes/vm-1.sock"},
+		{"uuid-like id", "a1b2c3d4-e5f6", "/run/gocracker", "/run/gocracker/sandboxes/a1b2c3d4-e5f6.sock"},
+		{"empty id", "", "/run/gocracker", ""},
+		{"empty state dir", "vm-1", "", ""},
+		{"both empty", "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := defaultUDSPath(tc.vmID, tc.stateDir)
+			if got != tc.want {
+				t.Fatalf("defaultUDSPath(%q, %q) = %q, want %q", tc.vmID, tc.stateDir, got, tc.want)
+			}
+		})
 	}
 }
 
