@@ -87,10 +87,13 @@ func newUDSListener(path string, dialer VsockDialer) (*udsListener, error) {
 		cancel:  cancel,
 		bridges: make(map[*bridgeConn]struct{}),
 	}
-	// Reserve wg slot for run() here — BEFORE the caller issues
-	// `go u.run()` — so Close()'s wg.Wait never races with a
-	// not-yet-started accept goroutine. See run() for the invariant.
+	// Reserve wg slot + spawn the accept loop here. Pairing Add with the
+	// go-statement inside the constructor makes the invariant airtight:
+	// the counter is ≥1 from the moment newUDSListener returns until
+	// run() exits, so Close's wg.Wait can never race an Add from the
+	// loop. Callers should never `go u.run()` themselves.
 	u.wg.Add(1)
+	go u.run()
 	return u, nil
 }
 
@@ -250,7 +253,6 @@ func attachVsockUDSListener(vm *VM) error {
 		return fmt.Errorf("vsock uds listener: %w", err)
 	}
 	vm.udsListener = listener
-	go listener.run()
 	return nil
 }
 

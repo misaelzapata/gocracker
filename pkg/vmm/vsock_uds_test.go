@@ -47,7 +47,7 @@ func startListener(t *testing.T, dialer VsockDialer) *udsListener {
 	if err != nil {
 		t.Fatalf("newUDSListener: %v", err)
 	}
-	go l.run()
+
 	t.Cleanup(func() { _ = l.Close() })
 	return l
 }
@@ -373,7 +373,7 @@ func TestUDSListener_NoGoroutineLeak(t *testing.T) {
 		if err != nil {
 			t.Fatalf("newUDSListener: %v", err)
 		}
-		go l.run()
+
 
 		// Open and complete a connection, then close it from the client
 		// side (guest-side pipe copier will exit on Read EOF).
@@ -478,7 +478,7 @@ func TestVM_Cleanup_ClosesUDSListener(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newUDSListener: %v", err)
 	}
-	go l.run()
+
 
 	vm := &VM{udsListener: l}
 	vm.cleanup()
@@ -523,7 +523,7 @@ func TestVM_Cleanup_WhileHandlersInDial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newUDSListener: %v", err)
 	}
-	go l.run()
+
 
 	// Fan out 10 concurrent clients; each drives a handler into DialVsock.
 	for i := 0; i < 10; i++ {
@@ -764,7 +764,7 @@ func TestVM_Cleanup_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newUDSListener: %v", err)
 	}
-	go l.run()
+
 
 	vm := &VM{udsListener: l}
 	for i := 0; i < 5; i++ {
