@@ -308,6 +308,7 @@ func LaunchVMMWithTimings(cfg vmm.Config, opts VMMOptions) (vmm.Handle, vmm.Boot
 			RNGRateLimiter:  jailedCfg.RNGRateLimiter,
 			VsockEnabled:    jailedCfg.Vsock != nil && jailedCfg.Vsock.Enabled,
 			VsockGuestCID:   vsockGuestCID(jailedCfg.Vsock),
+			VsockUDSPath:    vsockUDSPath(jailedCfg.Vsock),
 			ExecEnabled:     jailedCfg.Exec != nil && jailedCfg.Exec.Enabled,
 			ExecVsockPort:   execVsockPort(jailedCfg.Exec),
 			TrackDirtyPages: jailedCfg.TrackDirtyPages,
@@ -1256,6 +1257,13 @@ func vsockGuestCID(cfg *vmm.VsockConfig) uint32 {
 		return 0
 	}
 	return cfg.GuestCID
+}
+
+func vsockUDSPath(cfg *vmm.VsockConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.UDSPath
 }
 
 func execVsockPort(cfg *vmm.ExecConfig) uint32 {

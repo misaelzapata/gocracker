@@ -244,6 +244,10 @@ func fileSyscalls() []uintptr {
 		unix.SYS_COPY_FILE_RANGE,
 		// linkat: used by os.Link for hardlink-based snapshot asset bundling.
 		unix.SYS_LINKAT,
+		// fchmodat: os.Chmod used by attachVsockUDSListener to set 0660
+		// on the UDS socket file right after bind. Without this the
+		// jailed VMM's configure-and-start RPC fails with a cryptic EOF.
+		unix.SYS_FCHMODAT,
 	}
 }
 

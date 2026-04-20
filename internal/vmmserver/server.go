@@ -99,6 +99,7 @@ type MachineConfig struct {
 	RNGRateLimiter  *vmm.RateLimiterConfig `json:"rng_rate_limiter,omitempty"`
 	VsockEnabled    bool                   `json:"vsock_enabled,omitempty"`
 	VsockGuestCID   uint32                 `json:"vsock_guest_cid,omitempty"`
+	VsockUDSPath    string                 `json:"vsock_uds_path,omitempty"`
 	ExecEnabled     bool                   `json:"exec_enabled,omitempty"`
 	ExecVsockPort   uint32                 `json:"exec_vsock_port,omitempty"`
 	TrackDirtyPages bool                   `json:"track_dirty_pages,omitempty"`
@@ -1349,6 +1350,7 @@ func (s *Server) startPrebootVM() error {
 			cfg.Vsock = &vmm.VsockConfig{
 				Enabled:  true,
 				GuestCID: s.preboot.machineCfg.VsockGuestCID,
+				UDSPath:  s.preboot.machineCfg.VsockUDSPath,
 			}
 		}
 		if s.preboot.machineCfg.ExecEnabled {
