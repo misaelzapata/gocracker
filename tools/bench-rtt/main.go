@@ -12,16 +12,20 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/gocracker/gocracker/internal/guestexec"
 	"github.com/gocracker/gocracker/pkg/container"
 	"github.com/gocracker/gocracker/pkg/vmm"
 	"github.com/gocracker/gocracker/pkg/warmcache"
@@ -45,6 +49,7 @@ func main() {
 	warmups := flag.Int("warmups", 3, "warmup iterations (not recorded)")
 	memMB := flag.Int("mem", 256, "guest memory MiB")
 	output := flag.String("output", "", "optional JSON output path")
+	udsPath := flag.String("uds", "", "enable UDS handshake bench at this absolute path; empty = skip")
 	flag.Parse()
 
 	fmt.Printf("bench-rtt: image=%s iter=%d warmups=%d\n\n", *image, *iter, *warmups)
@@ -53,12 +58,13 @@ func main() {
 	fmt.Print("cold-booting template VM... ")
 	t0 := time.Now()
 	opts := container.RunOptions{
-		Image:       *image,
-		KernelPath:  *kernel,
-		MemMB:       uint64(*memMB),
-		CPUs:        1,
-		ExecEnabled: true,
-		JailerMode:  container.JailerModeOff,
+		Image:        *image,
+		KernelPath:   *kernel,
+		MemMB:        uint64(*memMB),
+		CPUs:         1,
+		ExecEnabled:  true,
+		JailerMode:   container.JailerModeOff,
+		VsockUDSPath: *udsPath,
 	}
 	result, err := container.Run(opts)
 	if err != nil {
@@ -176,7 +182,37 @@ func main() {
 		return d, nil
 	}))
 
-	// 6. Snapshot restore RTT.
+	// 6. UDS handshake RTT (only when --uds is set). Measures the cost of
+	// dialing the Firecracker-style Unix socket, sending
+	// "CONNECT <execPort>\n", and reading back the "OK\n" reply — the
+	// portion that a sandbox orchestrator pays on every exec. The guest
+	// side connection is torn down immediately so we do NOT include
+	// guestexec handshake time; this is purely host-side + virtio-vsock.
+	if *udsPath != "" {
+		execPort := guestexec.DefaultVsockPort
+		results = append(results, measure("uds_handshake_rtt", *iter, *warmups, func() (time.Duration, error) {
+			t := time.Now()
+			c, err := net.Dial("unix", *udsPath)
+			if err != nil {
+				return 0, err
+			}
+			defer c.Close()
+			if _, err := fmt.Fprintf(c, "CONNECT %d\n", execPort); err != nil {
+				return 0, err
+			}
+			br := bufio.NewReader(c)
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return 0, err
+			}
+			if !strings.HasPrefix(line, "OK") {
+				return 0, fmt.Errorf("unexpected handshake: %q", strings.TrimRight(line, "\r\n"))
+			}
+			return time.Since(t), nil
+		}))
+	}
+
+	// 7. Snapshot restore RTT.
 	results = append(results, measure("snapshot_restore_rtt", *iter, *warmups, func() (time.Duration, error) {
 		t := time.Now()
 		vm, err := vmm.RestoreFromSnapshotWithOptions(canonSnap, vmm.RestoreOptions{})

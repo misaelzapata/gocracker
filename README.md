@@ -497,6 +497,7 @@ Unlike the end-to-end TTI and snapshot-resume benchmarks above, `bench-rtt` isol
 | snapshot restore (`vmm.RestoreFromSnapshotWithOptions → vm.Start`) | **1.44 ms** | 3.26 ms | 7.81 ms | consistent with the Firecracker-parity snapshot-resume RTT above. |
 | warmcache lookup hit | **3.6 µs** | 4.9 µs | 20 µs | `pkg/warmcache.Lookup()` — hashes + stats the snapshot dir. |
 | warmcache lookup miss | **1.2 µs** | 1.8 µs | 4 µs | early-out when the directory does not exist. |
+| UDS handshake (`CONNECT → OK`) | *run `-uds` to populate* | | | Firecracker-style Unix socket: dial + `CONNECT <port>\n` + read `OK\n`. Measures the host→guest→host virtio-vsock round-trip the sandbox orchestrator pays per exec. Opt-in via `-uds /path/vm.sock`. |
 
 ### Reproducing
 
@@ -511,7 +512,8 @@ GC_KERNEL=/path/to/vmlinux ./tools/bench-node-tti.sh
 sudo go run ./tools/bench-rtt \
   -image alpine:3.20 \
   -kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux \
-  -iter 50 -warmups 3 -output /tmp/bench-rtt.json
+  -iter 50 -warmups 3 -output /tmp/bench-rtt.json \
+  -uds /tmp/bench-vm.sock      # optional: adds uds_handshake_rtt
 ```
 
 First run pulls `node:20-alpine` and builds the ext4 disk (~10–30 s). Every subsequent run hits the cache and measures only the boot path.
