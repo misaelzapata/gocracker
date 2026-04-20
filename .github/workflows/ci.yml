@@ -14,6 +14,8 @@ jobs:
           go-version-file: go.mod
       - name: Unit and package tests
         run: go test $(go list ./... | grep -v /tests/integration)
+      - name: UDS race + leak gate
+        run: make test-uds
 
   coverage:
     runs-on: ubuntu-latest
