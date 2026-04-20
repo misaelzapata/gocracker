@@ -223,9 +223,9 @@ make -C "$STAGED_SOURCE_DIR" mrproper
 
 cp "$BASE_CONFIG" "$BUILD_DIR/.config"
 if [[ -n "$PROFILE_FRAGMENT" ]]; then
-  "$STAGED_SOURCE_DIR/scripts/kconfig/merge_config.sh" -m -O "$BUILD_DIR" "$BUILD_DIR/.config" "$COMMON_FRAGMENT" "$PROFILE_FRAGMENT"
+  "$STAGED_SOURCE_DIR/scripts/kconfig/merge_config.sh" -O "$BUILD_DIR" "$BUILD_DIR/.config" "$COMMON_FRAGMENT" "$PROFILE_FRAGMENT"
 else
-  "$STAGED_SOURCE_DIR/scripts/kconfig/merge_config.sh" -m -O "$BUILD_DIR" "$BUILD_DIR/.config" "$COMMON_FRAGMENT"
+  "$STAGED_SOURCE_DIR/scripts/kconfig/merge_config.sh" -O "$BUILD_DIR" "$BUILD_DIR/.config" "$COMMON_FRAGMENT"
 fi
 make -C "$STAGED_SOURCE_DIR" O="$BUILD_DIR" olddefconfig
 make -C "$STAGED_SOURCE_DIR" O="$BUILD_DIR" -j "$JOBS" bzImage

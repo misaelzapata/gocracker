@@ -86,6 +86,7 @@ type Device struct {
 	mem          []byte
 	closed       bool
 	rxWG         sync.WaitGroup
+	Label        string // optional VM identifier for debug logs
 }
 
 // NewDevice creates a vsock device. listenFn is called when the guest
@@ -122,6 +123,7 @@ func (d *Device) HandleQueueNotify(idx uint32, q *virtio.Queue) bool {
 	if idx != 1 {
 		return false
 	}
+	gclog.VMM.Debug("vsock HandleQueueNotify TX", "vm", d.Label, "idx", idx)
 	return d.processTX(q)
 }
 
@@ -136,10 +138,12 @@ func (d *Device) processTX(q *virtio.Queue) bool {
 			return
 		}
 		if len(chain) == 0 {
+			gclog.VMM.Debug("[DBG-TX] empty chain", "vm", d.Label, "head", head)
 			return
 		}
 		// Read header
 		if chain[0].Len < hdrSize {
+			gclog.VMM.Debug("[DBG-TX] short descriptor", "vm", d.Label, "head", head, "len", chain[0].Len)
 			_ = q.PushUsed(uint32(head), 0)
 			return
 		}
@@ -151,6 +155,7 @@ func (d *Device) processTX(q *virtio.Queue) bool {
 		}
 		var hdr pktHdr
 		parseHdr(hdrBuf, &hdr)
+		gclog.VMM.Debug("[DBG-TX] parsed", "vm", d.Label, "op", hdr.Op, "srcPort", hdr.SrcPort, "dstPort", hdr.DstPort)
 
 		switch hdr.Op {
 		case opRequest:
@@ -168,19 +173,29 @@ func (d *Device) processTX(q *virtio.Queue) bool {
 	}); err != nil {
 		gclog.VMM.Warn("virtio-vsock TX queue iteration failed", "error", err)
 	}
+	// Log TX queue state after processing
+	txQ := d.Transport.Queue(1)
+	if txQ != nil {
+		avIdx, _ := txQ.AvailIdx()
+		gclog.VMM.Debug("[DBG-TX] queue state after processTX", "vm", d.Label, "processed", processed, "lastAvail", txQ.LastAvail, "availIdx", avIdx, "delta", uint16(avIdx-txQ.LastAvail))
+	}
 	return processed
 }
 
 func (d *Device) handleConnect(hdr *pktHdr, q *virtio.Queue) {
+	gclog.VMM.Debug("vsock handleConnect", "vm", d.Label, "guestPort", hdr.SrcPort, "hostPort", hdr.DstPort, "listenFn_nil", d.listenFn == nil)
 	if d.listenFn == nil {
+		gclog.VMM.Debug("vsock handleConnect: no listenFn, sending reset", "vm", d.Label)
 		d.sendReset(hdr)
 		return
 	}
 	conn, err := d.listenFn(hdr.DstPort)
 	if err != nil {
+		gclog.VMM.Debug("vsock handleConnect: listenFn error, sending reset", "vm", d.Label, "err", err)
 		d.sendReset(hdr)
 		return
 	}
+	gclog.VMM.Debug("vsock handleConnect: accepted", "vm", d.Label, "guestPort", hdr.SrcPort, "hostPort", hdr.DstPort)
 	c := &Connection{
 		guestPort: hdr.SrcPort,
 		hostPort:  hdr.DstPort,
@@ -246,6 +261,7 @@ func (d *Device) handleData(hdr *pktHdr, chain []virtio.Desc, q *virtio.Queue) {
 		// conn is "unknown" and the guest needs an explicit kill signal to
 		// reach `for { dial; handleExecAgentConn }` and redial the new
 		// broker. Without this RST the guest sits in Read forever.
+		gclog.VMM.Debug("[DBG-VSOCK] handleData: conn NOT found, sending RST", "guestPort", hdr.SrcPort, "hostPort", hdr.DstPort)
 		d.sendReset(hdr)
 		return
 	}
@@ -265,7 +281,11 @@ func (d *Device) handleData(hdr *pktHdr, chain []virtio.Desc, q *virtio.Queue) {
 	if len(data) > int(hdr.Len) {
 		data = data[:hdr.Len]
 	}
-	c.conn.Write(data) //nolint:errcheck
+	gclog.VMM.Debug("[DBG-VSOCK] handleData: guest→host", "guestPort", hdr.SrcPort, "hostPort", hdr.DstPort, "len", len(data))
+	n, err := c.conn.Write(data)
+	if err != nil {
+		gclog.VMM.Warn("[DBG-VSOCK] handleData: conn.Write FAILED", "guestPort", hdr.SrcPort, "hostPort", hdr.DstPort, "n", n, "err", err)
+	}
 }
 
 func (d *Device) handleDisconnect(hdr *pktHdr) {
@@ -277,7 +297,9 @@ func (d *Device) handleDisconnect(hdr *pktHdr) {
 	if pending != nil {
 		delete(d.pending, hdr.DstPort)
 	}
+	connsLen := len(d.conns)
 	d.mu.Unlock()
+	gclog.VMM.Debug("[DBG-DISC] handleDisconnect", "vm", d.Label, "op", hdr.Op, "guestPort", hdr.SrcPort, "hostPort", hdr.DstPort, "connFound", c != nil, "pendingFound", pending != nil, "remainingConns", connsLen)
 	if c != nil {
 		c.conn.Close()
 		// Send RST back so the guest's close() completes promptly
@@ -290,11 +312,56 @@ func (d *Device) handleDisconnect(hdr *pktHdr) {
 	}
 }
 
+// StartTXAvailPoller starts a background goroutine that polls the TX
+// queue's avail idx every 500ms for duration, logging when the guest
+// adds entries that weren't picked up by HandleQueueNotify. This detects
+// if the guest is writing to the TX vring without kicking the host.
+func (d *Device) StartTXAvailPoller(duration time.Duration) {
+	txQ := d.Transport.Queue(1)
+	rxQ := d.Transport.Queue(0)
+	if txQ == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		deadline := time.After(duration)
+		for {
+			select {
+			case <-ticker.C:
+				avIdx, err := txQ.AvailIdx()
+				if err != nil {
+					continue
+				}
+				delta := uint16(avIdx - txQ.LastAvail)
+				rxAvail := "n/a"
+				if rxQ != nil {
+					rxAvIdx, rxErr := rxQ.AvailIdx()
+					if rxErr == nil {
+						rxDelta := uint16(rxAvIdx - rxQ.LastAvail)
+						rxAvail = fmt.Sprintf("avail=%d,last=%d,free=%d", rxAvIdx, rxQ.LastAvail, rxDelta)
+					}
+				}
+				if delta > 0 {
+					gclog.VMM.Warn("[DBG-POLL] TX avail AHEAD of lastAvail!", "vm", d.Label, "availIdx", avIdx, "lastAvail", txQ.LastAvail, "delta", delta, "rx", rxAvail)
+				} else {
+					gclog.VMM.Debug("[DBG-POLL] TX avail check", "vm", d.Label, "availIdx", avIdx, "lastAvail", txQ.LastAvail, "rx", rxAvail)
+				}
+			case <-deadline:
+				gclog.VMM.Debug("[DBG-POLL] TX poller stopped", "vm", d.Label)
+				return
+			}
+		}
+	}()
+}
+
 func (d *Device) sendReset(hdr *pktHdr) {
 	d.sendPkt(hdr.DstCID, hdr.SrcCID, hdr.DstPort, hdr.SrcPort, opReset, nil)
 }
 
-func (d *Device) sendPkt(srcCID, dstCID uint64, srcPort, dstPort uint32, op uint16, data []byte) {
+// sendPkt returns true if the packet was successfully queued into the guest RX
+// queue, false if the queue was not ready (guest virtio driver not yet init'd).
+func (d *Device) sendPkt(srcCID, dstCID uint64, srcPort, dstPort uint32, op uint16, data []byte) bool {
 	hdr := &pktHdr{
 		SrcCID:   srcCID,
 		DstCID:   dstCID,
@@ -309,11 +376,13 @@ func (d *Device) sendPkt(srcCID, dstCID uint64, srcPort, dstPort uint32, op uint
 	payload := append(hdrBytes, data...)
 
 	if d.Transport == nil {
-		return
+		gclog.VMM.Debug("[DBG-VSOCK] sendPkt: Transport is nil!", "op", op, "srcPort", srcPort, "dstPort", dstPort)
+		return false
 	}
 	rxQ := d.Transport.Queue(0)
 	if rxQ == nil || !rxQ.Ready {
-		return
+		gclog.VMM.Debug("[DBG-VSOCK] sendPkt: RX queue not ready!", "op", op, "srcPort", srcPort, "dstPort", dstPort, "rxQ_nil", rxQ == nil)
+		return false
 	}
 	ok, err := rxQ.ConsumeAvail(func(head uint16) {
 		chain, walkErr := rxQ.WalkChain(head)
@@ -346,13 +415,15 @@ func (d *Device) sendPkt(srcCID, dstCID uint64, srcPort, dstPort uint32, op uint
 	})
 	if err != nil {
 		gclog.VMM.Warn("virtio-vsock RX queue consume failed", "error", err)
-		return
+		return false
 	}
 	if !ok {
-		return
+		gclog.VMM.Debug("[DBG-VSOCK] sendPkt: no avail descriptors in RX queue!", "op", op, "srcPort", srcPort, "dstPort", dstPort, "dataLen", len(data))
+		return false
 	}
 	d.Transport.SetInterruptStat(1)
 	d.Transport.SignalIRQ(true)
+	return true
 }
 
 // rxPump reads from the host connection and injects data into the guest RX queue.
@@ -370,9 +441,11 @@ func (c *Connection) rxPump(q *virtio.Queue) {
 			return
 		}
 		if n > 0 {
+			gclog.VMM.Debug("[DBG-VSOCK] rxPump: host→guest", "hostPort", c.hostPort, "guestPort", c.guestPort, "len", n)
 			c.device.sendPkt(HostCID, GuestCID, c.hostPort, c.guestPort, opRW, buf[:n])
 		}
 		if err == io.EOF || err != nil {
+			gclog.VMM.Debug("[DBG-VSOCK] rxPump: exit", "hostPort", c.hostPort, "guestPort", c.guestPort, "err", err)
 			if !c.device.isClosed() {
 				c.device.sendPkt(HostCID, GuestCID, c.hostPort, c.guestPort, opShutdown, nil)
 			}
@@ -382,94 +455,303 @@ func (c *Connection) rxPump(q *virtio.Queue) {
 }
 
 func (d *Device) Dial(port uint32) (net.Conn, error) {
-	hostConn, deviceConn := net.Pipe()
-	pending := &pendingConn{
-		conn: &Connection{
-			guestPort: port,
-			hostPort:  d.allocateHostPort(),
-			conn:      deviceConn,
-			device:    d,
-		},
-		ready: make(chan error, 1),
-	}
+	deadline := time.Now().Add(dialTimeout)
 
-	d.mu.Lock()
-	d.pending[pending.conn.hostPort] = pending
-	d.mu.Unlock()
-
-	d.sendPkt(HostCID, GuestCID, pending.conn.hostPort, port, opRequest, nil)
-
-	select {
-	case err := <-pending.ready:
-		if err != nil {
-			hostConn.Close()
-			return nil, err
+	for {
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("vsock dial timeout for guest port %d", port)
 		}
-		return hostConn, nil
-	case <-time.After(dialTimeout):
+
+		hostConn, deviceConn := net.Pipe()
+		pending := &pendingConn{
+			conn: &Connection{
+				guestPort: port,
+				hostPort:  d.allocateHostPort(),
+				conn:      deviceConn,
+				device:    d,
+			},
+			ready: make(chan error, 1),
+		}
+
 		d.mu.Lock()
-		delete(d.pending, pending.conn.hostPort)
+		d.pending[pending.conn.hostPort] = pending
 		d.mu.Unlock()
-		hostConn.Close()
-		deviceConn.Close()
-		return nil, fmt.Errorf("vsock dial timeout for guest port %d", port)
+
+		// Retry sending opRequest until the guest's RX queue is ready.
+		// On fresh boot the virtio-vsock driver initializes its queues ~50–200 ms
+		// after the vCPU starts; before that sendPkt returns false (queue not ready).
+		sent := false
+		for !sent {
+			if time.Now().After(deadline) {
+				d.mu.Lock()
+				delete(d.pending, pending.conn.hostPort)
+				d.mu.Unlock()
+				hostConn.Close()
+				deviceConn.Close()
+				return nil, fmt.Errorf("vsock dial timeout: RX queue never ready for port %d", port)
+			}
+			if d.sendPkt(HostCID, GuestCID, pending.conn.hostPort, port, opRequest, nil) {
+				sent = true
+			} else {
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+
+		select {
+		case err := <-pending.ready:
+			if err != nil {
+				// opReset received — guest had no listener yet (or rejected).
+				// Clean up this attempt and retry after a short pause.
+				hostConn.Close()
+				gclog.VMM.Debug("vsock Dial: opReset, retrying", "vm", d.Label, "port", port, "err", err)
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			return hostConn, nil
+		case <-time.After(time.Until(deadline)):
+			d.mu.Lock()
+			delete(d.pending, pending.conn.hostPort)
+			d.mu.Unlock()
+			hostConn.Close()
+			deviceConn.Close()
+			return nil, fmt.Errorf("vsock dial timeout for guest port %d", port)
+		}
 	}
 }
 
-// QuiesceForSnapshot tells the guest's vsock driver that every open socket
-// must be dropped, by emitting a VIRTIO_VSOCK_EVENT_TRANSPORT_RESET event on
-// the device's event queue (virtqueue index 2). This is Firecracker's
-// documented snapshot contract (docs/snapshotting/snapshot-support.md) and
-// is implemented in their vsock device's `prepare_save` as
-// `send_transport_reset_event()`:
+// QuiesceForSnapshot makes the guest-side vsock driver drop every open
+// socket, before the vCPUs are paused and a memory snapshot is taken.
 //
-//	The Linux virtio-vsock driver handles this event by calling
-//	virtio_vsock_reset_sock() on every active AF_VSOCK socket — much more
-//	aggressive (and correct) than sending opShutdown per connection, which
-//	only affects the sockets the host-side device still knows about.
+// The Firecracker contract is "vsock connections do not survive
+// snapshot/restore" (docs/snapshotting/snapshot-support.md). If the guest
+// kernel's AF_VSOCK sockets are still in state ESTABLISHED when the memory
+// image is captured, the restored guest will be blocked in
+// serveExecAgent's Decode forever — the host process that owned the peer
+// half of those sockets no longer exists, but the guest has no way to find
+// that out by itself.
 //
-// Must be called while the vCPUs are still running (so the guest can drain
-// the event queue and actually process the reset) but after the snapshot
-// machinery has committed to pausing. Idempotent: the event queue processes
-// at most one event per available descriptor, so repeated calls just queue
-// more resets — harmless but wasteful.
+// Two independent wake-up signals are delivered here, in this order,
+// because every individual signal has a failure mode:
+//
+//  1. Per-conn synchronous opRst on the RX queue (index 0). For every
+//     connection we currently track, we push a single "reset" packet to
+//     the RX ring. The Linux virtio-vsock driver processes this inline
+//     from its RX work function, walks the socket by (dst_cid, dst_port,
+//     src_cid, src_port), and calls virtio_transport_reset_no_sock /
+//     virtio_transport_do_close — which wakes any reader blocked in
+//     recvmsg. This is the same path virtio uses for a natural peer RST,
+//     so it is already well-exercised in the guest kernel and does not
+//     depend on the event queue.
+//
+//  2. VIRTIO_VSOCK_EVENT_TRANSPORT_RESET on the event queue (index 2).
+//     This is what Firecracker emits; it walks virtio_vsock_conns and
+//     resets any socket the driver knows about but our host-side conns
+//     map has already forgotten (stale from a previous restore, or
+//     connections we never tracked). Belt-and-suspenders.
+//
+// After signaling, we poll the RX queue's avail ring for evidence that
+// the guest driver drained our packets (it refills descriptors after
+// consuming them). This replaces the previous fixed 100 ms sleep — in
+// practice the guest drains in <5 ms but the old sleep occasionally
+// wasn't enough under scheduler contention, and 100 ms was a floor under
+// every snapshot.
 func (d *Device) QuiesceForSnapshot() {
 	if d.Transport == nil {
 		return
 	}
-	eventQ := d.Transport.Queue(2)
-	if eventQ == nil || !eventQ.Ready {
-		return
-	}
-	event := make([]byte, 4)
-	binary.LittleEndian.PutUint32(event, 0) // VIRTIO_VSOCK_EVENT_TRANSPORT_RESET = 0
-	_ = eventQ.IterAvail(func(head uint16) {
-		chain, err := eventQ.WalkChain(head)
-		if err != nil || len(chain) == 0 {
-			_ = eventQ.PushUsed(uint32(head), 0)
-			return
-		}
-		if err := eventQ.GuestWrite(chain[0].Addr, event); err != nil {
-			_ = eventQ.PushUsed(uint32(head), 0)
-			return
-		}
-		_ = eventQ.PushUsed(uint32(head), 4)
-	})
-	d.Transport.SignalIRQ(true)
-	// Also drop our server-side state for the reset conns so subsequent
-	// packets arriving for them get opRst (via handleData's unknown-conn
-	// path). This releases the host-side pipes so their rxPumps unblock
-	// and the exec broker's hostConn drains.
+
+	// Snapshot the conn set; we will issue per-conn opRst for each.
 	d.mu.Lock()
 	drained := make([]*Connection, 0, len(d.conns))
 	for _, c := range d.conns {
 		drained = append(drained, c)
 	}
+	// Clear d.conns first so any racing rxPump that wakes from the
+	// subsequent c.conn.Close() cannot re-send a duplicate opShutdown
+	// (it would hit a now-unknown connKey in handleData anyway, but
+	// clearing up front makes the sequence observable).
 	d.conns = map[connKey]*Connection{}
 	d.mu.Unlock()
-	for _, c := range drained {
-		c.conn.Close()
+
+	rxQ := d.Transport.Queue(0)
+	eventQ := d.Transport.Queue(2)
+
+	// Track the guest-visible descriptor position on RX *before* we
+	// inject anything, so we can verify drain afterwards.
+	var rxBaselineAvail uint16
+	rxPresent := rxQ != nil && rxQ.Ready
+	if rxPresent {
+		if av, err := rxQ.AvailIdx(); err == nil {
+			rxBaselineAvail = av
+		} else {
+			rxPresent = false
+		}
 	}
+
+	signalNeeded := false
+
+	// (1) Per-conn opRst on RX queue.
+	rstInjected := 0
+	rstFailed := 0
+	for _, c := range drained {
+		if !rxPresent {
+			break
+		}
+		// Direction: host -> guest, so src=Host/hostPort, dst=Guest/guestPort.
+		if d.injectPkt(rxQ, HostCID, GuestCID, c.hostPort, c.guestPort, opReset) {
+			signalNeeded = true
+			rstInjected++
+		} else {
+			rstFailed++
+		}
+	}
+	gclog.VMM.Debug("vsock quiesce rst injected",
+		"injected", rstInjected,
+		"failed", rstFailed,
+		"total_conns", len(drained),
+	)
+
+	// (2) TRANSPORT_RESET on event queue.
+	if eventQ != nil && eventQ.Ready {
+		event := make([]byte, 4)
+		binary.LittleEndian.PutUint32(event, 0) // VIRTIO_VSOCK_EVENT_TRANSPORT_RESET = 0
+		wrote := false
+		_ = eventQ.IterAvail(func(head uint16) {
+			chain, err := eventQ.WalkChain(head)
+			if err != nil || len(chain) == 0 {
+				_ = eventQ.PushUsed(uint32(head), 0)
+				return
+			}
+			if err := eventQ.GuestWrite(chain[0].Addr, event); err != nil {
+				_ = eventQ.PushUsed(uint32(head), 0)
+				return
+			}
+			_ = eventQ.PushUsed(uint32(head), 4)
+			wrote = true
+		})
+		if wrote {
+			signalNeeded = true
+		}
+	}
+
+	if signalNeeded {
+		// Virtio spec §4.2.2.5: ISR bit 0 = used buffer notification.
+		// Without this the guest's virtio-mmio ISR treats the IRQ as
+		// spurious and never drains the queues.
+		d.Transport.SetInterruptStat(1)
+		d.Transport.SignalIRQ(true)
+	}
+
+	// Release the host-side pipes. Close each guestConn so the rxPump
+	// goroutine sees EOF and sends opShutdown to the guest's RX queue.
+	// We then wait (bounded) for the rxPump goroutines to exit, which
+	// guarantees the opShutdown landed before we proceed to Pause.
+	var rxWG sync.WaitGroup
+	gclog.VMM.Debug("vsock quiesce closing conns", "count", len(drained))
+	for _, c := range drained {
+		rxWG.Add(1)
+		go func(conn net.Conn) {
+			defer rxWG.Done()
+			conn.Close()
+		}(c.conn)
+	}
+	// Wait up to 200ms for rxPumps to close and send opShutdown.
+	waitDone := make(chan struct{})
+	go func() { rxWG.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+		gclog.VMM.Debug("vsock quiesce rxPumps all closed")
+	case <-time.After(200 * time.Millisecond):
+		gclog.VMM.Warn("vsock quiesce rxPump close timeout")
+	}
+
+	gclog.VMM.Debug("vsock quiesce signaled",
+		"conns", len(drained),
+		"rx_present", rxPresent,
+		"event_present", eventQ != nil && eventQ.Ready,
+		"rx_baseline_avail", rxBaselineAvail,
+	)
+
+	// The RX drain is only meaningful when we actually injected RST packets
+	// onto the RX queue (i.e. there were active connections). TRANSPORT_RESET
+	// goes to the event queue (index 2) which is independent — the RX avail
+	// index won't advance for an event-only signal, so we skip the drain when
+	// drained is empty to avoid an unconditional 250ms timeout on every
+	// snapshot of an idle VM.
+	if !rxPresent || len(drained) == 0 {
+		return
+	}
+
+	// Wait for the guest to process what we just enqueued. Evidence:
+	// the guest replenishes RX descriptors after consuming them, so the
+	// avail ring's idx advances. Bounded at 250 ms.
+	drainDeadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(drainDeadline) {
+		av, err := rxQ.AvailIdx()
+		if err != nil {
+			break
+		}
+		if uint16(av-rxBaselineAvail) > 0 {
+			gclog.VMM.Debug("vsock quiesce drained",
+				"delta", uint16(av-rxBaselineAvail),
+				"elapsed_ms", time.Since(drainDeadline.Add(-250*time.Millisecond)).Milliseconds(),
+			)
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	gclog.VMM.Warn("vsock quiesce drain timeout",
+		"timeout_ms", 250,
+		"rx_baseline_avail", rxBaselineAvail,
+	)
+}
+
+// injectPkt synthesises a vsock control packet (header only, no payload)
+// and pushes it onto the given RX queue, returning whether a descriptor
+// was actually consumed. Reused from QuiesceForSnapshot so we do not
+// interleave sendPkt's own IRQ signaling with the batched one above.
+func (d *Device) injectPkt(rxQ *virtio.Queue, srcCID, dstCID uint64, srcPort, dstPort uint32, op uint16) bool {
+	hdr := &pktHdr{
+		SrcCID:   srcCID,
+		DstCID:   dstCID,
+		SrcPort:  srcPort,
+		DstPort:  dstPort,
+		Type:     1,
+		Op:       op,
+		BufAlloc: 65536,
+	}
+	payload := marshalHdr(hdr)
+	ok, err := rxQ.ConsumeAvail(func(head uint16) {
+		chain, walkErr := rxQ.WalkChain(head)
+		if walkErr != nil {
+			_ = rxQ.PushUsed(uint32(head), 0)
+			return
+		}
+		written := uint32(0)
+		remaining := payload
+		for _, desc := range chain {
+			if desc.Flags&virtio.DescFlagWrite == 0 {
+				continue
+			}
+			sz := uint32(len(remaining))
+			if sz > desc.Len {
+				sz = desc.Len
+			}
+			if err := rxQ.GuestWrite(desc.Addr, remaining[:sz]); err != nil {
+				break
+			}
+			remaining = remaining[sz:]
+			written += sz
+			if len(remaining) == 0 {
+				break
+			}
+		}
+		_ = rxQ.PushUsed(uint32(head), written)
+	})
+	if err != nil || !ok {
+		return false
+	}
+	return true
 }
 
 // Close shuts down the vsock device: it marks the device closed, terminates

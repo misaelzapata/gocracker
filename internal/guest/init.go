@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -31,6 +32,16 @@ import (
 )
 
 var kmsg *os.File
+
+// activePTY is the PTY master of the most recently started exec stream session.
+// A ModeResize request applies TIOCSWINSZ to this fd so the foreground process
+// group receives SIGWINCH and redraws correctly. Access is protected by
+// activePTYMu. Only one active PTY is tracked; this is sufficient for the
+// common case of a single interactive terminal session per sandbox.
+var (
+	activePTYMu sync.Mutex
+	activePTY   *os.File
+)
 
 func initKmsg() {
 	os.MkdirAll("/dev", 0755)
@@ -195,32 +206,66 @@ func startExecAgent(spec runtimecfg.GuestSpec) {
 
 func serveExecAgent(spec runtimecfg.GuestSpec) error {
 	port := spec.Exec.Port()
+	// Listen for connections from the host. The host dials in per exec call;
+	// we accept and dispatch each on its own goroutine. On snapshot/restore
+	// the listener fd is preserved in the memory image — after restore the
+	// host simply re-dials; no TRANSPORT_RESET dance needed.
 	for {
-		conn, err := dialVsock(vsock.HostCID, port)
+		ln, err := listenVsock(port)
 		if err != nil {
-			klogf("exec agent connect to host port %d failed: %v", port, err)
-			time.Sleep(250 * time.Millisecond)
+			klogf("[exec-agent] listen port=%d failed: %v — retrying", port, err)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		handleExecAgentConn(conn, spec)
+		klogf("[exec-agent] listening port=%d", port)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				klogf("[exec-agent] accept failed: %v — re-listening", err)
+				ln.Close()
+				break
+			}
+			klogf("[exec-agent] accepted connection")
+			go handleExecAgentConn(conn, spec)
+		}
 	}
 }
 
-func dialVsock(cid, port uint32) (net.Conn, error) {
+// listenVsock binds and listens on an AF_VSOCK port for incoming host connections.
+func listenVsock(port uint32) (net.Listener, error) {
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, fmt.Errorf("socket: %w", err)
+	}
+	sa := &unix.SockaddrVM{CID: unix.VMADDR_CID_ANY, Port: port}
+	if err := unix.Bind(fd, sa); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("bind port %d: %w", port, err)
+	}
+	if err := unix.Listen(fd, 8); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("listen port %d: %w", port, err)
+	}
+	return &vsockListener{fd: fd}, nil
+}
+
+type vsockListener struct{ fd int }
+
+func (l *vsockListener) Accept() (net.Conn, error) {
+	nfd, peerSA, err := unix.Accept(l.fd)
 	if err != nil {
 		return nil, err
 	}
-	sa := &unix.SockaddrVM{
-		CID:  cid,
-		Port: port,
+	vmSA, ok := peerSA.(*unix.SockaddrVM)
+	if !ok {
+		unix.Close(nfd)
+		return nil, fmt.Errorf("unexpected peer address type from accept")
 	}
-	if err := unix.Connect(fd, sa); err != nil {
-		unix.Close(fd)
-		return nil, err
-	}
-	return newVsockConn(fd, sa)
+	return newVsockConn(nfd, vmSA)
 }
+
+func (l *vsockListener) Close() error                { return unix.Close(l.fd) }
+func (l *vsockListener) Addr() net.Addr              { return vsockAddr{cid: vsock.GuestCID, port: 0} }
 
 type vsockConn struct {
 	file  *os.File
@@ -285,24 +330,9 @@ func sockaddrToAddr(sa unix.Sockaddr) net.Addr {
 
 func handleExecAgentConn(conn net.Conn, spec runtimecfg.GuestSpec) {
 	defer conn.Close()
-
-	// No first-Decode read deadline: snapshot-capture now sends
-	// VIRTIO_VSOCK_EVENT_TRANSPORT_RESET before the memory dump (see
-	// QuiesceForSnapshot in internal/vsock), which causes the guest's
-	// vsock driver to close every socket BEFORE the snapshot is taken.
-	// There are no orphaned conns post-restore, so the previously-armed
-	// 2 s deadline was pure overhead — evaluated on every Decode yet
-	// never necessary. Removing it shaves ~5–10 ms off the first /exec
-	// after a restore.
 	var req guestexec.Request
 	if err := guestexec.Decode(conn, &req); err != nil {
 		klogf("exec agent decode failed: %v", err)
-		// Do NOT try to Encode an error response here: if the Decode
-		// failure was caused by a virtio-vsock transport-reset (the
-		// host-initiated pre-snapshot quiesce), the conn is already dead
-		// and Encode would either error or — worse — block long enough
-		// to delay the next serveExecAgent dial, pushing the first
-		// post-restore /exec by several ms.
 		return
 	}
 	if err := req.Validate(); err != nil {
@@ -347,6 +377,20 @@ func handleExecAgentConn(conn net.Conn, spec runtimecfg.GuestSpec) {
 		if err := guestexec.Encode(conn, guestexec.Response{OK: true, MemoryHotplug: &hotplug}); err != nil {
 			klogf("exec agent memory hotplug update reply failed: %v", err)
 		}
+	case guestexec.ModeResize:
+		activePTYMu.Lock()
+		ptmx := activePTY
+		activePTYMu.Unlock()
+		if ptmx == nil {
+			_ = guestexec.Encode(conn, guestexec.Response{Error: "no active PTY session"})
+			return
+		}
+		ws := &unix.Winsize{Col: uint16(req.Columns), Row: uint16(req.Rows)}
+		if err := unix.IoctlSetWinsize(int(ptmx.Fd()), unix.TIOCSWINSZ, ws); err != nil {
+			_ = guestexec.Encode(conn, guestexec.Response{Error: fmt.Sprintf("TIOCSWINSZ: %v", err)})
+			return
+		}
+		_ = guestexec.Encode(conn, guestexec.Response{OK: true})
 	default:
 		_ = guestexec.Encode(conn, guestexec.Response{Error: fmt.Sprintf("unsupported exec mode %q", req.Mode)})
 	}
@@ -702,6 +746,46 @@ func runExecStream(conn net.Conn, req guestexec.Request, spec runtimecfg.GuestSp
 		return cmd.Run()
 	}
 	defer ptmx.Close()
+	// Register this PTY master as the active one so ModeResize requests can
+	// apply TIOCSWINSZ without needing a separate session-tracking mechanism.
+	activePTYMu.Lock()
+	activePTY = ptmx
+	activePTYMu.Unlock()
+	defer func() {
+		activePTYMu.Lock()
+		if activePTY == ptmx {
+			activePTY = nil
+		}
+		activePTYMu.Unlock()
+	}()
+	// Configure the PTY slave for interactive TUI use (vim, htop, tmux).
+	// pty.StartWithSize allocates the master+slave pair and starts the process
+	// with the slave as its controlling terminal, but it doesn't configure
+	// termios — the kernel defaults leave icanon and echo on, which breaks
+	// vim's cursor-key handling and makes htop look garbled.
+	//
+	// We resolve the slave device path via /proc/self/fd/<masterN> (Linux only),
+	// open it briefly to apply cbreak termios, then close it immediately.
+	// The process already holds the slave open as its controlling terminal, so
+	// closing our extra reference here doesn't affect it.
+	if slaveName, serr := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", ptmx.Fd())); serr == nil {
+		if slaveFd, ferr := unix.Open(slaveName, unix.O_RDWR|unix.O_NOCTTY, 0); ferr == nil {
+			termios, terr := unix.IoctlGetTermios(slaveFd, unix.TCGETS)
+			if terr == nil {
+				// cbreak: read keys immediately, one at a time.
+				termios.Lflag &^= unix.ICANON | unix.ECHO | unix.ECHOE | unix.ECHOK | unix.ECHONL
+				// isig: Ctrl-C delivers SIGINT, Ctrl-Z delivers SIGTSTP.
+				termios.Lflag |= unix.ISIG
+				// No output post-processing so ANSI escape sequences pass through intact.
+				termios.Oflag &^= unix.OPOST
+				// Minimum 1 byte per read, no timer — standard cbreak.
+				termios.Cc[unix.VMIN] = 1
+				termios.Cc[unix.VTIME] = 0
+				_ = unix.IoctlSetTermios(slaveFd, unix.TCSETS, termios)
+			}
+			_ = unix.Close(slaveFd)
+		}
+	}
 	if err := guestexec.Encode(conn, guestexec.Response{OK: true}); err != nil {
 		return err
 	}

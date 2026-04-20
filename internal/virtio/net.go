@@ -412,7 +412,10 @@ func openTAP(name string) (*os.File, int, error) {
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,
 		uintptr(fd), tunSetIFF, uintptr(unsafe.Pointer(&ifr))); errno != 0 {
 		f.Close()
-		return nil, -1, fmt.Errorf("TUNSETIFF: %w", errno)
+		if errno == unix.EPERM {
+			return nil, -1, fmt.Errorf("TUNSETIFF %s: %w (gocracker needs root or CAP_NET_ADMIN to create TAP devices; run as root, set cap_net_admin+ep on the binary, or provide a pre-existing --tap name)", name, errno)
+		}
+		return nil, -1, fmt.Errorf("TUNSETIFF %s: %w", name, errno)
 	}
 	size := int32(netHeaderLen)
 	if _, _, errno := unix.Syscall(unix.SYS_IOCTL,

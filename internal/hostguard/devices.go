@@ -57,6 +57,52 @@ func CheckDeviceTree(root string, req DeviceRequirements) error {
 	return nil
 }
 
+// HasNetAdmin reports whether the current process can create TAP/TUN
+// devices. True for uid 0 and for any process that carries the
+// CAP_NET_ADMIN capability in its effective set. Used by handleRun to
+// fail /run requests with network_mode=auto fast (403), instead of
+// queuing a VM that would crash at TUNSETIFF time.
+func HasNetAdmin() bool {
+	if os.Geteuid() == 0 {
+		return true
+	}
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return false
+	}
+	for _, line := range splitLines(data) {
+		if len(line) < 7 || string(line[:7]) != "CapEff:" {
+			continue
+		}
+		raw := string(line[7:])
+		for len(raw) > 0 && (raw[0] == ' ' || raw[0] == '\t') {
+			raw = raw[1:]
+		}
+		var cap uint64
+		if _, err := fmt.Sscanf(raw, "%x", &cap); err != nil {
+			return false
+		}
+		// CAP_NET_ADMIN is bit 12 (linux/capability.h).
+		return cap&(1<<12) != 0
+	}
+	return false
+}
+
+func splitLines(data []byte) [][]byte {
+	lines := make([][]byte, 0, 16)
+	start := 0
+	for i, b := range data {
+		if b == '\n' {
+			lines = append(lines, data[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(data) {
+		lines = append(lines, data[start:])
+	}
+	return lines
+}
+
 func checkCharDevice(root string, spec charDeviceSpec) error {
 	path := filepath.Join(root, spec.relPath)
 	info, err := os.Stat(path)

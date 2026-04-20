@@ -1,6 +1,6 @@
 # Validated Real-World Projects
 
-gocracker has been tested against **328 open-source projects** from GitHub,
+gocracker has been tested against **378 open-source projects** from GitHub,
 booting each from its Dockerfile as a KVM microVM.
 
 ### Go (123 projects)

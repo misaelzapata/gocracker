@@ -36,7 +36,7 @@ gocracker run --image ubuntu:22.04 --kernel ./kernel --wait
 No Docker daemon. No containerd. No runc. Just KVM.
 
 This started as a hobby project to understand KVM and Go systems programming.
-It grew into something that boots 328 real-world projects, runs Flask + PostgreSQL
+It grew into something that boots 378 real-world projects, runs Flask + PostgreSQL
 compose stacks on ARM64 bare metal, and supports snapshots, live migration, and a
 Firecracker-compatible REST API. All in a single static binary.
 
@@ -59,11 +59,11 @@ sudo ./gocracker run --image alpine:latest --kernel ./artifacts/kernels/gocracke
 
 **Orchestration** -- Docker Compose stacks as microVMs, healthchecks (CMD/CMD-SHELL executed in-guest), `depends_on` with conditions (`service_healthy`, `service_completed_successfully`), `.env` and interpolation.
 
-**Networking** -- `--net auto` for single-command TAP + IPv4 + NAT, per-stack network namespaces for Compose, manual TAP for advanced setups, deterministic per-VM MAC addresses, port publishing.
+**Networking** -- `--net auto` (CLI) and `network_mode=auto` (REST) for single-command TAP + IPv4 + NAT, per-stack network namespaces for Compose, manual TAP for advanced setups, deterministic per-VM MAC addresses, port publishing.
 
 **Isolation** -- KVM hardware virtualization, Firecracker-style jailer (`gocracker-jailer`), seccomp filters (per-arch), private mount namespaces, `pivot_root` isolation for builds.
 
-**Operations** -- Snapshot and restore (RAM + vCPU + device state), live migration (stop-and-copy), Firecracker-compatible REST API with extensions, structured logging, event streaming (SSE).
+**Operations** -- Snapshot / restore / pause / resume (RAM + vCPU + device state), in-place `/clone` (snapshot + restore as a new VM on the same server, fresh tap + guest re-IP), live migration (stop-and-copy), Firecracker-compatible REST API with extensions, structured logging, event streaming (SSE). Stale `/tmp/gocracker-*` from SIGKILL'd prior runs is pruned on `serve` startup.
 
 **Devices** -- virtio-net, virtio-blk, virtio-rng, virtio-vsock, virtio-balloon (manual + auto reclaim), virtio-fs, UART 16550A serial console, memory hotplug.
 
@@ -153,6 +153,47 @@ sudo ./gocracker run --image alpine:latest --kernel ./kernel --cpus 4 --mem 512 
 
 ![Multi-vCPU demo](assets/demos/08-multi-vcpu.gif)
 
+### 9. Sandbox pool from template (REST API)
+
+Boot a template VM, install tools once, then clone it per sandbox. Each
+clone gets a fresh TAP + subnet and the guest is re-IP'd on the fly via the
+exec agent so outbound networking works without the caller pre-allocating
+any host resources. `network_mode=auto` creates TAP devices so the server
+process must have root or `CAP_NET_ADMIN` (`sudo` or `setcap cap_net_admin+ep`
+on the binary); `/run` and `/clone` return 403 with an actionable message
+if it's missing.
+
+```bash
+sudo ./gocracker serve --addr 127.0.0.1:8080 --trusted-kernel-dir ./artifacts/kernels &
+
+# 1. Boot template (network_mode=auto + exec + wait=true)
+TEMPLATE=$(curl -sS http://127.0.0.1:8080/run -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"image":"alpine:3.20","kernel_path":"./artifacts/kernels/gocracker-guest-minimal-vmlinux",
+       "mem_mb":256,"network_mode":"auto","exec_enabled":true,"wait":true,
+       "cmd":["/bin/sh","-lc","sleep infinity"]}' | jq -r .id)
+
+# 2. Install tools on the template (persists in the ext4 disk)
+curl -sS http://127.0.0.1:8080/vms/$TEMPLATE/exec -X POST \
+  -d '{"command":["/bin/sh","-lc","apk add --no-cache bc && echo TEMPLATE-READY > /tmp/marker"]}'
+
+# 3. Clone it. Source keeps running. Clone gets tclone-<N> tap + fresh /30.
+CLONE=$(curl -sS http://127.0.0.1:8080/vms/$TEMPLATE/clone -X POST \
+  -d '{"exec_enabled":true,"network_mode":"auto"}' | jq -r .id)
+
+# 4. Clone has bc (disk inherited) AND working outbound net (re-IP'd eth0).
+curl -sS http://127.0.0.1:8080/vms/$CLONE/exec -X POST \
+  -d '{"command":["/bin/sh","-lc","echo 2*21 | bc && apk add --no-cache file"]}'
+
+# 5. Optionally pause idle clones; resume on next request.
+curl -sS -X POST http://127.0.0.1:8080/vms/$CLONE/pause -d '{}'
+curl -sS -X POST http://127.0.0.1:8080/vms/$CLONE/resume -d '{}'
+```
+
+See [docs/SNAPSHOTS.md#sandbox-template-flow](docs/SNAPSHOTS.md#sandbox-template-flow) for the full walkthrough
+and the pkg/warmcache / pkg/warmpool primitives (content-addressable snapshot cache + pre-spawned VMM pool)
+that make this pattern sub-100 ms on the hot path.
+
 ## Platform Support
 
 | Platform | Status | Tested On |
@@ -178,8 +219,8 @@ sudo ./gocracker run --image alpine:latest --kernel ./kernel --cpus 4 --mem 512 
 | virtio-rng | Done | Done | |
 | virtio-vsock | Done | Done | |
 | virtio-balloon | Done | Done | |
-| virtio-fs | Done | Done | |
-| Snapshot / Restore | Done | Done | |
+| virtio-fs | Done | Done | Cold-boot only; snapshot + active virtio-fs mount is not supported (Linux driver queue state cannot migrate to a fresh virtiofsd) — use virtio-blk for per-sandbox state |
+| Snapshot / Restore | Done | Done | memfd-backed restore when SharedFS is in the snapshot; MAP_PRIVATE COW otherwise |
 | Jailer + seccomp | Done | Done | seccomp filter compiled per-arch |
 | Compose networking | Done | Done | TAP + bridge + userspace port proxy |
 | Memory layout | RAM at GPA 0x0 | RAM at GPA 0x80000000 | ARM64 reserves low 2 GB for MMIO |
@@ -329,23 +370,6 @@ minimal   gocracker    tap   on     5ms  19ms  382ms  405ms  455ms
 
 5. **Functional sanity check** — running `gocracker run` on an Alpine Dockerfile with the minimal kernel, network `auto`, and a `CMD` of `apk update && date && echo APK_OK` prints `OK: 24175 distinct packages available` and the timestamp, confirming that the slim profile still supports DNS, HTTPS/TLS, virtio-blk, virtio-net, wall clock via kvm-clock, and the gocracker exec agent.
 
-### The "2x" that the old `duration` field showed
-
-The `gocracker run` CLI used to print a single `duration=Xms` number that looked like the jailer slowed boot by ~2×. I reproduced it:
-
-```
-gocracker run --jailer=off  →  running (27ms)  wall 862ms
-gocracker run --jailer=on   →  running (56ms)  wall 878ms
-```
-
-`56 / 27 ≈ 2.07×`, but the **wall clock is identical** (862 vs 878 ms). The ratio was real work (fork-exec of the jailer, chroot setup, socket polling, 7 REST PUTs to the worker VMM) but it is **~29 extra milliseconds on a 300 ms+ kernel boot**, not a 2× guest boot. The name `duration` was misleading because:
-
-- In `runLocal`, `t0` was placed right before in-process `vmm.New()`.
-- In `runViaWorker`, `t0` was placed right before `worker.LaunchVMM()`, which encapsulates the entire IPC pipeline *plus* an eventual remote `vmm.New()`.
-- Both paths stopped the clock when `vm.Start()` returned — which is before the guest kernel has printed a single byte. Neither number reflected the actual time-to-guest-ready.
-
-**This branch replaces that single field with a phase breakdown** (`orchestration_ms`, `vmm_setup_ms`, `guest_first_output_ms`, `total_ms`) so users see the split directly and no longer get a misleading 2× comparison. See `cmd/gocracker/main.go` and `pkg/container/container.go` for the new fields.
-
 ### How these numbers compare to Firecracker's published figures
 
 Context from authoritative sources:
@@ -445,6 +469,35 @@ A ~0.3 ms p50 gap at the low end of the latency budget, from a pure-Go VMM again
 
 Both benches run with the VMM pinned to a dedicated CPU (`taskset`) and boosted to SCHED_FIFO (`chrt -r 50`), with `mlockall(MCL_CURRENT)` locking the VMM's working set. The snapshot path deliberately does NOT set `MCL_FUTURE` because that would eager-fault the `MAP_PRIVATE` memory snapshot and turn a ~2 ms lazy-COW restore into ~30 ms.
 
+### ARM64 warm-cache benchmark
+
+`gocracker run ... --warm` captures a snapshot on first run and restores from it on every subsequent run with identical parameters. The ARM64 port round-trips the full vCPU register set (including SP_EL1, ELR_EL1, SPSR[0], V0-V31 FPSIMD, FPSR/FPCR, MPState, KVM_REG_ARM_TIMER_*), plus the entire VGICv3 state (distributor + per-vCPU redistributor + ICC_* CPU sysregs, with IC-then-IS ordered writes), so multi-vCPU guests resume with IRQ delivery and scheduler state intact — not just vCPU 0.
+
+Measured on `a1.metal` Graviton, Ubuntu 24.04, Alpine 3.20 guest, `--net auto --cmd nproc`, wall-clock end-to-end and the pure `restoreFromSnapshot → vm.Start()` phase (from the `[container] restored duration=...` log):
+
+| vCPUs | cold boot | warm restore (total) | pure restore |
+|---:|---:|---:|---:|
+| 1 | 5.28 s | **293 ms** | 87 ms |
+| 2 | 5.31 s | **288 ms** | 82 ms |
+| 4 | 5.24 s | **310 ms** | 105 ms |
+| 8 | 5.28 s | **290 ms** | 96 ms |
+| 16 | 5.41 s | **330 ms** | 117 ms |
+
+Cold-boot time here is dominated by OCI pull + ext4 build (~3 s for the alpine rootfs); the actual kernel-to-init boot is ~150 ms. Warm restore stays ~linear in vCPU count because VGIC state is O(vCPU) (one redistributor frame + 9 ICC sysregs each).
+
+### Per-primitive RTT benchmark ([tools/bench-rtt](tools/bench-rtt/main.go))
+
+Unlike the end-to-end TTI and snapshot-resume benchmarks above, `bench-rtt` isolates each primitive on the warm-cache hot path so a regression can be attributed to a specific code path. Measured on a Ryzen AI 9 HX 370 laptop, N=50 iterations after 3 warmups:
+
+| primitive | p50 | p90 | max | notes |
+|---|---:|---:|---:|---|
+| pause (`vm.Pause()`) | **10.3 ms** | 10.7 ms | 20.3 ms | floor is the 10 ms `time.Sleep` polling loop inside `(*VM).Pause()` — an architectural cost, not measurement noise. |
+| resume (`vm.Resume()`) | **<1 µs** | <4 µs | 55 µs | near-instant — no vCPU state round-trip. |
+| snapshot capture (`vm.TakeSnapshot()`) | **174 ms** | 240 ms | 1102 ms | max is a first-iteration outlier (dirty-bitmap cold start). |
+| snapshot restore (`vmm.RestoreFromSnapshotWithOptions → vm.Start`) | **1.44 ms** | 3.26 ms | 7.81 ms | consistent with the Firecracker-parity snapshot-resume RTT above. |
+| warmcache lookup hit | **3.6 µs** | 4.9 µs | 20 µs | `pkg/warmcache.Lookup()` — hashes + stats the snapshot dir. |
+| warmcache lookup miss | **1.2 µs** | 1.8 µs | 4 µs | early-out when the directory does not exist. |
+
 ### Reproducing
 
 ```bash
@@ -452,6 +505,13 @@ make build
 ./tools/bench-node-tti.sh               # 10 cold-boot TTI runs (default)
 ./tools/bench-node-tti.sh 50            # 50 runs
 GC_KERNEL=/path/to/vmlinux ./tools/bench-node-tti.sh
+
+# Per-primitive RTT — isolates pause, snapshot capture/restore, warmcache
+# lookup. Useful for regression-hunting after touching pkg/vmm or pkg/container.
+sudo go run ./tools/bench-rtt \
+  -image alpine:3.20 \
+  -kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux \
+  -iter 50 -warmups 3 -output /tmp/bench-rtt.json
 ```
 
 First run pulls `node:20-alpine` and builds the ext4 disk (~10–30 s). Every subsequent run hits the cache and measures only the boot path.
@@ -466,7 +526,7 @@ First run pulls `node:20-alpine` and builds the ext4 disk (~10–30 s). Every su
 - [CLI Reference](docs/CLI_REFERENCE.md) -- every command and flag
 - [Snapshots and Migration](docs/SNAPSHOTS.md) -- save, restore, live migrate
 - [Examples](docs/EXAMPLES.md) -- 16 example apps across 10 languages
-- [Validated Projects](docs/VALIDATED_PROJECTS.md) -- 328 real-world repos tested
+- [Validated Projects](docs/VALIDATED_PROJECTS.md) -- 378 real-world repos tested
 - [Troubleshooting](docs/TROUBLESHOOTING.md) -- common issues and fixes
 - [How gocracker Fits In](docs/COMPETITIVE_ANALYSIS.md) -- comparison with Firecracker, Kata, etc.
 - [Security Policy](SECURITY.md) -- isolation model, vulnerability reporting
@@ -501,9 +561,9 @@ Common flags (run):
   --jailer      Privilege model: on or off (default: on)
 ```
 
-## Tested with 328 Real-World Projects
+## Tested with 378 Real-World Projects
 
-gocracker has been validated against 328 open-source projects across 16 languages,
+gocracker has been validated against 378 open-source projects across 16 languages,
 booting each from its own Dockerfile as a microVM:
 
 | Category | Projects |
@@ -519,7 +579,7 @@ booting each from its own Dockerfile as a microVM:
 | Forges | Gitea, Gogs |
 | Languages | Go (123), Node.js (62), Python (50), PHP (24), Rust (21), Ruby (12), Java (12), Elixir (6), C (6), C++ (4), and more |
 
-Full manifest: [`tests/external-repos/manifest.tsv`](tests/external-repos/manifest.tsv) (328 entries)
+Full manifest: [`tests/external-repos/manifest.tsv`](tests/external-repos/manifest.tsv) (378 entries)
 
 See [docs/EXAMPLES.md](docs/EXAMPLES.md) for included example applications.
 

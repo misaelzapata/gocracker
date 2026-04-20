@@ -4,7 +4,7 @@ CMD      := ./cmd/gocracker
 TARGET_GOOS ?= linux
 TARGET_GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: all build build-amd64 build-arm64 generate tidy test coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs hostcheck
+.PHONY: all build build-amd64 build-arm64 generate tidy test coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed
 
 all: build
 
@@ -54,6 +54,21 @@ kernel-guest-virtiofs:
 
 hostcheck:
 	go run ./cmd/gocracker-hostcheck
+
+sandboxes-local:
+	chmod +x ./tools/sandboxes-local.sh && ./tools/sandboxes-local.sh up
+
+sandboxes-local-down:
+	chmod +x ./tools/sandboxes-local.sh && ./tools/sandboxes-local.sh down
+
+sandboxes-local-status:
+	chmod +x ./tools/sandboxes-local.sh && ./tools/sandboxes-local.sh status
+
+sandboxes-local-logs:
+	chmod +x ./tools/sandboxes-local.sh && ./tools/sandboxes-local.sh logs
+
+sandboxes-local-seed:
+	chmod +x ./tools/sandboxes-local.sh && ./tools/sandboxes-local.sh seed
 
 ## Run the API server on TCP port 8080 (easier for testing without root)
 run: build

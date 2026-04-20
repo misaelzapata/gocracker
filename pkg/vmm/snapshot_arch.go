@@ -37,11 +37,36 @@ type X86VCPUState struct {
 }
 
 // ARM64VCPUState stores the aarch64-specific vCPU register state needed for
-// snapshot/restore. CoreRegs maps KVM ONE_REG IDs to 64-bit values covering
-// X0-X30, SP, PC, and PSTATE.
+// snapshot/restore. Every register the guest can observe on resume is
+// round-tripped here; skipping any one of them tends to produce silent
+// corruption (wrong SIMD state, time warps, trap loops).
 type ARM64VCPUState struct {
-	CoreRegs map[uint64]uint64 `json:"core_regs,omitempty"` // X0-X30, SP, PC, PSTATE
-	SysRegs  map[uint64]uint64 `json:"sys_regs,omitempty"`  // SCTLR_EL1, TTBRx, TCR, etc.
+	// CoreRegs: X0-X30, SP (SP_EL0), PC, PSTATE, plus KVM extensions
+	// SP_EL1, ELR_EL1, SPSR[0]. All 64-bit KVM_REG_ARM_CORE ids.
+	CoreRegs map[uint64]uint64 `json:"core_regs,omitempty"`
+	// FPSIMDRegs: V0-V31 — 128-bit KVM_REG_ARM_CORE ids for the aarch64
+	// SIMD/FP register file. The kernel uses these (memcpy, memset,
+	// crypto) so restoring zero-initialised vregs corrupts in-flight
+	// operations immediately.
+	FPSIMDRegs map[uint64][16]byte `json:"fpsimd_regs,omitempty"`
+	// FPSR + FPCR: 32-bit FP status/control, also KVM_REG_ARM_CORE.
+	FPStatusRegs map[uint64]uint32 `json:"fp_status_regs,omitempty"`
+	// SysRegs: every KVM_REG_ARM64_SYSREG exposed via KVM_GET_REG_LIST
+	// that is actually writable (SCTLR_EL1, TTBR0/1_EL1, VBAR_EL1, TCR,
+	// MAIR, CPACR, timer sysregs, etc.). Read-only feature regs
+	// (MIDR_EL1, ID_*) are written back too but skipped if KVM refuses.
+	SysRegs map[uint64]uint64 `json:"sys_regs,omitempty"`
+	// OtherRegs: anything else GetRegList returns that isn't CORE or
+	// SYSREG — on aarch64 that's KVM_REG_ARM_TIMER (virtual timer
+	// counter, ctl, cval), captured as 64-bit. Without TIMER_CNT the
+	// guest's virtual clock jumps backwards on restore and the scheduler
+	// tight-loops trying to make progress.
+	OtherRegs map[uint64]uint64 `json:"other_regs,omitempty"`
+	// MPState: KVM multiprocessor state (RUNNABLE, STOPPED, HALTED,
+	// SUSPENDED). Secondary vCPUs that were in PSCI POWER_OFF at capture
+	// must restore as STOPPED, not RUNNABLE, otherwise they execute at
+	// whatever stale regs left their PC and trap-loop the host.
+	MPState uint32 `json:"mp_state"`
 }
 
 type VCPUState struct {
@@ -92,8 +117,42 @@ type X86MachineState struct {
 	IRQChips []kvm.IRQChip `json:"irqchips,omitempty"`
 }
 
-// ARM64MachineState is reserved for future VGIC/timer/one-reg snapshot state.
-type ARM64MachineState struct{}
+// ARM64MachineState carries the in-kernel VGIC state that must be round-tripped
+// across snapshot/restore for the guest to receive IRQs (virtio, vsock, timer)
+// after resume. Without it, the restored guest's memory-view of the GIC is
+// "fully programmed" but the KVM in-kernel GIC is freshly created with every
+// IRQ masked — IRQs are delivered via eventfd but dropped by the GIC.
+type ARM64MachineState struct {
+	// VGIC is nil on pre-VGIC-snapshot snapshots; the restore path treats
+	// nil as "no VGIC state to load" and falls back to the old behaviour
+	// (fresh GIC). Populated for new snapshots.
+	VGIC *VGICSnapshot `json:"vgic,omitempty"`
+}
+
+// VGICSnapshot captures a GICv3 in-kernel device's state via
+// KVM_GET_DEVICE_ATTR. Layout mirrors Firecracker's aarch64 gic snapshot:
+//
+//   - DistRegs:   distributor-wide registers (ICFGRn, IPRIORITYRn, ITARGETSRn
+//     equivalents on v3, ICENABLERn/ICACTIVERn/ISPENDRn/...).
+//     Keyed by register offset into the distributor region.
+//   - RedistRegs: per-vCPU redistributor state, keyed by
+//     ((mpidr << 32) | offset). mpidr here is the KVM logical vCPU index
+//     packed into the upper 32 bits of the device-attr value.
+//   - CPUSysRegs: per-vCPU ICC_* system-register shadow state (CTLR, SRE,
+//     IGRPEN0/1, PMR, BPR, AP*Rn, RPR). Keyed identically to RedistRegs.
+//   - LevelInfo:  per-IRQ line level / latched edge state.
+//
+// Every value is a single u64 read/written via GET_DEVICE_ATTR on the GIC fd.
+// The concrete offsets depend on GIC version and vCPU count, so we enumerate
+// them explicitly at capture time and replay at restore time.
+type VGICSnapshot struct {
+	Version    int             `json:"version"`      // 2 or 3 — must match host
+	NrIRQs     uint32          `json:"nr_irqs"`
+	DistRegs   map[uint64]uint64 `json:"dist_regs,omitempty"`
+	RedistRegs map[uint64]uint64 `json:"redist_regs,omitempty"`
+	CPUSysRegs map[uint64]uint64 `json:"cpu_sysregs,omitempty"`
+	LevelInfo  map[uint64]uint64 `json:"level_info,omitempty"`
+}
 
 type SnapshotArchState struct {
 	X86   *X86MachineState   `json:"x86,omitempty"`

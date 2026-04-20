@@ -68,12 +68,29 @@ jobs:
             GOCRACKER_JAILER_OFF=1 \
             GOCRACKER_SKIP_LARGE_MEM=1 \
             go test -tags integration ./tests/integration/... \
+            -coverpkg=github.com/gocracker/gocracker/... \
+            -coverprofile=coverage-integration.out \
             -count=1 -v -timeout 600s \
           || sudo -n env GOCRACKER_KERNEL=./artifacts/kernels/gocracker-guest-standard-vmlinux \
             GOCRACKER_SECCOMP=off \
             GOCRACKER_SKIP_MIGRATION=1 \
             go test -tags integration ./tests/integration/... \
+            -coverpkg=github.com/gocracker/gocracker/... \
+            -coverprofile=coverage-integration.out \
             -count=1 -v -timeout 600s
+      - name: Integration coverage summary
+        if: steps.prereq.outputs.run == 'true'
+        run: |
+          sudo chown "$USER" coverage-integration.out 2>/dev/null || true
+          go tool cover -func=coverage-integration.out | tail -1 | tee coverage-integration-summary.txt
+      - name: Upload integration coverage profile
+        if: steps.prereq.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-integration
+          path: |
+            coverage-integration.out
+            coverage-integration-summary.txt
       - name: Skip note
         if: steps.prereq.outputs.run != 'true'
         run: echo "Skipping privileged integration subset because /dev/kvm or /dev/net/tun is unavailable on this runner."
