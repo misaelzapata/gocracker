@@ -636,6 +636,89 @@ func TestUDSListener_CloseAllBridges_NoGoroutineLeak(t *testing.T) {
 		baseline, runtime.NumGoroutine())
 }
 
+// TestAttachVsockUDSListener guards the shared helper both arch backends
+// must call right after creating the vsock device. Prior regression:
+// arm64MachineBackend.setupDevices did NOT call this (it had its own
+// inline copy), so --vsock-uds-path silently did nothing on ARM64 even
+// though amd64 worked. Any new arch backend that forgets this is caught
+// by TestArchBackends_WireUDSListener below.
+func TestAttachVsockUDSListener(t *testing.T) {
+	t.Run("nil vm", func(t *testing.T) {
+		if err := attachVsockUDSListener(nil); err != nil {
+			t.Fatalf("nil vm should be no-op, got %v", err)
+		}
+	})
+	t.Run("vsock nil", func(t *testing.T) {
+		vm := &VM{cfg: Config{}}
+		if err := attachVsockUDSListener(vm); err != nil {
+			t.Fatal(err)
+		}
+		if vm.udsListener != nil {
+			t.Fatal("listener created despite Vsock==nil")
+		}
+	})
+	t.Run("udsPath empty", func(t *testing.T) {
+		vm := &VM{cfg: Config{Vsock: &VsockConfig{Enabled: true}}}
+		if err := attachVsockUDSListener(vm); err != nil {
+			t.Fatal(err)
+		}
+		if vm.udsListener != nil {
+			t.Fatal("listener created despite UDSPath==''")
+		}
+	})
+	t.Run("creates listener and accepts", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "vm.sock")
+		vm := &VM{cfg: Config{Vsock: &VsockConfig{Enabled: true, UDSPath: path}}}
+		if err := attachVsockUDSListener(vm); err != nil {
+			t.Fatal(err)
+		}
+		if vm.udsListener == nil {
+			t.Fatal("attachVsockUDSListener returned nil err but no listener")
+		}
+		t.Cleanup(func() { _ = vm.udsListener.Close() })
+		if vm.udsListener.Path() != path {
+			t.Fatalf("listener path = %q, want %q", vm.udsListener.Path(), path)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("stat socket: %v", err)
+		}
+		c, err := net.Dial("unix", path)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		c.Close()
+	})
+	t.Run("relative path rejected", func(t *testing.T) {
+		vm := &VM{cfg: Config{Vsock: &VsockConfig{Enabled: true, UDSPath: "relative/x.sock"}}}
+		if err := attachVsockUDSListener(vm); err == nil {
+			t.Fatal("expected error for relative path")
+		}
+	})
+}
+
+// TestArchBackends_WireUDSListener is the regression gate for the arm64
+// bug that slipped slice 4: every arch backend's setupDevices must either
+// delegate to vm.setupDevices() (which calls the helper) or invoke
+// attachVsockUDSListener directly. Without this guardrail, a new arch
+// silently breaks --vsock-uds-path.
+func TestArchBackends_WireUDSListener(t *testing.T) {
+	backends := []string{"arch_x86.go", "arch_arm64.go"}
+	for _, name := range backends {
+		t.Run(name, func(t *testing.T) {
+			data, err := os.ReadFile(name)
+			if err != nil {
+				t.Fatalf("read %s: %v", name, err)
+			}
+			src := string(data)
+			hasHelper := strings.Contains(src, "attachVsockUDSListener")
+			hasDelegate := strings.Contains(src, "vm.setupDevices()")
+			if !hasHelper && !hasDelegate {
+				t.Fatalf("%s: neither attachVsockUDSListener nor vm.setupDevices() referenced — UDS wiring would silently not run on this arch", name)
+			}
+		})
+	}
+}
+
 // TestVM_Cleanup_Idempotent ensures cleanup runs exactly once regardless
 // of how many times it is called.
 func TestVM_Cleanup_Idempotent(t *testing.T) {

@@ -1817,13 +1817,8 @@ func (m *VM) setupDevices() error {
 		m.transports = append(m.transports, vsockDev.Transport)
 		slot++
 
-		if m.cfg.Vsock.UDSPath != "" {
-			listener, err := newUDSListener(m.cfg.Vsock.UDSPath, m)
-			if err != nil {
-				return fmt.Errorf("vsock uds listener: %w", err)
-			}
-			m.udsListener = listener
-			go listener.run()
+		if err := attachVsockUDSListener(m); err != nil {
+			return err
 		}
 	}
 

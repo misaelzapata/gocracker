@@ -68,20 +68,32 @@ func newUDSListener(path string, dialer VsockDialer) (*udsListener, error) {
 		return nil, fmt.Errorf("uds listener: chmod: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &udsListener{
+	u := &udsListener{
 		path:    path,
 		dialer:  dialer,
 		ln:      ln.(*net.UnixListener),
 		ctx:     ctx,
 		cancel:  cancel,
 		bridges: make(map[*bridgeConn]struct{}),
-	}, nil
+	}
+	// Reserve wg slot for run() here — BEFORE the caller issues
+	// `go u.run()` — so Close()'s wg.Wait never races with a
+	// not-yet-started accept goroutine. See run() for the invariant.
+	u.wg.Add(1)
+	return u, nil
 }
 
 // run blocks accepting connections until the listener is closed. Each
 // accepted connection spawns a goroutine running handleConn. Safe to call
 // in its own goroutine.
+//
+// newUDSListener bumped wg by 1 for this loop; we Done at exit. Doing
+// the Add in the constructor (before `go run`) means Close's wg.Wait
+// cannot race with an Add from inside the loop: the counter is ≥1 from
+// construction until run returns, so handler Adds only ever grow a
+// non-zero counter — they never bump it off zero with a concurrent Wait.
 func (u *udsListener) run() {
+	defer u.wg.Done()
 	for {
 		c, err := u.ln.Accept()
 		if err != nil {
@@ -187,6 +199,25 @@ func (u *udsListener) Close() error {
 
 // Path returns the absolute filesystem path of the listening socket.
 func (u *udsListener) Path() string { return u.path }
+
+// attachVsockUDSListener wires a Firecracker-style UDS listener onto the VM
+// when Vsock.UDSPath is configured. Called from EVERY arch-specific
+// setupDevices implementation immediately after the vsock device is
+// created — the arch backends are the only place virtio-vsock is wired
+// in. Centralising it here keeps amd64 and arm64 in lockstep; a new arch
+// that forgets to call this is caught by TestAttachVsockUDSListener.
+func attachVsockUDSListener(vm *VM) error {
+	if vm == nil || vm.cfg.Vsock == nil || vm.cfg.Vsock.UDSPath == "" {
+		return nil
+	}
+	listener, err := newUDSListener(vm.cfg.Vsock.UDSPath, vm)
+	if err != nil {
+		return fmt.Errorf("vsock uds listener: %w", err)
+	}
+	vm.udsListener = listener
+	go listener.run()
+	return nil
+}
 
 func parseConnect(line string) (uint32, error) {
 	line = strings.TrimRight(line, "\r\n")
