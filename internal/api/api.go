@@ -286,6 +286,10 @@ type VMInfo struct {
 	GuestIP     string            `json:"guest_ip,omitempty"`
 	Gateway     string            `json:"gateway,omitempty"`
 	NetworkMode string            `json:"network_mode,omitempty"`
+	// VsockUDSPath is the host-visible path (already jailer-resolved) where
+	// the VM's Firecracker-style vsock UDS is listening. Empty when the VM
+	// did not configure a UDS. Clients dial it and send "CONNECT <port>\n".
+	VsockUDSPath string `json:"vsock_uds_path,omitempty"`
 }
 
 type APIError struct {
@@ -1751,20 +1755,35 @@ func (s *Server) buildVMInfo(entry *vmEntry) VMInfo {
 		id = entry.apiID
 	}
 	return VMInfo{
-		ID:          id,
-		State:       entry.handle.State().String(),
-		Uptime:      entry.handle.Uptime().Round(time.Second).String(),
-		MemMB:       cfg.MemMB,
-		Arch:        defaultVMArch(cfg.Arch),
-		Kernel:      cfg.KernelPath,
-		Events:      events,
-		Devices:     entry.handle.DeviceList(),
-		Metadata:    metadata,
-		TapName:     metadata["tap_name"],
-		GuestIP:     metadata["guest_ip"],
-		Gateway:     metadata["gateway"],
-		NetworkMode: metadata["network_mode"],
+		ID:           id,
+		State:        entry.handle.State().String(),
+		Uptime:       entry.handle.Uptime().Round(time.Second).String(),
+		MemMB:        cfg.MemMB,
+		Arch:         defaultVMArch(cfg.Arch),
+		Kernel:       cfg.KernelPath,
+		Events:       events,
+		Devices:      entry.handle.DeviceList(),
+		Metadata:     metadata,
+		TapName:      metadata["tap_name"],
+		GuestIP:      metadata["guest_ip"],
+		Gateway:      metadata["gateway"],
+		NetworkMode:  metadata["network_mode"],
+		VsockUDSPath: vsockUDSPathForInfo(entry, &cfg),
 	}
+}
+
+// vsockUDSPathForInfo resolves the host-visible UDS path for a VM: when
+// jailed, the path serialized in VsockConfig.UDSPath points inside the
+// chroot, so we prepend the jail root reported by WorkerMetadata.
+func vsockUDSPathForInfo(entry *vmEntry, cfg *vmm.Config) string {
+	if cfg == nil || cfg.Vsock == nil || cfg.Vsock.UDSPath == "" {
+		return ""
+	}
+	jailRoot := ""
+	if wb, ok := entry.handle.(vmm.WorkerBacked); ok {
+		jailRoot = wb.WorkerMetadata().JailRoot
+	}
+	return vmm.ResolveHostSidePath(jailRoot, cfg.Vsock.UDSPath)
 }
 
 func defaultVMArch(raw string) string {

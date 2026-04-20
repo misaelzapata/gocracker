@@ -101,6 +101,12 @@ type RunOptions struct {
 	// InteractiveExec boots the guest into an idle supervisor so the CLI can
 	// attach a PTY over the exec agent instead of running the image process as PID 1.
 	InteractiveExec bool
+	// VsockUDSPath, when set, tells the VMM to expose its vsock device as a
+	// Firecracker-style Unix Domain Socket at this absolute path. Clients
+	// outside the VMM (sandboxd, CLI, socat) dial the path and send
+	// "CONNECT <port>\n" to reach a guest vsock port. Setting this path
+	// implies vsock is enabled.
+	VsockUDSPath string
 
 	// Additional create-time block devices exposed after the root disk.
 	Drives []vmm.DriveConfig
@@ -667,12 +673,13 @@ func trimCIDR(value string) string {
 }
 
 func buildVsockConfig(opts RunOptions) *vmm.VsockConfig {
-	if !opts.ExecEnabled && !guestAgentRequired(opts.Balloon, opts.MemoryHotplug) {
+	if !opts.ExecEnabled && !guestAgentRequired(opts.Balloon, opts.MemoryHotplug) && opts.VsockUDSPath == "" {
 		return nil
 	}
 	return &vmm.VsockConfig{
 		Enabled:  true,
 		GuestCID: 0,
+		UDSPath:  opts.VsockUDSPath,
 	}
 }
 
