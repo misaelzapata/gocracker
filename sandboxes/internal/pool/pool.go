@@ -22,6 +22,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -95,6 +96,14 @@ type Config struct {
 	// failure threshold before attempting another create. Default:
 	// 60 s.
 	Cooldown time.Duration
+
+	// ReconcileInterval is how often the refiller loop polls the
+	// MinPaused invariant in the absence of TriggerReconcile events.
+	// Default: 500 ms. Tests can shorten this; production should
+	// leave the default — Slice 6 makes the path event-driven so
+	// the polling interval becomes a slow safety net, not the
+	// hot-path trigger.
+	ReconcileInterval time.Duration
 }
 
 // defaultsApplied returns a copy of cfg with zero-valued fields set
@@ -115,6 +124,9 @@ func (c Config) defaultsApplied() Config {
 	}
 	if c.Cooldown == 0 {
 		c.Cooldown = 60 * time.Second
+	}
+	if c.ReconcileInterval == 0 {
+		c.ReconcileInterval = 500 * time.Millisecond
 	}
 	return c
 }
@@ -182,10 +194,27 @@ var ErrNotLeased = errors.New("pool: entry not in leased state")
 // in via AddPaused (tests) to populate it. Wiring the refiller onto
 // pkg/container.Run lands in slice 2.
 type Pool struct {
-	cfg Config
+	cfg    Config
+	booter Booter // nil until Start; tests inject via NewPoolWithBooter.
 
 	mu      sync.Mutex
 	entries map[string]*Entry
+
+	// Refiller state (slice 2). All mutated under p.mu.
+	started             bool
+	inflight            int
+	consecutiveFailures int
+	cooldownUntil       time.Time
+	lastBootError       error
+
+	// Lifecycle. ctx/cancel are set by Start, cleared by Stop. wg
+	// tracks the refiller goroutine + every in-flight Booter call so
+	// Stop blocks until all of them finish. triggerCh is a buffered
+	// (size 1) channel so TriggerReconcile never blocks.
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	triggerCh chan struct{}
 }
 
 // NewPool applies defaults, validates, and returns a zero-entry pool.
