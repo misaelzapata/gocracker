@@ -346,7 +346,7 @@ func TestSendPktNoRXQueueNoPanic(t *testing.T) {
 	mem := make([]byte, testMemSz)
 	d := newTestDev(mem, nil)
 	// Queue 0 not ready
-	d.sendPkt(HostCID, GuestCID, 1024, 1000, opRW, []byte("data"))
+	d.sendPkt(HostCID, GuestCID, 1024, 1000, opRW, []byte("data"), 0)
 }
 
 func TestSendPktWritesToRXQueueWithPayload(t *testing.T) {
@@ -354,7 +354,7 @@ func TestSendPktWritesToRXQueueWithPayload(t *testing.T) {
 	d := newTestDev(mem, nil)
 	setupRXQ(mem, d)
 
-	d.sendPkt(HostCID, GuestCID, 1024, 1000, opRW, []byte("test data"))
+	d.sendPkt(HostCID, GuestCID, 1024, 1000, opRW, []byte("test data"), 0)
 
 	usedIdx := binary.LittleEndian.Uint16(mem[usedB+2:])
 	if usedIdx != 1 {
@@ -390,7 +390,7 @@ func TestSendPktEmptyPayload(t *testing.T) {
 	d := newTestDev(mem, nil)
 	setupRXQ(mem, d)
 
-	d.sendPkt(HostCID, GuestCID, 1024, 1000, opShutdown, nil)
+	d.sendPkt(HostCID, GuestCID, 1024, 1000, opShutdown, nil, 0)
 
 	usedIdx := binary.LittleEndian.Uint16(mem[usedB+2:])
 	if usedIdx != 1 {
@@ -574,7 +574,7 @@ func TestSendPktMultiplePackets(t *testing.T) {
 	setupRXQ(mem, d)
 
 	for i := 0; i < 5; i++ {
-		d.sendPkt(HostCID, GuestCID, uint32(1024+i), 1000, opRW, []byte(fmt.Sprintf("pkt%d", i)))
+		d.sendPkt(HostCID, GuestCID, uint32(1024+i), 1000, opRW, []byte(fmt.Sprintf("pkt%d", i)), 0)
 	}
 
 	usedIdx := binary.LittleEndian.Uint16(mem[usedB+2:])

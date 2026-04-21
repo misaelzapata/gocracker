@@ -24,10 +24,12 @@ func resetSecrets(t *testing.T) {
 
 func newTestServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
+	// Do NOT os.Chdir here — it's process-global state and other
+	// tests in the same package binary inherit the change. If those
+	// later tests spawn subprocesses (exec_test.go does, via cmd.Run)
+	// the child's getcwd() fails because t.TempDir() already
+	// cleaned up the dir we chdir'd into.
 	dir := t.TempDir()
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("chdir tmp: %v", err)
-	}
 	srv := httptest.NewServer(Handler())
 	t.Cleanup(srv.Close)
 	return srv, dir

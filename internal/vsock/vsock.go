@@ -58,11 +58,23 @@ type pktHdr struct {
 }
 
 // Connection represents one guest↔host vsock stream.
+//
+// fwdCnt tracks total bytes forwarded host-side from the guest's TX
+// stream. We send opCreditUpdate packets carrying this counter so the
+// guest's vsock socket can free its send buffer — without it the
+// guest blocks at ~64 KiB (the BufAlloc the host advertises in
+// every packet header), which silently truncates any agent output
+// larger than that. fwdCntMu serialises read+update because handleData
+// runs from the virtio TX worker while sendCreditUpdate writes back
+// onto the same vsock device.
 type Connection struct {
 	guestPort uint32
 	hostPort  uint32
 	conn      net.Conn
 	device    *Device
+
+	fwdCntMu sync.Mutex
+	fwdCnt   uint32
 }
 
 type connKey struct {
@@ -216,7 +228,7 @@ func (d *Device) handleConnect(hdr *pktHdr, q *virtio.Queue) {
 	d.mu.Unlock()
 
 	// Send RESPONSE
-	d.sendPkt(hdr.DstCID, hdr.SrcCID, hdr.DstPort, hdr.SrcPort, opResponse, nil)
+	d.sendPkt(hdr.DstCID, hdr.SrcCID, hdr.DstPort, hdr.SrcPort, opResponse, nil, 0)
 
 	// Pump data from host connection → guest
 	go func() {
@@ -288,7 +300,26 @@ func (d *Device) handleData(hdr *pktHdr, chain []virtio.Desc, q *virtio.Queue) {
 	n, err := c.conn.Write(data)
 	if err != nil {
 		gclog.VMM.Warn("[DBG-VSOCK] handleData: conn.Write FAILED", "guestPort", hdr.SrcPort, "hostPort", hdr.DstPort, "n", n, "err", err)
+		return
 	}
+	// Credit the guest for the bytes we just forwarded. Without this
+	// the guest's vsock socket fills its send buffer (~64 KiB per
+	// the BufAlloc we advertise) and blocks — masking as data loss
+	// for any large output (toolbox /exec stdout, file downloads).
+	c.fwdCntMu.Lock()
+	c.fwdCnt += uint32(n)
+	fc := c.fwdCnt
+	c.fwdCntMu.Unlock()
+	d.sendCreditUpdate(c, fc)
+}
+
+// sendCreditUpdate emits an opCreditUpdate packet to the guest with
+// the running fwdCnt so its sender side can advance its peer-fwd
+// counter and free buffer. Best-effort: if RX queue isn't ready (rare,
+// only during early bring-up) the credit is simply not advertised
+// this round and we'll catch up on the next handleData.
+func (d *Device) sendCreditUpdate(c *Connection, fwdCnt uint32) {
+	d.sendPkt(HostCID, GuestCID, c.hostPort, c.guestPort, opCreditUpdate, nil, fwdCnt)
 }
 
 func (d *Device) handleDisconnect(hdr *pktHdr) {
@@ -307,7 +338,7 @@ func (d *Device) handleDisconnect(hdr *pktHdr) {
 		c.conn.Close()
 		// Send RST back so the guest's close() completes promptly
 		// instead of timing out waiting for the peer to acknowledge.
-		d.sendPkt(hdr.DstCID, hdr.SrcCID, hdr.DstPort, hdr.SrcPort, opReset, nil)
+		d.sendPkt(hdr.DstCID, hdr.SrcCID, hdr.DstPort, hdr.SrcPort, opReset, nil, 0)
 	}
 	if pending != nil {
 		pending.conn.conn.Close()
@@ -371,12 +402,18 @@ func (d *Device) StartTXAvailPoller(duration time.Duration) {
 }
 
 func (d *Device) sendReset(hdr *pktHdr) {
-	d.sendPkt(hdr.DstCID, hdr.SrcCID, hdr.DstPort, hdr.SrcPort, opReset, nil)
+	d.sendPkt(hdr.DstCID, hdr.SrcCID, hdr.DstPort, hdr.SrcPort, opReset, nil, 0)
 }
 
 // sendPkt returns true if the packet was successfully queued into the guest RX
 // queue, false if the queue was not ready (guest virtio driver not yet init'd).
-func (d *Device) sendPkt(srcCID, dstCID uint64, srcPort, dstPort uint32, op uint16, data []byte) bool {
+//
+// fwdCnt is the host's running count of bytes received from the guest on this
+// connection — set by sendCreditUpdate when emitting opCreditUpdate so the
+// guest's vsock socket can free its send buffer. Zero is correct for control
+// packets (opRequest/opResponse/opShutdown/opReset) where credit accounting
+// has not yet started or doesn't apply.
+func (d *Device) sendPkt(srcCID, dstCID uint64, srcPort, dstPort uint32, op uint16, data []byte, fwdCnt uint32) bool {
 	hdr := &pktHdr{
 		SrcCID:   srcCID,
 		DstCID:   dstCID,
@@ -386,6 +423,7 @@ func (d *Device) sendPkt(srcCID, dstCID uint64, srcPort, dstPort uint32, op uint
 		Type:     1, // stream
 		Op:       op,
 		BufAlloc: 65536,
+		FwdCnt:   fwdCnt,
 	}
 	hdrBytes := marshalHdr(hdr)
 	payload := append(hdrBytes, data...)
@@ -457,12 +495,18 @@ func (c *Connection) rxPump(q *virtio.Queue) {
 		}
 		if n > 0 {
 			gclog.VMM.Debug("[DBG-VSOCK] rxPump: host→guest", "hostPort", c.hostPort, "guestPort", c.guestPort, "len", n)
-			c.device.sendPkt(HostCID, GuestCID, c.hostPort, c.guestPort, opRW, buf[:n])
+			// Carry the running fwdCnt on data packets too — kernel
+			// vsock peers update their peer-fwd counter from any
+			// packet's header, not only from explicit credit updates.
+			c.fwdCntMu.Lock()
+			fc := c.fwdCnt
+			c.fwdCntMu.Unlock()
+			c.device.sendPkt(HostCID, GuestCID, c.hostPort, c.guestPort, opRW, buf[:n], fc)
 		}
 		if err == io.EOF || err != nil {
 			gclog.VMM.Debug("[DBG-VSOCK] rxPump: exit", "hostPort", c.hostPort, "guestPort", c.guestPort, "err", err)
 			if !c.device.isClosed() {
-				c.device.sendPkt(HostCID, GuestCID, c.hostPort, c.guestPort, opShutdown, nil)
+				c.device.sendPkt(HostCID, GuestCID, c.hostPort, c.guestPort, opShutdown, nil, 0)
 			}
 			return
 		}
@@ -505,7 +549,7 @@ func (d *Device) Dial(port uint32) (net.Conn, error) {
 				deviceConn.Close()
 				return nil, fmt.Errorf("vsock dial timeout: RX queue never ready for port %d", port)
 			}
-			if d.sendPkt(HostCID, GuestCID, pending.conn.hostPort, port, opRequest, nil) {
+			if d.sendPkt(HostCID, GuestCID, pending.conn.hostPort, port, opRequest, nil, 0) {
 				sent = true
 			} else {
 				time.Sleep(10 * time.Millisecond)

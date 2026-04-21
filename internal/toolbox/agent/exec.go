@@ -51,9 +51,11 @@ const (
 	// the connection mid-exec. Matches the docker-stop default.
 	killGrace = 2 * time.Second
 
-	// Output chunk size for process → host frames. 32 KiB is a kernel
-	// pipe-buffer-friendly read; output larger than this gets split
-	// into multiple frames automatically.
+	// Output chunk size for process → host frames. 32 KiB is a
+	// kernel pipe-buffer-friendly read; output larger than this
+	// gets split into multiple frames automatically. With the host
+	// vsock device now sending opCreditUpdate after every TX
+	// payload, there is no longer a 64-KiB stall at the bridge.
 	outputChunkSize = 32 << 10
 )
 
@@ -183,17 +185,23 @@ func runWithPipes(
 		return fmt.Errorf("start: %w", err)
 	}
 
-	// Pump output → frames. Both pumps Done() on EOF/error so the
-	// main goroutine knows when there's nothing more to forward.
+	// Pump output → frames. CRITICAL: drain BEFORE cmd.Wait. Per
+	// os/exec docs, "it is incorrect to call Wait before all reads
+	// from the pipe have completed" — Wait's cleanup() closes the
+	// parent end of the pipes, dropping any kernel-buffered bytes
+	// the pump hasn't yet read. Concurrent sessions hit this race
+	// hardest (small stdout, fast exit). Draining first is safe
+	// because the pumps see EOF naturally when the child closes its
+	// write end on exit.
 	var outWG sync.WaitGroup
 	outWG.Add(2)
 	go pumpReaderToFrames(stdoutR, ChannelStdout, emit, &outWG)
 	go pumpReaderToFrames(stderrR, ChannelStderr, emit, &outWG)
 
 	// Pump input frames → stdin / signals. Returns when the client
-	// closes the conn or sends EOF on stdin. clientGone is the signal
-	// to start the SIGTERM-then-SIGKILL countdown if the process is
-	// still running.
+	// closes the conn or sends EOF on stdin. clientGone triggers
+	// the SIGTERM-then-SIGKILL escalation if the process is still
+	// running.
 	clientGone := make(chan struct{})
 	go func() {
 		pumpFramesToProcess(brw.Reader, stdinW, nil, cmd)
@@ -203,9 +211,9 @@ func runWithPipes(
 	processDone := make(chan struct{})
 	go escalateOnClientGone(cmd, clientGone, processDone)
 
+	outWG.Wait() // pumps drained — child wrote everything and EOF'd
 	waitErr := cmd.Wait()
 	close(processDone)
-	outWG.Wait() // make sure all queued stdout/stderr frames flushed
 
 	code := exitCodeFromWait(waitErr)
 	return emitExit(int32(code))
@@ -249,6 +257,10 @@ func runWithPTY(
 	processDone := make(chan struct{})
 	go escalateOnClientGone(cmd, clientGone, processDone)
 
+	// Same drain-first ordering as runWithPipes: the output pump on
+	// ptmx exits when the child closes the slave (on exit). After
+	// that we cmd.Wait to reap, then force the input pump to exit.
+	outWG.Wait()
 	waitErr := cmd.Wait()
 	close(processDone)
 	// Cleanup ordering: the input pump goroutine may still be holding
@@ -256,15 +268,14 @@ func runWithPTY(
 	// Closing ptmx while Setsize is in flight is a data race on the
 	// underlying fd. Force the input pump to exit by setting a
 	// past-deadline on the conn (its ReadFrame errors out and the
-	// pump's defer closes ptmx for us, which then wakes the output
-	// pump). We avoid closing the conn here because we still need to
-	// emit EXIT on it below.
+	// pump's defer closes ptmx for us). We avoid closing the conn
+	// here because we still need to emit EXIT on it below.
 	_ = conn.SetReadDeadline(time.Now())
 	<-clientGone
-	outWG.Wait()
 	// Restore the conn for write — the read deadline is irrelevant
 	// once the input pump is gone.
 	_ = conn.SetDeadline(time.Time{})
+	_ = ptmx // keep reference live until here; input pump closes via stdinW alias
 
 	code := exitCodeFromWait(waitErr)
 	return emitExit(int32(code))
