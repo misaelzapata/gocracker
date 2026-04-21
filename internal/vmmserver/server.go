@@ -207,6 +207,11 @@ type RestoreRequest struct {
 	X86Boot         string               `json:"x86_boot,omitempty"`
 	Resume          bool                 `json:"resume"`
 	SharedFSRebinds []vmm.SharedFSRebind `json:"shared_fs_rebinds,omitempty"`
+	// VsockUDSPath overrides the snapshot's vsock uds_path on restore.
+	// Required for sandboxd's per-sandbox UDS model and for any caller
+	// that restores a template snapshot but wants a fresh per-instance
+	// socket. Empty = keep the snapshot's original path.
+	VsockUDSPath string `json:"vsock_uds_path,omitempty"`
 }
 
 // restoreResponse is the minimal payload returned by POST /restore. It stays
@@ -1044,10 +1049,11 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	vm, err := vmm.RestoreFromSnapshotWithOptions(req.SnapshotDir, vmm.RestoreOptions{
-		OverrideTap:     req.TapName,
-		OverrideVCPUs:   req.VcpuCount,
-		OverrideX86Boot: mode,
-		SharedFSRebinds: req.SharedFSRebinds,
+		OverrideTap:          req.TapName,
+		OverrideVCPUs:        req.VcpuCount,
+		OverrideX86Boot:      mode,
+		OverrideVsockUDSPath: req.VsockUDSPath,
+		SharedFSRebinds:      req.SharedFSRebinds,
 	})
 	if err != nil {
 		apiErr(w, http.StatusBadRequest, err.Error())

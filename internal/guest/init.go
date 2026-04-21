@@ -25,6 +25,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/gocracker/gocracker/internal/guestexec"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
+	toolboxspec "github.com/gocracker/gocracker/internal/toolbox/spec"
 	"github.com/gocracker/gocracker/internal/usercfg"
 	"github.com/gocracker/gocracker/internal/vsock"
 	"github.com/vishvananda/netlink"
@@ -135,6 +136,7 @@ func main() {
 	klogf("hosts file ensured count=%d", len(spec.Hosts))
 	_ = os.Remove(guestExitCodeFile)
 	startExecAgent(spec)
+	startToolboxSupervisor()
 
 	// Set working directory if specified
 	if spec.WorkDir != "" {
@@ -190,6 +192,56 @@ func effectivePID1Mode(spec runtimecfg.GuestSpec) string {
 		return runtimecfg.PID1ModeSupervised
 	}
 	return runtimecfg.PID1ModeHandoff
+}
+
+// startToolboxSupervisor spawns the baked toolbox agent
+// (/opt/gocracker/toolbox/toolboxguest) in the background and restarts
+// it up to maxToolboxRestarts times if it crashes. The supervisor lives
+// for the lifetime of the VM — there is no graceful shutdown because
+// init's exit means the kernel is rebooting anyway.
+//
+// If the binary is missing (older snapshot or image without the agent
+// baked in), this is a no-op: the legacy exec path on vsock 10022
+// still works, and post-Fase-2 features that need the new agent will
+// fail dial with a clear error from the host UDS bridge instead of
+// silently hanging.
+//
+// Past failure context (PLAN_SANDBOXD §1 row 1): feat/sandboxes-v2 ran
+// the equivalent install via runtime.Exec + base64 upload AFTER boot,
+// causing a ~200 ms race that triggered EnsureToolbox-on-lease, version
+// stamps, and event-refill workarounds. Baking + spawning from PID 1
+// before the user's CMD eliminates that whole class.
+const maxToolboxRestarts = 3
+
+func startToolboxSupervisor() {
+	if _, err := os.Stat(toolboxspec.BinaryPath); err != nil {
+		klogf("toolbox binary absent at %s; skipping supervisor (legacy exec on 10022 still active)", toolboxspec.BinaryPath)
+		return
+	}
+	go func() {
+		for attempt := 1; attempt <= maxToolboxRestarts; attempt++ {
+			cmd := exec.Command(toolboxspec.BinaryPath, "serve",
+				"--vsock-port", strconv.FormatUint(uint64(toolboxspec.VsockPort), 10))
+			cmd.Stdout = kmsg
+			cmd.Stderr = kmsg
+			// Init's own env is whatever the kernel passed (typically
+			// empty). The toolbox needs PATH so the processes it
+			// spawns can resolve common binaries (echo, sh, sleep,
+			// etc.) via exec.LookPath. Without this every /exec call
+			// fails with "executable file not found in $PATH".
+			cmd.Env = append(os.Environ(),
+				"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+				"HOME=/root",
+			)
+			klogf("toolbox supervisor: starting attempt=%d", attempt)
+			err := cmd.Run()
+			klogf("toolbox supervisor: exited attempt=%d err=%v", attempt, err)
+			if attempt < maxToolboxRestarts {
+				time.Sleep(500 * time.Millisecond)
+			}
+		}
+		klogf("toolbox supervisor: gave up after %d attempts; vsock 10023 will not respond", maxToolboxRestarts)
+	}()
 }
 
 func startExecAgent(spec runtimecfg.GuestSpec) {

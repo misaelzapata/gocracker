@@ -31,6 +31,8 @@ import (
 	"github.com/gocracker/gocracker/internal/oci"
 	"github.com/gocracker/gocracker/internal/repo"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
+	toolboxembed "github.com/gocracker/gocracker/internal/toolbox/embed"
+	toolboxspec "github.com/gocracker/gocracker/internal/toolbox/spec"
 	"github.com/gocracker/gocracker/internal/worker"
 	"github.com/gocracker/gocracker/pkg/vmm"
 	"github.com/gocracker/gocracker/pkg/warmcache"
@@ -368,13 +370,14 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 			// confused, and it becomes harder to distinguish original
 			// from restored in instrumentation.
 			vm, err := vmm.RestoreFromSnapshotWithOptions(opts.SnapshotDir, vmm.RestoreOptions{
-				ConsoleIn:        opts.ConsoleIn,
-				ConsoleOut:       opts.ConsoleOut,
-				OverrideVCPUs:    opts.CPUs,
-				OverrideID:       opts.ID,
-				OverrideTap:      opts.TapName,
-				OverrideX86Boot:  opts.X86Boot,
-				SharedFSRebinds:  buildSharedFSRebinds(opts.Mounts),
+				ConsoleIn:            opts.ConsoleIn,
+				ConsoleOut:           opts.ConsoleOut,
+				OverrideVCPUs:        opts.CPUs,
+				OverrideID:           opts.ID,
+				OverrideTap:          opts.TapName,
+				OverrideX86Boot:      opts.X86Boot,
+				OverrideVsockUDSPath: opts.VsockUDSPath,
+				SharedFSRebinds:      buildSharedFSRebinds(opts.Mounts),
 			})
 			if err == nil {
 				// Activate the freshly-allocated host-side tap (assigns the
@@ -465,6 +468,26 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	specPath := filepath.Join(workDir, "runtime-spec.json")
 	defer func() { _ = os.RemoveAll(rootfsDir) }()
 
+	// Concurrent container.Run calls for the same image would
+	// otherwise race on the shared workDir (defer RemoveAll(rootfs)
+	// of goroutine A fires mid-extract of B). Serialise JUST the
+	// cache inspect + disk + initrd build region — the VM boot /
+	// network setup afterwards is per-instance work that
+	// parallelises cleanly, and holding the lock across boot would
+	// serialise 10 jailer-on cold-boots into 3 s instead of ~350 ms
+	// parallel. unlockArtifact runs once under both defer (panic
+	// safety) and explicit call (narrow the lock window before VM
+	// boot) via the once guard below.
+	unlockArtifactRaw := lockArtifactDir(workDir)
+	unlockedArtifact := false
+	unlockArtifact := func() {
+		if !unlockedArtifact {
+			unlockArtifactRaw()
+			unlockedArtifact = true
+		}
+	}
+	defer unlockArtifact()
+
 	var imgConfig oci.ImageConfig
 	var guestSpec runtimecfg.GuestSpec
 	sharedFS := resolveSharedFSMounts(opts.Mounts)
@@ -510,6 +533,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		}
 
 		injectHostCACerts(rootfsDir)
+		injectToolboxBinary(rootfsDir)
 		if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 			return nil, fmt.Errorf("ext4: %w", err)
 		}
@@ -548,6 +572,13 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 			return nil, fmt.Errorf("write runtime spec cache: %w", err)
 		}
 	}
+
+	// Release the artifact lock BEFORE prepareBootDisk + VM start.
+	// From here on we're dealing with per-instance state (runtime
+	// disk hardlink/COW, per-VM tap, per-VM UDS) that doesn't race
+	// on the shared workDir, and holding the lock would pointlessly
+	// serialise the VM boots.
+	unlockArtifact()
 
 	// ---- Assemble kernel cmdline ----
 	cmdline := buildCmdlineWithPlan(opts, sharedFS, len(kernelModules) > 0)
@@ -765,12 +796,13 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		if _, err := os.Stat(filepath.Join(opts.SnapshotDir, "snapshot.json")); err == nil {
 			gclog.Container.Info("restoring from snapshot via worker", "dir", opts.SnapshotDir)
 			handle, cleanup, err := worker.LaunchRestoredVMM(opts.SnapshotDir, vmm.RestoreOptions{
-				OverrideTap:     opts.TapName,
-				OverrideVCPUs:   opts.CPUs,
-				OverrideX86Boot: opts.X86Boot,
-				ConsoleIn:       opts.ConsoleIn,
-				ConsoleOut:      opts.ConsoleOut,
-				SharedFSRebinds: buildSharedFSRebinds(opts.Mounts),
+				OverrideTap:          opts.TapName,
+				OverrideVCPUs:        opts.CPUs,
+				OverrideX86Boot:      opts.X86Boot,
+				OverrideVsockUDSPath: opts.VsockUDSPath,
+				ConsoleIn:            opts.ConsoleIn,
+				ConsoleOut:           opts.ConsoleOut,
+				SharedFSRebinds:      buildSharedFSRebinds(opts.Mounts),
 			}, worker.VMMOptions{
 				JailerBinary: opts.JailerBinary,
 				VMMBinary:    opts.VMMBinary,
@@ -836,6 +868,20 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 	specPath := filepath.Join(workDir, "runtime-spec.json")
 	defer func() { _ = os.RemoveAll(rootfsDir) }()
 
+	// Same rationale as runLocal: concurrent Run calls for the
+	// same image race on the shared workDir. Lock covers disk +
+	// initrd rebuild only; released before boot so concurrent VMs
+	// don't serialise on each other. See pkg/container/artifact_lock.go.
+	unlockArtifactRaw := lockArtifactDir(workDir)
+	unlockedArtifact := false
+	unlockArtifact := func() {
+		if !unlockedArtifact {
+			unlockArtifactRaw()
+			unlockedArtifact = true
+		}
+	}
+	defer unlockArtifact()
+
 	var imgConfig oci.ImageConfig
 	var guestSpec runtimecfg.GuestSpec
 	sharedFS := resolveSharedFSMounts(opts.Mounts)
@@ -878,6 +924,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 			return nil, fmt.Errorf("write runtime spec: %w", err)
 		}
 		injectHostCACerts(rootfsDir)
+		injectToolboxBinary(rootfsDir)
 		if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 			return nil, fmt.Errorf("ext4: %w", err)
 		}
@@ -914,6 +961,10 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 			return nil, fmt.Errorf("write runtime spec cache: %w", err)
 		}
 	}
+	// Release the artifact lock before the per-VM boot path so
+	// concurrent creates parallelise on prepareBootDisk + VMM start.
+	unlockArtifact()
+
 	cmdline := buildCmdlineWithPlan(opts, sharedFS, len(kernelModules) > 0)
 
 	bootDiskPath, cleanupRuntimeDisk, err := prepareBootDisk(workDir, diskPath, opts.ID, !opts.RootfsPersistent)
@@ -1115,6 +1166,7 @@ func buildLocal(opts BuildOptions) (*BuildResult, error) {
 	}
 
 	injectHostCACerts(rootfsDir)
+	injectToolboxBinary(rootfsDir)
 	if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 		return nil, fmt.Errorf("ext4: %w", err)
 	}
@@ -1185,6 +1237,7 @@ func buildViaWorker(opts BuildOptions) (*BuildResult, error) {
 		return nil, err
 	}
 	injectHostCACerts(rootfsDir)
+	injectToolboxBinary(rootfsDir)
 	if err := oci.BuildExt4(rootfsDir, diskPath, opts.DiskSizeMB); err != nil {
 		return nil, fmt.Errorf("ext4: %w", err)
 	}
@@ -1338,6 +1391,35 @@ func writeRuntimeSpecToRootfs(rootfsDir string, spec runtimecfg.GuestSpec) error
 		return err
 	}
 	return os.WriteFile(hostPath, data, 0644)
+}
+
+// injectToolboxBinary writes the embedded toolbox agent binary into the
+// guest rootfs at toolboxembed.Path. Every disk gocracker builds gets
+// the agent for free — there is no opt-out and no per-image config.
+//
+// Why baked, not bootstrapped: feat/sandboxes-v2 used a runtime.Exec +
+// base64 upload flow to install the agent post-boot, which introduced a
+// ~200 ms race window that then required EnsureToolbox-on-lease,
+// ToolboxVersion stamps, and event-refill workarounds. PLAN_SANDBOXD §1
+// table row 1 makes the lesson explicit. Baking eliminates the entire
+// failure class.
+//
+// Best-effort: if the embedded binary is empty (e.g. a host arch we
+// don't ship a binary for) the disk boots without the agent — old
+// /vms/{id}/exec on vsock 10022 still works. We emit no warning here
+// because the disk-build path is hot; callers that need to confirm
+// the agent is reachable should dial vsock 10023 directly.
+func injectToolboxBinary(rootfsDir string) {
+	if len(toolboxembed.Binary) == 0 {
+		return
+	}
+	guestPath := filepath.Join(rootfsDir, toolboxspec.BinaryPath)
+	if err := os.MkdirAll(filepath.Dir(guestPath), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(guestPath, toolboxembed.Binary, 0o755)
+	versionPath := filepath.Join(rootfsDir, toolboxspec.VersionFilePath)
+	_ = os.WriteFile(versionPath, []byte(toolboxspec.Version+"\n"), 0o644)
 }
 
 // injectHostCACerts copies the host's CA certificate bundle into the guest

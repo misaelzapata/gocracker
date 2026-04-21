@@ -37,18 +37,25 @@ import (
 // override to RestoreOptions without adding it here would let the cache
 // hand out snapshots that corrupt the guest on restore.
 type KeyInput struct {
-	ImageDigest string // OCI image digest or rootfs content hash
-	KernelHash  string // sha256 of the vmlinux/bzImage bytes
-	Cmdline     string // kernel command line
-	MemMB       uint64
-	VCPUs       int
-	Arch        string // "amd64" | "arm64"
-	NetworkMode string // "" (none) | "auto" — affects virtio-net presence in snapshot
+	ImageDigest    string // OCI image digest or rootfs content hash
+	KernelHash     string // sha256 of the vmlinux/bzImage bytes
+	Cmdline        string // kernel command line
+	MemMB          uint64
+	VCPUs          int
+	Arch           string // "amd64" | "arm64"
+	NetworkMode    string // "" (none) | "auto" — affects virtio-net presence in snapshot
+	ToolboxVersion string // internal/toolbox/spec.Version baked into the disk
 }
 
 // Key returns the canonical hex SHA-256 of the input. Two KeyInputs with
 // the same fields always produce the same key, regardless of map order or
 // whitespace variation in the cmdline.
+//
+// Adding ToolboxVersion to the key (Fase 2) deliberately invalidates every
+// pre-toolbox snapshot in the on-disk cache: their disks were built without
+// /opt/gocracker/toolbox/toolboxguest, so restoring one would silently leave
+// vsock 10023 dead. First post-merge run of any image cold-boots, recaptures
+// with the agent baked in, and subsequent runs hit warm normally.
 func Key(in KeyInput) string {
 	parts := []string{
 		"image=" + in.ImageDigest,
@@ -58,6 +65,7 @@ func Key(in KeyInput) string {
 		fmt.Sprintf("vcpus=%d", in.VCPUs),
 		"arch=" + in.Arch,
 		"net=" + in.NetworkMode,
+		"toolbox=" + in.ToolboxVersion,
 	}
 	sort.Strings(parts)
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))

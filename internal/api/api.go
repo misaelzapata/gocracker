@@ -1695,14 +1695,21 @@ func (s *Server) handleListVMs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetVM(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	// Hold the read lock while building the VMInfo so markPendingVMStartFailed
+	// (which takes the write lock) can't race with our reads on
+	// entry.pendingState / pendingEvents / metadata. The previous shape
+	// released the lock before buildVMInfo and -race flagged it as a
+	// flaky failure of TestHandleRun_FailedStartRemainsVisible.
 	s.mu.RLock()
 	v, ok := s.vms[id]
-	s.mu.RUnlock()
 	if !ok {
+		s.mu.RUnlock()
 		apiErr(w, 404, "VM not found")
 		return
 	}
-	json.NewEncoder(w).Encode(s.buildVMInfo(v))
+	info := s.buildVMInfo(v)
+	s.mu.RUnlock()
+	json.NewEncoder(w).Encode(info)
 }
 
 func (s *Server) buildVMInfo(entry *vmEntry) VMInfo {

@@ -112,6 +112,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 func main() {
 	data, err := os.ReadFile("/proc/cmdline")
@@ -129,6 +130,10 @@ func main() {
 	if strings.Contains(cmdline, "root=/dev/vda") {
 		fmt.Println("cmdline-root-ok")
 	}
+	// Drain UART before the PID 1 exit triggers a kernel panic —
+	// the panic output races with our prints and intermittently
+	// wins on slow runners. See TestContainerRunWorkloadBecomesPID1.
+	time.Sleep(500 * time.Millisecond)
 }
 `)
 	copyFileIntoContext(t, binaryPath, filepath.Join(contextDir, "guest"))

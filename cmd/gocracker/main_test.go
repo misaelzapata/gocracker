@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,7 +25,14 @@ import (
 	mobyterm "github.com/moby/term"
 )
 
+// testHandle is exercised concurrently by waitVM's polling goroutine
+// and individual test bodies that mutate state/stopCalls. All field
+// access goes through the mutex; exported methods that mutate take
+// the write lock, State() takes the read lock. Before this, -race
+// flagged TestWaitVM_TransitionsToStopped when the test goroutine
+// wrote state=StateStopped while waitVM's goroutine read it.
 type testHandle struct {
+	mu        sync.RWMutex
 	cfg       vmm.Config
 	state     vmm.State
 	stopCalls int
@@ -32,12 +40,33 @@ type testHandle struct {
 	dial      func(uint32) (net.Conn, error)
 }
 
-func (h *testHandle) Start() error                               { return nil }
-func (h *testHandle) Stop()                                      { h.stopCalls++; h.state = vmm.StateStopped }
-func (h *testHandle) Pause() error                               { h.state = vmm.StatePaused; return nil }
-func (h *testHandle) Resume() error                              { h.state = vmm.StateRunning; return nil }
+func (h *testHandle) setState(s vmm.State) {
+	h.mu.Lock()
+	h.state = s
+	h.mu.Unlock()
+}
+
+func (h *testHandle) Start() error { return nil }
+func (h *testHandle) Stop() {
+	h.mu.Lock()
+	h.stopCalls++
+	h.state = vmm.StateStopped
+	h.mu.Unlock()
+}
+func (h *testHandle) Pause() error {
+	h.setState(vmm.StatePaused)
+	return nil
+}
+func (h *testHandle) Resume() error {
+	h.setState(vmm.StateRunning)
+	return nil
+}
 func (h *testHandle) TakeSnapshot(string) (*vmm.Snapshot, error) { return nil, nil }
-func (h *testHandle) State() vmm.State                           { return h.state }
+func (h *testHandle) State() vmm.State {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.state
+}
 func (h *testHandle) ID() string                                 { return h.cfg.ID }
 func (h *testHandle) Uptime() time.Duration                      { return 0 }
 func (h *testHandle) Events() vmm.EventSource                    { return vmm.NewEventLog() }
@@ -1752,7 +1781,7 @@ func TestWaitVM_TransitionsToStopped(t *testing.T) {
 
 	// Simulate VM stopping after a brief delay
 	time.Sleep(100 * time.Millisecond)
-	handle.state = vmm.StateStopped
+	handle.setState(vmm.StateStopped)
 
 	select {
 	case <-done:
