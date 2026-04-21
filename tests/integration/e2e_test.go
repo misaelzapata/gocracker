@@ -166,9 +166,17 @@ package main
 import (
 	"fmt"
 	"os"
+	"time"
 )
 func main() {
 	fmt.Printf("guest-pid=%d guest-ppid=%d\n", os.Getpid(), os.Getppid())
+	// When the workload is PID 1, returning from main triggers a
+	// kernel panic ("Attempted to kill init!"). That panic racing
+	// with pending UART TX makes the serial output intermittently
+	// missing on slow CI runners — the test then fails even though
+	// the workload did run. A short sleep lets the printf drain to
+	// the host before the process exits and the kernel panics.
+	time.Sleep(500 * time.Millisecond)
 }
 `)
 	copyFileIntoContext(t, binaryPath, filepath.Join(contextDir, "guest"))
