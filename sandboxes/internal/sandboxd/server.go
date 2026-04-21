@@ -55,9 +55,15 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	sb, err := s.Lifecycle.Create(req)
 	if err != nil {
-		// Sandbox row may exist in StateError; we return 500 + the
-		// error so callers can decide whether to retry or DELETE.
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
+		// ErrInvalidRequest → 400 so clients know to fix the request
+		// instead of retrying blindly. Any other Create failure
+		// (runtime / VM setup / OCI pull) → 500 + the partial
+		// sandbox row so callers can DELETE it and try again.
+		status := http.StatusInternalServerError
+		if errors.Is(err, ErrInvalidRequest) {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, map[string]any{
 			"error":   err.Error(),
 			"sandbox": sb,
 		})

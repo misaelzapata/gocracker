@@ -91,6 +91,9 @@ func Serve(ctx context.Context, port uint32) error {
 
 func handleListFiles(w http.ResponseWriter, r *http.Request) {
 	dir := cleanGuestPath(r.URL.Query().Get("path"))
+	if !requirePath(w, dir) {
+		return
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -119,6 +122,9 @@ func handleListFiles(w http.ResponseWriter, r *http.Request) {
 
 func handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 	filePath := cleanGuestPath(r.URL.Query().Get("path"))
+	if !requirePath(w, filePath) {
+		return
+	}
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -132,6 +138,9 @@ func handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 
 func handleUploadFile(w http.ResponseWriter, r *http.Request) {
 	filePath := cleanGuestPath(r.URL.Query().Get("path"))
+	if !requirePath(w, filePath) {
+		return
+	}
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -141,7 +150,10 @@ func handleUploadFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := os.WriteFile(filePath, data, 0o755); err != nil {
+	// 0644 — regular file-transfer default. Callers that need an
+	// executable bit should follow up with POST /files/chmod (which
+	// takes an explicit mode) instead of every upload gaining +x.
+	if err := os.WriteFile(filePath, data, 0o644); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -150,6 +162,9 @@ func handleUploadFile(w http.ResponseWriter, r *http.Request) {
 
 func handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 	filePath := cleanGuestPath(r.URL.Query().Get("path"))
+	if !requirePath(w, filePath) {
+		return
+	}
 	if err := os.RemoveAll(filePath); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -167,6 +182,9 @@ func handleMkdir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dir := cleanGuestPath(req.Path)
+	if !requirePath(w, dir) {
+		return
+	}
 	var err error
 	if req.All {
 		err = os.MkdirAll(dir, 0o755)
@@ -191,6 +209,9 @@ func handleRename(w http.ResponseWriter, r *http.Request) {
 	}
 	src := cleanGuestPath(req.OldPath)
 	dst := cleanGuestPath(req.NewPath)
+	if !requirePath(w, src) || !requirePath(w, dst) {
+		return
+	}
 	if err := os.Rename(src, dst); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -208,6 +229,9 @@ func handleChmod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := cleanGuestPath(req.Path)
+	if !requirePath(w, p) {
+		return
+	}
 	if err := os.Chmod(p, os.FileMode(req.Mode)); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -222,6 +246,9 @@ func handleGitClone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dir := cleanGuestPath(req.Directory)
+	if !requirePath(w, dir) {
+		return
+	}
 	cmd := exec.CommandContext(r.Context(), "git", "clone", req.Repository, dir)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -238,6 +265,9 @@ func handleGitStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dir := cleanGuestPath(req.Directory)
+	if !requirePath(w, dir) {
+		return
+	}
 	cmd := exec.CommandContext(r.Context(), "git", "-C", dir, "status", "--short", "--branch")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -290,11 +320,29 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+// cleanGuestPath returns a filepath.Clean'd copy of value, or "" if
+// value is empty/whitespace. Callers that require a path MUST check
+// for "" and reject the request — defaulting to "." used to be the
+// behavior but made `DELETE /files?path=` (omitting path entirely)
+// silently run `os.RemoveAll(".")` against whatever cwd the agent
+// happened to be in, which for PID-1-spawned agents is `/`.
 func cleanGuestPath(value string) string {
-	if strings.TrimSpace(value) == "" {
-		return "."
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
 	}
-	return filepath.Clean(value)
+	return filepath.Clean(trimmed)
+}
+
+// requirePath writes a 400 and returns false if the caller didn't
+// supply a path. Centralises the check so every handler that needs
+// a non-empty path fails the same way.
+func requirePath(w http.ResponseWriter, p string) bool {
+	if p == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("path is required"))
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, code int, value any) {

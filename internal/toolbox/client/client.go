@@ -187,9 +187,15 @@ func (c *Client) Exec(
 
 	exit, err := sess.copyOutputUntilExit(stdout, stderr)
 	_ = sess.Close()
-	<-stdinDone
+	stdinErr := <-stdinDone
 	if err != nil {
+		if stdinErr != nil {
+			return ExecResult{}, errors.Join(err, stdinErr)
+		}
 		return ExecResult{}, err
+	}
+	if stdinErr != nil {
+		return ExecResult{}, fmt.Errorf("stdin pump: %w", stdinErr)
 	}
 	return ExecResult{ExitCode: exit}, nil
 }

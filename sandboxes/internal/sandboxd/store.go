@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Store is the in-memory map of live sandboxes plus a best-effort
@@ -26,8 +27,11 @@ type Store struct {
 
 // NewStore opens (or creates) a JSON-backed store at the given path.
 // On nonexistent file the store starts empty; on parse error the
-// file is renamed .corrupt-<ts> and we start fresh — losing the
-// stopped audit trail is preferable to refusing to boot.
+// file is renamed to `<path>.corrupt-<unix-ts>` and we start fresh
+// — losing the stopped audit trail is preferable to refusing to
+// boot, and the timestamped sidecar keeps multiple corruption
+// events on disk for post-mortem instead of overwriting the
+// previous one.
 func NewStore(statePath string) (*Store, error) {
 	s := &Store{statePath: statePath, sandboxes: map[string]*Sandbox{}}
 	if statePath == "" {
@@ -48,7 +52,13 @@ func NewStore(statePath string) (*Store, error) {
 	}
 	var loaded map[string]*Sandbox
 	if err := json.Unmarshal(data, &loaded); err != nil {
-		_ = os.Rename(statePath, statePath+".corrupt")
+		sidecar := fmt.Sprintf("%s.corrupt-%d", statePath, time.Now().Unix())
+		if rerr := os.Rename(statePath, sidecar); rerr != nil {
+			// If we can't move the corrupt file aside, fall back
+			// to deleting it so we can recover on this boot — the
+			// alternative is refusing to start, which is worse.
+			_ = os.Remove(statePath)
+		}
 		return s, nil
 	}
 	s.sandboxes = loaded

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -193,5 +192,4 @@ func TestServer_PostNotAllowedOnGet(t *testing.T) {
 	if resp.StatusCode == http.StatusOK {
 		t.Fatalf("expected non-200 for POST on GET-only route, got %d", resp.StatusCode)
 	}
-	_ = fmt.Sprintf
 }

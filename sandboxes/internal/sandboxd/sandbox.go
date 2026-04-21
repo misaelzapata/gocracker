@@ -31,10 +31,10 @@ type Manager struct {
 // StateError with the cause and the partial RunResult cleaned up.
 func (m *Manager) Create(req CreateSandboxRequest) (*Sandbox, error) {
 	if req.Image == "" {
-		return nil, fmt.Errorf("sandboxd create: image is required")
+		return nil, fmt.Errorf("%w: image is required", ErrInvalidRequest)
 	}
 	if req.KernelPath == "" {
-		return nil, fmt.Errorf("sandboxd create: kernel_path is required")
+		return nil, fmt.Errorf("%w: kernel_path is required", ErrInvalidRequest)
 	}
 	id := newSandboxID()
 	udsPath := filepath.Join(m.StateDir, "sandboxes", id+".sock")
@@ -113,6 +113,11 @@ func (m *Manager) Delete(id string) error {
 // when the supplied id has no live sandbox. Server-side this maps
 // to HTTP 404.
 var ErrSandboxNotFound = fmt.Errorf("sandbox not found")
+
+// ErrInvalidRequest flags Create-time validation failures that
+// clients should fix rather than retry. The server maps this to
+// HTTP 400 via errors.Is so callers see the right status.
+var ErrInvalidRequest = fmt.Errorf("invalid request")
 
 // newSandboxID returns a 12-hex-char unique id (sb-XXXXXX format)
 // — long enough to avoid collisions in any realistic per-host

@@ -3,6 +3,7 @@ package sandboxd
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -104,8 +105,21 @@ func TestStore_CorruptFileRecovers(t *testing.T) {
 	if len(s.List()) != 0 {
 		t.Fatal("expected empty store after recovery")
 	}
-	// The corrupt file should have been moved aside.
-	if _, err := os.Stat(statePath + ".corrupt"); err != nil {
-		t.Fatalf("expected .corrupt sidecar: %v", err)
+	// The corrupt file should have been moved aside under a
+	// timestamped name so multiple failures don't overwrite
+	// the last diagnostic copy.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	found := false
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "store.json.corrupt-") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected .corrupt-<ts> sidecar; entries=%v", entries)
 	}
 }
