@@ -370,13 +370,14 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 			// confused, and it becomes harder to distinguish original
 			// from restored in instrumentation.
 			vm, err := vmm.RestoreFromSnapshotWithOptions(opts.SnapshotDir, vmm.RestoreOptions{
-				ConsoleIn:        opts.ConsoleIn,
-				ConsoleOut:       opts.ConsoleOut,
-				OverrideVCPUs:    opts.CPUs,
-				OverrideID:       opts.ID,
-				OverrideTap:      opts.TapName,
-				OverrideX86Boot:  opts.X86Boot,
-				SharedFSRebinds:  buildSharedFSRebinds(opts.Mounts),
+				ConsoleIn:            opts.ConsoleIn,
+				ConsoleOut:           opts.ConsoleOut,
+				OverrideVCPUs:        opts.CPUs,
+				OverrideID:           opts.ID,
+				OverrideTap:          opts.TapName,
+				OverrideX86Boot:      opts.X86Boot,
+				OverrideVsockUDSPath: opts.VsockUDSPath,
+				SharedFSRebinds:      buildSharedFSRebinds(opts.Mounts),
 			})
 			if err == nil {
 				// Activate the freshly-allocated host-side tap (assigns the
@@ -768,12 +769,13 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		if _, err := os.Stat(filepath.Join(opts.SnapshotDir, "snapshot.json")); err == nil {
 			gclog.Container.Info("restoring from snapshot via worker", "dir", opts.SnapshotDir)
 			handle, cleanup, err := worker.LaunchRestoredVMM(opts.SnapshotDir, vmm.RestoreOptions{
-				OverrideTap:     opts.TapName,
-				OverrideVCPUs:   opts.CPUs,
-				OverrideX86Boot: opts.X86Boot,
-				ConsoleIn:       opts.ConsoleIn,
-				ConsoleOut:      opts.ConsoleOut,
-				SharedFSRebinds: buildSharedFSRebinds(opts.Mounts),
+				OverrideTap:          opts.TapName,
+				OverrideVCPUs:        opts.CPUs,
+				OverrideX86Boot:      opts.X86Boot,
+				OverrideVsockUDSPath: opts.VsockUDSPath,
+				ConsoleIn:            opts.ConsoleIn,
+				ConsoleOut:           opts.ConsoleOut,
+				SharedFSRebinds:      buildSharedFSRebinds(opts.Mounts),
 			}, worker.VMMOptions{
 				JailerBinary: opts.JailerBinary,
 				VMMBinary:    opts.VMMBinary,
