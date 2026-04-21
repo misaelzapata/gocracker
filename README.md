@@ -439,20 +439,22 @@ The Firecracker head-to-head above measures at the VMM level. [ComputeSDK's lead
 ### Results (10 timed runs after one warmup, CPU-pinned + FIFO scheduler)
 
 ```
-TTI 1: 211ms
-TTI 2: 220ms
-TTI 3: 216ms
-TTI 4: 208ms
-TTI 5: 217ms
-TTI 6: 220ms
-TTI 7: 215ms
-TTI 8: 229ms
-TTI 9: 219ms
-TTI 10: 218ms
-median = 218 ms, mean = 218 ms, p95 = 229 ms, min = 208 ms, max = 229 ms
+TTI 1: 209ms
+TTI 2: 211ms
+TTI 3: 219ms
+TTI 4: 227ms
+TTI 5: 245ms
+TTI 6: 262ms
+TTI 7: 287ms
+TTI 8: 285ms
+TTI 9: 274ms
+TTI 10: 292ms
+median = 253 ms, mean = 251 ms, p95 = 292 ms, min = 209 ms, max = 292 ms
 ```
 
-The bench pins `gocracker` to CPU 0 with `taskset -c 0` and SCHED_FIFO priority 50 via `chrt`. Override with `TTI_PIN_CPUS="0-3"` or `TTI_PIN_CPUS=""` to disable pinning. The VMM process itself also calls `mlockall(MCL_CURRENT)` in [cmd/gocracker-vmm/main.go](cmd/gocracker-vmm/main.go) so its working set stays resident; that drops p95 by ~50 ms and narrows the run-to-run spread from ~75 ms to ~20 ms.
+The bench pins `gocracker` to CPU 0 with `taskset -c 0` and SCHED_FIFO priority 50 via `chrt`. Override with `TTI_PIN_CPUS="0-3"` or `TTI_PIN_CPUS=""` to disable pinning. The VMM process itself also calls `mlockall(MCL_CURRENT)` in [cmd/gocracker-vmm/main.go](cmd/gocracker-vmm/main.go) so its working set stays resident.
+
+The median is ~35 ms slower than the pre-toolbox 218 ms baseline because [internal/guest/init.go](internal/guest/init.go) now also spawns the baked toolbox agent (`/opt/gocracker/toolbox/toolboxguest serve --vsock-port 10023`) before the user's CMD runs. That's the honest cost of having a dial-able per-sandbox UDS on vsock 10023 at `t=0` instead of paying a bootstrap race on every lease (which is what feat/sandboxes-v2 tried and burned down on). For most sandbox workloads it's a rounding-error tradeoff; for latency-critical cold-boot-only callers [internal/toolbox/embed](internal/toolbox/embed/) can be omitted at build time with a short stub.
 
 ### ComputeSDK leaderboard (reference)
 
@@ -495,8 +497,9 @@ A ~0.3 ms p50 gap at the low end of the latency budget, from a pure-Go VMM again
 
 | scenario | gocracker | Firecracker v1.10.1 | notes |
 |---|---:|---:|---|
-| Cold boot (Node TTI) | **218 ms** p50 | — | `gocracker run` to first `node -v` stdout (ComputeSDK methodology) |
-| Snapshot-resume | **2.24 ms** p50 | 1.92 ms p50 | `POST /restore {resume:true}` RTT, 128 MiB guest, curl time_total |
+| Cold boot (Node TTI) | **253 ms** p50 | — | `gocracker run` to first `node -v` stdout (ComputeSDK methodology). +35 ms over the pre-toolbox baseline — that's the cost of init spawning the baked toolbox agent before the user's CMD. |
+| Snapshot-resume | **1.33 ms** p50 | 1.92 ms p50 | `bench-rtt` measurement of `RestoreFromSnapshotWithOptions → vm.Start` on this branch; the older head-to-head row on Firecracker v1.10.1 used `curl -w '%{time_total}'` including HTTP layer. |
+| Warm restore + SetNetwork re-IP | **~55 ms** p50 | — | Full lease-style path: `Restore` (40-45 ms) + toolbox SetNetwork (11-13 ms). Fase 5 (warm pool) lowers this further by reusing Pause/Resume on pre-restored VMs, targeting <15 ms. |
 
 Both benches run with the VMM pinned to a dedicated CPU (`taskset`) and boosted to SCHED_FIFO (`chrt -r 50`), with `mlockall(MCL_CURRENT)` locking the VMM's working set. The snapshot path deliberately does NOT set `MCL_FUTURE` because that would eager-fault the `MAP_PRIVATE` memory snapshot and turn a ~2 ms lazy-COW restore into ~30 ms.
 
@@ -518,19 +521,19 @@ Cold-boot time here is dominated by OCI pull + ext4 build (~3 s for the alpine r
 
 ### Per-primitive RTT benchmark ([tools/bench-rtt](tools/bench-rtt/main.go))
 
-Unlike the end-to-end TTI and snapshot-resume benchmarks above, `bench-rtt` isolates each primitive on the warm-cache hot path so a regression can be attributed to a specific code path. Measured on a Ryzen AI 9 HX 370 laptop, N=50 iterations after 3 warmups:
+Unlike the end-to-end TTI and snapshot-resume benchmarks above, `bench-rtt` isolates each primitive on the warm-cache hot path so a regression can be attributed to a specific code path. Measured on a Ryzen AI 9 HX 370 laptop, N=30 iterations after 2 warmups, against the current `feat/sandboxd-v3` head:
 
 | primitive | p50 | p90 | max | notes |
 |---|---:|---:|---:|---|
-| pause (`vm.Pause()`) | **10.3 ms** | 10.7 ms | 20.3 ms | floor is the 10 ms `time.Sleep` polling loop inside `(*VM).Pause()` — an architectural cost, not measurement noise. |
-| resume (`vm.Resume()`) | **<1 µs** | <4 µs | 55 µs | near-instant — no vCPU state round-trip. |
-| snapshot capture (`vm.TakeSnapshot()`) | **174 ms** | 240 ms | 1102 ms | max is a first-iteration outlier (dirty-bitmap cold start). |
-| snapshot restore (`vmm.RestoreFromSnapshotWithOptions → vm.Start`) | **1.44 ms** | 3.26 ms | 7.81 ms | consistent with the Firecracker-parity snapshot-resume RTT above. |
-| warmcache lookup hit | **3.6 µs** | 4.9 µs | 20 µs | `pkg/warmcache.Lookup()` — hashes + stats the snapshot dir. |
-| warmcache lookup miss | **1.2 µs** | 1.8 µs | 4 µs | early-out when the directory does not exist. |
-| UDS handshake (`CONNECT → OK`) | **~1 ms** | ~2 ms | ~5 ms | Firecracker-style Unix socket: dial + `CONNECT <port>\n` + read `OK\n`. Measures the host→guest→host virtio-vsock round-trip the sandbox orchestrator pays per exec. Opt-in via `-uds /path/vm.sock`. |
-| Toolbox framed exec stdout throughput | **50 MB/s** sustained | — | — | `POST /exec` on vsock 10023 with `[channel][len][payload]` framing (PLAN §4). Validated 4 MB round-trips end-to-end through UDS+vsock+framing after the `opCreditUpdate` fix in `internal/vsock/vsock.go` — prior to that any output >64 KiB stalled forever waiting for credits the host never emitted. |
-| SetNetwork RPC (re-IP post-restore) | **~12 ms** | ~15 ms | ~20 ms | Toolbox `POST /internal/setnetwork`: `netlink.LinkSetDown → LinkSetHardwareAddr → LinkSetUp → AddrFlush(v4) → AddrAdd → RouteReplace → arping -U` (async best-effort). Dominant cost is the netlink round-trips. |
+| pause (`vm.Pause()`) | **10.5 ms** | 11.1 ms | 21.6 ms | floor is the 10 ms `time.Sleep` polling loop inside `(*VM).Pause()` — an architectural cost, not measurement noise. |
+| resume (`vm.Resume()`) | **2 µs** | 6 µs | 10 µs | near-instant — no vCPU state round-trip. |
+| snapshot capture (`vm.TakeSnapshot()`) | **134.5 ms** | 151 ms | 177 ms | median is ~40 ms faster than the previous branch thanks to the `SkipDiskBundle` plumbing landed on `feat/warm-cache`. |
+| snapshot restore (`vmm.RestoreFromSnapshotWithOptions → vm.Start`) | **1.33 ms** | 2.56 ms | 3.18 ms | consistent with the Firecracker-parity snapshot-resume RTT above. |
+| warmcache lookup hit | **7 µs** | 10 µs | 18 µs | `pkg/warmcache.Lookup()` — hashes + stats the snapshot dir. |
+| warmcache lookup miss | **1.5 µs** | 3 µs | 5 µs | early-out when the directory does not exist. |
+| UDS handshake (`CONNECT → OK`) | **0.13 ms** | 0.99 ms | 2.13 ms mean | Firecracker-style Unix socket: dial + `CONNECT <port>\n` + read `OK\n`. Measures the host→guest→host virtio-vsock round-trip the sandbox orchestrator pays per exec. Populated automatically when bench-rtt is run with `-uds <path>`. |
+| Toolbox framed exec stdout throughput | **50 MB/s** sustained | — | — | `POST /exec` on vsock 10023 with `[channel][len][payload]` framing (PLAN §4). Validated end-to-end 4 MB round-trips (64 KB 22 ms, 512 KB 31 ms, 1 MB 33 ms, 4 MB 83 ms). Prior to the `opCreditUpdate` fix in [internal/vsock/vsock.go](internal/vsock/vsock.go) any output >64 KiB stalled forever waiting for credits the host never emitted. |
+| SetNetwork RPC (re-IP post-restore) | **~12 ms** | ~15 ms | ~20 ms | Toolbox `POST /internal/setnetwork`: `netlink.LinkSetDown → LinkSetHardwareAddr → LinkSetUp → AddrFlush(v4) → AddrAdd → RouteReplace → arping -U` (async best-effort). Measured 11-13 ms p50 both jailer-off and jailer-on. |
 
 ### Reproducing
 
