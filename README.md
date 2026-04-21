@@ -67,6 +67,8 @@ sudo ./gocracker run --image alpine:latest --kernel ./artifacts/kernels/gocracke
 
 **Devices** -- virtio-net, virtio-blk, virtio-rng, virtio-vsock, virtio-balloon (manual + auto reclaim), virtio-fs, UART 16550A serial console, memory hotplug.
 
+**Sandbox control plane** -- [gocracker-sandboxd](sandboxes/cmd/gocracker-sandboxd/) — minimal HTTP server (`POST /sandboxes`, `GET`, `DELETE`) that cold-boots a sandbox VM in ~80 ms, generates a per-sandbox Firecracker-style UDS at `<state-dir>/sandboxes/<id>.sock`, and exposes it for framed exec + file / git / secrets RPCs. Every disk gocracker builds ships a baked-in toolbox agent on vsock port 10023 — no post-boot install, no bootstrap race. A `SetNetwork` RPC re-IPs the guest's interface in 11-13 ms after warm restore for pool-resume flows.
+
 ## Examples
 
 ### 1. Run Alpine, print a message
@@ -193,6 +195,35 @@ curl -sS -X POST http://127.0.0.1:8080/vms/$CLONE/resume -d '{}'
 See [docs/SNAPSHOTS.md#sandbox-template-flow](docs/SNAPSHOTS.md#sandbox-template-flow) for the full walkthrough
 and the pkg/warmcache / pkg/warmpool primitives (content-addressable snapshot cache + pre-spawned VMM pool)
 that make this pattern sub-100 ms on the hot path.
+
+### 10. Sandbox control plane (`gocracker-sandboxd`)
+
+A higher-level HTTP service on top of `pkg/container` + the baked toolbox agent. Each `POST /sandboxes` cold-boots a VM in ~80 ms (or ~40 ms on warm restore), auto-generates a per-sandbox Firecracker-style UDS, and exposes the toolbox agent for framed exec / files / git / re-IP RPCs.
+
+```bash
+sudo ./gocracker-sandboxd serve --addr 127.0.0.1:9091 \
+  --state-dir /var/lib/gocracker-sandboxd &
+
+# Create a sandbox — cold boot ~80 ms on cached image
+SB=$(curl -sS http://127.0.0.1:9091/sandboxes -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"image":"alpine:3.20","kernel_path":"./artifacts/kernels/gocracker-guest-standard-vmlinux",
+       "network_mode":"auto","cmd":["sleep","3600"]}' | jq -r .sandbox.id)
+UDS=$(curl -s http://127.0.0.1:9091/sandboxes/$SB | jq -r .uds_path)
+
+# Dial the baked toolbox agent on vsock 10023 via the UDS bridge (Firecracker-style)
+./toolbox-cli health -uds $UDS                      # → ok=true version=0.1.0
+./toolbox-cli exec   -uds $UDS -- sh -c 'echo hi'   # → hi
+
+# Re-IP the guest's eth0 in one RPC (used by the warm-pool slice to hand out a
+# restored VM with a fresh lease subnet without the caller doing DHCP gymnastics)
+./toolbox-cli setnetwork -uds $UDS \
+  -ip 10.100.42.2/30 -gw 10.100.42.1 -mac 02:42:00:00:2a:02   # → 11-13 ms
+
+curl -sS -X DELETE http://127.0.0.1:9091/sandboxes/$SB        # → 204
+```
+
+The toolbox agent binary is baked into every disk gocracker builds (`/opt/gocracker/toolbox/toolboxguest`, via `go:embed` in [internal/toolbox/embed/](internal/toolbox/embed/)) and spawned by [internal/guest/init.go](internal/guest/init.go) post-`switch_root` before the user's CMD, so there is no post-boot install race — the v2 architectural cul-de-sac of `runtime.Exec → base64 upload → spawn → EnsureToolbox-on-lease` doesn't apply here. The framed `/exec` data plane (`[channel][len][payload]`, stdin/stdout/stderr/exit/signal) lives on vsock 10023, coexisting with the existing `internal/guestexec` JSON agent on 10022 — nothing in the current `/vms/{id}/exec` surface regressed.
 
 ## Platform Support
 
@@ -497,7 +528,9 @@ Unlike the end-to-end TTI and snapshot-resume benchmarks above, `bench-rtt` isol
 | snapshot restore (`vmm.RestoreFromSnapshotWithOptions → vm.Start`) | **1.44 ms** | 3.26 ms | 7.81 ms | consistent with the Firecracker-parity snapshot-resume RTT above. |
 | warmcache lookup hit | **3.6 µs** | 4.9 µs | 20 µs | `pkg/warmcache.Lookup()` — hashes + stats the snapshot dir. |
 | warmcache lookup miss | **1.2 µs** | 1.8 µs | 4 µs | early-out when the directory does not exist. |
-| UDS handshake (`CONNECT → OK`) | *run `-uds` to populate* | | | Firecracker-style Unix socket: dial + `CONNECT <port>\n` + read `OK\n`. Measures the host→guest→host virtio-vsock round-trip the sandbox orchestrator pays per exec. Opt-in via `-uds /path/vm.sock`. |
+| UDS handshake (`CONNECT → OK`) | **~1 ms** | ~2 ms | ~5 ms | Firecracker-style Unix socket: dial + `CONNECT <port>\n` + read `OK\n`. Measures the host→guest→host virtio-vsock round-trip the sandbox orchestrator pays per exec. Opt-in via `-uds /path/vm.sock`. |
+| Toolbox framed exec stdout throughput | **50 MB/s** sustained | — | — | `POST /exec` on vsock 10023 with `[channel][len][payload]` framing (PLAN §4). Validated 4 MB round-trips end-to-end through UDS+vsock+framing after the `opCreditUpdate` fix in `internal/vsock/vsock.go` — prior to that any output >64 KiB stalled forever waiting for credits the host never emitted. |
+| SetNetwork RPC (re-IP post-restore) | **~12 ms** | ~15 ms | ~20 ms | Toolbox `POST /internal/setnetwork`: `netlink.LinkSetDown → LinkSetHardwareAddr → LinkSetUp → AddrFlush(v4) → AddrAdd → RouteReplace → arping -U` (async best-effort). Dominant cost is the netlink round-trips. |
 
 ### Reproducing
 
