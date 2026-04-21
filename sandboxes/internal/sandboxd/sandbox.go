@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gocracker/gocracker/pkg/container"
+	"github.com/gocracker/gocracker/pkg/vmm"
 )
 
 // Manager owns the sandbox lifecycle. It writes to the Store, calls
@@ -24,6 +25,14 @@ import (
 type Manager struct {
 	Store    *Store
 	StateDir string // base for per-sandbox runtime state (UDS sockets, etc.)
+
+	// VMMBinary / JailerBinary let sandboxd spawn workers via the
+	// main gocracker binary instead of re-exec-ing itself (it has no
+	// worker/jailer subcommands). Empty = fall back to the internal/
+	// worker resolver (os.Executable()), which only works when
+	// running as part of the gocracker binary proper.
+	VMMBinary    string
+	JailerBinary string
 }
 
 // Create cold-boots a fresh sandbox VM. Blocks until container.Run
@@ -36,7 +45,20 @@ func (m *Manager) Create(req CreateSandboxRequest) (Sandbox, error) {
 		return Sandbox{}, err
 	}
 	id := newSandboxID()
-	udsPath := filepath.Join(m.StateDir, "sandboxes", id+".sock")
+	// For jailer-on we can't just put the UDS under StateDir: the jail
+	// prefix (~65 chars) plus <StateDir>/sandboxes/<id>.sock blows past
+	// the sockaddr_un 108-byte limit. /worker is already bind-mounted
+	// rw from the worker's runDir into the chroot, so putting the UDS
+	// at /worker/<id>.sock keeps both the internal path short (~24
+	// chars) AND the host-side path short (runDir is ~40 chars, total
+	// ~60 chars). ResolveWorkerHostSidePath handles the translation.
+	// Jailer-off keeps StateDir since there's no chroot layering.
+	var udsPath string
+	if normalized.JailerMode == container.JailerModeOn {
+		udsPath = "/worker/sb-" + id[3:] + ".sock" // id already has "sb-" prefix; keep total short
+	} else {
+		udsPath = filepath.Join(m.StateDir, "sandboxes", id+".sock")
+	}
 
 	sb := &Sandbox{
 		ID:        id,
@@ -61,6 +83,8 @@ func (m *Manager) Create(req CreateSandboxRequest) (Sandbox, error) {
 		JailerMode:   normalized.JailerMode,
 		ExecEnabled:  true, // sandboxes always run with the exec agent (and now toolbox) idle
 		VsockUDSPath: udsPath,
+		VMMBinary:    m.VMMBinary,
+		JailerBinary: m.JailerBinary,
 	}
 
 	result, runErr := container.Run(opts)
@@ -73,11 +97,22 @@ func (m *Manager) Create(req CreateSandboxRequest) (Sandbox, error) {
 		return snap, fmt.Errorf("sandboxd create: container run: %w", runErr)
 	}
 
+	// Translate the guest-internal UDS path into the host-visible one.
+	// Jailer-on: the VMM binds under /worker which is bind-mounted from
+	// runDir, so ResolveWorkerHostSidePath rewrites /worker/... to the
+	// host RunDir (stays short — critical for the 108-byte sockaddr_un
+	// limit). Jailer-off: no chroot, no translation.
+	hostUDSPath := udsPath
+	if wh, ok := result.VM.(vmm.WorkerBacked); ok {
+		hostUDSPath = vmm.ResolveWorkerHostSidePath(wh.WorkerMetadata(), udsPath)
+	}
+
 	m.Store.Update(id, func(s *Sandbox) {
 		s.State = StateReady
 		s.runResult = result
 		s.RuntimeID = result.ID
 		s.GuestIP = result.GuestIP
+		s.UDSPath = hostUDSPath
 	})
 
 	updated, _ := m.Store.Get(id)

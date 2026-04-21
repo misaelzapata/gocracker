@@ -1200,6 +1200,13 @@ func cloneVMLimiter(cfg *vmm.RateLimiterConfig) *vmm.RateLimiterConfig {
 
 func resolveLauncher(explicit, mode string) (string, []string, error) {
 	if explicit != "" {
+		// A bare "gocracker" binary dispatches by first arg (run/serve/vmm/
+		// jailer/build-worker/...) so we still need to prepend the mode.
+		// Standalone gocracker-vmm / gocracker-jailer / gocracker-build-worker
+		// binaries take flags directly — no prefix. Decide by basename.
+		if filepath.Base(explicit) == "gocracker" {
+			return explicit, []string{mode}, nil
+		}
 		return explicit, nil, nil
 	}
 	exe, err := os.Executable()
