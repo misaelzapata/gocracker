@@ -11,7 +11,6 @@
 package sandboxd
 
 import (
-	"sync"
 	"time"
 
 	"github.com/gocracker/gocracker/pkg/container"
@@ -29,9 +28,11 @@ const (
 )
 
 // Sandbox is the in-memory representation of a single sandbox VM.
-// Not safe for concurrent mutation by multiple goroutines without
-// holding the parent Store's lock — Store.Update is the only
-// supported way to change fields.
+// All mutation flows through Store methods, which hold Store.mu for
+// the duration of any read or write. There is no per-Sandbox lock —
+// attempting to add one re-introduces the go-vet mutex-copy warnings
+// on every return-by-value (JSON-encoded responses are values on
+// purpose, decoupled from concurrent Store.Update writes).
 type Sandbox struct {
 	ID        string    `json:"id"`
 	State     State     `json:"state"`
@@ -46,21 +47,14 @@ type Sandbox struct {
 	// open VM handle that only makes sense in-process. Persistence
 	// of stopped sandboxes drops this field on load.
 	runResult *container.RunResult `json:"-"`
-
-	// mu guards mutable fields above when callers hold a Sandbox
-	// pointer outside the Store's lock (e.g. during async ops like
-	// stop). Most mutation should still flow through Store.
-	mu sync.Mutex `json:"-"`
 }
 
-// snapshot returns a copy safe to expose outside the Store lock —
-// notably for JSON encoding in HTTP handlers where concurrent
-// Store.Update calls would otherwise race on the live pointer's
-// fields. runResult and mu are intentionally dropped because neither
-// is meaningful to external callers; re-copying the mutex would be a
-// vet-flagged foot-gun anyway. The caller is responsible for holding
-// the relevant lock while calling snapshot so the read itself is
-// consistent.
+// snapshot returns a copy of the exported fields safe to expose
+// outside the Store lock — notably for JSON encoding in HTTP
+// handlers where concurrent Store.Update calls would otherwise race
+// on the live pointer's fields. runResult is intentionally dropped
+// because it's not meaningful to external callers. Caller must hold
+// Store.mu for the read to be consistent.
 func (s *Sandbox) snapshot() Sandbox {
 	return Sandbox{
 		ID:        s.ID,

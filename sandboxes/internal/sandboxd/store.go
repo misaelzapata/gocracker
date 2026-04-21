@@ -91,20 +91,7 @@ func (s *Store) Get(id string) (Sandbox, bool) {
 	if !ok {
 		return Sandbox{}, false
 	}
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
 	return sb.snapshot(), true
-}
-
-// getLive returns the live pointer under the store lock. Intended
-// only for internal callers that need access to the unexported
-// runResult field (e.g. Manager.Delete tearing down the VM).
-// HTTP-facing callers must use Get/List which return snapshots.
-func (s *Store) getLive(id string) (*Sandbox, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sb, ok := s.sandboxes[id]
-	return sb, ok
 }
 
 // List returns snapshots of every sandbox sorted by CreatedAt
@@ -116,9 +103,7 @@ func (s *Store) List() []Sandbox {
 	defer s.mu.Unlock()
 	out := make([]Sandbox, 0, len(s.sandboxes))
 	for _, sb := range s.sandboxes {
-		sb.mu.Lock()
 		out = append(out, sb.snapshot())
-		sb.mu.Unlock()
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].CreatedAt.Before(out[j].CreatedAt)
@@ -127,13 +112,9 @@ func (s *Store) List() []Sandbox {
 }
 
 // Update applies fn to the sandbox under the store's lock and
-// persists. Returns false if the id isn't found. fn is called with
-// the sandbox's own mutex held so concurrent Store.Update calls on
-// the same id (and any future Sandbox-internal locking) serialize.
-//
-// sb.mu is released via defer so a panic inside fn doesn't leave the
-// mutex locked forever. The outer s.mu is also deferred; both locks
-// will be released cleanly before the panic propagates.
+// persists. Returns false if the id isn't found. Store.mu is held for
+// the whole callback so fn has exclusive access; it is deferred so a
+// panic inside fn doesn't leave the lock held.
 func (s *Store) Update(id string, fn func(*Sandbox)) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -141,8 +122,6 @@ func (s *Store) Update(id string, fn func(*Sandbox)) bool {
 	if !ok {
 		return false
 	}
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
 	fn(sb)
 	s.persistLocked()
 	return true
