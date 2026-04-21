@@ -12,7 +12,7 @@ import (
 // inject a fake without standing up real VMs (container.Run needs
 // KVM + root and is not unit-testable in isolation).
 type Lifecycle interface {
-	Create(req CreateSandboxRequest) (*Sandbox, error)
+	Create(req CreateSandboxRequest) (Sandbox, error)
 	Delete(id string) error
 }
 

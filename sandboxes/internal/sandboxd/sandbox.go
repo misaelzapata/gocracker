@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -29,12 +30,10 @@ type Manager struct {
 // returns (typically <100 ms for warm-cached images, ~1-3s for cold
 // pulls). On success the sandbox is in StateReady; on failure it's
 // StateError with the cause and the partial RunResult cleaned up.
-func (m *Manager) Create(req CreateSandboxRequest) (*Sandbox, error) {
-	if req.Image == "" {
-		return nil, fmt.Errorf("%w: image is required", ErrInvalidRequest)
-	}
-	if req.KernelPath == "" {
-		return nil, fmt.Errorf("%w: kernel_path is required", ErrInvalidRequest)
+func (m *Manager) Create(req CreateSandboxRequest) (Sandbox, error) {
+	normalized, err := validateCreateRequest(req)
+	if err != nil {
+		return Sandbox{}, err
 	}
 	id := newSandboxID()
 	udsPath := filepath.Join(m.StateDir, "sandboxes", id+".sock")
@@ -42,35 +41,36 @@ func (m *Manager) Create(req CreateSandboxRequest) (*Sandbox, error) {
 	sb := &Sandbox{
 		ID:        id,
 		State:     StateCreating,
-		Image:     req.Image,
+		Image:     normalized.Image,
 		UDSPath:   udsPath,
 		CreatedAt: time.Now().UTC(),
 	}
 	if err := m.Store.Add(sb); err != nil {
-		return nil, err
+		return Sandbox{}, err
 	}
 
 	opts := container.RunOptions{
-		Image:        req.Image,
-		KernelPath:   req.KernelPath,
-		MemMB:        defaultUint64(req.MemMB, 256),
-		CPUs:         defaultInt(req.CPUs, 1),
-		Cmd:          req.Cmd,
-		Env:          req.Env,
-		WorkDir:      req.WorkDir,
-		NetworkMode:  defaultString(req.NetworkMode, "auto"),
-		JailerMode:   defaultString(req.JailerMode, container.JailerModeOff),
+		Image:        normalized.Image,
+		KernelPath:   normalized.KernelPath,
+		MemMB:        defaultUint64(normalized.MemMB, 256),
+		CPUs:         defaultInt(normalized.CPUs, 1),
+		Cmd:          normalized.Cmd,
+		Env:          normalized.Env,
+		WorkDir:      normalized.WorkDir,
+		NetworkMode:  normalized.NetworkMode,
+		JailerMode:   normalized.JailerMode,
 		ExecEnabled:  true, // sandboxes always run with the exec agent (and now toolbox) idle
 		VsockUDSPath: udsPath,
 	}
 
-	result, err := container.Run(opts)
-	if err != nil {
+	result, runErr := container.Run(opts)
+	if runErr != nil {
 		m.Store.Update(id, func(s *Sandbox) {
 			s.State = StateError
-			s.Error = err.Error()
+			s.Error = runErr.Error()
 		})
-		return sb, fmt.Errorf("sandboxd create: container run: %w", err)
+		snap, _ := m.Store.Get(id)
+		return snap, fmt.Errorf("sandboxd create: container run: %w", runErr)
 	}
 
 	m.Store.Update(id, func(s *Sandbox) {
@@ -80,33 +80,81 @@ func (m *Manager) Create(req CreateSandboxRequest) (*Sandbox, error) {
 		s.GuestIP = result.GuestIP
 	})
 
-	// Re-read to return the updated copy.
 	updated, _ := m.Store.Get(id)
 	return updated, nil
 }
 
 // Delete stops the sandbox VM, removes it from the store, and
-// returns nil on success. If the sandbox doesn't exist, returns a
-// NotFound-style error the server maps to 404. Idempotent on the
-// store side — calling Delete twice for the same id returns the
-// not-found error on the second call.
+// returns nil on success. Idempotent on the store side — calling
+// Delete twice returns the not-found error the second time.
+//
+// We read sb.runResult INSIDE the Store.Update closure (which holds
+// both the store lock and sb.mu) so a concurrent Create-in-flight
+// can't race us on the pointer assignment. The VM teardown itself
+// runs outside the lock — VM.Stop + RunResult.Close can block for
+// seconds and we don't want to stall other Store callers on it.
 func (m *Manager) Delete(id string) error {
-	sb, ok := m.Store.Get(id)
-	if !ok {
-		return ErrSandboxNotFound
-	}
-	m.Store.Update(id, func(s *Sandbox) {
+	var rr *container.RunResult
+	found := m.Store.Update(id, func(s *Sandbox) {
+		rr = s.runResult
+		s.runResult = nil
 		s.State = StateStopping
 	})
-	if sb.runResult != nil {
-		// Stop the VM and drain any background work (warm-cache goroutine, etc.)
-		if sb.runResult.VM != nil {
-			sb.runResult.VM.Stop()
+	if !found {
+		return ErrSandboxNotFound
+	}
+	if rr != nil {
+		if rr.VM != nil {
+			rr.VM.Stop()
 		}
-		sb.runResult.Close()
+		rr.Close()
 	}
 	m.Store.Remove(id)
 	return nil
+}
+
+// validateCreateRequest canonicalizes the user input, runs the
+// cheap/synchronous validations (path exists + mode/jailer enums)
+// and returns a copy that's safe to pass into container.Run. Every
+// validation failure wraps ErrInvalidRequest so the HTTP layer maps
+// it to 400 — avoids the previous situation where a bad kernel_path
+// or garbage jailer_mode silently turned into a runtime 500.
+func validateCreateRequest(req CreateSandboxRequest) (CreateSandboxRequest, error) {
+	if req.Image == "" {
+		return req, fmt.Errorf("%w: image is required", ErrInvalidRequest)
+	}
+	if req.KernelPath == "" {
+		return req, fmt.Errorf("%w: kernel_path is required", ErrInvalidRequest)
+	}
+	info, err := os.Stat(req.KernelPath)
+	if err != nil {
+		return req, fmt.Errorf("%w: kernel_path %q: %v", ErrInvalidRequest, req.KernelPath, err)
+	}
+	if info.IsDir() {
+		return req, fmt.Errorf("%w: kernel_path %q is a directory", ErrInvalidRequest, req.KernelPath)
+	}
+	// network_mode: accept "" (default "auto"), "auto", or "none" / "off" (disable).
+	switch req.NetworkMode {
+	case "":
+		req.NetworkMode = "auto"
+	case "auto":
+		// keep
+	case "none", "off":
+		req.NetworkMode = ""
+	default:
+		return req, fmt.Errorf("%w: network_mode %q (expected \"\", \"auto\", or \"none\")", ErrInvalidRequest, req.NetworkMode)
+	}
+	// jailer_mode: "" defaults to off; only on/off accepted — container.jailerEnabled
+	// treats unknown values as jailer-ON, which would silently flip privilege mode.
+	switch req.JailerMode {
+	case "":
+		req.JailerMode = container.JailerModeOff
+	case container.JailerModeOn, container.JailerModeOff:
+		// keep
+	default:
+		return req, fmt.Errorf("%w: jailer_mode %q (expected \"on\" or \"off\")", ErrInvalidRequest, req.JailerMode)
+	}
+	return req, nil
 }
 
 // ErrSandboxNotFound is returned by Manager.Delete and Manager.Get

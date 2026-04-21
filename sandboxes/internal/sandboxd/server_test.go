@@ -19,14 +19,14 @@ type fakeLifecycle struct {
 	deleteErr     error
 	createCalls   int
 	createOpts    CreateSandboxRequest
-	createdResult *Sandbox
+	createdResult Sandbox
 }
 
-func (f *fakeLifecycle) Create(req CreateSandboxRequest) (*Sandbox, error) {
+func (f *fakeLifecycle) Create(req CreateSandboxRequest) (Sandbox, error) {
 	f.createCalls++
 	f.createOpts = req
 	if f.createErr != nil {
-		return nil, f.createErr
+		return Sandbox{}, f.createErr
 	}
 	sb := &Sandbox{
 		ID:        "sb-fake-" + req.Image,
@@ -35,8 +35,9 @@ func (f *fakeLifecycle) Create(req CreateSandboxRequest) (*Sandbox, error) {
 		CreatedAt: time.Now().UTC(),
 	}
 	_ = f.store.Add(sb)
-	f.createdResult = sb
-	return sb, nil
+	snap, _ := f.store.Get(sb.ID)
+	f.createdResult = snap
+	return snap, nil
 }
 
 func (f *fakeLifecycle) Delete(id string) error {

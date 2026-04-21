@@ -127,7 +127,16 @@ func cmdExec(args []string) {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		for s := range sigCh {
-			_ = sess.Signal(s.(syscall.Signal))
+			// Guard against non-Unix signal implementations. On
+			// plausible non-Linux platforms (or future os.Signal
+			// shapes) the direct assertion used to panic; log and
+			// skip so the CLI stays up and reading output.
+			sig, ok := s.(syscall.Signal)
+			if !ok {
+				fmt.Fprintf(os.Stderr, "ignoring unsupported signal type %T (%v)\n", s, s)
+				continue
+			}
+			_ = sess.Signal(sig)
 		}
 	}()
 

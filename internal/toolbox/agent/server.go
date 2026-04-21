@@ -149,28 +149,61 @@ func handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, f)
 }
 
+// maxUploadFileSize caps a single POST /files/upload body. 100 MiB
+// is comfortable for typical code/config/model-artifact transfers
+// while ensuring one request can't OOM the agent — the prior shape
+// io.ReadAll'd the whole body into memory before writing to disk.
+const maxUploadFileSize int64 = 100 << 20
+
 func handleUploadFile(w http.ResponseWriter, r *http.Request) {
 	filePath := cleanGuestPath(r.URL.Query().Get("path"))
 	if !requirePath(w, filePath) {
-		return
-	}
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// 0644 — regular file-transfer default. Callers that need an
-	// executable bit should follow up with POST /files/chmod (which
-	// takes an explicit mode) instead of every upload gaining +x.
-	if err := os.WriteFile(filePath, data, 0o644); err != nil {
+	// Stream to a sibling temp file so a partial upload never shows
+	// up under the destination name. io.LimitReader + the maxSize+1
+	// trick lets us detect over-cap uploads without blindly buffering
+	// the oversized tail.
+	tmp, err := os.CreateTemp(filepath.Dir(filePath), ".upload-*")
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": filePath, "size": len(data)})
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op if rename already happened
+
+	// 0644 — regular file-transfer default. Callers that need +x
+	// should follow up with POST /files/chmod.
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	written, err := io.Copy(tmp, io.LimitReader(r.Body, maxUploadFileSize+1))
+	if err != nil {
+		tmp.Close()
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if written > maxUploadFileSize {
+		tmp.Close()
+		writeError(w, http.StatusRequestEntityTooLarge,
+			fmt.Errorf("upload exceeds maximum size of %d bytes", maxUploadFileSize))
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := os.Rename(tmpPath, filePath); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": filePath, "size": written})
 }
 
 func handleDeleteFile(w http.ResponseWriter, r *http.Request) {

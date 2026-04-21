@@ -79,23 +79,46 @@ func (s *Store) Add(sb *Sandbox) error {
 	return nil
 }
 
-// Get returns the sandbox for id, or (nil, false) if not present.
-func (s *Store) Get(id string) (*Sandbox, bool) {
+// Get returns a snapshot of the sandbox for id, or zero-value+false
+// if not present. The snapshot is safe to use outside the store lock
+// (e.g. for JSON encoding) because it's decoupled from any
+// concurrent Store.Update writes on the live record. Callers that
+// need to mutate the sandbox must go through Store.Update instead.
+func (s *Store) Get(id string) (Sandbox, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sb, ok := s.sandboxes[id]
+	if !ok {
+		return Sandbox{}, false
+	}
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return sb.snapshot(), true
+}
+
+// getLive returns the live pointer under the store lock. Intended
+// only for internal callers that need access to the unexported
+// runResult field (e.g. Manager.Delete tearing down the VM).
+// HTTP-facing callers must use Get/List which return snapshots.
+func (s *Store) getLive(id string) (*Sandbox, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sb, ok := s.sandboxes[id]
 	return sb, ok
 }
 
-// List returns a snapshot of all sandboxes sorted by CreatedAt
-// ascending. Pointers in the returned slice are the same objects in
-// the store — callers must not mutate fields directly; use Update.
-func (s *Store) List() []*Sandbox {
+// List returns snapshots of every sandbox sorted by CreatedAt
+// ascending. Unlike the prior "return []*Sandbox live pointers"
+// shape, this is race-safe: callers can iterate and JSON-encode the
+// result without holding any lock because each element is a copy.
+func (s *Store) List() []Sandbox {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]*Sandbox, 0, len(s.sandboxes))
+	out := make([]Sandbox, 0, len(s.sandboxes))
 	for _, sb := range s.sandboxes {
-		out = append(out, sb)
+		sb.mu.Lock()
+		out = append(out, sb.snapshot())
+		sb.mu.Unlock()
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].CreatedAt.Before(out[j].CreatedAt)
@@ -105,8 +128,8 @@ func (s *Store) List() []*Sandbox {
 
 // Update applies fn to the sandbox under the store's lock and
 // persists. Returns false if the id isn't found. fn is called with
-// the sandbox's own mutex held so concurrent UpdateSelf calls also
-// serialize.
+// the sandbox's own mutex held so concurrent Store.Update calls on
+// the same id (and any future Sandbox-internal locking) serialize.
 //
 // sb.mu is released via defer so a panic inside fn doesn't leave the
 // mutex locked forever. The outer s.mu is also deferred; both locks
