@@ -123,9 +123,22 @@ var ErrInvalidRequest = fmt.Errorf("invalid request")
 // — long enough to avoid collisions in any realistic per-host
 // load, short enough to type. Format kept identical across slices
 // so logs and external tooling don't churn.
+//
+// If crypto/rand.Read fails (shouldn't on Linux with getrandom, but
+// possible under exotic conditions like SELinux denying the syscall)
+// we salt the zero bytes with time.Now().UnixNano() so IDs stay
+// unique per-call instead of collapsing to "sb-000000000000" on
+// every create. Callers that need cryptographic randomness should
+// source it elsewhere — this is a collision-avoidance token, not a
+// secret.
 func newSandboxID() string {
 	var b [6]byte
-	_, _ = rand.Read(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		nanos := uint64(time.Now().UnixNano())
+		for i := 0; i < 6; i++ {
+			b[i] = byte(nanos >> (uint(i) * 8))
+		}
+	}
 	return "sb-" + hex.EncodeToString(b[:])
 }
 

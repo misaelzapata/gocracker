@@ -107,6 +107,10 @@ func (s *Store) List() []*Sandbox {
 // persists. Returns false if the id isn't found. fn is called with
 // the sandbox's own mutex held so concurrent UpdateSelf calls also
 // serialize.
+//
+// sb.mu is released via defer so a panic inside fn doesn't leave the
+// mutex locked forever. The outer s.mu is also deferred; both locks
+// will be released cleanly before the panic propagates.
 func (s *Store) Update(id string, fn func(*Sandbox)) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -115,8 +119,8 @@ func (s *Store) Update(id string, fn func(*Sandbox)) bool {
 		return false
 	}
 	sb.mu.Lock()
+	defer sb.mu.Unlock()
 	fn(sb)
-	sb.mu.Unlock()
 	s.persistLocked()
 	return true
 }

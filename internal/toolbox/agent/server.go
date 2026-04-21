@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/textproto"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	toolboxspec "github.com/gocracker/gocracker/internal/toolbox/spec"
 )
@@ -125,15 +127,26 @@ func handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 	if !requirePath(w, filePath) {
 		return
 	}
-	data, err := os.ReadFile(filePath)
+	// Stream the file rather than os.ReadFile → Write: large downloads
+	// (logs, model weights, /tmp uploads round-tripped back) would
+	// otherwise pin the whole file in agent RAM before the first byte
+	// reaches the wire. Stat first so we can send Content-Length and
+	// also so we return 400 early on a missing/unreadable path.
+	f, err := os.Open(filePath)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	_, _ = io.Copy(w, f)
 }
 
 func handleUploadFile(w http.ResponseWriter, r *http.Request) {
@@ -162,7 +175,7 @@ func handleUploadFile(w http.ResponseWriter, r *http.Request) {
 
 func handleDeleteFile(w http.ResponseWriter, r *http.Request) {
 	filePath := cleanGuestPath(r.URL.Query().Get("path"))
-	if !requirePath(w, filePath) {
+	if !requireSafeDestructivePath(w, filePath) {
 		return
 	}
 	if err := os.RemoveAll(filePath); err != nil {
@@ -277,6 +290,28 @@ func handleGitStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"output": string(out)})
 }
 
+// proxyClient backs handleHTTPProxy. One shared client means connection
+// reuse across preview calls; per-call timeouts cap the hang radius of
+// a slow or stuck upstream. Preview targets are loopback so 30 s total
+// + 5 s dial is comfortably larger than any reasonable user response
+// while still guaranteeing the agent goroutine doesn't pin forever.
+var proxyClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		Proxy:               nil,
+		DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		IdleConnTimeout:     60 * time.Second,
+		MaxIdleConnsPerHost: 4,
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		// Upstream may choose to redirect — we pass the redirect
+		// response through to the caller unchanged instead of
+		// following it transparently, matching a standard reverse
+		// proxy.
+		return http.ErrUseLastResponse
+	},
+}
+
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	trimmed := strings.TrimPrefix(r.URL.Path, "/proxy/http/")
 	parts := strings.SplitN(trimmed, "/", 2)
@@ -306,10 +341,13 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request) {
 	req.Header = cloneHeaders(r.Header)
 	req.Host = fmt.Sprintf("127.0.0.1:%d", port)
 
-	client := &http.Client{
-		Transport: &http.Transport{Proxy: nil},
-	}
-	resp, err := client.Do(req)
+	// Reuse a single client/transport across all proxy calls so we
+	// don't burn a fresh connection per request, and cap both the
+	// total request budget and the individual dial so a stuck
+	// upstream can't pin the agent goroutine indefinitely. These
+	// timeouts are generous for preview-traffic use cases (curl,
+	// file serving) and tight enough to fail fast on a dead port.
+	resp, err := proxyClient.Do(req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -340,6 +378,25 @@ func cleanGuestPath(value string) string {
 func requirePath(w http.ResponseWriter, p string) bool {
 	if p == "" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("path is required"))
+		return false
+	}
+	return true
+}
+
+// requireSafeDestructivePath is requirePath + a guard against "/" and
+// "." targets that would clobber the guest rootfs or the agent's cwd.
+// Used by handlers whose operation is destructive (delete, rename-dst
+// overwrite, etc.) — a Copilot-review catch after the empty-path
+// default was already fixed. The sandbox is isolated in a VM so a
+// rogue delete doesn't hurt the host, but a single stray request
+// that nukes `/` inside the guest still looks like a bug to users.
+func requireSafeDestructivePath(w http.ResponseWriter, p string) bool {
+	if !requirePath(w, p) {
+		return false
+	}
+	switch p {
+	case "/", ".":
+		writeError(w, http.StatusBadRequest, fmt.Errorf("refusing destructive operation on %q (guest rootfs)", p))
 		return false
 	}
 	return true
