@@ -13,6 +13,10 @@ import (
 )
 
 type vsockListener struct {
+	// fd=-1 means "closed / never opened". Using 0 was wrong because fd
+	// 0 is a legitimate file descriptor (stdin if nothing else has been
+	// opened); if we ever received fd=0 for the vsock socket, Close()
+	// would silently leak it.
 	fd int
 }
 
@@ -39,7 +43,8 @@ func ListenVsock(port uint32) (net.Listener, error) {
 		_ = unix.Close(fd)
 		return nil, err
 	}
-	return &vsockListener{fd: fd}, nil
+	l := &vsockListener{fd: fd}
+	return l, nil
 }
 
 func (l *vsockListener) Accept() (net.Conn, error) {
@@ -51,11 +56,11 @@ func (l *vsockListener) Accept() (net.Conn, error) {
 }
 
 func (l *vsockListener) Close() error {
-	if l.fd == 0 {
+	if l.fd < 0 {
 		return nil
 	}
 	err := unix.Close(l.fd)
-	l.fd = 0
+	l.fd = -1
 	return err
 }
 

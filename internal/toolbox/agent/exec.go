@@ -134,8 +134,13 @@ func runExecSession(ctx context.Context, conn net.Conn, brw *bufio.ReadWriter, r
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
+	// Merge req.Env with the agent's environment (PATH, HOME, etc.
+	// that init.go configured for the toolbox process). Replacing
+	// cmd.Env wholesale with only req.Env was a footgun — callers
+	// that set a single KEY=VALUE ended up losing PATH and then
+	// exec.LookPath failed for trivial commands like "echo".
 	if len(req.Env) > 0 {
-		cmd.Env = req.Env
+		cmd.Env = append(os.Environ(), req.Env...)
 	}
 
 	// frameWriter serializes WriteFrame calls — multiple goroutines

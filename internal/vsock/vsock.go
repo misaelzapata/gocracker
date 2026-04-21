@@ -300,6 +300,16 @@ func (d *Device) handleData(hdr *pktHdr, chain []virtio.Desc, q *virtio.Queue) {
 	n, err := c.conn.Write(data)
 	if err != nil {
 		gclog.VMM.Warn("[DBG-VSOCK] handleData: conn.Write FAILED", "guestPort", hdr.SrcPort, "hostPort", hdr.DstPort, "n", n, "err", err)
+		// Close the host side, drop the connKey, and send RST to the
+		// guest so its socket leaves ESTABLISHED immediately instead
+		// of continuing to send bytes we can't deliver. Prior shape
+		// returned without any of this, leaving the guest stuck
+		// writing into a dead pipe and spamming us with writes.
+		c.conn.Close()
+		d.mu.Lock()
+		delete(d.conns, connKey{guestPort: hdr.SrcPort, hostPort: hdr.DstPort})
+		d.mu.Unlock()
+		d.sendReset(hdr)
 		return
 	}
 	// Credit the guest for the bytes we just forwarded. Without this

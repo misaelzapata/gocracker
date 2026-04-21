@@ -481,6 +481,11 @@ func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, re
 		X86Boot:         string(opts.OverrideX86Boot),
 		Resume:          resume,
 		SharedFSRebinds: opts.SharedFSRebinds,
+		// Plumb the new UDS path across the worker RPC so the
+		// in-jail vmmserver can rebind the snapshot's vsock device
+		// to the caller's socket (sandboxd's per-sandbox UDS).
+		// Empty = keep the snapshot's original path.
+		VsockUDSPath: opts.OverrideVsockUDSPath,
 	})
 	if err != nil {
 		_ = cmd.Process.Kill()
@@ -1195,6 +1200,13 @@ func cloneVMLimiter(cfg *vmm.RateLimiterConfig) *vmm.RateLimiterConfig {
 
 func resolveLauncher(explicit, mode string) (string, []string, error) {
 	if explicit != "" {
+		// A bare "gocracker" binary dispatches by first arg (run/serve/vmm/
+		// jailer/build-worker/...) so we still need to prepend the mode.
+		// Standalone gocracker-vmm / gocracker-jailer / gocracker-build-worker
+		// binaries take flags directly — no prefix. Decide by basename.
+		if filepath.Base(explicit) == "gocracker" {
+			return explicit, []string{mode}, nil
+		}
 		return explicit, nil, nil
 	}
 	exe, err := os.Executable()
