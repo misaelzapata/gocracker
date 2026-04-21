@@ -66,6 +66,11 @@ func Handler() http.Handler {
 	// handshake JSON and switches to the binary frame protocol — see
 	// internal/toolbox/agent/exec.go and frame.go.
 	mux.HandleFunc("POST /exec", handleExec)
+	// /internal/* is host-only — sandboxd-side trusted callers (PLAN
+	// §3 SetNetwork after warm restore). Not exposed via any
+	// user-facing API surface; callers reach it via the same UDS
+	// CONNECT 10023 path as the other endpoints.
+	mux.HandleFunc("POST /internal/setnetwork", handleSetNetwork)
 	return mux
 }
 

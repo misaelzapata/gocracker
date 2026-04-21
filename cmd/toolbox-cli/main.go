@@ -31,9 +31,37 @@ func main() {
 		cmdHealth(os.Args[2:])
 	case "exec":
 		cmdExec(os.Args[2:])
+	case "setnetwork":
+		cmdSetNetwork(os.Args[2:])
 	default:
 		usage()
 	}
+}
+
+func cmdSetNetwork(args []string) {
+	fs := flag.NewFlagSet("setnetwork", flag.ExitOnError)
+	uds := fs.String("uds", "", "absolute path to the VM's UDS")
+	iface := fs.String("iface", "eth0", "guest interface name")
+	ip := fs.String("ip", "", "CIDR (e.g. 10.100.7.2/30)")
+	gw := fs.String("gw", "", "gateway IP (e.g. 10.100.7.1)")
+	mac := fs.String("mac", "", "MAC address (optional)")
+	timeout := fs.Duration("timeout", 5*time.Second, "request timeout")
+	fs.Parse(args)
+	if *uds == "" || *ip == "" {
+		fmt.Fprintln(os.Stderr, "usage: toolbox-cli setnetwork -uds <path> -ip <CIDR> [-gw <ip>] [-iface eth0] [-mac <mac>]")
+		os.Exit(2)
+	}
+	c := &client.Client{UDSPath: *uds}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	resp, err := c.SetNetwork(ctx, agent.SetNetworkRequest{
+		Interface: *iface, IP: *ip, Gateway: *gw, MAC: *mac,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "setnetwork:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("ok=%v iface=%s ip=%s gw=%s mac=%s\n", resp.OK, resp.Interface, resp.IP, resp.Gateway, resp.MAC)
 }
 
 func usage() {

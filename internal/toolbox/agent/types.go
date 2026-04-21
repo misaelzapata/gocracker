@@ -35,3 +35,27 @@ type GitCloneRequest struct {
 type GitStatusRequest struct {
 	Directory string `json:"directory"`
 }
+
+// SetNetworkRequest is the host-only payload that re-IPs the guest's
+// primary interface after a snapshot restore. Sent host → agent on
+// POST /internal/setnetwork between vmm.Restore() and returning the
+// VM to the user. The host control plane is trusted to provide a
+// non-conflicting IP/MAC pair from its sandbox pool — the agent does
+// no allocation, just applies what it's told.
+type SetNetworkRequest struct {
+	Interface string `json:"interface,omitempty"` // empty = "eth0"
+	IP        string `json:"ip"`                  // CIDR notation, e.g. "10.100.7.2/30"
+	Gateway   string `json:"gateway,omitempty"`   // bare IP, e.g. "10.100.7.1"
+	MAC       string `json:"mac,omitempty"`       // colon-hex, e.g. "02:42:00:00:00:07"
+}
+
+// SetNetworkResponse mirrors the request inputs back so the host can
+// log/audit. Errors come back as HTTP 4xx/5xx with the error JSON
+// the rest of the agent uses.
+type SetNetworkResponse struct {
+	OK        bool   `json:"ok"`
+	Interface string `json:"interface"`
+	IP        string `json:"ip"`
+	Gateway   string `json:"gateway,omitempty"`
+	MAC       string `json:"mac,omitempty"`
+}

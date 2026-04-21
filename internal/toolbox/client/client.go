@@ -63,6 +63,68 @@ func New(udsPath string) *Client {
 	return &Client{UDSPath: udsPath}
 }
 
+// SetNetwork applies an IP/MAC/gateway to the guest's primary
+// interface — used by the host control plane between vmm.Restore()
+// and returning a warm VM to the user. See agent.SetNetworkRequest
+// for the field semantics. Errors come back as HTTP errors decoded
+// into a Go error; the caller is expected to fail-close (tear down
+// the VM and try another warm slot) on any failure.
+func (c *Client) SetNetwork(ctx context.Context, req agent.SetNetworkRequest) (agent.SetNetworkResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return agent.SetNetworkResponse{}, fmt.Errorf("marshal setnetwork: %w", err)
+	}
+	conn, err := c.dialAndConnect(ctx)
+	if err != nil {
+		return agent.SetNetworkResponse{}, err
+	}
+	defer conn.Close()
+	httpReq := fmt.Sprintf(
+		"POST /internal/setnetwork HTTP/1.0\r\nHost: x\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+		len(body),
+	)
+	if _, err := conn.Write([]byte(httpReq)); err != nil {
+		return agent.SetNetworkResponse{}, fmt.Errorf("write setnetwork headers: %w", err)
+	}
+	if _, err := conn.Write(body); err != nil {
+		return agent.SetNetworkResponse{}, fmt.Errorf("write setnetwork body: %w", err)
+	}
+	// We CANNOT use io.ReadAll on br: the agent's HTTP response
+	// ships a Content-Length but the conn doesn't always close
+	// promptly after the body (vsock-side close is best-effort
+	// from the kernel; the host bridge may keep the half-closed
+	// pipe alive briefly). json.Decoder.Decode returns as soon as
+	// it has a complete JSON object — same trick Health uses, and
+	// it sidesteps a 5-second hang on every successful call.
+	br := bufio.NewReader(conn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		return agent.SetNetworkResponse{}, fmt.Errorf("read status: %w", err)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return agent.SetNetworkResponse{}, fmt.Errorf("read headers: %w", err)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+	if !strings.HasPrefix(statusLine, "HTTP/1.0 200") && !strings.HasPrefix(statusLine, "HTTP/1.1 200") {
+		// Read the JSON error body. It's small and one object — Decoder returns at EOF-of-object.
+		var perr map[string]string
+		_ = json.NewDecoder(br).Decode(&perr)
+		return agent.SetNetworkResponse{}, fmt.Errorf("setnetwork: %s: %s",
+			strings.TrimRight(statusLine, "\r\n"),
+			perr["error"])
+	}
+	var resp agent.SetNetworkResponse
+	if err := json.NewDecoder(br).Decode(&resp); err != nil {
+		return agent.SetNetworkResponse{}, fmt.Errorf("decode setnetwork response: %w", err)
+	}
+	return resp, nil
+}
+
 // Health performs a single GET /healthz round-trip and returns the
 // agent's reported state. Useful as a readiness probe — a successful
 // call proves the UDS bridge, vsock, AND agent are all live.
