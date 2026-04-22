@@ -56,6 +56,9 @@ func cmdServe(args []string) {
 	stateDir := fs.String("state-dir", "/var/lib/gocracker-sandboxd", "directory for sandbox runtime state (UDS sockets, store)")
 	vmmBinary := fs.String("vmm-binary", "", "Path to gocracker binary used to spawn VMM workers (default: sibling of this binary, else PATH lookup)")
 	jailerBinary := fs.String("jailer-binary", "", "Path to gocracker binary used as jailer launcher (default: same as -vmm-binary)")
+	previewKeyEnv := fs.String("preview-key-env", "GOCRACKER_PREVIEW_KEY", "Env var holding the preview-token HMAC key (≥32 bytes). Empty env = auto-gen a random key (tokens expire at sandboxd restart).")
+	previewTTL := fs.Duration("preview-ttl", 1*time.Hour, "Default TTL for minted preview tokens")
+	previewHost := fs.String("preview-host", "sbx.localhost", "DNS root for preview subdomains (<id>--<port>.<preview-host>)")
 	fs.Parse(args)
 
 	if err := os.MkdirAll(*stateDir, 0o755); err != nil {
@@ -74,11 +77,20 @@ func cmdServe(args []string) {
 		fmt.Fprintln(os.Stderr, "open store:", err)
 		os.Exit(1)
 	}
+	var previewKey []byte
+	if envName := *previewKeyEnv; envName != "" {
+		if v := os.Getenv(envName); v != "" {
+			previewKey = []byte(v)
+		}
+	}
 	mgr := &sandboxd.Manager{
-		Store:        store,
-		StateDir:     *stateDir,
-		VMMBinary:    resolvedVMM,
-		JailerBinary: resolvedJailer,
+		Store:             store,
+		StateDir:          *stateDir,
+		VMMBinary:         resolvedVMM,
+		JailerBinary:      resolvedJailer,
+		PreviewSigningKey: previewKey,
+		PreviewTTL:        *previewTTL,
+		PreviewHost:       *previewHost,
 	}
 	srv := &http.Server{
 		Addr:              *addr,
@@ -102,8 +114,13 @@ func cmdServe(args []string) {
 		mgr.Shutdown(shutCtx)
 	}()
 
+	previewKeySource := "auto-gen"
+	if len(previewKey) > 0 {
+		previewKeySource = "env " + *previewKeyEnv
+	}
 	fmt.Printf("gocracker-sandboxd: listening on %s state=%s vmm=%s jailer=%s\n",
 		*addr, *stateDir, resolvedVMM, resolvedJailer)
+	fmt.Printf("  preview: host=%s ttl=%s key=%s\n", *previewHost, previewTTL.String(), previewKeySource)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintln(os.Stderr, "serve:", err)
 		os.Exit(1)
