@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -57,13 +58,41 @@ func (b containerBooter) Boot(ctx context.Context) (*BootResult, error) {
 	// internally. The ctx passed here is checked AFTER Run returns so
 	// shutdown cancellation immediately tears down anything that just
 	// finished booting.
-	result, err := container.Run(b.opts)
+	//
+	// Per-boot UDSPath: for jailer-off the VsockUDSPath is a direct
+	// host path, so every VM in the pool needs a unique one (a
+	// shared path would either collide at bind() or cross-wire
+	// clients into the wrong guest). For jailer-on the configured
+	// path is relative to /worker which is per-VM bind-mounted, so
+	// it's already unique — no mutation needed.
+	opts := b.opts
+	if opts.VsockUDSPath == "" && opts.JailerMode != container.JailerModeOn {
+		opts.VsockUDSPath = fmt.Sprintf("/tmp/gc-pool-%d-%d.sock", os.Getpid(), time.Now().UnixNano())
+	}
+	result, err := container.Run(opts)
 	if err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		result.Close()
 		return nil, fmt.Errorf("pool: booter canceled post-boot: %w", err)
+	}
+	// Drain WarmCapture's background snapshot writer BEFORE pausing.
+	// container.Run with WarmCapture=true returns immediately after
+	// boot but does the heavy snapshot.json + mem.bin write in a
+	// goroutine; subsequent Booter.Boot calls would race and miss
+	// the warmcache.Lookup hit, falling back to cold-boot. Waiting
+	// here costs ~50-200 ms on the FIRST boot of a template
+	// (one-time tax) and zero on every subsequent one. Net effect:
+	// the entire pool warms via restore-from-snapshot instead of
+	// N parallel cold-boots.
+	if result.WarmDone != nil {
+		select {
+		case <-result.WarmDone:
+		case <-ctx.Done():
+			result.Close()
+			return nil, fmt.Errorf("pool: booter canceled waiting for warm capture: %w", ctx.Err())
+		}
 	}
 	if err := result.VM.Pause(); err != nil {
 		result.Close()
@@ -75,7 +104,7 @@ func (b containerBooter) Boot(ctx context.Context) (*BootResult, error) {
 	// through; sandboxd will unwrap it on lease.
 	return &BootResult{
 		Result:  result,
-		UDSPath: b.opts.VsockUDSPath,
+		UDSPath: opts.VsockUDSPath,
 		Resumer: result.VM,
 		Stater:  vmHandleStater{h: result.VM},
 	}, nil

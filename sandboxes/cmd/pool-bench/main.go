@@ -23,15 +23,24 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/gocracker/gocracker/internal/toolbox/agent"
+	toolboxspec "github.com/gocracker/gocracker/internal/toolbox/spec"
 	"github.com/gocracker/gocracker/pkg/container"
 	"github.com/gocracker/gocracker/sandboxes/internal/sandboxd"
 )
@@ -46,7 +55,9 @@ func main() {
 	p95BudgetMs := flag.Int("p95-budget-ms", 20, "fail if p95 exceeds this (plan §5: <20 ms)")
 	stateDir := flag.String("state-dir", "/tmp/pool-bench-state", "sandboxd state directory")
 	timeoutS := flag.Int("timeout-s", 30, "per-lease wait timeout")
+	execCmd := flag.String("exec", "", "if set, exec this command in each leased VM (e.g. \"node --version\" or \"bun --version\") and report TTI as lease+exec end-to-end")
 	flag.Parse()
+	cmdParts := splitCmd(*execCmd)
 
 	if os.Getuid() != 0 {
 		fmt.Fprintln(os.Stderr, "pool-bench: must run as root (KVM + jailer require it)")
@@ -131,8 +142,22 @@ func main() {
 				TemplateID: tmpl,
 				Timeout:    time.Duration(*timeoutS) * time.Second,
 			})
+			if err != nil {
+				results <- sample{idx: i, latency: time.Since(t0), err: err}
+				return
+			}
+			// If -exec is set, measure TTI = lease + exec round-trip.
+			// This is the number that matters for the user-visible
+			// "I asked for a sandbox and got my command output back".
+			if len(cmdParts) > 0 {
+				_, execErr := execAndReadFirstChunk(ctx, sb.UDSPath, cmdParts, 5*time.Second)
+				if execErr != nil {
+					results <- sample{idx: i, latency: time.Since(t0), err: execErr, id: sb.ID}
+					return
+				}
+			}
 			elapsed := time.Since(t0)
-			results <- sample{idx: i, latency: elapsed, err: err, id: sb.ID}
+			results <- sample{idx: i, latency: elapsed, err: nil, id: sb.ID}
 		}(i)
 	}
 	wg.Wait()
@@ -219,3 +244,137 @@ func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "pool-bench: "+format+"\n", args...)
 	os.Exit(1)
 }
+
+// splitCmd is a poor-man's shlex — splits on whitespace, no quoting.
+// Sufficient for benchmark commands like "node --version" or
+// "bun --eval 'console.log(1+1)'" (avoid quotes — use a wrapper
+// script if you need them).
+func splitCmd(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	parts := strings.Fields(s)
+	return parts
+}
+
+// execAndReadFirstChunk dials the toolbox UDS, sends an exec request
+// for cmd, and waits until either (a) a stdout/stderr frame arrives,
+// or (b) the exit frame arrives, or (c) timeout. Returns the first
+// chunk of output (capped at 256 bytes for logging). Used by
+// pool-bench to measure end-to-end TTI = lease + exec round-trip.
+//
+// We DON'T wait for the full output because TTI is "first byte" —
+// node --version prints ~10 bytes and exits immediately, so reading
+// just one frame is all we need.
+func execAndReadFirstChunk(ctx context.Context, udsPath string, cmd []string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	dialCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	conn, err := dialUDSAndConnect(dialCtx, udsPath, toolboxspec.VsockPort)
+	if err != nil {
+		return "", fmt.Errorf("dial uds: %w", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(deadline)
+
+	body, _ := json.Marshal(agent.ExecRequest{Cmd: cmd})
+	httpReq := fmt.Sprintf(
+		"POST /exec HTTP/1.0\r\nHost: x\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+		len(body),
+	)
+	if _, err := conn.Write([]byte(httpReq)); err != nil {
+		return "", fmt.Errorf("write headers: %w", err)
+	}
+	if _, err := conn.Write(body); err != nil {
+		return "", fmt.Errorf("write body: %w", err)
+	}
+
+	br := bufio.NewReader(conn)
+	// Drain HTTP response line + headers.
+	if _, err := br.ReadString('\n'); err != nil {
+		return "", fmt.Errorf("read status: %w", err)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return "", fmt.Errorf("read header: %w", err)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	// Read framed responses until first stdout/stderr OR exit.
+	for {
+		ch, payload, err := readFrame(br)
+		if err != nil {
+			return "", fmt.Errorf("read frame: %w", err)
+		}
+		switch ch {
+		case agent.ChannelStdout, agent.ChannelStderr:
+			out := string(payload)
+			if len(out) > 256 {
+				out = out[:256]
+			}
+			return out, nil
+		case agent.ChannelExit:
+			// Exit before any output — return empty (still counts as
+			// successful TTI; the command was a no-op printer that
+			// wrote nothing or only whitespace).
+			return "", nil
+		}
+	}
+}
+
+// dialUDSAndConnect mirrors internal/toolbox/client.dialAndConnect
+// without depending on it (exported helpers would mean reaching
+// across an internal/ boundary that we can't cross from cmd/).
+func dialUDSAndConnect(ctx context.Context, udsPath string, port uint32) (net.Conn, error) {
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "unix", udsPath)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Write([]byte(fmt.Sprintf("CONNECT %d\n", port))); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("write CONNECT: %w", err)
+	}
+	br := bufio.NewReader(conn)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("read CONNECT response: %w", err)
+	}
+	if !strings.HasPrefix(line, "OK") {
+		conn.Close()
+		return nil, fmt.Errorf("CONNECT rejected: %s", strings.TrimSpace(line))
+	}
+	return conn, nil
+}
+
+// readFrame reads one framed message: [1 byte channel][4 byte len BE][payload].
+// Mirrors internal/toolbox/agent.ReadFrame which is in an internal
+// package we can't import from cmd/.
+func readFrame(r io.Reader) (byte, []byte, error) {
+	var hdr [5]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return 0, nil, err
+	}
+	channel := hdr[0]
+	n := binary.BigEndian.Uint32(hdr[1:5])
+	if n > 64<<10 {
+		return 0, nil, fmt.Errorf("frame too large: %d", n)
+	}
+	payload := make([]byte, n)
+	if n > 0 {
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return 0, nil, err
+		}
+	}
+	return channel, payload, nil
+}
+
+// errors used to keep import list minimal.
+var _ = errors.New

@@ -22,6 +22,7 @@ import (
 
 	"github.com/gocracker/gocracker/pkg/container"
 	"github.com/gocracker/gocracker/pkg/vmm"
+	"github.com/gocracker/gocracker/pkg/warmcache"
 	"github.com/gocracker/gocracker/sandboxes/internal/pool"
 )
 
@@ -153,10 +154,25 @@ func (m *Manager) RegisterPool(ctx context.Context, req CreatePoolRequest) (Pool
 			MemMB:        defaultUint64(req.MemMB, 256),
 			CPUs:         defaultInt(req.CPUs, 1),
 			JailerMode:   jailerMode,
+			// Lease path SetNetwork configures eth0 post-restore —
+			// the pool needs a TAP + eth0 available on every booted
+			// VM. network_mode=auto gives us exactly that (host-side
+			// TAP + guest-side eth0); anything else (none / manual)
+			// would fail SetNetwork with "Link not found".
+			NetworkMode:  "auto",
 			ExecEnabled:  true, // pooled sandboxes always have toolbox running
 			VsockUDSPath: poolVsockUDSPath(req.TemplateID, jailerMode),
 			VMMBinary:    m.VMMBinary,
 			JailerBinary: m.JailerBinary,
+			// WarmCapture is the whole point of the pool: the FIRST
+			// boot pays the cold-boot cost (~200-500 ms) AND captures
+			// a snapshot. Every subsequent boot via container.Run
+			// hits warmcache.Lookup → restore in ~3 ms instead of
+			// re-cold-booting. Without this, refill mid-burst pays
+			// the full cold tax and p95 spikes 100-500 ms — exactly
+			// the regression PLAN §5 was avoiding.
+			WarmCapture:     true,
+			InteractiveExec: true, // CMD-agnostic snapshot — any LeaseSpec.Cmd works
 		},
 		MinPaused:            req.MinPaused,
 		MaxPaused:            req.MaxPaused,
@@ -167,6 +183,24 @@ func (m *Manager) RegisterPool(ctx context.Context, req CreatePoolRequest) (Pool
 		return PoolRegistration{}, fmt.Errorf("sandboxd: new pool: %w", err)
 	}
 	p.SetNetworker(pm.netter)
+
+	// Pre-warm the warmcache snapshot. Without this, the FIRST N
+	// pool boots all race as cold-boots (each not yet seeing the
+	// other's not-yet-written snapshot), and we lose the entire
+	// point of WarmCapture for pool refill. One synchronous warm-up
+	// boot here populates the cache; once container.Run returns
+	// and WarmDone fires, every subsequent container.Run for this
+	// template hits the cache and restores in ~3-5 ms instead of
+	// re-cold-booting in ~200-500 ms.
+	//
+	// Cost: one cold-boot + snapshot capture (~3 s) at register
+	// time. Benefit: N×~200 ms saved on every pool fill thereafter.
+	// Net win at any pool size > 0.
+	if err := prewarmSnapshot(ctx, cfg.RunOptions); err != nil {
+		p.Stop()
+		return PoolRegistration{}, fmt.Errorf("sandboxd: prewarm snapshot: %w", err)
+	}
+
 	if err := p.Start(ctx); err != nil {
 		return PoolRegistration{}, fmt.Errorf("sandboxd: start pool: %w", err)
 	}
@@ -321,6 +355,49 @@ func (m *Manager) ReleaseLeased(id string) error {
 	pm.ipAlloc.Free(sb.poolIPSlot)
 	_, _ = m.Store.Remove(id)
 	return relErr
+}
+
+// prewarmSnapshot does one synchronous cold-boot with WarmCapture
+// so the warmcache snapshot exists on disk before the pool refiller
+// starts. After this returns, every subsequent container.Run with
+// the same RunOptions hits warmcache.Lookup → restore (~3-5 ms)
+// instead of re-cold-booting.
+//
+// The booted VM is closed immediately — we only care about the
+// side-effect of populating the cache. Failure is non-fatal at the
+// VM-handle level (Close errors are best-effort) but IS fatal at the
+// snapshot level (caller propagates).
+func prewarmSnapshot(ctx context.Context, opts container.RunOptions) error {
+	// If a snapshot already exists in the cache for this opts, we
+	// can skip the cold-boot entirely — container.Run on the next
+	// pool boot will hit it.
+	key, ok := container.ComputeWarmCacheKey(opts)
+	if ok {
+		if _, hit := warmcacheLookup(key); hit {
+			return nil
+		}
+	}
+	result, err := container.Run(opts)
+	if err != nil {
+		return err
+	}
+	defer result.Close()
+	defer result.VM.Stop()
+	if result.WarmDone != nil {
+		select {
+		case <-result.WarmDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// warmcacheLookup is a thin wrapper so prewarmSnapshot can ask
+// "does this template's snapshot already exist on disk?" without
+// a full container.Run round-trip.
+func warmcacheLookup(key string) (string, bool) {
+	return warmcache.Lookup(warmcache.DefaultRoot(), key)
 }
 
 // poolVsockUDSPath picks the per-template UDS template path. For
