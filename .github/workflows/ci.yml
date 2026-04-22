@@ -85,6 +85,20 @@ jobs:
         run: |
           sudo chown "$USER" coverage-integration.out 2>/dev/null || true
           go tool cover -func=coverage-integration.out | tail -1 | tee coverage-integration-summary.txt
+      - name: Template-bench gate (Fase 6 §6 step 3)
+        if: steps.prereq.outputs.run == 'true'
+        run: |
+          # Plan §6 target: "Segundo create idéntico: cache hit,
+          # < 10 ms". Local dev measures ~70 µs — 140× under budget.
+          # CI runner is slower but the cache-hit path has no KVM
+          # work (just map lookup + registry add), so even on shared
+          # hardware 10 ms should hold with room to spare.
+          go build -o /tmp/template-bench ./sandboxes/cmd/template-bench/
+          sudo -n /tmp/template-bench \
+            -image alpine:3.20 \
+            -kernel "$GITHUB_WORKSPACE/artifacts/kernels/gocracker-guest-standard-vmlinux" \
+            -iterations 5 \
+            -p95-budget-ms 10
       - name: Pool-bench gate (Fase 5 §5 step 6)
         if: steps.prereq.outputs.run == 'true'
         run: |

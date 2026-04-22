@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -39,6 +40,14 @@ type Builder struct {
 	// production default (containerColdBooter). Tests inject a
 	// fake.
 	Booter ColdBooter
+
+	// VMMBinary / JailerBinary are plumbed into the container.Run
+	// RunOptions on every Build. These aren't part of Spec (they're
+	// per-operator, not per-template — the SAME snapshot can be
+	// produced by different operator paths) so they live on the
+	// Builder instead of SpecHash.
+	VMMBinary    string
+	JailerBinary string
 
 	mu       sync.Mutex
 	building map[string]*sync.Mutex // spec_hash → per-hash lock
@@ -130,7 +139,10 @@ func (b *Builder) Build(ctx context.Context, id string, spec Spec) (BuildResult,
 	if booter == nil {
 		booter = containerColdBooter{}
 	}
-	snapshotDir, err := booter.BootAndCapture(ctx, tmpl.AsRunOptions())
+	opts := tmpl.AsRunOptions()
+	opts.VMMBinary = b.VMMBinary
+	opts.JailerBinary = b.JailerBinary
+	snapshotDir, err := booter.BootAndCapture(ctx, opts)
 	if err != nil {
 		b.Registry.Update(tmpl.ID, func(t *Template) {
 			t.State = StateError
@@ -166,8 +178,19 @@ func (containerColdBooter) BootAndCapture(ctx context.Context, opts container.Ru
 		}
 	}
 	// After WarmDone, container.Run has populated the warmcache. Look
-	// up the snapshot dir for the spec's key — that's our return.
-	key, ok := container.ComputeWarmCacheKey(opts)
+	// up the snapshot dir for the spec's key.
+	//
+	// container.Run applies a few defaults to opts before computing
+	// the key (Arch=runtime.GOARCH when empty; same for a couple of
+	// other fields). Replicate them here so our Lookup key matches
+	// the Store key — otherwise the lookup misses for a snapshot we
+	// just successfully captured, which was the original symptom of
+	// this bug.
+	lookupOpts := opts
+	if lookupOpts.Arch == "" {
+		lookupOpts.Arch = runtime.GOARCH
+	}
+	key, ok := container.ComputeWarmCacheKey(lookupOpts)
 	if !ok {
 		return "", errors.New("templates: warmcache key not derivable from spec")
 	}

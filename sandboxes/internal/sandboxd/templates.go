@@ -73,9 +73,12 @@ func (m *Manager) ensureTemplateManager() (*templateManager, error) {
 			err = fmt.Errorf("sandboxd: new template registry: %w", regErr)
 			return
 		}
+		b := templates.NewBuilder(reg)
+		b.VMMBinary = m.VMMBinary
+		b.JailerBinary = m.JailerBinary
 		m.tmplMgr = &templateManager{
 			registry: reg,
-			builder:  templates.NewBuilder(reg),
+			builder:  b,
 		}
 	})
 	return m.tmplMgr, err
