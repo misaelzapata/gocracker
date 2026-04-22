@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"sync"
@@ -129,7 +130,7 @@ func TestNewPool_PropagatesValidateError(t *testing.T) {
 
 func TestAcquire_EmptyReturnsErrPoolEmpty(t *testing.T) {
 	p, _ := NewPool(baseCfg())
-	_, err := p.Acquire()
+	_, err := p.Acquire(context.Background(), LeaseSpec{})
 	if !errors.Is(err, ErrPoolEmpty) {
 		t.Fatalf("Acquire on empty = %v, want ErrPoolEmpty", err)
 	}
@@ -137,16 +138,16 @@ func TestAcquire_EmptyReturnsErrPoolEmpty(t *testing.T) {
 
 func TestAcquire_TransitionsPausedToLeased(t *testing.T) {
 	p, _ := NewPool(baseCfg())
-	p.AddPaused("a", nil)
+	p.AddPaused("a", nil, "", nil)
 	if got := p.CountByState()[StatePaused]; got != 1 {
 		t.Fatalf("pre-Acquire paused=%d, want 1", got)
 	}
-	e, err := p.Acquire()
+	lease, err := p.Acquire(context.Background(), LeaseSpec{})
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
-	if e.ID != "a" || e.State != StateLeased {
-		t.Errorf("got %+v, want id=a state=leased", e)
+	if lease.ID != "a" {
+		t.Errorf("got %+v, want id=a", lease)
 	}
 	if got := p.CountByState()[StateLeased]; got != 1 {
 		t.Errorf("post-Acquire leased=%d, want 1", got)
@@ -158,9 +159,9 @@ func TestAcquire_TransitionsPausedToLeased(t *testing.T) {
 
 func TestAcquire_PicksOldestPaused(t *testing.T) {
 	p, _ := NewPool(baseCfg())
-	p.AddPaused("new", nil)
+	p.AddPaused("new", nil, "", nil)
 	time.Sleep(10 * time.Millisecond) // ensure distinct CreatedAt
-	p.AddPaused("newer", nil)
+	p.AddPaused("newer", nil, "", nil)
 	// Inject an even-older entry by hand to assert ordering.
 	p.mu.Lock()
 	p.entries["oldest"] = &Entry{
@@ -169,7 +170,7 @@ func TestAcquire_PicksOldestPaused(t *testing.T) {
 		CreatedAt: time.Now().Add(-time.Hour),
 	}
 	p.mu.Unlock()
-	e, err := p.Acquire()
+	e, err := p.Acquire(context.Background(), LeaseSpec{})
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
@@ -185,7 +186,7 @@ func TestAcquire_SkipsLeasedAndStopped(t *testing.T) {
 	p.entries["stopped"] = &Entry{ID: "stopped", State: StateStopped, CreatedAt: time.Now().Add(-time.Hour)}
 	p.entries["paused"] = &Entry{ID: "paused", State: StatePaused, CreatedAt: time.Now()}
 	p.mu.Unlock()
-	e, err := p.Acquire()
+	e, err := p.Acquire(context.Background(), LeaseSpec{})
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
@@ -196,8 +197,8 @@ func TestAcquire_SkipsLeasedAndStopped(t *testing.T) {
 
 func TestRelease_TransitionsLeasedToStopped(t *testing.T) {
 	p, _ := NewPool(baseCfg())
-	p.AddPaused("a", nil)
-	_, _ = p.Acquire()
+	p.AddPaused("a", nil, "", nil)
+	_, _ = p.Acquire(context.Background(), LeaseSpec{})
 	rr, err := p.Release("a")
 	if err != nil {
 		t.Fatalf("Release: %v", err)
@@ -220,7 +221,7 @@ func TestRelease_UnknownIDReturnsErrNotFound(t *testing.T) {
 
 func TestRelease_PausedReturnsErrNotLeased(t *testing.T) {
 	p, _ := NewPool(baseCfg())
-	p.AddPaused("a", nil)
+	p.AddPaused("a", nil, "", nil)
 	_, err := p.Release("a")
 	if !errors.Is(err, ErrNotLeased) {
 		t.Fatalf("Release(paused) = %v, want ErrNotLeased", err)
@@ -229,8 +230,8 @@ func TestRelease_PausedReturnsErrNotLeased(t *testing.T) {
 
 func TestRelease_DoubleReleaseIsRejected(t *testing.T) {
 	p, _ := NewPool(baseCfg())
-	p.AddPaused("a", nil)
-	_, _ = p.Acquire()
+	p.AddPaused("a", nil, "", nil)
+	_, _ = p.Acquire(context.Background(), LeaseSpec{})
 	if _, err := p.Release("a"); err != nil {
 		t.Fatalf("first Release: %v", err)
 	}
@@ -245,7 +246,7 @@ func TestRelease_DoubleReleaseIsRejected(t *testing.T) {
 func TestConcurrentAcquire(t *testing.T) {
 	p, _ := NewPool(baseCfg())
 	for i := 0; i < 9; i++ {
-		p.AddPaused(string(rune('a'+i)), nil)
+		p.AddPaused(string(rune('a'+i)), nil, "", nil)
 	}
 
 	var (
@@ -258,7 +259,7 @@ func TestConcurrentAcquire(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			e, err := p.Acquire()
+			e, err := p.Acquire(context.Background(), LeaseSpec{})
 			mu.Lock()
 			defer mu.Unlock()
 			if errors.Is(err, ErrPoolEmpty) {

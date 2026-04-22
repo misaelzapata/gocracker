@@ -164,9 +164,21 @@ type Entry struct {
 	State     State
 	CreatedAt time.Time
 	LeasedAt  time.Time
+	// UDSPath is the HOST-VISIBLE Firecracker-style UDS for this VM's
+	// toolbox agent. Used by the lease path to issue SetNetwork and
+	// by callers to stream exec/files via internal/toolbox/client.
+	UDSPath string
+	// GuestIP is set on Lease when SetNetwork succeeded. Empty for
+	// paused entries.
+	GuestIP string
 	// result holds the live container.RunResult for paused/leased VMs.
 	// Released to nil when the entry transitions to Stopped.
 	result *container.RunResult
+	// resumer is the minimal vm-handle subset the lease path calls
+	// (Resume). Kept as its own field so tests can inject a fake
+	// without implementing the full vmm.Handle interface; production
+	// sets it to result.VM which satisfies Resumer implicitly.
+	resumer Resumer
 	// lastError is the error that pushed this entry into StateError.
 	// Drained by the refiller's failure-backoff logic.
 	lastError error
@@ -194,8 +206,9 @@ var ErrNotLeased = errors.New("pool: entry not in leased state")
 // in via AddPaused (tests) to populate it. Wiring the refiller onto
 // pkg/container.Run lands in slice 2.
 type Pool struct {
-	cfg    Config
-	booter Booter // nil until Start; tests inject via NewPoolWithBooter.
+	cfg       Config
+	booter    Booter    // nil until Start; tests inject via NewPoolWithBooter.
+	networker Networker // nil = lease skips SetNetwork; tests inject via SetNetworker.
 
 	mu      sync.Mutex
 	entries map[string]*Entry
@@ -262,32 +275,103 @@ func (p *Pool) CountByState() map[State]int {
 }
 
 // AddPaused inserts an already-booted-and-paused entry into the pool.
-// Slice-1-only API: in slice 2 the refiller will be the sole writer.
-// Tests use this to exercise Acquire/Release without standing up real
-// VMs.
-func (p *Pool) AddPaused(id string, result *container.RunResult) {
+// Test-only API (production goes through the refiller); kept exported
+// because lease/refiller tests across the package need it. udsPath
+// surfaces on the returned Lease; resumer is invoked on Acquire so
+// tests can assert Resume() is called without standing up a VM.
+func (p *Pool) AddPaused(id string, result *container.RunResult, udsPath string, resumer Resumer) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.entries[id] = &Entry{
 		ID:        id,
 		State:     StatePaused,
 		CreatedAt: time.Now(),
+		UDSPath:   udsPath,
 		result:    result,
+		resumer:   resumer,
 	}
 }
 
-// Acquire returns the oldest paused entry, transitioning it to
-// StateLeased. Returns ErrPoolEmpty when no paused entry is
-// available. The returned Entry is a snapshot — callers must use
-// entry.ID for subsequent Release calls, not retained pointers.
-//
-// Picking the OLDEST paused entry (FIFO) matches the v2 behavior and
-// keeps long-idle VMs exercised, which surfaces any "paused sandbox
-// rots after N hours" bugs early instead of hiding them under a LIFO
-// that only serves the freshest entries.
-func (p *Pool) Acquire() (Entry, error) {
+// LeaseSpec configures what the pool does to a paused sandbox on the
+// way out the door. All fields optional — zero-value LeaseSpec means
+// "just flip the state to leased" (slice 1 behavior; tests use this).
+type LeaseSpec struct {
+	// IP / Gateway / MAC / Interface are passed through to the
+	// guest's toolbox agent via Networker.SetNetwork. Empty IP =
+	// skip SetNetwork entirely (e.g. the caller wants to own IP
+	// assignment themselves). Gateway / MAC / Interface are
+	// no-ops unless IP is set.
+	IP        string
+	Gateway   string
+	MAC       string
+	Interface string
+
+	// ResumeTimeout caps the vm.Resume() step. Default 2 s.
+	ResumeTimeout time.Duration
+	// SetNetworkTimeout caps the Networker.SetNetwork step. Default
+	// 2 s. Plan §5 target is 15 ms, so 2 s leaves two orders of
+	// magnitude of slack for pathological runs without stalling the
+	// caller indefinitely.
+	SetNetworkTimeout time.Duration
+}
+
+// Lease is what Acquire returns on success. Callers stash lease.ID
+// to call Release; lease.UDSPath to talk to the guest's toolbox
+// agent; lease.GuestIP when SetNetwork actually applied one.
+type Lease struct {
+	ID       string
+	UDSPath  string
+	GuestIP  string
+	LeasedAt time.Time
+}
+
+// Networker applies guest network config. In production the
+// containerNetworker wraps internal/toolbox/client.SetNetwork; tests
+// inject a fake.
+type Networker interface {
+	SetNetwork(ctx context.Context, udsPath, ip, gateway, mac, iface string) error
+}
+
+// Resumer is the minimal subset of vmm.Handle the lease path needs.
+// Kept as its own interface so tests can inject a fake Resumer
+// without standing up a real VMM.
+type Resumer interface {
+	Resume() error
+}
+
+// SetNetworker configures a pool-wide Networker used on every Lease.
+// Must be called before Start. Nil is fine — Lease just skips the
+// SetNetwork step (useful when the caller owns IP assignment out-of-
+// band, e.g. early demos before the IP allocator from slice 4 lands).
+func (p *Pool) SetNetworker(n Networker) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.networker = n
+}
+
+// Acquire picks the oldest paused entry, Resume()s the VM, optionally
+// SetNetwork()s the guest per spec, and returns a Lease. Returns
+// ErrPoolEmpty when no paused entry is available.
+//
+// Picking the OLDEST paused entry (FIFO) keeps long-idle VMs
+// exercised, surfacing any "paused sandbox rots after N hours" bug
+// early instead of hiding it behind a LIFO that only serves the
+// freshest entries.
+//
+// On Resume failure the entry is transitioned to StateStopped and
+// the underlying RunResult is returned via the error path so the
+// caller can tear it down — a VM that can't Resume is unusable and
+// leaving it in the pool would just make the next Acquire pick the
+// same broken entry.
+func (p *Pool) Acquire(ctx context.Context, spec LeaseSpec) (Lease, error) {
+	if spec.ResumeTimeout == 0 {
+		spec.ResumeTimeout = 2 * time.Second
+	}
+	if spec.SetNetworkTimeout == 0 {
+		spec.SetNetworkTimeout = 2 * time.Second
+	}
+
+	p.mu.Lock()
 	var oldest *Entry
 	for _, e := range p.entries {
 		if e.State != StatePaused {
@@ -298,11 +382,85 @@ func (p *Pool) Acquire() (Entry, error) {
 		}
 	}
 	if oldest == nil {
-		return Entry{}, ErrPoolEmpty
+		p.mu.Unlock()
+		return Lease{}, ErrPoolEmpty
 	}
 	oldest.State = StateLeased
 	oldest.LeasedAt = time.Now()
-	return *oldest, nil
+	lease := Lease{
+		ID:       oldest.ID,
+		UDSPath:  oldest.UDSPath,
+		LeasedAt: oldest.LeasedAt,
+	}
+	resumer := oldest.resumer
+	networker := p.networker
+	p.mu.Unlock()
+
+	// Resume OUTSIDE p.mu: vm.Resume walks all vCPUs + re-arms
+	// device state; it's fast but non-trivial, and holding the
+	// pool lock across it would serialise every Acquire — exactly
+	// the concurrency we're trying to enable.
+	if resumer != nil {
+		resumeCtx, cancel := context.WithTimeout(ctx, spec.ResumeTimeout)
+		if err := resumeWithContext(resumeCtx, resumer); err != nil {
+			cancel()
+			p.markStoppedAndReturn(lease.ID)
+			return Lease{}, fmt.Errorf("pool: resume %s: %w", lease.ID, err)
+		}
+		cancel()
+	}
+
+	// SetNetwork: only when caller provided an IP AND a Networker is
+	// configured. The guest-IP → Lease handoff happens here so
+	// callers see exactly what got applied (important for the IP
+	// allocator in slice 4 — it needs to know which IP to free if
+	// the lease fails downstream).
+	if spec.IP != "" && networker != nil && lease.UDSPath != "" {
+		netCtx, cancel := context.WithTimeout(ctx, spec.SetNetworkTimeout)
+		err := networker.SetNetwork(netCtx, lease.UDSPath, spec.IP, spec.Gateway, spec.MAC, spec.Interface)
+		cancel()
+		if err != nil {
+			p.markStoppedAndReturn(lease.ID)
+			return Lease{}, fmt.Errorf("pool: setnetwork %s: %w", lease.ID, err)
+		}
+		p.mu.Lock()
+		if e, ok := p.entries[lease.ID]; ok {
+			e.GuestIP = spec.IP
+		}
+		p.mu.Unlock()
+		lease.GuestIP = spec.IP
+	}
+
+	return lease, nil
+}
+
+// resumeWithContext runs vm.Resume() in a goroutine so the caller's
+// ResumeTimeout actually caps it — Resume itself has no ctx param.
+// The goroutine is fire-and-forget on timeout; Resume is idempotent
+// so a late completion doesn't wedge state (and we've already marked
+// the VM as unusable).
+func resumeWithContext(ctx context.Context, vm Resumer) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- vm.Resume()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// markStoppedAndReturn transitions lease.ID to StateStopped under
+// p.mu. Called from Acquire error paths so the poisoned entry is
+// removed from the pool's paused population.
+func (p *Pool) markStoppedAndReturn(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.entries[id]; ok {
+		e.State = StateStopped
+	}
 }
 
 // Release transitions the entry to StateStopped and returns its

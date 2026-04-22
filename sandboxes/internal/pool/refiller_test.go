@@ -23,7 +23,7 @@ type fakeBooter struct {
 	results    []*container.RunResult
 }
 
-func (f *fakeBooter) Boot(ctx context.Context) (*container.RunResult, error) {
+func (f *fakeBooter) Boot(ctx context.Context) (*BootResult, error) {
 	n := atomic.AddInt64(&f.calls, 1)
 	if f.delay > 0 {
 		select {
@@ -37,13 +37,15 @@ func (f *fakeBooter) Boot(ctx context.Context) (*container.RunResult, error) {
 	}
 	atomic.AddInt32(&f.boots, 1)
 	// Real Pool only dereferences result.VM / result.ID on certain
-	// paths; slice 2 tests don't touch VM, so nil VM is fine. We
-	// synthesize a unique ID so entries don't collide in the map.
-	rr := &container.RunResult{ID: fakeID(n)}
+	// paths; slice 2 tests don't touch VM, so nil RunResult is fine.
+	// We synthesize a unique ID via BootResult so entries don't
+	// collide in the map — a nil RunResult triggers the id="" branch
+	// in runCreate which then generates a pool-<ts> id.
+	br := &BootResult{Result: &container.RunResult{ID: fakeID(n)}}
 	f.mu.Lock()
-	f.results = append(f.results, rr)
+	f.results = append(f.results, br.Result)
 	f.mu.Unlock()
-	return rr, nil
+	return br, nil
 }
 
 func fakeID(n int64) string {
@@ -225,12 +227,12 @@ type flipBooter struct {
 	n         int64
 }
 
-func (f *flipBooter) Boot(ctx context.Context) (*container.RunResult, error) {
+func (f *flipBooter) Boot(ctx context.Context) (*BootResult, error) {
 	n := atomic.AddInt64(&f.n, 1)
 	if n <= f.threshold {
 		return nil, errors.New("flipBooter: fail")
 	}
-	return &container.RunResult{ID: fakeID(n)}, nil
+	return &BootResult{Result: &container.RunResult{ID: fakeID(n)}}, nil
 }
 
 func TestRefiller_StopWaitsForInflight(t *testing.T) {
@@ -298,12 +300,12 @@ func TestRefiller_TriggerReconcileAccelerates(t *testing.T) {
 	}
 
 	// Acquire to drop below MinPaused, then TriggerReconcile.
-	e, err := p.Acquire()
+	lease, err := p.Acquire(context.Background(), LeaseSpec{})
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
 	// Release so the slot is counted as stopped (not leased).
-	rr, _ := p.Release(e.ID)
+	rr, _ := p.Release(lease.ID)
 	_ = rr
 
 	preTrigger := atomic.LoadInt64(&b.calls)

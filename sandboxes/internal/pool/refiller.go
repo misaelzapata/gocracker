@@ -10,6 +10,21 @@ import (
 	"github.com/gocracker/gocracker/pkg/container"
 )
 
+// BootResult is what Booter hands the refiller on a successful boot.
+// Result owns the VM teardown surface (callers run Result.Close() at
+// shutdown); UDSPath is the HOST-VISIBLE toolbox UDS for this VM
+// (ResolveWorkerHostSidePath'd for jailer-on); Resumer is the minimal
+// VM handle the lease path calls for vm.Resume() (typically
+// Result.VM which satisfies Resumer via vmm.Handle's Resume()).
+//
+// Tests can leave Result=nil and still exercise the lease path by
+// providing Resumer — teardown just skips when result is nil.
+type BootResult struct {
+	Result  *container.RunResult
+	UDSPath string
+	Resumer Resumer
+}
+
 // Booter cold-boots a new sandbox for the pool. The default
 // implementation (containerBooter) wraps pkg/container.Run + vm.Pause,
 // but tests inject fakes via NewPoolWithBooter so they can exercise
@@ -23,7 +38,7 @@ import (
 // failure Boot returns an error and the pool tracks it against
 // ConsecutiveFailureThreshold.
 type Booter interface {
-	Boot(ctx context.Context) (*container.RunResult, error)
+	Boot(ctx context.Context) (*BootResult, error)
 }
 
 // containerBooter is the production Booter: cold-boots via
@@ -34,7 +49,7 @@ type containerBooter struct {
 	opts container.RunOptions
 }
 
-func (b containerBooter) Boot(ctx context.Context) (*container.RunResult, error) {
+func (b containerBooter) Boot(ctx context.Context) (*BootResult, error) {
 	// container.Run is synchronous and does its own context handling
 	// internally. The ctx passed here is checked AFTER Run returns so
 	// shutdown cancellation immediately tears down anything that just
@@ -51,7 +66,15 @@ func (b containerBooter) Boot(ctx context.Context) (*container.RunResult, error)
 		result.Close()
 		return nil, fmt.Errorf("pool: vm.Pause after boot: %w", err)
 	}
-	return result, nil
+	// UDSPath resolution is left to slice 7's HTTP integrator
+	// (sandboxd knows about ResolveWorkerHostSidePath + the jailer
+	// mount conventions). Here we just pass the internal path
+	// through; sandboxd will unwrap it on lease.
+	return &BootResult{
+		Result:  result,
+		UDSPath: b.opts.VsockUDSPath,
+		Resumer: result.VM,
+	}, nil
 }
 
 // NewPoolWithBooter is NewPool with an explicit Booter. Used by tests
@@ -256,7 +279,7 @@ func (p *Pool) reconcile() {
 // counter + cooldown on a successful boot.
 func (p *Pool) runCreate(ctx context.Context, booter Booter) {
 	defer p.wg.Done()
-	result, err := booter.Boot(ctx)
+	bootResult, err := booter.Boot(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.inflight--
@@ -272,11 +295,16 @@ func (p *Pool) runCreate(ctx context.Context, booter Booter) {
 	// it in the map where no one will Release it.
 	if ctx.Err() != nil {
 		p.mu.Unlock()
-		result.Close()
+		if bootResult != nil && bootResult.Result != nil {
+			bootResult.Result.Close()
+		}
 		p.mu.Lock()
 		return
 	}
-	id := result.ID
+	id := ""
+	if bootResult.Result != nil {
+		id = bootResult.Result.ID
+	}
 	if id == "" {
 		id = fmt.Sprintf("pool-%d", time.Now().UnixNano())
 	}
@@ -284,7 +312,9 @@ func (p *Pool) runCreate(ctx context.Context, booter Booter) {
 		ID:        id,
 		State:     StatePaused,
 		CreatedAt: time.Now(),
-		result:    result,
+		UDSPath:   bootResult.UDSPath,
+		result:    bootResult.Result,
+		resumer:   bootResult.Resumer,
 	}
 	p.consecutiveFailures = 0
 	p.cooldownUntil = time.Time{}
