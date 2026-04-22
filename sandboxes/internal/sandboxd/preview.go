@@ -165,6 +165,127 @@ func (m *Manager) ServePreview(w http.ResponseWriter, r *http.Request) {
 	_ = pm.proxy.ServeRequest(w, r2, payload.SandboxID, payload.Port)
 }
 
+// ServePreviewHost is the subdomain entry point. Called from the
+// top-level mux (slice 4 middleware) when r.Host matches the
+// preview-host pattern <id>--<port>.<previewHost>. Falls through to
+// cookie-based auth: the first legitimate request carries
+// ?token=<tok> which we verify, mint a sbx_t cookie, and redirect
+// onto the same URL without the query. Subsequent requests with
+// the cookie skip the token param.
+//
+// Rejections:
+//   - host doesn't parse → 400
+//   - host port/id doesn't match cookie + no ?token → 401
+//   - cookie token's sandbox_id != host's sandbox_id → 403
+//   - verify fails → 401 (indistinguishable)
+func (m *Manager) ServePreviewHost(w http.ResponseWriter, r *http.Request) {
+	pm, err := m.ensurePreviewManager()
+	if err != nil {
+		http.Error(w, ErrPreviewDisabled.Error(), http.StatusNotImplemented)
+		return
+	}
+	id, port, ok := parsePreviewHost(r.Host, pm.previewHost)
+	if !ok {
+		http.Error(w, "invalid preview host", http.StatusBadRequest)
+		return
+	}
+
+	// Try ?token=... first (first-hit flow).
+	if qtok := r.URL.Query().Get("token"); qtok != "" {
+		payload, verr := pm.signer.Verify(qtok)
+		if verr != nil {
+			http.Error(w, "invalid token", http.StatusUnauthorized)
+			return
+		}
+		if payload.SandboxID != id || payload.Port != port {
+			// Token is valid but for a different sandbox/port —
+			// explicit 403 here (not 401) because the caller's
+			// credential is genuine, they just pointed it at the
+			// wrong subdomain.
+			http.Error(w, "token mismatches subdomain", http.StatusForbidden)
+			return
+		}
+		// Set the cookie, redirect to the same URL without ?token
+		// so the token doesn't leak into logs / browser history.
+		http.SetCookie(w, &http.Cookie{
+			Name:     previewCookieName,
+			Value:    qtok,
+			Path:     "/",
+			Expires:  payload.ExpiresAt,
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		})
+		clean := *r.URL
+		q := clean.Query()
+		q.Del("token")
+		clean.RawQuery = q.Encode()
+		http.Redirect(w, r, clean.RequestURI(), http.StatusSeeOther)
+		return
+	}
+
+	// Cookie-based auth (subsequent requests).
+	cookie, err := r.Cookie(previewCookieName)
+	if err != nil || cookie.Value == "" {
+		http.Error(w, "missing preview credentials", http.StatusUnauthorized)
+		return
+	}
+	payload, verr := pm.signer.Verify(cookie.Value)
+	if verr != nil {
+		http.Error(w, "invalid token", http.StatusUnauthorized)
+		return
+	}
+	if payload.SandboxID != id || payload.Port != port {
+		http.Error(w, "cookie mismatches subdomain", http.StatusForbidden)
+		return
+	}
+	_ = pm.proxy.ServeRequest(w, r, payload.SandboxID, payload.Port)
+}
+
+// IsPreviewHost reports whether r.Host matches the preview-host
+// shape (<id>--<port>.<previewHost>). Used by the top-level mux
+// to decide whether to route the request to ServePreviewHost vs
+// the normal control-plane.
+func (m *Manager) IsPreviewHost(host string) bool {
+	pm, err := m.ensurePreviewManager()
+	if err != nil || pm == nil {
+		return false
+	}
+	_, _, ok := parsePreviewHost(host, pm.previewHost)
+	return ok
+}
+
+// parsePreviewHost validates the Host header shape and extracts the
+// sandbox id + port. Expected shape: "<sandbox-id>--<port>.<root>"
+// (e.g. "sb-abc123--3000.sbx.localhost"). Ignores any ":port" suffix
+// on the host header (the client's sandboxd port, not the guest's).
+func parsePreviewHost(host, root string) (string, uint16, bool) {
+	// Strip optional :port on Host (browsers send it for non-standard
+	// sandboxd ports).
+	if idx := strings.LastIndexByte(host, ':'); idx > 0 {
+		host = host[:idx]
+	}
+	if !strings.HasSuffix(host, "."+root) {
+		return "", 0, false
+	}
+	prefix := strings.TrimSuffix(host, "."+root)
+	sep := strings.LastIndex(prefix, "--")
+	if sep < 0 {
+		return "", 0, false
+	}
+	id := prefix[:sep]
+	portStr := prefix[sep+2:]
+	if id == "" || portStr == "" {
+		return "", 0, false
+	}
+	n, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || n == 0 {
+		return "", 0, false
+	}
+	return id, uint16(n), true
+}
+
+const previewCookieName = "sbx_t"
+
 // parsePreviewPort parses the {port} path value from
 // /sandboxes/{id}/preview/{port}. Invalid → ErrInvalidRequest.
 func parsePreviewPort(raw string) (uint16, error) {

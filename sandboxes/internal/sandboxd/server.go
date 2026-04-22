@@ -46,6 +46,8 @@ type TemplateLifecycle interface {
 type PreviewLifecycle interface {
 	MintPreview(id string, port uint16) (MintPreviewResponse, error)
 	ServePreview(w http.ResponseWriter, r *http.Request)
+	ServePreviewHost(w http.ResponseWriter, r *http.Request)
+	IsPreviewHost(host string) bool
 }
 
 // Server wires HTTP routes onto a Lifecycle (typically a *Manager)
@@ -91,8 +93,26 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("/previews/{token...}", func(w http.ResponseWriter, r *http.Request) {
 			pv.ServePreview(w, r)
 		})
+		// Subdomain routing (<id>--<port>.sbx.localhost): wrap the
+		// mux so requests hitting a preview host go straight to the
+		// host handler instead of landing in the default 404 path.
+		// Non-preview hosts fall through to the mux unchanged.
+		return previewHostMiddleware(pv, mux)
 	}
 	return mux
+}
+
+// previewHostMiddleware intercepts requests whose Host header
+// matches the preview-subdomain shape and routes them to
+// pv.ServePreviewHost. Non-preview hosts fall through to next.
+func previewHostMiddleware(pv PreviewLifecycle, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if pv.IsPreviewHost(r.Host) {
+			pv.ServePreviewHost(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleMintPreview(pv PreviewLifecycle) http.HandlerFunc {
