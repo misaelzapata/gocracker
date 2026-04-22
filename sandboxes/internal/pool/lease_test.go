@@ -58,7 +58,7 @@ func (f *fakeNetworker) SetNetwork(ctx context.Context, udsPath, ip, gateway, ma
 func TestAcquire_ResumesVM_OnSuccess(t *testing.T) {
 	p, _ := NewPool(baseCfg())
 	r := &fakeResumer{}
-	p.AddPaused("a", nil, "/tmp/fake.sock", r)
+	p.AddPaused("a", nil, "/tmp/fake.sock", r, nil)
 
 	lease, err := p.Acquire(context.Background(), LeaseSpec{})
 	if err != nil {
@@ -75,7 +75,7 @@ func TestAcquire_ResumesVM_OnSuccess(t *testing.T) {
 func TestAcquire_ResumeFailure_MarksStopped(t *testing.T) {
 	p, _ := NewPool(baseCfg())
 	r := &fakeResumer{failErr: errors.New("resume boom")}
-	p.AddPaused("a", nil, "/tmp/fake.sock", r)
+	p.AddPaused("a", nil, "/tmp/fake.sock", r, nil)
 
 	_, err := p.Acquire(context.Background(), LeaseSpec{})
 	if err == nil || !strings.Contains(err.Error(), "resume") {
@@ -94,7 +94,7 @@ func TestAcquire_ResumeFailure_MarksStopped(t *testing.T) {
 func TestAcquire_ResumeTimeout_UsesContext(t *testing.T) {
 	p, _ := NewPool(baseCfg())
 	r := &fakeResumer{delay: 500 * time.Millisecond}
-	p.AddPaused("a", nil, "", r)
+	p.AddPaused("a", nil, "", r, nil)
 
 	start := time.Now()
 	_, err := p.Acquire(context.Background(), LeaseSpec{ResumeTimeout: 30 * time.Millisecond})
@@ -112,7 +112,7 @@ func TestAcquire_SetNetwork_OnlyWhenIPProvided(t *testing.T) {
 	n := &fakeNetworker{}
 	p.SetNetworker(n)
 
-	p.AddPaused("a", nil, "/tmp/a.sock", &fakeResumer{})
+	p.AddPaused("a", nil, "/tmp/a.sock", &fakeResumer{}, nil)
 	// No IP → no SetNetwork call.
 	if _, err := p.Acquire(context.Background(), LeaseSpec{}); err != nil {
 		t.Fatalf("Acquire: %v", err)
@@ -122,7 +122,7 @@ func TestAcquire_SetNetwork_OnlyWhenIPProvided(t *testing.T) {
 	}
 
 	// Add a second entry and Acquire with IP.
-	p.AddPaused("b", nil, "/tmp/b.sock", &fakeResumer{})
+	p.AddPaused("b", nil, "/tmp/b.sock", &fakeResumer{}, nil)
 	lease, err := p.Acquire(context.Background(), LeaseSpec{
 		IP:        "198.19.100.2/30",
 		Gateway:   "198.19.100.1",
@@ -152,7 +152,7 @@ func TestAcquire_SetNetworkFailure_MarksStopped(t *testing.T) {
 	p, _ := NewPool(baseCfg())
 	r := &fakeResumer{}
 	n := &fakeNetworker{failErr: errors.New("netlink sad")}
-	p.AddPaused("a", nil, "/tmp/a.sock", r)
+	p.AddPaused("a", nil, "/tmp/a.sock", r, nil)
 	p.SetNetworker(n)
 
 	_, err := p.Acquire(context.Background(), LeaseSpec{IP: "198.19.100.2/30"})
@@ -173,7 +173,7 @@ func TestAcquire_SetNetworkFailure_MarksStopped(t *testing.T) {
 func TestAcquire_NoNetworker_SkipsSetNetworkSilently(t *testing.T) {
 	p, _ := NewPool(baseCfg())
 	r := &fakeResumer{}
-	p.AddPaused("a", nil, "/tmp/a.sock", r)
+	p.AddPaused("a", nil, "/tmp/a.sock", r, nil)
 	// Networker intentionally NOT set.
 
 	lease, err := p.Acquire(context.Background(), LeaseSpec{IP: "198.19.100.2/30"})
@@ -189,7 +189,7 @@ func TestAcquire_SetNetworkTimeout_Respected(t *testing.T) {
 	p, _ := NewPool(baseCfg())
 	r := &fakeResumer{}
 	n := &fakeNetworker{delay: 500 * time.Millisecond}
-	p.AddPaused("a", nil, "/tmp/a.sock", r)
+	p.AddPaused("a", nil, "/tmp/a.sock", r, nil)
 	p.SetNetworker(n)
 
 	start := time.Now()
@@ -210,7 +210,7 @@ func TestAcquire_NoResumer_SkipsResumeSilently(t *testing.T) {
 	p, _ := NewPool(baseCfg())
 	// AddPaused without a resumer — tests that don't care about
 	// Resume should still be able to exercise the lease path.
-	p.AddPaused("a", nil, "/tmp/a.sock", nil)
+	p.AddPaused("a", nil, "/tmp/a.sock", nil, nil)
 
 	lease, err := p.Acquire(context.Background(), LeaseSpec{})
 	if err != nil {
@@ -233,7 +233,7 @@ func BenchmarkAcquire_Lease(b *testing.B) {
 	n := &fakeNetworker{}
 	p.SetNetworker(n)
 	for i := 0; i < b.N+10; i++ {
-		p.AddPaused(benchID(i), nil, "/tmp/b.sock", &fakeResumer{})
+		p.AddPaused(benchID(i), nil, "/tmp/b.sock", &fakeResumer{}, nil)
 	}
 
 	ctx := context.Background()

@@ -138,7 +138,7 @@ func TestAcquire_EmptyReturnsErrPoolEmpty(t *testing.T) {
 
 func TestAcquire_TransitionsPausedToLeased(t *testing.T) {
 	p, _ := NewPool(baseCfg())
-	p.AddPaused("a", nil, "", nil)
+	p.AddPaused("a", nil, "", nil, nil)
 	if got := p.CountByState()[StatePaused]; got != 1 {
 		t.Fatalf("pre-Acquire paused=%d, want 1", got)
 	}
@@ -159,9 +159,9 @@ func TestAcquire_TransitionsPausedToLeased(t *testing.T) {
 
 func TestAcquire_PicksOldestPaused(t *testing.T) {
 	p, _ := NewPool(baseCfg())
-	p.AddPaused("new", nil, "", nil)
+	p.AddPaused("new", nil, "", nil, nil)
 	time.Sleep(10 * time.Millisecond) // ensure distinct CreatedAt
-	p.AddPaused("newer", nil, "", nil)
+	p.AddPaused("newer", nil, "", nil, nil)
 	// Inject an even-older entry by hand to assert ordering.
 	p.mu.Lock()
 	p.entries["oldest"] = &Entry{
@@ -197,7 +197,7 @@ func TestAcquire_SkipsLeasedAndStopped(t *testing.T) {
 
 func TestRelease_TransitionsLeasedToStopped(t *testing.T) {
 	p, _ := NewPool(baseCfg())
-	p.AddPaused("a", nil, "", nil)
+	p.AddPaused("a", nil, "", nil, nil)
 	_, _ = p.Acquire(context.Background(), LeaseSpec{})
 	rr, err := p.Release("a")
 	if err != nil {
@@ -221,7 +221,7 @@ func TestRelease_UnknownIDReturnsErrNotFound(t *testing.T) {
 
 func TestRelease_PausedReturnsErrNotLeased(t *testing.T) {
 	p, _ := NewPool(baseCfg())
-	p.AddPaused("a", nil, "", nil)
+	p.AddPaused("a", nil, "", nil, nil)
 	_, err := p.Release("a")
 	if !errors.Is(err, ErrNotLeased) {
 		t.Fatalf("Release(paused) = %v, want ErrNotLeased", err)
@@ -230,7 +230,7 @@ func TestRelease_PausedReturnsErrNotLeased(t *testing.T) {
 
 func TestRelease_DoubleReleaseIsRejected(t *testing.T) {
 	p, _ := NewPool(baseCfg())
-	p.AddPaused("a", nil, "", nil)
+	p.AddPaused("a", nil, "", nil, nil)
 	_, _ = p.Acquire(context.Background(), LeaseSpec{})
 	if _, err := p.Release("a"); err != nil {
 		t.Fatalf("first Release: %v", err)
@@ -246,7 +246,7 @@ func TestRelease_DoubleReleaseIsRejected(t *testing.T) {
 func TestConcurrentAcquire(t *testing.T) {
 	p, _ := NewPool(baseCfg())
 	for i := 0; i < 9; i++ {
-		p.AddPaused(string(rune('a'+i)), nil, "", nil)
+		p.AddPaused(string(rune('a'+i)), nil, "", nil, nil)
 	}
 
 	var (

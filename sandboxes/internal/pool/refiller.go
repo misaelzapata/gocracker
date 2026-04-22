@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gocracker/gocracker/pkg/container"
+	"github.com/gocracker/gocracker/pkg/vmm"
 )
 
 // BootResult is what Booter hands the refiller on a successful boot.
@@ -15,7 +16,8 @@ import (
 // shutdown); UDSPath is the HOST-VISIBLE toolbox UDS for this VM
 // (ResolveWorkerHostSidePath'd for jailer-on); Resumer is the minimal
 // VM handle the lease path calls for vm.Resume() (typically
-// Result.VM which satisfies Resumer via vmm.Handle's Resume()).
+// Result.VM which satisfies Resumer via vmm.Handle's Resume());
+// Stater is what the reaper polls to detect dead VMs.
 //
 // Tests can leave Result=nil and still exercise the lease path by
 // providing Resumer — teardown just skips when result is nil.
@@ -23,6 +25,7 @@ type BootResult struct {
 	Result  *container.RunResult
 	UDSPath string
 	Resumer Resumer
+	Stater  Stater
 }
 
 // Booter cold-boots a new sandbox for the pool. The default
@@ -74,7 +77,23 @@ func (b containerBooter) Boot(ctx context.Context) (*BootResult, error) {
 		Result:  result,
 		UDSPath: b.opts.VsockUDSPath,
 		Resumer: result.VM,
+		Stater:  vmHandleStater{h: result.VM},
 	}, nil
+}
+
+// vmHandleStater adapts vmm.Handle to the pool's Stater interface.
+// Returns true once the VM has transitioned to vmm.StateStopped —
+// kernel panic, OOM, manual kill of the worker, or any other
+// non-recoverable terminal state.
+type vmHandleStater struct {
+	h vmm.Handle
+}
+
+func (s vmHandleStater) Stopped() bool {
+	if s.h == nil {
+		return false
+	}
+	return s.h.State() == vmm.StateStopped
 }
 
 // NewPoolWithBooter is NewPool with an explicit Booter. Used by tests
@@ -117,8 +136,9 @@ func (p *Pool) Start(ctx context.Context) error {
 	p.triggerCh = make(chan struct{}, 1)
 	p.mu.Unlock()
 
-	p.wg.Add(1)
+	p.wg.Add(2)
 	go p.refillLoop()
+	go p.reapLoop()
 	return nil
 }
 
@@ -273,6 +293,64 @@ func (p *Pool) reconcile() {
 	}
 }
 
+// reapLoop is the dead-VM watcher. Periodically scans paused entries,
+// asks each entry's Stater whether the VM is still alive, and
+// transitions any dead entries to StateStopped. Triggers reconcile
+// after a sweep so the refiller replaces what we reaped.
+//
+// Only PAUSED entries are reaped — leased entries belong to the caller
+// and we don't second-guess their lifecycle (a leased VM that died
+// surfaces via the caller's exec/health checks). Entries with nil
+// Stater are skipped (test-only AddPaused calls without a Stater).
+func (p *Pool) reapLoop() {
+	defer p.wg.Done()
+	ticker := time.NewTicker(p.cfg.ReapInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			if p.reapOnce() > 0 {
+				p.TriggerReconcile()
+			}
+		}
+	}
+}
+
+// reapOnce sweeps once and returns the count of entries reaped.
+// Closing result.Close() happens OUTSIDE p.mu — Close can block
+// (Stop a worker subprocess) and holding the pool lock through it
+// would stall every Acquire.
+func (p *Pool) reapOnce() int {
+	type doomed struct {
+		id     string
+		result *container.RunResult
+	}
+	var dead []doomed
+
+	p.mu.Lock()
+	for id, e := range p.entries {
+		if e.State != StatePaused {
+			continue
+		}
+		if e.stater == nil || !e.stater.Stopped() {
+			continue
+		}
+		e.State = StateStopped
+		dead = append(dead, doomed{id: id, result: e.result})
+		e.result = nil
+	}
+	p.mu.Unlock()
+
+	for _, d := range dead {
+		if d.result != nil {
+			d.result.Close()
+		}
+	}
+	return len(dead)
+}
+
 // runCreate is one cold-boot-and-pause attempt. It decrements
 // p.inflight on exit and either adds a paused entry (on success) or
 // bumps the failure counter (on error). Also resets the failure
@@ -315,6 +393,7 @@ func (p *Pool) runCreate(ctx context.Context, booter Booter) {
 		UDSPath:   bootResult.UDSPath,
 		result:    bootResult.Result,
 		resumer:   bootResult.Resumer,
+		stater:    bootResult.Stater,
 	}
 	p.consecutiveFailures = 0
 	p.cooldownUntil = time.Time{}

@@ -104,17 +104,35 @@ type Config struct {
 	// the polling interval becomes a slow safety net, not the
 	// hot-path trigger.
 	ReconcileInterval time.Duration
+
+	// ReapInterval is how often the reaper scans paused entries for
+	// dead VMs (kernel panic, OOM, manual kill -9). Plan §5 step 5
+	// targets <10 s detection; default 5 s comfortably hits that.
+	// Tests shorten to surface dead VMs within their ~1 s timeouts.
+	ReapInterval time.Duration
 }
 
 // defaultsApplied returns a copy of cfg with zero-valued fields set
-// to the Fase 5 defaults. Kept separate from the struct literal so
-// tests can assert "I passed 0, the pool used the default".
+// to the Fase 5 defaults. The MinPaused/MaxPaused pair is treated as
+// a unit — if BOTH are zero we apply the Fase 5 defaults; if EITHER
+// is non-zero we honor the explicit values (a caller passing
+// MinPaused=0, MaxPaused=8 wants "no warm minimum, cap at 8" — not
+// the default 4/8 — and tests rely on MinPaused=0 to disable the
+// refiller's create loop entirely).
 func (c Config) defaultsApplied() Config {
-	if c.MinPaused == 0 {
+	if c.MinPaused == 0 && c.MaxPaused == 0 {
 		c.MinPaused = 4
-	}
-	if c.MaxPaused == 0 {
 		c.MaxPaused = 8
+	}
+	// MaxPaused unset but MinPaused set: pull MaxPaused up so the
+	// pair stays consistent (Validate rejects MaxPaused < MinPaused).
+	// Picks the larger of the Fase 5 default (8) and 2× MinPaused so
+	// generous MinPaused configs still get headroom.
+	if c.MaxPaused == 0 && c.MinPaused > 0 {
+		c.MaxPaused = 8
+		if 2*c.MinPaused > c.MaxPaused {
+			c.MaxPaused = 2 * c.MinPaused
+		}
 	}
 	if c.ReplenishParallelism == 0 {
 		c.ReplenishParallelism = 2
@@ -127,6 +145,9 @@ func (c Config) defaultsApplied() Config {
 	}
 	if c.ReconcileInterval == 0 {
 		c.ReconcileInterval = 500 * time.Millisecond
+	}
+	if c.ReapInterval == 0 {
+		c.ReapInterval = 5 * time.Second
 	}
 	return c
 }
@@ -179,6 +200,11 @@ type Entry struct {
 	// without implementing the full vmm.Handle interface; production
 	// sets it to result.VM which satisfies Resumer implicitly.
 	resumer Resumer
+	// stater is the minimal vm-handle subset the reaper polls.
+	// Nil = reaper skips this entry (test entries created without a
+	// stater are immortal — useful for bench code that never wants
+	// the reaper interfering).
+	stater Stater
 	// lastError is the error that pushed this entry into StateError.
 	// Drained by the refiller's failure-backoff logic.
 	lastError error
@@ -279,7 +305,9 @@ func (p *Pool) CountByState() map[State]int {
 // because lease/refiller tests across the package need it. udsPath
 // surfaces on the returned Lease; resumer is invoked on Acquire so
 // tests can assert Resume() is called without standing up a VM.
-func (p *Pool) AddPaused(id string, result *container.RunResult, udsPath string, resumer Resumer) {
+// stater is polled by the reaper — pass nil to opt out of reap (the
+// entry is treated as immortal).
+func (p *Pool) AddPaused(id string, result *container.RunResult, udsPath string, resumer Resumer, stater Stater) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.entries[id] = &Entry{
@@ -289,6 +317,7 @@ func (p *Pool) AddPaused(id string, result *container.RunResult, udsPath string,
 		UDSPath:   udsPath,
 		result:    result,
 		resumer:   resumer,
+		stater:    stater,
 	}
 }
 
@@ -337,6 +366,20 @@ type Networker interface {
 // without standing up a real VMM.
 type Resumer interface {
 	Resume() error
+}
+
+// Stater is the minimal subset of vmm.Handle the reaper needs to
+// detect dead VMs (kernel panic, OOM, manual kill -9 of the worker).
+// Returns true once the VM has terminated and is no longer usable —
+// the reaper transitions such entries to StateStopped and triggers a
+// refill so the dead slot gets replaced.
+//
+// Production wires this via a thin adapter over vmm.Handle.State():
+// `s.h.State() == vmm.StateStopped` (see containerBooter). Tests
+// inject a fake Stater that flips on a channel/atomic so they don't
+// have to mock the full vmm package.
+type Stater interface {
+	Stopped() bool
 }
 
 // SetNetworker configures a pool-wide Networker used on every Lease.
