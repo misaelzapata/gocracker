@@ -1,6 +1,7 @@
 package sandboxd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,17 @@ import (
 type Lifecycle interface {
 	Create(req CreateSandboxRequest) (Sandbox, error)
 	Delete(id string) error
+}
+
+// PoolLifecycle is the Fase 5 superset that adds warm-pool routes.
+// Optional — Server falls back to cold-only when the underlying
+// Lifecycle doesn't implement it.
+type PoolLifecycle interface {
+	RegisterPool(ctx context.Context, req CreatePoolRequest) (PoolRegistration, error)
+	UnregisterPool(templateID string) error
+	ListPools() []PoolRegistration
+	LeaseSandbox(ctx context.Context, req LeaseSandboxRequest) (Sandbox, error)
+	ReleaseLeased(id string) error
 }
 
 // Server wires HTTP routes onto a Lifecycle (typically a *Manager)
@@ -40,7 +52,80 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /sandboxes", s.handleListSandboxes)
 	mux.HandleFunc("GET /sandboxes/{id}", s.handleGetSandbox)
 	mux.HandleFunc("DELETE /sandboxes/{id}", s.handleDeleteSandbox)
+	if pl, ok := s.Lifecycle.(PoolLifecycle); ok {
+		mux.HandleFunc("POST /pools", s.handleRegisterPool(pl))
+		mux.HandleFunc("GET /pools", s.handleListPools(pl))
+		mux.HandleFunc("DELETE /pools/{id}", s.handleUnregisterPool(pl))
+		mux.HandleFunc("POST /sandboxes/lease", s.handleLeaseSandbox(pl))
+	}
 	return mux
+}
+
+func (s *Server) handleRegisterPool(pl PoolLifecycle) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req CreatePoolRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("decode request: %w", err))
+			return
+		}
+		reg, err := pl.RegisterPool(r.Context(), req)
+		if err != nil {
+			status := http.StatusInternalServerError
+			switch {
+			case errors.Is(err, ErrInvalidRequest):
+				status = http.StatusBadRequest
+			case errors.Is(err, ErrPoolAlreadyRegistered):
+				status = http.StatusConflict
+			}
+			writeError(w, status, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, reg)
+	}
+}
+
+func (s *Server) handleListPools(pl PoolLifecycle) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"pools": pl.ListPools()})
+	}
+}
+
+func (s *Server) handleUnregisterPool(pl PoolLifecycle) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if err := pl.UnregisterPool(id); err != nil {
+			if errors.Is(err, ErrPoolNotFound) {
+				writeError(w, http.StatusNotFound, err)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (s *Server) handleLeaseSandbox(pl PoolLifecycle) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req LeaseSandboxRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("decode request: %w", err))
+			return
+		}
+		sb, err := pl.LeaseSandbox(r.Context(), req)
+		if err != nil {
+			status := http.StatusInternalServerError
+			switch {
+			case errors.Is(err, ErrInvalidRequest):
+				status = http.StatusBadRequest
+			case errors.Is(err, ErrPoolNotFound):
+				status = http.StatusNotFound
+			}
+			writeError(w, status, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, CreateSandboxResponse{Sandbox: sb})
+	}
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -88,6 +173,23 @@ func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// If the sandbox came from a lease, route teardown through the
+	// pool's Release path so the IP is freed and the slot is recycled.
+	// Cold-booted sandboxes go through the original Delete path.
+	if pl, ok := s.Lifecycle.(PoolLifecycle); ok {
+		if sb, found := s.Store.Get(id); found && sb.poolTemplateID != "" {
+			if err := pl.ReleaseLeased(id); err != nil {
+				if errors.Is(err, ErrSandboxNotFound) {
+					writeError(w, http.StatusNotFound, err)
+					return
+				}
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
 	if err := s.Lifecycle.Delete(id); err != nil {
 		if errors.Is(err, ErrSandboxNotFound) {
 			writeError(w, http.StatusNotFound, err)

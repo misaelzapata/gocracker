@@ -47,6 +47,14 @@ type Sandbox struct {
 	// open VM handle that only makes sense in-process. Persistence
 	// of stopped sandboxes drops this field on load.
 	runResult *container.RunResult `json:"-"`
+
+	// poolTemplateID and poolIPSlot are set on lease (Fase 5
+	// slice 7) so the DELETE handler can route teardown back to
+	// pool.Release + ipalloc.Free. Cold-booted sandboxes leave
+	// both zero. Not serialized — leased sandboxes don't survive
+	// a sandboxd restart.
+	poolTemplateID string `json:"-"`
+	poolIPSlot     int    `json:"-"`
 }
 
 // snapshot returns a copy of the exported fields safe to expose
@@ -57,14 +65,16 @@ type Sandbox struct {
 // Store.mu for the read to be consistent.
 func (s *Sandbox) snapshot() Sandbox {
 	return Sandbox{
-		ID:        s.ID,
-		State:     s.State,
-		Image:     s.Image,
-		UDSPath:   s.UDSPath,
-		GuestIP:   s.GuestIP,
-		RuntimeID: s.RuntimeID,
-		CreatedAt: s.CreatedAt,
-		Error:     s.Error,
+		ID:             s.ID,
+		State:          s.State,
+		Image:          s.Image,
+		UDSPath:        s.UDSPath,
+		GuestIP:        s.GuestIP,
+		RuntimeID:      s.RuntimeID,
+		CreatedAt:      s.CreatedAt,
+		Error:          s.Error,
+		poolTemplateID: s.poolTemplateID,
+		poolIPSlot:     s.poolIPSlot,
 	}
 }
 
