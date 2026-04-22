@@ -397,6 +397,12 @@ func (p *Pool) runCreate(ctx context.Context, booter Booter) {
 	}
 	p.consecutiveFailures = 0
 	p.cooldownUntil = time.Time{}
+	// Wake any AcquireWait callers parked on warmAvailableCh — this
+	// is the event-driven side of slice 6's refill path. Polling the
+	// map every N ms wastes cycles AND adds latency to a burst of
+	// concurrent Acquires; broadcasting on each successful boot lets
+	// every parked caller race for the new entry immediately.
+	p.signalWarmAvailableLocked()
 }
 
 // Inflight returns the current count of in-flight cold-boots. Used

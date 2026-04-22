@@ -254,6 +254,11 @@ type Pool struct {
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 	triggerCh chan struct{}
+	// warmAvailableCh is closed-and-replaced every time the refiller
+	// successfully adds a paused entry. AcquireWait selects on it to
+	// wake up as soon as new warm capacity lands, rather than polling
+	// the entries map. Guarded by p.mu.
+	warmAvailableCh chan struct{}
 }
 
 // NewPool applies defaults, validates, and returns a zero-entry pool.
@@ -264,9 +269,21 @@ func NewPool(cfg Config) (*Pool, error) {
 		return nil, err
 	}
 	return &Pool{
-		cfg:     cfg,
-		entries: map[string]*Entry{},
+		cfg:             cfg,
+		entries:         map[string]*Entry{},
+		warmAvailableCh: make(chan struct{}),
 	}, nil
+}
+
+// signalWarmAvailableLocked closes the current warmAvailableCh and
+// installs a fresh one. Must be called with p.mu held. The
+// close-and-replace pattern is the standard Go idiom for "broadcast
+// once" — every goroutine currently selecting on the channel wakes
+// up exactly once, and subsequent selects observe the new (open)
+// channel until the next refill lands.
+func (p *Pool) signalWarmAvailableLocked() {
+	close(p.warmAvailableCh)
+	p.warmAvailableCh = make(chan struct{})
 }
 
 // Config returns a copy of the pool's configuration. Exposed so
@@ -503,6 +520,58 @@ func (p *Pool) markStoppedAndReturn(id string) {
 	defer p.mu.Unlock()
 	if e, ok := p.entries[id]; ok {
 		e.State = StateStopped
+	}
+}
+
+// AcquireWait is Acquire that blocks until a paused entry becomes
+// available, ctx is canceled, or timeout elapses. The wait listens
+// on p.warmAvailableCh which the refiller closes-and-replaces on
+// every successful boot — sub-millisecond wake latency, no polling.
+//
+// Use over Acquire when the caller cannot tolerate ErrPoolEmpty (the
+// HTTP /sandboxes/lease handler in slice 7 is the canonical user).
+// Eager-refill: the refiller is woken via TriggerReconcile every time
+// AcquireWait observes an empty pool, so even a cold burst converges
+// to the steady state quickly without manual prodding.
+func (p *Pool) AcquireWait(ctx context.Context, spec LeaseSpec, timeout time.Duration) (Lease, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		// Try a non-blocking Acquire first. The fast path avoids the
+		// channel handshake when the pool is steadily warm.
+		lease, err := p.Acquire(ctx, spec)
+		if err == nil {
+			// Eager-refill: replenish the slot we just consumed.
+			// Slice 7 will plug the IP allocator + Networker into
+			// LeaseSpec; here we only need the wake.
+			p.TriggerReconcile()
+			return lease, nil
+		}
+		if !errors.Is(err, ErrPoolEmpty) {
+			return Lease{}, err
+		}
+
+		// Pool empty. Wake the refiller (in case the periodic ticker
+		// hasn't fired yet) and park on the broadcast channel.
+		p.TriggerReconcile()
+
+		p.mu.Lock()
+		ch := p.warmAvailableCh
+		p.mu.Unlock()
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return Lease{}, fmt.Errorf("pool: AcquireWait timeout after %s: %w", timeout, ErrPoolEmpty)
+		}
+		select {
+		case <-ch:
+			// Refill landed; loop and try Acquire again. The new
+			// entry may have been picked off by another waiting
+			// goroutine in the race; that's fine, we retry.
+		case <-ctx.Done():
+			return Lease{}, ctx.Err()
+		case <-time.After(remaining):
+			return Lease{}, fmt.Errorf("pool: AcquireWait timeout after %s: %w", timeout, ErrPoolEmpty)
+		}
 	}
 }
 
