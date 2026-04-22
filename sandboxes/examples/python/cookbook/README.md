@@ -23,6 +23,11 @@ python hello_world.py /abs/path/to/vmlinux
 | `files.py` | upload + read + list (waits on toolbox files API) |
 | `preview.py` | guest server :8080, mint URL, curl from host |
 | `pool_burst.py` | 50 concurrent leases against a warm pool, p95 stats |
+| `files_full.py` | full toolbox files surface (upload / list / download / mkdir / rename / chmod / delete) |
+| `git_clone.py` | clone a public repo inside the guest + git status |
+| `secrets.py` | toolbox /secrets set / list / delete |
+| `template_pool.py` | template → pool (from_template) → lease pipeline, times each step |
+| `concurrent_cold.py` | N concurrent cold-boots (stress test, reproduces artifact_lock correctness) |
 
 ## Notes
 
