@@ -98,13 +98,20 @@ func (b containerBooter) Boot(ctx context.Context) (*BootResult, error) {
 		result.Close()
 		return nil, fmt.Errorf("pool: vm.Pause after boot: %w", err)
 	}
-	// UDSPath resolution is left to slice 7's HTTP integrator
-	// (sandboxd knows about ResolveWorkerHostSidePath + the jailer
-	// mount conventions). Here we just pass the internal path
-	// through; sandboxd will unwrap it on lease.
+	// Translate the internal UDSPath into a host-visible one. For
+	// jailer-on the VM bound at /worker/<x>.sock inside its chroot;
+	// the host must dial <runDir>/<x>.sock instead because /worker
+	// is a per-VM bind mount. Without this translation the lease
+	// caller would dial the internal path and fail with ENOENT or
+	// connect to the wrong VM. Jailer-off: identity (the internal
+	// path IS the host path).
+	hostUDS := opts.VsockUDSPath
+	if wb, ok := result.VM.(vmm.WorkerBacked); ok {
+		hostUDS = vmm.ResolveWorkerHostSidePath(wb.WorkerMetadata(), opts.VsockUDSPath)
+	}
 	return &BootResult{
 		Result:  result,
-		UDSPath: opts.VsockUDSPath,
+		UDSPath: hostUDS,
 		Resumer: result.VM,
 		Stater:  vmHandleStater{h: result.VM},
 	}, nil

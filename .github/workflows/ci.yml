@@ -85,6 +85,21 @@ jobs:
         run: |
           sudo chown "$USER" coverage-integration.out 2>/dev/null || true
           go tool cover -func=coverage-integration.out | tail -1 | tee coverage-integration-summary.txt
+      - name: Pool-bench gate (Fase 5 §5 step 6)
+        if: steps.prereq.outputs.run == 'true'
+        run: |
+          # Build the bench binary, then run a steady-state burst-8
+          # against an alpine pool. Plan §5 budget is p95 < 20 ms;
+          # we use 30 ms here to give the runner some slack (GH
+          # runners are slower than dev laptops). Failure exit code
+          # bubbles up and fails the job — that's the gate.
+          go build -o /tmp/pool-bench ./sandboxes/cmd/pool-bench/
+          sudo -n /tmp/pool-bench \
+            -burst 8 -warm 8 \
+            -timeout-s 300 \
+            -p95-budget-ms 30 \
+            -image alpine:3.20 \
+            -kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux
       - name: Upload integration coverage profile
         if: steps.prereq.outputs.run == 'true'
         uses: actions/upload-artifact@v4

@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/gocracker/gocracker/pkg/container"
-	"github.com/gocracker/gocracker/pkg/vmm"
 	"github.com/gocracker/gocracker/pkg/warmcache"
 	"github.com/gocracker/gocracker/sandboxes/internal/pool"
 )
@@ -256,6 +255,31 @@ func (m *Manager) ListPools() []PoolRegistration {
 	return out
 }
 
+// Shutdown stops every registered pool and drains their paused VMs.
+// Wired into sandboxd's main() signal-handling so Ctrl-C / SIGTERM
+// doesn't orphan running VMs (the refiller goroutines die with the
+// process but their booted KVM children would survive otherwise).
+//
+// Safe to call multiple times; second call is a no-op because pools
+// are removed from the registry on first iteration.
+func (m *Manager) Shutdown(ctx context.Context) {
+	if m.poolMgr == nil {
+		return
+	}
+	pm := m.poolMgr
+	pm.mu.Lock()
+	regs := make([]*PoolRegistration, 0, len(pm.pools))
+	for _, r := range pm.pools {
+		regs = append(regs, r)
+	}
+	pm.pools = map[string]*PoolRegistration{}
+	pm.mu.Unlock()
+	for _, r := range regs {
+		r.pool.Stop()
+		r.pool.DrainPaused()
+	}
+}
+
 // LeaseSandbox pulls a paused sandbox from the named pool, allocates
 // an IP, and applies the network config via toolbox SetNetwork. The
 // returned Sandbox carries the host-visible UDSPath and the assigned
@@ -401,17 +425,16 @@ func warmcacheLookup(key string) (string, bool) {
 }
 
 // poolVsockUDSPath picks the per-template UDS template path. For
-// jailer-on we use the /worker/-prefixed path that ResolveWorkerHostSidePath
-// rewrites to the runDir on the host (avoids the 108-byte
-// sockaddr_un limit, see commit a45700a). For jailer-off we let the
-// runtime pick its own default.
+// jailer-on we use the /worker/-prefixed path: each VM has its own
+// runDir bind-mounted at /worker, so the same configured path
+// resolves to a different host-side socket per VM. The pool's
+// containerBooter calls ResolveWorkerHostSidePath after each boot to
+// rewrite this internal path into the host-dialable one (lives on
+// BootResult.UDSPath, then surfaces on Lease.UDSPath).
 //
-// NB: the pool boots N VMs from the same RunOptions, so the UDSPath
-// here MUST be the same for every boot — each booted VM gets its own
-// runDir, and ResolveWorkerHostSidePath translates per-VM. Slice 8
-// will revisit if pool-bench surfaces collisions; the expected
-// behavior is that internal/worker/vmm.go gives every VM a unique
-// runDir and the bind-mount keeps the per-VM .sock files distinct.
+// For jailer-off we return "" and the booter generates a unique
+// /tmp/gc-pool-<pid>-<ns>.sock per Boot — direct host paths can't
+// be shared across pooled VMs without colliding at bind().
 func poolVsockUDSPath(templateID, jailerMode string) string {
 	if jailerMode == container.JailerModeOn {
 		return "/worker/" + templateID + ".sock"
@@ -419,14 +442,3 @@ func poolVsockUDSPath(templateID, jailerMode string) string {
 	return ""
 }
 
-// resolveLeaseUDSPath translates the pool's internal UDSPath into the
-// host-visible one for the leased sandbox. Wrapped here so the lease
-// path doesn't have to know the vmm.WorkerBacked dance directly.
-//
-// Currently unused — the pool's BootResult.UDSPath is already the
-// internal path, and slice 7 sets the lease's UDSPath to it as-is
-// for jailer-off. Slice 8's pool-bench will exercise jailer-on and
-// surface whether we need full translation here.
-func resolveLeaseUDSPath(internal string, _ vmm.WorkerMetadata) string {
-	return internal
-}
