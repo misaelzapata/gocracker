@@ -85,6 +85,34 @@ jobs:
         run: |
           sudo chown "$USER" coverage-integration.out 2>/dev/null || true
           go tool cover -func=coverage-integration.out | tail -1 | tee coverage-integration-summary.txt
+      - name: Pool-bench gate (Fase 5 §5 step 6)
+        if: steps.prereq.outputs.run == 'true'
+        run: |
+          # Build the bench binary, then run a steady-state burst-8
+          # against an alpine pool. Plan §5 success target is p95
+          # < 20 ms on a dev laptop (Ryzen AI 9 HX 370 measures
+          # 17 ms). GitHub Actions runners are dramatically slower
+          # — empirically 19× on the lease path (vsock + netlink on
+          # shared/older hardware), so 17 ms locally surfaces as
+          # ~330 ms in CI even with warm-cache restore working
+          # correctly. The CI gate uses a 500 ms budget: tight
+          # enough to catch a "fell off the cliff" regression
+          # (a 1.5+ s p95 means warm-cache fell off and we're
+          # cold-booting; a 700+ ms p95 means SetNetwork is slow-
+          # path), loose enough to absorb runner noise. Local dev
+          # should keep using the 20 ms target via `make pool-bench-local`.
+          #
+          # Absolute kernel path is required: warm-cache snapshot
+          # bundling stat()s the kernel at the path stored in the
+          # cached RunOptions, and a relative path resolves against
+          # the snapshot's temp dir at restore time, not the repo.
+          go build -o /tmp/pool-bench ./sandboxes/cmd/pool-bench/
+          sudo -n /tmp/pool-bench \
+            -burst 8 -warm 8 \
+            -timeout-s 300 \
+            -p95-budget-ms 500 \
+            -image alpine:3.20 \
+            -kernel "$GITHUB_WORKSPACE/artifacts/kernels/gocracker-guest-standard-vmlinux"
       - name: Upload integration coverage profile
         if: steps.prereq.outputs.run == 'true'
         uses: actions/upload-artifact@v4

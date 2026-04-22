@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/gocracker/gocracker/pkg/container"
@@ -33,6 +34,12 @@ type Manager struct {
 	// running as part of the gocracker binary proper.
 	VMMBinary    string
 	JailerBinary string
+
+	// Pool registry (Fase 5 slice 7). Lazily initialized on first
+	// RegisterPool / LeaseSandbox / ListPools call so Managers that
+	// only do cold-boot creates pay zero overhead.
+	poolInit sync.Once
+	poolMgr  *poolManager
 }
 
 // Create cold-boots a fresh sandbox VM. Blocks until container.Run

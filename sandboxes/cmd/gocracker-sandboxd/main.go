@@ -89,6 +89,12 @@ func cmdServe(args []string) {
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer shutCancel()
 		_ = srv.Shutdown(shutCtx)
+		// Drain registered pools BEFORE process exit so their
+		// refiller goroutines terminate cleanly and their paused
+		// VMs (KVM children of this process) don't orphan. Without
+		// this, Ctrl-C leaves N qemu-like worker processes running
+		// per pool slot until the OS reaper picks them up.
+		mgr.Shutdown(shutCtx)
 	}()
 
 	fmt.Printf("gocracker-sandboxd: listening on %s state=%s vmm=%s jailer=%s\n",
