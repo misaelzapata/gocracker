@@ -40,6 +40,14 @@ type TemplateLifecycle interface {
 	DeleteTemplate(id string) error
 }
 
+// PreviewLifecycle is the Fase 7 superset that adds preview routes.
+// Implemented by *Manager — kept as an interface so the Server can
+// test-inject a fake (same shape as Pool/Template lifecycles).
+type PreviewLifecycle interface {
+	MintPreview(id string, port uint16) (MintPreviewResponse, error)
+	ServePreview(w http.ResponseWriter, r *http.Request)
+}
+
 // Server wires HTTP routes onto a Lifecycle (typically a *Manager)
 // and a Store. Constructed via NewServer; Handler() returns the mux.
 type Server struct {
@@ -76,7 +84,41 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("GET /templates/{id}", s.handleGetTemplate(tl))
 		mux.HandleFunc("DELETE /templates/{id}", s.handleDeleteTemplate(tl))
 	}
+	if pv, ok := s.Lifecycle.(PreviewLifecycle); ok {
+		mux.HandleFunc("POST /sandboxes/{id}/preview/{port}", s.handleMintPreview(pv))
+		// Go 1.22 ServeMux: {token...} path wildcard captures the
+		// remainder, so /previews/<tok>/foo/bar all routes here.
+		mux.HandleFunc("/previews/{token...}", func(w http.ResponseWriter, r *http.Request) {
+			pv.ServePreview(w, r)
+		})
+	}
 	return mux
+}
+
+func (s *Server) handleMintPreview(pv PreviewLifecycle) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		portRaw := r.PathValue("port")
+		port, err := parsePreviewPort(portRaw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		res, err := pv.MintPreview(id, port)
+		if err != nil {
+			if errors.Is(err, ErrSandboxNotFound) {
+				writeError(w, http.StatusNotFound, err)
+				return
+			}
+			if errors.Is(err, ErrPreviewDisabled) {
+				writeError(w, http.StatusNotImplemented, err)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, res)
+	}
 }
 
 func (s *Server) handleCreateTemplate(tl TemplateLifecycle) http.HandlerFunc {

@@ -45,6 +45,18 @@ type Manager struct {
 	// first Create/Get/List/Delete template call.
 	tmplInit sync.Once
 	tmplMgr  *templateManager
+
+	// Preview signer + proxy (Fase 7 slice 3). Lazily initialized
+	// on first MintPreview / ServePreview call. PreviewSigningKey
+	// (≥32 bytes) is set by main() from env / flag; empty means
+	// auto-generate a per-process random key (tokens expire on
+	// restart). PreviewTTL defaults to 1 h, PreviewHost to
+	// "sbx.localhost".
+	PreviewSigningKey []byte
+	PreviewTTL        time.Duration
+	PreviewHost       string
+	previewInit       sync.Once
+	previewMgr        *previewManager
 }
 
 // Create cold-boots a fresh sandbox VM. Blocks until container.Run
