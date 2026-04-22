@@ -40,6 +40,11 @@ type Manager struct {
 	// only do cold-boot creates pay zero overhead.
 	poolInit sync.Once
 	poolMgr  *poolManager
+
+	// Template registry (Fase 6 slice 3). Lazily initialized on
+	// first Create/Get/List/Delete template call.
+	tmplInit sync.Once
+	tmplMgr  *templateManager
 }
 
 // Create cold-boots a fresh sandbox VM. Blocks until container.Run
