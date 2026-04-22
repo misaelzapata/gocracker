@@ -45,6 +45,13 @@ const (
 	// StateCreating: cold-boot in flight. Not yet usable; counted
 	// against GlobalInflightBudget.
 	StateCreating State = "creating"
+	// StateHot: booted and KEPT RUNNING (no Pause). Acquire hands
+	// these back without a Resume step. Reserved for templates where
+	// the SetNetwork round-trip isn't needed OR where the caller
+	// explicitly opted into the lower-latency tier (plan §5 step 3:
+	// "MaxHot=2 solo para templates con startup pesado que no
+	// quieran pagar el SetNetwork"). Slice picks Hot before Paused.
+	StateHot State = "hot"
 	// StatePaused: booted + vm.Pause()'d. Eligible for Acquire.
 	StatePaused State = "paused"
 	// StateLeased: Acquire returned this to a caller. Not eligible
@@ -110,6 +117,19 @@ type Config struct {
 	// targets <10 s detection; default 5 s comfortably hits that.
 	// Tests shorten to surface dead VMs within their ~1 s timeouts.
 	ReapInterval time.Duration
+
+	// MinHot / MaxHot size the always-running tier (plan §5 step 3).
+	// Hot entries are booted but NEVER paused — Acquire skips Resume
+	// entirely for them, so leases are a few µs of state transition.
+	// SetNetwork still runs since each lease gets its own IP.
+	//
+	// MaxHot=0 (default) disables the hot tier — the pool is
+	// paused-only, which is what 99% of templates want. Turn it on
+	// for templates where startup cost matters AND the extra RSS
+	// (a hot VM holds full guest memory, a paused one sits at the
+	// kernel's idle footprint) is acceptable.
+	MinHot int
+	MaxHot int
 }
 
 // defaultsApplied returns a copy of cfg with zero-valued fields set
@@ -241,10 +261,18 @@ type Pool struct {
 
 	// Refiller state (slice 2). All mutated under p.mu.
 	started             bool
-	inflight            int
+	inflight            int // legacy total; kept for ABI compat with Inflight()
+	inflightHot         int
+	inflightPaused      int
 	consecutiveFailures int
 	cooldownUntil       time.Time
 	lastBootError       error
+
+	// globalBudget caps cross-template concurrent cold-boots. Nil =
+	// unlimited (per-template ReplenishParallelism is the only
+	// ceiling). Set via SetGlobalBudget after NewPool; Manager-level
+	// integrators share one Budget across every pool they register.
+	globalBudget *GlobalInflightBudget
 
 	// Lifecycle. ctx/cancel are set by Start, cleared by Stop. wg
 	// tracks the refiller goroutine + every in-flight Booter call so
@@ -432,12 +460,25 @@ func (p *Pool) Acquire(ctx context.Context, spec LeaseSpec) (Lease, error) {
 	}
 
 	p.mu.Lock()
+	// Hot tier wins over paused — lease cost is lower (no Resume).
+	// Within each tier we pick the oldest entry (FIFO) so long-idle
+	// VMs get exercised.
 	var oldest *Entry
+	var oldestState State
 	for _, e := range p.entries {
-		if e.State != StatePaused {
+		if e.State != StateHot && e.State != StatePaused {
 			continue
 		}
-		if oldest == nil || e.CreatedAt.Before(oldest.CreatedAt) {
+		// Prefer hot over paused.
+		if oldest == nil {
+			oldest, oldestState = e, e.State
+			continue
+		}
+		if oldestState == StatePaused && e.State == StateHot {
+			oldest, oldestState = e, e.State
+			continue
+		}
+		if oldestState == e.State && e.CreatedAt.Before(oldest.CreatedAt) {
 			oldest = e
 		}
 	}
@@ -445,7 +486,10 @@ func (p *Pool) Acquire(ctx context.Context, spec LeaseSpec) (Lease, error) {
 		p.mu.Unlock()
 		return Lease{}, ErrPoolEmpty
 	}
+	wasHot := oldest.State == StateHot
 	oldest.State = StateLeased
+	metricLeases.Add(1)
+	p.publishGaugesLocked()
 	oldest.LeasedAt = time.Now()
 	lease := Lease{
 		ID:       oldest.ID,
@@ -460,7 +504,9 @@ func (p *Pool) Acquire(ctx context.Context, spec LeaseSpec) (Lease, error) {
 	// device state; it's fast but non-trivial, and holding the
 	// pool lock across it would serialise every Acquire — exactly
 	// the concurrency we're trying to enable.
-	if resumer != nil {
+	//
+	// Hot tier skips Resume entirely — the VM is already running.
+	if resumer != nil && !wasHot {
 		resumeCtx, cancel := context.WithTimeout(ctx, spec.ResumeTimeout)
 		if err := resumeWithContext(resumeCtx, resumer); err != nil {
 			cancel()

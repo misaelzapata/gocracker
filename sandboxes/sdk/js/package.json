@@ -1,0 +1,20 @@
+{
+  "name": "@gocracker/sdk",
+  "version": "0.1.0",
+  "description": "gocracker sandboxd + toolbox agent client",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.js",
+      "types": "./src/index.d.ts"
+    }
+  },
+  "files": ["src"],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["gocracker", "sandbox", "microvm", "firecracker"],
+  "license": "Apache-2.0"
+}

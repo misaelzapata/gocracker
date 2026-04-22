@@ -197,7 +197,8 @@ class ToolboxClient:
             FileEntry(
                 name=e.get("name", ""),
                 size=e.get("size", 0),
-                is_dir=e.get("is_dir", False),
+                # Agent returns kind="file"|"dir"; map to is_dir bool.
+                is_dir=e.get("kind") == "dir",
                 mode=e.get("mode", 0),
             )
             for e in parsed.get("entries", [])
@@ -218,6 +219,70 @@ class ToolboxClient:
         )
         if status not in (200, 201):
             raise ToolboxError(f"upload: status={status} body={body[:200]!r}")
+
+    def delete_file(self, path: str) -> None:
+        status, _, body = self._request("DELETE", f"/files?path={path}")
+        if status not in (200, 204):
+            raise ToolboxError(f"delete_file: status={status} body={body[:200]!r}")
+
+    def mkdir(self, path: str, parents: bool = False) -> None:
+        # Agent expects {"path": ..., "all": bool} — not "parents".
+        body = {"path": path, "all": parents}
+        status, _, resp = self._request("POST", "/files/mkdir", body=json.dumps(body).encode())
+        if status != 200:
+            raise ToolboxError(f"mkdir: status={status} body={resp[:200]!r}")
+
+    def rename(self, src: str, dst: str) -> None:
+        # Agent expects {"old_path": ..., "new_path": ...}.
+        body = {"old_path": src, "new_path": dst}
+        status, _, resp = self._request("POST", "/files/rename", body=json.dumps(body).encode())
+        if status != 200:
+            raise ToolboxError(f"rename: status={status} body={resp[:200]!r}")
+
+    def chmod(self, path: str, mode: int) -> None:
+        body = {"path": path, "mode": mode}
+        status, _, resp = self._request("POST", "/files/chmod", body=json.dumps(body).encode())
+        if status != 200:
+            raise ToolboxError(f"chmod: status={status} body={resp[:200]!r}")
+
+    # ---- Git ----
+
+    def git_clone(self, repository: str, directory: str, ref: str = "") -> Dict[str, object]:
+        body: Dict[str, object] = {"repository": repository, "directory": directory}
+        if ref:
+            body["ref"] = ref
+        status, _, resp = self._request("POST", "/git/clone", body=json.dumps(body).encode())
+        if status != 200:
+            raise ToolboxError(f"git_clone: status={status} body={resp[:200]!r}")
+        return json.loads(resp)
+
+    def git_status(self, directory: str) -> Dict[str, object]:
+        body = {"directory": directory}
+        status, _, resp = self._request("POST", "/git/status", body=json.dumps(body).encode())
+        if status != 200:
+            raise ToolboxError(f"git_status: status={status} body={resp[:200]!r}")
+        return json.loads(resp)
+
+    # ---- Secrets ----
+
+    def set_secret(self, name: str, value: str) -> None:
+        body = {"name": name, "value": value}
+        status, _, resp = self._request("POST", "/secrets", body=json.dumps(body).encode())
+        if status not in (200, 201):
+            raise ToolboxError(f"set_secret: status={status} body={resp[:200]!r}")
+
+    def list_secrets(self) -> List[str]:
+        status, _, resp = self._request("GET", "/secrets")
+        if status != 200:
+            raise ToolboxError(f"list_secrets: status={status} body={resp[:200]!r}")
+        parsed = json.loads(resp)
+        # Agent returns {"secrets": [name1, name2, ...]}.
+        return parsed.get("secrets", [])
+
+    def delete_secret(self, name: str) -> None:
+        status, _, resp = self._request("DELETE", f"/secrets/{name}")
+        if status not in (200, 204):
+            raise ToolboxError(f"delete_secret: status={status} body={resp[:200]!r}")
 
     # ---- Internals ----
 
@@ -271,7 +336,26 @@ class ToolboxClient:
                 if b":" in line:
                     k, v = line.split(b":", 1)
                     headers[k.strip().decode("ascii").lower()] = v.strip().decode("latin-1")
-            body_bytes = f.read()
+            # Bound the read by Content-Length if present. Without
+            # this, f.read() waits for EOF — which never arrives
+            # promptly over the UDS bridge because the agent's
+            # Connection: close + flush races with the host-side
+            # io.Copy. A stale socket timeout masqueraded as a
+            # "hung mkdir" bug.
+            body_bytes: bytes
+            # Responses that definitionally have no body (RFC 7230).
+            if status in (204, 205, 304):
+                body_bytes = b""
+            else:
+                cl = headers.get("content-length", "")
+                if cl:
+                    try:
+                        n = int(cl)
+                        body_bytes = f.read(n) if n > 0 else b""
+                    except ValueError:
+                        body_bytes = f.read()
+                else:
+                    body_bytes = f.read()
             if raw_body:
                 return status, headers, body_bytes
             return status, headers, body_bytes.decode("utf-8", errors="replace")

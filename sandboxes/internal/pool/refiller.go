@@ -268,64 +268,110 @@ func (p *Pool) refillLoop() {
 // reconcile is one pass of the refiller logic. Holds p.mu only to
 // read/mutate counters + launch goroutines — the launched goroutines
 // do container.Run WITHOUT holding p.mu (Run blocks for ~200-500 ms).
+//
+// Two tiers refilled independently: hot (keep running) and paused
+// (boot then Pause). Both honor the global inflight budget (via
+// globalBudget, optional — if nil, per-template ReplenishParallelism
+// is the only limit).
 func (p *Pool) reconcile() {
 	p.mu.Lock()
 	if !p.started {
 		p.mu.Unlock()
 		return
 	}
-	// Count live (paused or creating-in-flight) slots.
-	paused := 0
+	// Count both tiers + creating.
+	hot, paused := 0, 0
 	for _, e := range p.entries {
-		if e.State == StatePaused {
+		switch e.State {
+		case StateHot:
+			hot++
+		case StatePaused:
 			paused++
 		}
 	}
-	live := paused + p.inflight
+	liveHot := hot + p.inflightHot
+	livePaused := paused + p.inflightPaused
 
-	// Respect cooldown: if we're inside a failure backoff, skip.
+	// Respect cooldown.
 	if now := time.Now(); now.Before(p.cooldownUntil) {
 		p.mu.Unlock()
 		return
 	}
 
-	// Slots we should launch this pass.
-	wantMore := p.cfg.MinPaused - live
-	if wantMore <= 0 {
-		p.mu.Unlock()
-		return
+	// Compute how many of each tier we want to start. Hot before
+	// paused so the higher-value slot always refills first (Plan §5
+	// step 3 comment about hot tier being reserved for heavier
+	// templates — if we have both a hot gap AND a paused gap, the
+	// hot one matters more).
+	hotWant := p.cfg.MinHot - liveHot
+	if hotWant < 0 || p.cfg.MaxHot == 0 {
+		hotWant = 0
 	}
-	// Cap by per-template parallelism.
-	canLaunch := p.cfg.ReplenishParallelism - p.inflight
+	hotRoom := p.cfg.MaxHot - liveHot
+	if hotRoom < hotWant {
+		hotWant = hotRoom
+	}
+
+	pausedWant := p.cfg.MinPaused - livePaused
+	if pausedWant < 0 {
+		pausedWant = 0
+	}
+	pausedRoom := p.cfg.MaxPaused - livePaused
+	if pausedRoom < pausedWant {
+		pausedWant = pausedRoom
+	}
+
+	// Cap by per-template parallelism (combined over tiers).
+	canLaunch := p.cfg.ReplenishParallelism - (p.inflightHot + p.inflightPaused)
 	if canLaunch <= 0 {
 		p.mu.Unlock()
 		return
 	}
-	// Cap by MaxPaused so we never overshoot.
-	roomToMax := p.cfg.MaxPaused - live
-	if roomToMax < wantMore {
-		wantMore = roomToMax
+	// Cap by global inflight budget.
+	if p.globalBudget != nil {
+		globalRemain := p.globalBudget.remainingLocked()
+		if globalRemain < canLaunch {
+			canLaunch = globalRemain
+		}
 	}
-	if canLaunch < wantMore {
-		wantMore = canLaunch
-	}
-	if wantMore <= 0 {
+	if canLaunch <= 0 {
 		p.mu.Unlock()
 		return
 	}
 
-	// Reserve inflight slots BEFORE unlocking so a concurrent
-	// reconcile (shouldn't happen — single refiller goroutine — but
-	// belt + suspenders for future Manager callers of reconcile)
-	// can't double-launch.
-	p.inflight += wantMore
+	// Allocate the can-launch budget to hot first, then paused.
+	launchHot := hotWant
+	if launchHot > canLaunch {
+		launchHot = canLaunch
+	}
+	remaining := canLaunch - launchHot
+	launchPaused := pausedWant
+	if launchPaused > remaining {
+		launchPaused = remaining
+	}
+	if launchHot == 0 && launchPaused == 0 {
+		p.mu.Unlock()
+		return
+	}
+
+	p.inflightHot += launchHot
+	p.inflightPaused += launchPaused
+	if p.globalBudget != nil {
+		p.globalBudget.acquireLocked(launchHot + launchPaused)
+	}
 	ctx := p.ctx
 	booter := p.booter
 	p.mu.Unlock()
 
-	for i := 0; i < wantMore; i++ {
+	for i := 0; i < launchHot; i++ {
 		p.wg.Add(1)
-		go p.runCreate(ctx, booter)
+		metricBootAttempts.Add(1)
+		go p.runCreate(ctx, booter, true /*hot*/)
+	}
+	for i := 0; i < launchPaused; i++ {
+		p.wg.Add(1)
+		metricBootAttempts.Add(1)
+		go p.runCreate(ctx, booter, false /*paused*/)
 	}
 }
 
@@ -384,25 +430,36 @@ func (p *Pool) reapOnce() int {
 			d.result.Close()
 		}
 	}
+	if n := len(dead); n > 0 {
+		metricReaps.Add(int64(n))
+	}
 	return len(dead)
 }
 
-// runCreate is one cold-boot-and-pause attempt. It decrements
-// p.inflight on exit and either adds a paused entry (on success) or
-// bumps the failure counter (on error). Also resets the failure
-// counter + cooldown on a successful boot.
-func (p *Pool) runCreate(ctx context.Context, booter Booter) {
+// runCreate is one cold-boot attempt. If isHot, the VM is LEFT
+// RUNNING; otherwise the booter pauses it after capture. Decrements
+// the tier-specific inflight counter on exit; resets / bumps the
+// failure state as appropriate. Releases the global budget slot.
+func (p *Pool) runCreate(ctx context.Context, booter Booter, isHot bool) {
 	defer p.wg.Done()
 	bootResult, err := booter.Boot(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.inflight--
+	if isHot {
+		p.inflightHot--
+	} else {
+		p.inflightPaused--
+	}
+	if p.globalBudget != nil {
+		p.globalBudget.releaseLocked(1)
+	}
 	if err != nil {
 		p.consecutiveFailures++
 		p.lastBootError = err
 		if p.consecutiveFailures >= p.cfg.ConsecutiveFailureThreshold {
 			p.cooldownUntil = time.Now().Add(p.cfg.Cooldown)
 		}
+		metricBootFailures.Add(1)
 		return
 	}
 	// Boot raced shutdown: tear the VM back down instead of parking
@@ -422,9 +479,21 @@ func (p *Pool) runCreate(ctx context.Context, booter Booter) {
 	if id == "" {
 		id = fmt.Sprintf("pool-%d", time.Now().UnixNano())
 	}
+	// Hot entries must NOT have been paused by the booter. The default
+	// containerBooter always pauses; hot-tier producers set a
+	// HotBooter override OR Boot returns a running VM and we flag
+	// it here. Simplest path for slice: if isHot and the bootResult
+	// includes a Resumer (vmm.Handle), assume the VM is still
+	// running — containerBooter.Boot calls Pause AFTER WarmDone, so
+	// hot-tier flow requires a different Booter that skips Pause.
+	// We document this constraint on HotBooter below.
+	state := StatePaused
+	if isHot {
+		state = StateHot
+	}
 	p.entries[id] = &Entry{
 		ID:        id,
-		State:     StatePaused,
+		State:     state,
 		CreatedAt: time.Now(),
 		UDSPath:   bootResult.UDSPath,
 		result:    bootResult.Result,
@@ -433,6 +502,8 @@ func (p *Pool) runCreate(ctx context.Context, booter Booter) {
 	}
 	p.consecutiveFailures = 0
 	p.cooldownUntil = time.Time{}
+	metricBootSuccesses.Add(1)
+	p.publishGaugesLocked()
 	// Wake any AcquireWait callers parked on warmAvailableCh — this
 	// is the event-driven side of slice 6's refill path. Polling the
 	// map every N ms wastes cycles AND adds latency to a burst of
@@ -441,12 +512,21 @@ func (p *Pool) runCreate(ctx context.Context, booter Booter) {
 	p.signalWarmAvailableLocked()
 }
 
-// Inflight returns the current count of in-flight cold-boots. Used
-// by tests and expvar gauges in slice 7. Protected by p.mu.
+// Inflight returns the current count of in-flight cold-boots
+// across both tiers.
 func (p *Pool) Inflight() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.inflight
+	return p.inflightHot + p.inflightPaused
+}
+
+// SetGlobalBudget attaches a shared inflight budget to the pool.
+// Must be called BEFORE Start — setting it after the refiller is
+// already running is racy. Nil disables the global cap.
+func (p *Pool) SetGlobalBudget(g *GlobalInflightBudget) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.globalBudget = g
 }
 
 // ConsecutiveFailures returns the current failure-run length. Resets
