@@ -47,15 +47,25 @@ type PoolRegistration struct {
 // container.RunOptions (the user-relevant warm-cache surface) plus
 // pool-policy knobs. Anything not set falls through to the pool
 // package's Fase 5 defaults.
+//
+// FromTemplate (Fase 6 slice 4): when set, RegisterPool resolves
+// the named template, copies its Spec into RunOptions, and skips
+// the per-pool prewarm cold-boot — the template's snapshot is
+// already on disk, so the first refill restores from it directly
+// (~30-60 ms per VM instead of ~200-500 ms cold-boot). Image /
+// KernelPath / Mem / CPUs may still be set on the request to
+// override fields, but FromTemplate's Spec wins for fields it
+// defines (caller is expected to pick one or the other).
 type CreatePoolRequest struct {
-	TemplateID string `json:"template_id"`           // required, unique per Manager
-	Image      string `json:"image"`                 // OCI ref (or Dockerfile)
-	Dockerfile string `json:"dockerfile,omitempty"`  // alternative to Image
-	Context    string `json:"context,omitempty"`     // build context for Dockerfile
-	KernelPath string `json:"kernel_path"`           // required
-	MemMB      uint64 `json:"mem_mb,omitempty"`      // default 256
-	CPUs       int    `json:"cpus,omitempty"`        // default 1
-	JailerMode string `json:"jailer_mode,omitempty"` // "on"|"off", default "off"
+	TemplateID   string `json:"template_id"`           // required, unique per Manager
+	FromTemplate string `json:"from_template,omitempty"` // optional template id; if set, spec inherited
+	Image        string `json:"image,omitempty"`       // OCI ref (or Dockerfile); ignored if FromTemplate set
+	Dockerfile   string `json:"dockerfile,omitempty"`  // alternative to Image
+	Context      string `json:"context,omitempty"`     // build context for Dockerfile
+	KernelPath   string `json:"kernel_path,omitempty"` // required unless FromTemplate set
+	MemMB        uint64 `json:"mem_mb,omitempty"`      // default 256
+	CPUs         int    `json:"cpus,omitempty"`        // default 1
+	JailerMode   string `json:"jailer_mode,omitempty"` // "on"|"off", default "off"
 
 	MinPaused            int `json:"min_paused,omitempty"`
 	MaxPaused            int `json:"max_paused,omitempty"`
@@ -117,9 +127,44 @@ func (m *Manager) ensurePoolManager() *poolManager {
 // the registration on success; ErrPoolAlreadyRegistered if the ID
 // is taken. Pool refiller goroutines start immediately and run
 // until UnregisterPool or process exit.
+//
+// When req.FromTemplate is set, the pool inherits the template's
+// Spec (image, kernel, mem, etc.) and skips the per-pool prewarm
+// cold-boot — the template's snapshot is already cached.
 func (m *Manager) RegisterPool(ctx context.Context, req CreatePoolRequest) (PoolRegistration, error) {
 	if req.TemplateID == "" {
 		return PoolRegistration{}, fmt.Errorf("%w: template_id required", ErrInvalidRequest)
+	}
+	// Resolve FromTemplate FIRST: it can supply Image / KernelPath /
+	// Mem / CPUs that fill in the otherwise-required fields.
+	if req.FromTemplate != "" {
+		t, err := m.GetTemplate(req.FromTemplate)
+		if err != nil {
+			return PoolRegistration{}, fmt.Errorf("%w: from_template %q: %v", ErrInvalidRequest, req.FromTemplate, err)
+		}
+		if t.State != "ready" {
+			return PoolRegistration{}, fmt.Errorf("%w: from_template %q is in state %q (need ready)", ErrInvalidRequest, req.FromTemplate, t.State)
+		}
+		// Template fields fill in missing request fields. Anything
+		// the request DOES set wins — operator can tweak per-pool.
+		if req.Image == "" {
+			req.Image = t.Spec.Image
+		}
+		if req.Dockerfile == "" {
+			req.Dockerfile = t.Spec.Dockerfile
+		}
+		if req.Context == "" {
+			req.Context = t.Spec.Context
+		}
+		if req.KernelPath == "" {
+			req.KernelPath = t.Spec.KernelPath
+		}
+		if req.MemMB == 0 {
+			req.MemMB = t.Spec.MemMB
+		}
+		if req.CPUs == 0 {
+			req.CPUs = t.Spec.CPUs
+		}
 	}
 	if req.KernelPath == "" {
 		return PoolRegistration{}, fmt.Errorf("%w: kernel_path required", ErrInvalidRequest)
@@ -195,9 +240,18 @@ func (m *Manager) RegisterPool(ctx context.Context, req CreatePoolRequest) (Pool
 	// Cost: one cold-boot + snapshot capture (~3 s) at register
 	// time. Benefit: N×~200 ms saved on every pool fill thereafter.
 	// Net win at any pool size > 0.
-	if err := prewarmSnapshot(ctx, cfg.RunOptions); err != nil {
-		p.Stop()
-		return PoolRegistration{}, fmt.Errorf("sandboxd: prewarm snapshot: %w", err)
+	//
+	// FromTemplate skip: when the pool inherits a template, the
+	// snapshot is already cached (the template was Build()ed before
+	// RegisterPool got called). The prewarm path's
+	// warmcacheLookup hit-check would short-circuit anyway, but
+	// going straight to p.Start avoids the extra round-trip + log
+	// noise.
+	if req.FromTemplate == "" {
+		if err := prewarmSnapshot(ctx, cfg.RunOptions); err != nil {
+			p.Stop()
+			return PoolRegistration{}, fmt.Errorf("sandboxd: prewarm snapshot: %w", err)
+		}
 	}
 
 	if err := p.Start(ctx); err != nil {
