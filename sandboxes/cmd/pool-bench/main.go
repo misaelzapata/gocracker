@@ -33,6 +33,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -74,7 +75,13 @@ func main() {
 	if err != nil {
 		fatal("new store: %v", err)
 	}
-	mgr := &sandboxd.Manager{Store: store, StateDir: *stateDir}
+	vmmBin := resolveVMMBinary()
+	mgr := &sandboxd.Manager{
+		Store:        store,
+		StateDir:     *stateDir,
+		VMMBinary:    vmmBin,
+		JailerBinary: vmmBin,
+	}
 
 	tmpl := "bench-pool"
 	fmt.Printf("pool-bench: image=%s burst=%d warm=%d jailer=%s\n", *image, *burst, *warm, *jailerMode)
@@ -243,6 +250,30 @@ func getPausedCount(mgr *sandboxd.Manager, templateID string) int {
 func fatal(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "pool-bench: "+format+"\n", args...)
 	os.Exit(1)
+}
+
+// resolveVMMBinary locates the `gocracker` binary used to spawn VMM
+// workers. Checks sibling-of-self (which is how the CI job invokes
+// us, with /tmp/pool-bench next to nothing — fallthrough) then $PWD
+// and $PWD/bin. Returns "gocracker" for PATH lookup as last resort.
+func resolveVMMBinary() string {
+	if self, err := os.Executable(); err == nil {
+		for _, candidate := range []string{
+			filepath.Join(filepath.Dir(self), "gocracker"),
+			filepath.Join(mustCwd(), "gocracker"),
+			filepath.Join(mustCwd(), "bin", "gocracker"),
+		} {
+			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+				return candidate
+			}
+		}
+	}
+	return "gocracker"
+}
+
+func mustCwd() string {
+	d, _ := os.Getwd()
+	return d
 }
 
 // splitCmd is a poor-man's shlex — splits on whitespace, no quoting.

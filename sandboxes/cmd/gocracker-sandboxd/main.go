@@ -35,13 +35,18 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		cmdServe(os.Args[2:])
+	case "template":
+		cmdTemplate(os.Args[2:])
 	default:
 		usage()
 	}
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: gocracker-sandboxd serve [flags]")
+	fmt.Fprintln(os.Stderr, "usage: gocracker-sandboxd <command> [flags]")
+	fmt.Fprintln(os.Stderr, "commands:")
+	fmt.Fprintln(os.Stderr, "  serve                                 Start the HTTP control plane")
+	fmt.Fprintln(os.Stderr, "  template create|list|delete|get       Manage warm templates (Fase 6)")
 	os.Exit(2)
 }
 

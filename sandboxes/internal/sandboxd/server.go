@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+
+	"github.com/gocracker/gocracker/sandboxes/internal/templates"
 )
 
 // Lifecycle is the small interface the HTTP server depends on for
@@ -26,6 +28,16 @@ type PoolLifecycle interface {
 	ListPools() []PoolRegistration
 	LeaseSandbox(ctx context.Context, req LeaseSandboxRequest) (Sandbox, error)
 	ReleaseLeased(id string) error
+}
+
+// TemplateLifecycle is the Fase 6 superset that adds template routes.
+// Same pattern as PoolLifecycle — optional, the Server mounts the
+// routes only when the underlying Lifecycle implements it.
+type TemplateLifecycle interface {
+	CreateTemplate(ctx context.Context, req CreateTemplateRequest) (CreateTemplateResponse, error)
+	GetTemplate(id string) (templates.Template, error)
+	ListTemplates() []templates.Template
+	DeleteTemplate(id string) error
 }
 
 // Server wires HTTP routes onto a Lifecycle (typically a *Manager)
@@ -58,7 +70,70 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("DELETE /pools/{id}", s.handleUnregisterPool(pl))
 		mux.HandleFunc("POST /sandboxes/lease", s.handleLeaseSandbox(pl))
 	}
+	if tl, ok := s.Lifecycle.(TemplateLifecycle); ok {
+		mux.HandleFunc("POST /templates", s.handleCreateTemplate(tl))
+		mux.HandleFunc("GET /templates", s.handleListTemplates(tl))
+		mux.HandleFunc("GET /templates/{id}", s.handleGetTemplate(tl))
+		mux.HandleFunc("DELETE /templates/{id}", s.handleDeleteTemplate(tl))
+	}
 	return mux
+}
+
+func (s *Server) handleCreateTemplate(tl TemplateLifecycle) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req CreateTemplateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("decode request: %w", err))
+			return
+		}
+		res, err := tl.CreateTemplate(r.Context(), req)
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, ErrInvalidRequest) || errors.Is(err, templates.ErrInvalidSpec) {
+				status = http.StatusBadRequest
+			}
+			writeError(w, status, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, res)
+	}
+}
+
+func (s *Server) handleListTemplates(tl TemplateLifecycle) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, ListTemplatesResponse{Templates: tl.ListTemplates()})
+	}
+}
+
+func (s *Server) handleGetTemplate(tl TemplateLifecycle) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		t, err := tl.GetTemplate(id)
+		if err != nil {
+			if errors.Is(err, templates.ErrTemplateNotFound) {
+				writeError(w, http.StatusNotFound, err)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, t)
+	}
+}
+
+func (s *Server) handleDeleteTemplate(tl TemplateLifecycle) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if err := tl.DeleteTemplate(id); err != nil {
+			if errors.Is(err, templates.ErrTemplateNotFound) {
+				writeError(w, http.StatusNotFound, err)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func (s *Server) handleRegisterPool(pl PoolLifecycle) http.HandlerFunc {
