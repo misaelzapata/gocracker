@@ -30,6 +30,10 @@ type fakePoolLifecycle struct {
 	leaseResult      Sandbox
 	releaseCalls     int
 	releaseErr       error
+	recycleCalls     int
+	recycleErr       error
+	recycleArg       string
+	recycleResult    Sandbox
 }
 
 func (f *fakePoolLifecycle) RegisterPool(_ context.Context, req CreatePoolRequest) (PoolRegistration, error) {
@@ -62,6 +66,15 @@ func (f *fakePoolLifecycle) LeaseSandbox(_ context.Context, req LeaseSandboxRequ
 func (f *fakePoolLifecycle) ReleaseLeased(_ string) error {
 	f.releaseCalls++
 	return f.releaseErr
+}
+
+func (f *fakePoolLifecycle) RecycleLeased(_ context.Context, id string) (Sandbox, error) {
+	f.recycleCalls++
+	f.recycleArg = id
+	if f.recycleErr != nil {
+		return Sandbox{}, f.recycleErr
+	}
+	return f.recycleResult, nil
 }
 
 func newPoolTestServer(t *testing.T) (*httptest.Server, *fakePoolLifecycle, *Store) {

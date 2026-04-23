@@ -92,6 +92,19 @@ var ErrPoolAlreadyRegistered = errors.New("sandboxd: pool already registered")
 // has no registered pool.
 var ErrPoolNotFound = errors.New("sandboxd: pool not found")
 
+// ErrSandboxNotLeased is returned by RecycleLeased when the target
+// sandbox was created via cold-boot (`POST /sandboxes`) instead of
+// lease (`POST /sandboxes/lease`). Cold sandboxes don't belong to a
+// pool so there's nothing to recycle from — callers should
+// DELETE + create a fresh one instead.
+var ErrSandboxNotLeased = errors.New("sandboxd: sandbox is not leased")
+
+// ErrPoolExhausted surfaces when recycle / lease requests timeout
+// waiting for a paused VM. Distinct from ErrPoolNotFound (pool
+// doesn't exist) — the pool exists but has no capacity within the
+// configured timeout.
+var ErrPoolExhausted = errors.New("sandboxd: pool exhausted")
+
 // poolManager holds the per-Manager pool registry, IP allocator,
 // and the shared Networker. Embedded into Manager via composition;
 // kept in its own struct so the file boundary isolates Fase 5
@@ -254,7 +267,13 @@ func (m *Manager) RegisterPool(ctx context.Context, req CreatePoolRequest) (Pool
 		}
 	}
 
-	if err := p.Start(ctx); err != nil {
+	// The pool's lifetime is bound to the Manager (until UnregisterPool
+	// or Shutdown), NOT the HTTP request. Using r.Context() here would
+	// cancel every in-flight refill goroutine the moment the POST /pools
+	// response flushes — callers then see a pool with counts={}, refill
+	// goroutines aborting with "context canceled", and a hang on
+	// AcquireWait because nothing ever fills the warm tier. Detach now.
+	if err := p.Start(context.Background()); err != nil {
 		return PoolRegistration{}, fmt.Errorf("sandboxd: start pool: %w", err)
 	}
 
@@ -362,19 +381,13 @@ func (m *Manager) LeaseSandbox(ctx context.Context, req LeaseSandboxRequest) (Sa
 		return Sandbox{}, ErrPoolNotFound
 	}
 
-	addr, err := pm.ipAlloc.Allocate()
+	// Warm lease fast path: reuse the IP the refiller baked in via
+	// hostnet.NewAuto at cold-boot time. The manager's ipAlloc is only
+	// consulted when the caller explicitly wants a specific IP (not the
+	// default SDK flow today). Skipping Allocate + SetNetwork removes
+	// the 12–18 ms netlink round trip that used to dominate lease p95.
+	lease, err := reg.pool.AcquireWait(ctx, pool.LeaseSpec{Interface: "eth0"}, timeout)
 	if err != nil {
-		return Sandbox{}, fmt.Errorf("sandboxd: ip allocate: %w", err)
-	}
-	spec := pool.LeaseSpec{
-		IP:        addr.IP,
-		Gateway:   addr.Gateway,
-		MAC:       addr.MAC,
-		Interface: "eth0",
-	}
-	lease, err := reg.pool.AcquireWait(ctx, spec, timeout)
-	if err != nil {
-		pm.ipAlloc.Free(addr.Slot)
 		return Sandbox{}, fmt.Errorf("sandboxd: lease: %w", err)
 	}
 
@@ -383,21 +396,17 @@ func (m *Manager) LeaseSandbox(ctx context.Context, req LeaseSandboxRequest) (Sa
 		State:     StateReady,
 		Image:     reg.Image,
 		UDSPath:   lease.UDSPath,
-		GuestIP:   addr.IP,
+		GuestIP:   lease.GuestIP,
 		RuntimeID: lease.ID,
 		CreatedAt: lease.LeasedAt,
 	}
 	if err := m.Store.Add(sb); err != nil {
-		// ID collision (shouldn't happen — pool IDs are gc-N hex).
-		// Free the IP, return; the leased VM stays in the pool's
-		// leased state and will be reaped on UnregisterPool.
-		pm.ipAlloc.Free(addr.Slot)
 		return Sandbox{}, fmt.Errorf("sandboxd: store add: %w", err)
 	}
 	// Stash the lease metadata so DELETE can route to Pool.Release.
+	// poolIPSlot stays 0 (no manager-side IP allocation in the warm path).
 	m.Store.Update(lease.ID, func(s *Sandbox) {
 		s.poolTemplateID = req.TemplateID
-		s.poolIPSlot = addr.Slot
 	})
 	updated, _ := m.Store.Get(lease.ID)
 	return updated, nil
@@ -427,12 +436,116 @@ func (m *Manager) ReleaseLeased(id string) error {
 		return nil
 	}
 	rr, relErr := reg.pool.Release(id)
+	// VM teardown runs async so the lease-release round trip stays
+	// sub-ms. The refiller sees the slot free (state=Stopped) on the
+	// next reconcile tick and enqueues a replacement boot — no need to
+	// block the caller on Close() which is I/O-heavy (Stop + TAP flush
+	// + rootfs cleanup ~60–80 ms).
 	if rr != nil {
-		rr.Close()
+		go func(r *container.RunResult) { r.Close() }(rr)
 	}
-	pm.ipAlloc.Free(sb.poolIPSlot)
+	if sb.poolIPSlot > 0 {
+		pm.ipAlloc.Free(sb.poolIPSlot)
+	}
 	_, _ = m.Store.Remove(id)
 	return relErr
+}
+
+// RecycleLeased tears down the current leased sandbox and returns a
+// fresh one from the same pool in a single round trip. Cheaper than
+// DELETE-then-lease because the caller avoids an extra HTTP hop and
+// the slot returns to the pool immediately (refiller triggers as part
+// of the recycle), keeping the warm population topped up.
+//
+// Semantics:
+//   - Old sandbox id is gone from the store and the pool the moment
+//     this call returns. Callers that kept the old `Sandbox` handle
+//     must swap to the returned one.
+//   - New sandbox is a freshly restored VM from the same pool — fresh
+//     process state, fresh filesystem (snapshot baseline), new id.
+//   - The pool's refiller takes care of replenishing the slot the
+//     old VM occupied, asynchronously.
+//
+// Errors:
+//   - ErrSandboxNotFound: id unknown or already deleted.
+//   - ErrSandboxNotLeased: id belongs to a cold-booted sandbox (no
+//     pool membership) — caller should DELETE and CreateSandbox anew.
+//   - ErrPoolNotFound: pool was unregistered between lease and
+//     recycle. The old sandbox is cleaned up either way.
+//   - ErrPoolExhausted: the pool's AcquireWait timed out (default 5s)
+//     waiting for a paused entry.
+func (m *Manager) RecycleLeased(ctx context.Context, id string) (Sandbox, error) {
+	sb, ok := m.Store.Get(id)
+	if !ok {
+		return Sandbox{}, ErrSandboxNotFound
+	}
+	if sb.poolTemplateID == "" {
+		return Sandbox{}, ErrSandboxNotLeased
+	}
+	templateID := sb.poolTemplateID
+	oldSlot := sb.poolIPSlot
+
+	pm := m.ensurePoolManager()
+	pm.mu.Lock()
+	reg, ok := pm.pools[templateID]
+	pm.mu.Unlock()
+	if !ok {
+		// Pool's gone — make sure the old record doesn't linger.
+		_, _ = m.Store.Remove(id)
+		return Sandbox{}, ErrPoolNotFound
+	}
+
+	// Remove old id FIRST so a concurrent DELETE on the same id turns
+	// into a no-op (Store.Remove is idempotent + returns false) and
+	// the client can't double-process a dying sandbox.
+	if _, removed := m.Store.Remove(id); !removed {
+		return Sandbox{}, ErrSandboxNotFound
+	}
+
+	// Release the old VM back to the pool — state=Stopped, async
+	// teardown. The refiller picks this up on the next reconcile tick.
+	rr, _ := reg.pool.Release(id)
+	if rr != nil {
+		go func(r *container.RunResult) { r.Close() }(rr)
+	}
+	if oldSlot > 0 {
+		pm.ipAlloc.Free(oldSlot)
+	}
+
+	// Acquire the replacement. 5s cap matches the default in
+	// LeaseSandbox — keeps misbehaving clients from pinning a pool
+	// entry indefinitely.
+	timeout := 5 * time.Second
+	lease, err := reg.pool.AcquireWait(ctx, pool.LeaseSpec{Interface: "eth0"}, timeout)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return Sandbox{}, fmt.Errorf("sandboxd: recycle %s: %w", id, ErrPoolExhausted)
+		}
+		return Sandbox{}, fmt.Errorf("sandboxd: recycle %s: %w", id, err)
+	}
+
+	// Publish the fresh sandbox under the new id.
+	newSb := &Sandbox{
+		ID:        lease.ID,
+		State:     StateReady,
+		Image:     reg.Image,
+		UDSPath:   lease.UDSPath,
+		GuestIP:   lease.GuestIP,
+		RuntimeID: lease.ID,
+		CreatedAt: lease.LeasedAt,
+	}
+	if err := m.Store.Add(newSb); err != nil {
+		// Very unlikely (pool ids are gc-<hex>). Release what we just
+		// acquired and surface the error.
+		rr, _ := reg.pool.Release(lease.ID)
+		if rr != nil {
+			go func(r *container.RunResult) { r.Close() }(rr)
+		}
+		return Sandbox{}, fmt.Errorf("sandboxd: recycle store add: %w", err)
+	}
+	m.Store.Update(lease.ID, func(s *Sandbox) { s.poolTemplateID = templateID })
+	final, _ := m.Store.Get(lease.ID)
+	return final, nil
 }
 
 // prewarmSnapshot does one synchronous cold-boot with WarmCapture
