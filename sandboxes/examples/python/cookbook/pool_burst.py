@@ -14,19 +14,16 @@ import concurrent.futures
 import statistics
 import sys
 import time
-from pathlib import Path
-
-repo_root = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(repo_root / "sdk" / "python"))
+from _common import resolve_kernel, sandboxd_url
 
 from gocracker import Client, SandboxError  # noqa: E402
 
 
 def main() -> int:
-    kernel = sys.argv[1] if len(sys.argv) > 1 else "/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-standard-vmlinux"
+    kernel = resolve_kernel()
     burst = int(sys.argv[2]) if len(sys.argv) > 2 else 50
 
-    client = Client("http://127.0.0.1:9091", timeout=300.0)
+    client = Client(sandboxd_url(), timeout=300.0)
     template_id = "burst-pool"
 
     print(f"registering pool '{template_id}' MinPaused={burst} MaxPaused={burst}...")

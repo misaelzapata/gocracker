@@ -66,6 +66,32 @@ type Spec struct {
 	Cmd        []string `json:"cmd,omitempty"`
 	Env        []string `json:"env,omitempty"`
 	WorkDir    string   `json:"workdir,omitempty"`
+
+	// Readiness, when non-nil, tells the builder to wait until the app
+	// inside the guest responds 2xx on Readiness.HTTPPort/HTTPPath
+	// before taking the snapshot. The captured memory image then
+	// contains the already-running app — a lease restoring this
+	// snapshot comes up with the service live, skipping the 2-4 s
+	// "wait for postgres/flask init" tax that would otherwise run on
+	// every lease. Nil = standard boot-only snapshot (fast to build,
+	// but the caller's CMD needs to run again on each lease).
+	Readiness *ReadinessProbe `json:"readiness,omitempty"`
+}
+
+// ReadinessProbe is an HTTP readiness check the template builder runs
+// after cold-boot, before taking the snapshot. Any 2xx response counts
+// as ready; anything else retries until Timeout elapses. The probe goes
+// through the toolbox agent's /proxy/http/<port> surface so the app
+// doesn't need its own vsock listener.
+type ReadinessProbe struct {
+	// HTTPPort is the guest-side TCP port the app listens on.
+	HTTPPort uint16 `json:"http_port"`
+	// HTTPPath is the request path; defaults to "/".
+	HTTPPath string `json:"http_path,omitempty"`
+	// Timeout caps total wait before the build errors. Default 2 min.
+	Timeout time.Duration `json:"timeout,omitempty"`
+	// Interval is the gap between attempts. Default 500 ms.
+	Interval time.Duration `json:"interval,omitempty"`
 }
 
 // CacheFormatVersion bumps when the Spec/Build pipeline changes in

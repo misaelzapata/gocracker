@@ -97,14 +97,18 @@ func (m *Manager) Create(req CreateSandboxRequest) (Sandbox, error) {
 
 	opts := container.RunOptions{
 		Image:        normalized.Image,
+		Dockerfile:   normalized.Dockerfile,
+		Context:      normalized.Context,
 		KernelPath:   normalized.KernelPath,
 		MemMB:        defaultUint64(normalized.MemMB, 256),
 		CPUs:         defaultInt(normalized.CPUs, 1),
+		Entrypoint:   normalized.Entrypoint,
 		Cmd:          normalized.Cmd,
 		Env:          normalized.Env,
 		WorkDir:      normalized.WorkDir,
 		NetworkMode:  normalized.NetworkMode,
 		JailerMode:   normalized.JailerMode,
+		SnapshotDir:  normalized.SnapshotDir,
 		ExecEnabled:  true, // sandboxes always run with the exec agent (and now toolbox) idle
 		VsockUDSPath: udsPath,
 		VMMBinary:    m.VMMBinary,
@@ -162,13 +166,26 @@ func (m *Manager) Delete(id string) error {
 	if !found {
 		return ErrSandboxNotFound
 	}
-	if rr != nil {
-		if rr.VM != nil {
-			rr.VM.Stop()
-		}
-		rr.Close()
-	}
 	m.Store.Remove(id)
+	// VM teardown (Stop + TAP flush + rootfs cleanup) takes ~60–80 ms
+	// for a single VM and holding the HTTP response on it multiplies
+	// the end-to-end "hello world + close" by ~3×. Hand it to a
+	// goroutine: the caller sees a 204 immediately, and the VMM
+	// subprocess reaps in the background. Safe because:
+	//   - Store has already forgotten the id → GET /sandboxes/{id}
+	//     returns 404.
+	//   - rr.VM is a local handle; nobody else races us on it (we
+	//     cleared s.runResult under the Store lock above).
+	//   - Cleanup is idempotent; if sandboxd is killed mid-teardown,
+	//     the next startup reconciles.
+	if rr != nil {
+		go func(r *container.RunResult) {
+			if r.VM != nil {
+				r.VM.Stop()
+			}
+			r.Close()
+		}(rr)
+	}
 	return nil
 }
 
@@ -179,8 +196,18 @@ func (m *Manager) Delete(id string) error {
 // it to 400 — avoids the previous situation where a bad kernel_path
 // or garbage jailer_mode silently turned into a runtime 500.
 func validateCreateRequest(req CreateSandboxRequest) (CreateSandboxRequest, error) {
-	if req.Image == "" {
-		return req, fmt.Errorf("%w: image is required", ErrInvalidRequest)
+	if req.Image == "" && req.Dockerfile == "" {
+		return req, fmt.Errorf("%w: image or dockerfile is required", ErrInvalidRequest)
+	}
+	if req.Dockerfile != "" {
+		if _, err := os.Stat(req.Dockerfile); err != nil {
+			return req, fmt.Errorf("%w: dockerfile %q: %v", ErrInvalidRequest, req.Dockerfile, err)
+		}
+		if req.Context != "" {
+			if info, err := os.Stat(req.Context); err != nil || !info.IsDir() {
+				return req, fmt.Errorf("%w: context %q must be an existing directory", ErrInvalidRequest, req.Context)
+			}
+		}
 	}
 	if req.KernelPath == "" {
 		return req, fmt.Errorf("%w: kernel_path is required", ErrInvalidRequest)

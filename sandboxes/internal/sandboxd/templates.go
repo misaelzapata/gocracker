@@ -26,16 +26,17 @@ import (
 // pin a deterministic template id (CLI / tests use this; HTTP
 // clients usually leave it empty to get a generated tmpl-<hex>).
 type CreateTemplateRequest struct {
-	ID         string   `json:"id,omitempty"`
-	Image      string   `json:"image,omitempty"`
-	Dockerfile string   `json:"dockerfile,omitempty"`
-	Context    string   `json:"context,omitempty"`
-	KernelPath string   `json:"kernel_path"`
-	MemMB      uint64   `json:"mem_mb,omitempty"`
-	CPUs       int      `json:"cpus,omitempty"`
-	Cmd        []string `json:"cmd,omitempty"`
-	Env        []string `json:"env,omitempty"`
-	WorkDir    string   `json:"workdir,omitempty"`
+	ID         string                    `json:"id,omitempty"`
+	Image      string                    `json:"image,omitempty"`
+	Dockerfile string                    `json:"dockerfile,omitempty"`
+	Context    string                    `json:"context,omitempty"`
+	KernelPath string                    `json:"kernel_path"`
+	MemMB      uint64                    `json:"mem_mb,omitempty"`
+	CPUs       int                       `json:"cpus,omitempty"`
+	Cmd        []string                  `json:"cmd,omitempty"`
+	Env        []string                  `json:"env,omitempty"`
+	WorkDir    string                    `json:"workdir,omitempty"`
+	Readiness  *templates.ReadinessProbe `json:"readiness,omitempty"`
 }
 
 // CreateTemplateResponse wraps the built template + the CacheHit
@@ -102,6 +103,7 @@ func (m *Manager) CreateTemplate(ctx context.Context, req CreateTemplateRequest)
 		Cmd:        req.Cmd,
 		Env:        req.Env,
 		WorkDir:    req.WorkDir,
+		Readiness:  req.Readiness,
 	}
 	if err := spec.Validate(); err != nil {
 		return CreateTemplateResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)

@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	gclog "github.com/gocracker/gocracker/internal/log"
 	"github.com/gocracker/gocracker/pkg/container"
 )
 
@@ -494,6 +495,7 @@ func (p *Pool) Acquire(ctx context.Context, spec LeaseSpec) (Lease, error) {
 	lease := Lease{
 		ID:       oldest.ID,
 		UDSPath:  oldest.UDSPath,
+		GuestIP:  oldest.GuestIP, // entry's baked-in IP (from refill cold-boot)
 		LeasedAt: oldest.LeasedAt,
 	}
 	resumer := oldest.resumer
@@ -506,7 +508,9 @@ func (p *Pool) Acquire(ctx context.Context, spec LeaseSpec) (Lease, error) {
 	// the concurrency we're trying to enable.
 	//
 	// Hot tier skips Resume entirely — the VM is already running.
+	var resumeMs, setnetMs int64
 	if resumer != nil && !wasHot {
+		t0 := time.Now()
 		resumeCtx, cancel := context.WithTimeout(ctx, spec.ResumeTimeout)
 		if err := resumeWithContext(resumeCtx, resumer); err != nil {
 			cancel()
@@ -514,17 +518,21 @@ func (p *Pool) Acquire(ctx context.Context, spec LeaseSpec) (Lease, error) {
 			return Lease{}, fmt.Errorf("pool: resume %s: %w", lease.ID, err)
 		}
 		cancel()
+		resumeMs = time.Since(t0).Milliseconds()
 	}
 
-	// SetNetwork: only when caller provided an IP AND a Networker is
-	// configured. The guest-IP → Lease handoff happens here so
-	// callers see exactly what got applied (important for the IP
-	// allocator in slice 4 — it needs to know which IP to free if
-	// the lease fails downstream).
+	// SetNetwork: only when caller explicitly provides a DIFFERENT IP.
+	// Warm leases normally pass spec.IP="" and reuse the entry's
+	// baked-in IP (from cold-boot's hostnet.NewAuto), which avoids a
+	// 15–20 ms host↔guest netlink round trip on the hot path. Callers
+	// that need a specific IP (e.g. deterministic test fixtures) still
+	// go through the slower path by setting spec.IP.
 	if spec.IP != "" && networker != nil && lease.UDSPath != "" {
+		t1 := time.Now()
 		netCtx, cancel := context.WithTimeout(ctx, spec.SetNetworkTimeout)
 		err := networker.SetNetwork(netCtx, lease.UDSPath, spec.IP, spec.Gateway, spec.MAC, spec.Interface)
 		cancel()
+		setnetMs = time.Since(t1).Milliseconds()
 		if err != nil {
 			p.markStoppedAndReturn(lease.ID)
 			return Lease{}, fmt.Errorf("pool: setnetwork %s: %w", lease.ID, err)
@@ -536,6 +544,7 @@ func (p *Pool) Acquire(ctx context.Context, spec LeaseSpec) (Lease, error) {
 		p.mu.Unlock()
 		lease.GuestIP = spec.IP
 	}
+	gclog.VMM.Info("lease timing", "id", lease.ID, "resume_ms", resumeMs, "setnet_ms", setnetMs, "guest_ip", lease.GuestIP)
 
 	return lease, nil
 }

@@ -4,7 +4,7 @@ CMD      := ./cmd/gocracker
 TARGET_GOOS ?= linux
 TARGET_GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: all build build-amd64 build-arm64 generate tidy test test-uds coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed
+.PHONY: all build build-amd64 build-arm64 generate tidy test test-uds coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs kernel-guest-arm64 kernel-guest-arm64-minimal hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed
 
 all: build
 
@@ -59,6 +59,12 @@ kernel-guest:
 
 kernel-guest-virtiofs:
 	./tools/build-guest-kernel.sh --profile virtiofs
+
+kernel-guest-arm64:
+	./tools/build-guest-kernel-arm64.sh --profile standard
+
+kernel-guest-arm64-minimal:
+	./tools/build-guest-kernel-arm64.sh --profile minimal
 
 hostcheck:
 	go run ./cmd/gocracker-hostcheck

@@ -28,6 +28,7 @@ type PoolLifecycle interface {
 	ListPools() []PoolRegistration
 	LeaseSandbox(ctx context.Context, req LeaseSandboxRequest) (Sandbox, error)
 	ReleaseLeased(id string) error
+	RecycleLeased(ctx context.Context, id string) (Sandbox, error)
 }
 
 // TemplateLifecycle is the Fase 6 superset that adds template routes.
@@ -79,6 +80,7 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("GET /pools", s.handleListPools(pl))
 		mux.HandleFunc("DELETE /pools/{id}", s.handleUnregisterPool(pl))
 		mux.HandleFunc("POST /sandboxes/lease", s.handleLeaseSandbox(pl))
+		mux.HandleFunc("POST /sandboxes/{id}/recycle", s.handleRecycleSandbox(pl))
 	}
 	if tl, ok := s.Lifecycle.(TemplateLifecycle); ok {
 		mux.HandleFunc("POST /templates", s.handleCreateTemplate(tl))
@@ -257,6 +259,38 @@ func (s *Server) handleLeaseSandbox(pl PoolLifecycle) http.HandlerFunc {
 				status = http.StatusBadRequest
 			case errors.Is(err, ErrPoolNotFound):
 				status = http.StatusNotFound
+			case errors.Is(err, ErrPoolExhausted):
+				status = http.StatusServiceUnavailable
+			}
+			writeError(w, status, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, CreateSandboxResponse{Sandbox: sb})
+	}
+}
+
+// handleRecycleSandbox serves `POST /sandboxes/{id}/recycle`. Tears
+// down the current leased sandbox and returns a fresh one from the
+// same pool. Error-status mapping mirrors handleLeaseSandbox so SDK
+// callers get a consistent experience across the lease and recycle
+// endpoints.
+func (s *Server) handleRecycleSandbox(pl PoolLifecycle) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if id == "" {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("missing sandbox id"))
+			return
+		}
+		sb, err := pl.RecycleLeased(r.Context(), id)
+		if err != nil {
+			status := http.StatusInternalServerError
+			switch {
+			case errors.Is(err, ErrSandboxNotFound), errors.Is(err, ErrPoolNotFound):
+				status = http.StatusNotFound
+			case errors.Is(err, ErrSandboxNotLeased):
+				status = http.StatusConflict
+			case errors.Is(err, ErrPoolExhausted):
+				status = http.StatusServiceUnavailable
 			}
 			writeError(w, status, err)
 			return

@@ -64,7 +64,16 @@ func (p *Proxy) ServeRequest(w http.ResponseWriter, r *http.Request, sandboxID s
 	}
 	dialCtx, cancel := context.WithTimeout(r.Context(), dialTO)
 	defer cancel()
-	guestConn, err := dialUDSConnect(dialCtx, udsPath, uint32(port))
+	// CRITICAL: the guest's HTTP server (Flask, Node, nginx, ...)
+	// listens on a TCP port inside the guest — NOT on a vsock port.
+	// Direct `CONNECT <port>` to the guest's vsock would hit no
+	// listener. Instead we route through the toolbox agent on
+	// vsock:10023 and use its `/proxy/http/{port}/...` reverse-proxy
+	// endpoint; the agent dials `127.0.0.1:<port>` inside the guest
+	// and forwards the request. This is the Firecracker + Modal-
+	// style preview transport: a single guest-side vsock listener
+	// fronts every user port.
+	guestConn, err := dialUDSConnect(dialCtx, udsPath, agentVsockPort)
 	if err != nil {
 		http.Error(w, "guest unreachable: "+err.Error(), http.StatusBadGateway)
 		return err
@@ -75,37 +84,25 @@ func (p *Proxy) ServeRequest(w http.ResponseWriter, r *http.Request, sandboxID s
 		_ = guestConn.SetDeadline(time.Now().Add(p.IdleTimeout))
 	}
 
-	// Rewrite the request URI to the path the guest sees: strip
-	// any leading /previews/{token} prefix the caller already
-	// consumed. The caller (slice 3 handler) sets r.URL.Path to the
-	// sub-path; we forward that as-is.
-	if err := writeRequestToGuest(guestConn, r); err != nil {
+	// Rewrite the inbound request onto the agent's /proxy/http/{port}/...
+	// surface. The agent strips the prefix and forwards the rest to
+	// the local TCP server.
+	if err := writeProxyRequestToAgent(guestConn, r, port); err != nil {
 		http.Error(w, "guest write failed: "+err.Error(), http.StatusBadGateway)
 		return err
 	}
 
-	// Hijack the inbound conn so we can stream the response in
-	// both directions (websocket / SSE / chunked). Fall through to
-	// plain copy when hijack isn't supported (httptest.ResponseRecorder
-	// in unit tests).
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		return copyResponseToResponseWriter(w, guestConn)
-	}
-	clientConn, brw, err := hj.Hijack()
-	if err != nil {
-		http.Error(w, "hijack: "+err.Error(), http.StatusInternalServerError)
-		return err
-	}
-	defer clientConn.Close()
-	// Drain anything bufio buffered on the client side into the
-	// guest (handles request bodies that arrived after the hijack).
-	if buffered := brw.Reader.Buffered(); buffered > 0 {
-		b, _ := brw.Reader.Peek(buffered)
-		_, _ = guestConn.Write(b)
-	}
-	return bidiCopy(clientConn, guestConn)
+	// Simple response pass-through. The agent speaks HTTP/1.0 with
+	// Connection: close, so reading a complete response is deterministic
+	// (Content-Length or EOF). No need to hijack: the agent doesn't
+	// support upgraded protocols on the preview path, and bidi-copy
+	// after a unidirectional HTTP response races the client-side close.
+	return copyResponseToResponseWriter(w, guestConn)
 }
+
+// agentVsockPort is the well-known toolbox agent vsock port.
+// Matches internal/toolbox/spec.VsockPort.
+const agentVsockPort = 10023
 
 // dialUDSConnect dials udsPath and performs the Firecracker-style
 // CONNECT handshake to reach guest port. Returns the bridged
@@ -140,14 +137,16 @@ func dialUDSConnect(ctx context.Context, udsPath string, port uint32) (net.Conn,
 	return conn, nil
 }
 
-// writeRequestToGuest re-emits the HTTP request on the guest conn.
-// Uses Go's stdlib http.Request.Write which is HTTP/1.1 compliant
-// and handles Host, Content-Length, transfer encodings, etc.
+// writeProxyRequestToAgent rewrites the inbound URL onto the
+// toolbox agent's reverse-proxy surface (/proxy/http/{port}/...) and
+// emits the resulting HTTP request on the vsock-bridged conn. The
+// agent then forwards to 127.0.0.1:{port} inside the guest.
 //
-// Strips Hop-by-hop headers per RFC 7230 §6.1. Connection: close is
-// added so the guest closes after the response — simpler than
-// keep-alive accounting at this layer.
-func writeRequestToGuest(w net.Conn, r *http.Request) error {
+// Strips hop-by-hop headers per RFC 7230 §6.1. Forces
+// Connection: close so the read side can detect EOF deterministically
+// (HTTP/1.0 semantics on the agent conn — the agent's
+// handleHTTPProxy issues Connection: close on its upstream too).
+func writeProxyRequestToAgent(w net.Conn, r *http.Request, guestPort uint16) error {
 	r2 := r.Clone(r.Context())
 	for _, h := range hopByHopHeaders {
 		r2.Header.Del(h)
@@ -158,8 +157,17 @@ func writeRequestToGuest(w net.Conn, r *http.Request) error {
 	if origHost := r.Host; origHost != "" {
 		r2.Header.Set("X-Forwarded-Host", origHost)
 	}
-	// http.Request.Write requires URL.Host to be empty (it would
-	// otherwise emit a proxy-style absolute URL).
+
+	// Map /some/path → /proxy/http/<port>/some/path. A bare "/"
+	// becomes "/proxy/http/<port>/".
+	origPath := r2.URL.Path
+	if origPath == "" {
+		origPath = "/"
+	}
+	trimmed := strings.TrimPrefix(origPath, "/")
+	newPath := fmt.Sprintf("/proxy/http/%d/%s", guestPort, trimmed)
+	r2.URL.Path = newPath
+	r2.RequestURI = "" // forces Write to regenerate from URL
 	r2.URL.Scheme = ""
 	r2.URL.Host = ""
 	return r2.Write(w)
