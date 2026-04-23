@@ -68,11 +68,24 @@ type CreateSandboxRequest struct {
 	KernelPath  string   `json:"kernel_path"`
 	MemMB       uint64   `json:"mem_mb,omitempty"`
 	CPUs        int      `json:"cpus,omitempty"`
+	Entrypoint  []string `json:"entrypoint,omitempty"`
 	Cmd         []string `json:"cmd,omitempty"`
 	Env         []string `json:"env,omitempty"`
 	WorkDir     string   `json:"workdir,omitempty"`
 	NetworkMode string   `json:"network_mode,omitempty"`
 	JailerMode  string   `json:"jailer_mode,omitempty"`
+
+	// Template, when set, names a registered template (e.g. "base-python",
+	// "base-node"). The SDK resolves the template's spec client-side and
+	// fills in Image/KernelPath/MemMB/CPUs if the caller left them zero.
+	// This is the field Daytona-style callers use:
+	//
+	//	c.CreateSandbox(ctx, gocracker.CreateSandboxRequest{Template: "base-python"})
+	//
+	// Not sent on the wire — the wire shape is the one sandboxd's
+	// CreateSandboxRequest expects (no template field). Resolution
+	// happens in Client.CreateSandbox before POSTing.
+	Template string `json:"-"`
 }
 
 // Sandbox mirrors sandboxd.Sandbox.
@@ -95,6 +108,16 @@ func (s *Sandbox) Delete(ctx context.Context) error {
 		return fmt.Errorf("sandbox has no client; call client.Delete(id) instead")
 	}
 	return s.client.Delete(ctx, s.ID)
+}
+
+// Recycle tears down this leased sandbox and returns a fresh one from
+// the same pool. The old handle (`s`) is dead after this call — use
+// the returned *Sandbox. Only works for lease-origin sandboxes.
+func (s *Sandbox) Recycle(ctx context.Context) (*Sandbox, error) {
+	if s.client == nil {
+		return nil, fmt.Errorf("sandbox has no client; call client.Recycle(ctx, id) instead")
+	}
+	return s.client.Recycle(ctx, s.ID)
 }
 
 // Toolbox returns a ToolboxClient bound to this sandbox's UDS.
@@ -201,12 +224,69 @@ func NewClient(baseURL string) *Client {
 // Sandbox lifecycle --------------------------------------------------
 
 func (c *Client) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*Sandbox, error) {
+	// Daytona-style template resolution: look up the named template
+	// and fill in the spec fields the caller didn't set. The template's
+	// snapshot is already in the warm cache so container.Run hits the
+	// restore fast path instead of cold-booting from scratch.
+	if req.Template != "" {
+		t, err := c.GetTemplate(ctx, req.Template)
+		if err != nil {
+			return nil, fmt.Errorf("%w: template %q: %v", ErrTemplateNotFound, req.Template, err)
+		}
+		if req.Image == "" {
+			req.Image = stringFromSpec(t.Spec, "image")
+		}
+		if req.KernelPath == "" {
+			req.KernelPath = stringFromSpec(t.Spec, "kernel_path")
+		}
+		if req.MemMB == 0 {
+			req.MemMB = uint64FromSpec(t.Spec, "mem_mb")
+		}
+		if req.CPUs == 0 {
+			req.CPUs = intFromSpec(t.Spec, "cpus")
+		}
+		req.Template = "" // never sent on the wire
+	}
 	var resp CreateSandboxResponse
 	if err := c.post(ctx, "/sandboxes", req, &resp); err != nil {
 		return nil, err
 	}
 	resp.Sandbox.client = c
 	return &resp.Sandbox, nil
+}
+
+// stringFromSpec / uint64FromSpec / intFromSpec are tiny helpers for
+// reading a field out of a template's Spec map (the SDK models the
+// template's Spec as map[string]interface{} for wire flexibility).
+func stringFromSpec(spec map[string]interface{}, key string) string {
+	if v, ok := spec[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func uint64FromSpec(spec map[string]interface{}, key string) uint64 {
+	switch v := spec[key].(type) {
+	case float64:
+		return uint64(v)
+	case uint64:
+		return v
+	case int:
+		return uint64(v)
+	}
+	return 0
+}
+
+func intFromSpec(spec map[string]interface{}, key string) int {
+	switch v := spec[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case uint64:
+		return int(v)
+	}
+	return 0
 }
 
 func (c *Client) ListSandboxes(ctx context.Context) ([]Sandbox, error) {
@@ -233,6 +313,25 @@ func (c *Client) GetSandbox(ctx context.Context, id string) (*Sandbox, error) {
 
 func (c *Client) Delete(ctx context.Context, id string) error {
 	return c.request(ctx, http.MethodDelete, "/sandboxes/"+id, nil, nil, []int{http.StatusNoContent})
+}
+
+// Recycle tears down a leased sandbox and returns a fresh one from the
+// same pool in a single HTTP round trip. The returned *Sandbox has a
+// new id; the old id is gone. Errors:
+//
+//   - ErrSandboxNotFound: id unknown or already deleted
+//   - ErrConflict: the sandbox was cold-booted, not leased (recycle
+//     only works for pool-origin sandboxes)
+//   - ErrPoolNotFound: the pool was unregistered between lease and
+//     recycle
+//   - ErrPoolExhausted: the pool's AcquireWait timed out (5 s)
+func (c *Client) Recycle(ctx context.Context, id string) (*Sandbox, error) {
+	var resp CreateSandboxResponse
+	if err := c.request(ctx, http.MethodPost, "/sandboxes/"+id+"/recycle", nil, &resp, []int{http.StatusCreated, http.StatusOK}); err != nil {
+		return nil, err
+	}
+	resp.Sandbox.client = c
+	return &resp.Sandbox, nil
 }
 
 // Pool lifecycle ---------------------------------------------------
