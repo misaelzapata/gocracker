@@ -124,7 +124,7 @@ func TestPreview_MintPost_Returns201WithToken(t *testing.T) {
 	if !strings.HasPrefix(got.URL, "/previews/") {
 		t.Errorf("URL=%q, want /previews/ prefix", got.URL)
 	}
-	if got.Subdomain != sbID+"--3000.sbx.localhost" {
+	if got.Subdomain != sbID+".sbx.localhost" {
 		t.Errorf("Subdomain=%q", got.Subdomain)
 	}
 	if got.ExpiresAt.Before(time.Now()) {
@@ -253,7 +253,7 @@ func TestPreview_SubdomainRoute_CookieAuth(t *testing.T) {
 func TestPreview_SubdomainRoute_NoCredentials_401(t *testing.T) {
 	srv, _, sbID := setupPreview(t, guestHTTPHandler(200, "wont-see"))
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
-	req.Host = sbID + "--3000.sbx.localhost"
+	req.Host = sbID + ".sbx.localhost"
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET: %v", err)
@@ -274,9 +274,9 @@ func TestPreview_SubdomainRoute_WrongSandboxID_403(t *testing.T) {
 	_ = mgr.Store.Add(&Sandbox{ID: otherID, State: StateReady, UDSPath: "/nonexistent/sock"})
 	otherMint, _ := mgr.MintPreview(otherID, 9999)
 
-	// Hit "sb-preview-x--3000.sbx.localhost" with otherMint.Token.
+	// Hit "sb-preview-x.sbx.localhost" with otherMint.Token.
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
-	req.Host = "sb-preview-x--3000.sbx.localhost"
+	req.Host = "sb-preview-x.sbx.localhost"
 	req.AddCookie(&http.Cookie{Name: previewCookieName, Value: otherMint.Token})
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -304,26 +304,24 @@ func TestPreview_NonPreviewHostFallsThrough(t *testing.T) {
 
 func TestParsePreviewHost(t *testing.T) {
 	cases := []struct {
-		host    string
-		root    string
-		wantID  string
-		wantPrt uint16
-		ok      bool
+		host   string
+		root   string
+		wantID string
+		ok     bool
 	}{
-		{"sb-abc--3000.sbx.localhost", "sbx.localhost", "sb-abc", 3000, true},
-		{"sb-abc--3000.sbx.localhost:9091", "sbx.localhost", "sb-abc", 3000, true},
-		{"sb-abc.sbx.localhost", "sbx.localhost", "", 0, false},
-		{"sb-abc--0.sbx.localhost", "sbx.localhost", "", 0, false},
-		{"--3000.sbx.localhost", "sbx.localhost", "", 0, false},
-		{"sb-abc--notanum.sbx.localhost", "sbx.localhost", "", 0, false},
-		{"sb-abc--3000.other.com", "sbx.localhost", "", 0, false},
+		{"sb-abc.sbx.localhost", "sbx.localhost", "sb-abc", true},
+		{"sb-abc.sbx.localhost:9091", "sbx.localhost", "sb-abc", true},
+		{"sbx.localhost", "sbx.localhost", "", false},                  // no subdomain label
+		{"foo.bar.sbx.localhost", "sbx.localhost", "", false},          // nested subdomain
+		{"sb-abc.other.com", "sbx.localhost", "", false},
+		{".sbx.localhost", "sbx.localhost", "", false},                 // empty label
 	}
 	for _, tc := range cases {
 		t.Run(tc.host, func(t *testing.T) {
-			id, port, ok := parsePreviewHost(tc.host, tc.root)
-			if ok != tc.ok || id != tc.wantID || port != tc.wantPrt {
-				t.Errorf("parsePreviewHost(%q) = (%q, %d, %v), want (%q, %d, %v)",
-					tc.host, id, port, ok, tc.wantID, tc.wantPrt, tc.ok)
+			id, ok := parsePreviewHost(tc.host, tc.root)
+			if ok != tc.ok || id != tc.wantID {
+				t.Errorf("parsePreviewHost(%q) = (%q, %v), want (%q, %v)",
+					tc.host, id, ok, tc.wantID, tc.ok)
 			}
 		})
 	}
