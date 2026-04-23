@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	gclog "github.com/gocracker/gocracker/internal/log"
 	"github.com/gocracker/gocracker/pkg/container"
 	"github.com/gocracker/gocracker/pkg/vmm"
 )
@@ -20,11 +21,18 @@ import (
 // Result.VM which satisfies Resumer via vmm.Handle's Resume());
 // Stater is what the reaper polls to detect dead VMs.
 //
+// GuestIP is the IP the guest was booted with (via hostnet.NewAuto on
+// cold-boot, or reIPGuest on warm-cache restore). Populated here so the
+// lease path can return it without a second network-config round-trip
+// to the guest — the VM is already reachable at this IP. Empty when the
+// booter didn't configure network.
+//
 // Tests can leave Result=nil and still exercise the lease path by
 // providing Resumer — teardown just skips when result is nil.
 type BootResult struct {
 	Result  *container.RunResult
 	UDSPath string
+	GuestIP string
 	Resumer Resumer
 	Stater  Stater
 }
@@ -112,6 +120,7 @@ func (b containerBooter) Boot(ctx context.Context) (*BootResult, error) {
 	return &BootResult{
 		Result:  result,
 		UDSPath: hostUDS,
+		GuestIP: result.GuestIP,
 		Resumer: result.VM,
 		Stater:  vmHandleStater{h: result.VM},
 	}, nil
@@ -454,14 +463,28 @@ func (p *Pool) runCreate(ctx context.Context, booter Booter, isHot bool) {
 		p.globalBudget.releaseLocked(1)
 	}
 	if err != nil {
+		// Clean shutdown (Stop() canceled p.ctx mid-boot) is not a
+		// failure — don't bump consecutiveFailures, don't trip cooldown,
+		// don't WARN-spam the log on every UnregisterPool. These show up
+		// as ctx.Err() bubbled out of containerBooter.Boot.
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		p.consecutiveFailures++
 		p.lastBootError = err
 		if p.consecutiveFailures >= p.cfg.ConsecutiveFailureThreshold {
 			p.cooldownUntil = time.Now().Add(p.cfg.Cooldown)
 		}
 		metricBootFailures.Add(1)
+		gclog.VMM.Warn("pool boot failed", "hot", isHot, "err", err.Error(), "consecutive", p.consecutiveFailures)
 		return
 	}
+	gclog.VMM.Info("pool boot ok", "hot", isHot, "id", func() string {
+		if bootResult != nil && bootResult.Result != nil {
+			return bootResult.Result.ID
+		}
+		return "?"
+	}())
 	// Boot raced shutdown: tear the VM back down instead of parking
 	// it in the map where no one will Release it.
 	if ctx.Err() != nil {
@@ -496,6 +519,7 @@ func (p *Pool) runCreate(ctx context.Context, booter Booter, isHot bool) {
 		State:     state,
 		CreatedAt: time.Now(),
 		UDSPath:   bootResult.UDSPath,
+		GuestIP:   bootResult.GuestIP,
 		result:    bootResult.Result,
 		resumer:   bootResult.Resumer,
 		stater:    bootResult.Stater,

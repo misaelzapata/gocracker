@@ -120,7 +120,10 @@ func (m *Manager) MintPreview(id string, port uint16) (MintPreviewResponse, erro
 	return MintPreviewResponse{
 		Token:     tok,
 		URL:       "/previews/" + tok + "/",
-		Subdomain: fmt.Sprintf("%s--%d.%s", id, port, pm.previewHost),
+		// Subdomain is just <sandbox-id>.<root>. The target port lives
+		// in the signed token; a single subdomain can front multiple
+		// ports if the caller mints separate tokens for each.
+		Subdomain: fmt.Sprintf("%s.%s", id, pm.previewHost),
 		ExpiresAt: expires,
 	}, nil
 }
@@ -165,26 +168,28 @@ func (m *Manager) ServePreview(w http.ResponseWriter, r *http.Request) {
 	_ = pm.proxy.ServeRequest(w, r2, payload.SandboxID, payload.Port)
 }
 
-// ServePreviewHost is the subdomain entry point. Called from the
-// top-level mux (slice 4 middleware) when r.Host matches the
-// preview-host pattern <id>--<port>.<previewHost>. Falls through to
-// cookie-based auth: the first legitimate request carries
-// ?token=<tok> which we verify, mint a sbx_t cookie, and redirect
-// onto the same URL without the query. Subsequent requests with
-// the cookie skip the token param.
+// ServePreviewHost is the subdomain entry point. Host shape is
+// <sandbox-id>.<previewHost>; the port lives in the signed token,
+// not the DNS label, so end-user URLs stay short (<id>.sbx.localhost
+// vs <id>--<port>.sbx.localhost). One token = one (sandbox, port)
+// pair.
+//
+// First hit carries ?token=<tok> → verify → Set-Cookie: sbx_t →
+// 303 redirect to same URL sans ?token. Subsequent hits use the
+// cookie.
 //
 // Rejections:
 //   - host doesn't parse → 400
-//   - host port/id doesn't match cookie + no ?token → 401
-//   - cookie token's sandbox_id != host's sandbox_id → 403
-//   - verify fails → 401 (indistinguishable)
+//   - no cookie and no ?token → 401
+//   - invalid/expired token or cookie → 401 (indistinguishable)
+//   - token's sandbox_id mismatches the subdomain → 403
 func (m *Manager) ServePreviewHost(w http.ResponseWriter, r *http.Request) {
 	pm, err := m.ensurePreviewManager()
 	if err != nil {
 		http.Error(w, ErrPreviewDisabled.Error(), http.StatusNotImplemented)
 		return
 	}
-	id, port, ok := parsePreviewHost(r.Host, pm.previewHost)
+	id, ok := parsePreviewHost(r.Host, pm.previewHost)
 	if !ok {
 		http.Error(w, "invalid preview host", http.StatusBadRequest)
 		return
@@ -197,16 +202,10 @@ func (m *Manager) ServePreviewHost(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid token", http.StatusUnauthorized)
 			return
 		}
-		if payload.SandboxID != id || payload.Port != port {
-			// Token is valid but for a different sandbox/port —
-			// explicit 403 here (not 401) because the caller's
-			// credential is genuine, they just pointed it at the
-			// wrong subdomain.
+		if payload.SandboxID != id {
 			http.Error(w, "token mismatches subdomain", http.StatusForbidden)
 			return
 		}
-		// Set the cookie, redirect to the same URL without ?token
-		// so the token doesn't leak into logs / browser history.
 		http.SetCookie(w, &http.Cookie{
 			Name:     previewCookieName,
 			Value:    qtok,
@@ -223,7 +222,6 @@ func (m *Manager) ServePreviewHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cookie-based auth (subsequent requests).
 	cookie, err := r.Cookie(previewCookieName)
 	if err != nil || cookie.Value == "" {
 		http.Error(w, "missing preview credentials", http.StatusUnauthorized)
@@ -234,7 +232,7 @@ func (m *Manager) ServePreviewHost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
 	}
-	if payload.SandboxID != id || payload.Port != port {
+	if payload.SandboxID != id {
 		http.Error(w, "cookie mismatches subdomain", http.StatusForbidden)
 		return
 	}
@@ -242,46 +240,42 @@ func (m *Manager) ServePreviewHost(w http.ResponseWriter, r *http.Request) {
 }
 
 // IsPreviewHost reports whether r.Host matches the preview-host
-// shape (<id>--<port>.<previewHost>). Used by the top-level mux
-// to decide whether to route the request to ServePreviewHost vs
-// the normal control-plane.
+// shape (<id>.<previewHost>). Used by the top-level mux to route
+// to ServePreviewHost vs the normal control-plane.
 func (m *Manager) IsPreviewHost(host string) bool {
 	pm, err := m.ensurePreviewManager()
 	if err != nil || pm == nil {
 		return false
 	}
-	_, _, ok := parsePreviewHost(host, pm.previewHost)
+	_, ok := parsePreviewHost(host, pm.previewHost)
 	return ok
 }
 
 // parsePreviewHost validates the Host header shape and extracts the
-// sandbox id + port. Expected shape: "<sandbox-id>--<port>.<root>"
-// (e.g. "sb-abc123--3000.sbx.localhost"). Ignores any ":port" suffix
-// on the host header (the client's sandboxd port, not the guest's).
-func parsePreviewHost(host, root string) (string, uint16, bool) {
-	// Strip optional :port on Host (browsers send it for non-standard
-	// sandboxd ports).
+// sandbox id. Expected shape: "<sandbox-id>.<root>" (e.g.
+// "sb-abc123.sbx.localhost"). The target port lives in the signed
+// token, not the hostname — keeps URLs short and lets one subdomain
+// front any number of ports the user has minted tokens for.
+//
+// Ignores any ":port" suffix on the Host header (that's the
+// client→sandboxd port, not the guest's port).
+func parsePreviewHost(host, root string) (string, bool) {
 	if idx := strings.LastIndexByte(host, ':'); idx > 0 {
 		host = host[:idx]
 	}
 	if !strings.HasSuffix(host, "."+root) {
-		return "", 0, false
+		return "", false
 	}
-	prefix := strings.TrimSuffix(host, "."+root)
-	sep := strings.LastIndex(prefix, "--")
-	if sep < 0 {
-		return "", 0, false
+	id := strings.TrimSuffix(host, "."+root)
+	if id == "" {
+		return "", false
 	}
-	id := prefix[:sep]
-	portStr := prefix[sep+2:]
-	if id == "" || portStr == "" {
-		return "", 0, false
+	// Reject nested subdomains (e.g. "foo.bar.sbx.localhost") — we
+	// only accept one label in front of the root.
+	if strings.Contains(id, ".") {
+		return "", false
 	}
-	n, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil || n == 0 {
-		return "", 0, false
-	}
-	return id, uint16(n), true
+	return id, true
 }
 
 const previewCookieName = "sbx_t"

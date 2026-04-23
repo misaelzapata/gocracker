@@ -18,3 +18,17 @@ artifacts/kernels/host-*
 __pycache__/
 2026-*.txt
 gocracker-bottleneck.md
+
+# Build artifacts / local binaries (none of these belong in git)
+/gocracker-sandboxd
+/gocracker-sweep
+/bench-rtt
+/pool-bench
+/template-bench
+/bin/
+/sandboxes/bin/
+/sandboxes/artifacts/
+/sandboxes/sdk/python/src/
+
+# Local Claude / agent scratch
+.claude/

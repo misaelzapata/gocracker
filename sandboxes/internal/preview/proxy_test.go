@@ -175,8 +175,12 @@ func TestProxy_ForwardsRequestPathAndMethod(t *testing.T) {
 	if seen.Method != http.MethodPost {
 		t.Errorf("guest saw method=%q, want POST", seen.Method)
 	}
-	if seen.URL.Path != "/api/v1/foo" {
-		t.Errorf("guest saw path=%q, want /api/v1/foo", seen.URL.Path)
+	// Proxy routes via toolbox agent's /proxy/http/{port}/... surface,
+	// NOT direct to the guest TCP service (which wouldn't have a vsock
+	// listener). Agent then strips /proxy/http/{port} and forwards to
+	// 127.0.0.1:{port}{subPath}.
+	if seen.URL.Path != "/proxy/http/8080/api/v1/foo" {
+		t.Errorf("guest saw path=%q, want /proxy/http/8080/api/v1/foo", seen.URL.Path)
 	}
 	if seen.URL.RawQuery != "q=bar" {
 		t.Errorf("guest saw query=%q, want q=bar", seen.URL.RawQuery)

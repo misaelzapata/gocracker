@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# bench-node-tti.sh — reproduce the ComputeSDK-style Time-to-Interactive
-# benchmark (https://www.computesdk.com/benchmarks/) on top of gocracker.
+# bench-node-tti.sh — Time-to-Interactive benchmark for gocracker.
 #
-# ComputeSDK times `await compute.sandbox.create()` + `await sandbox.runCommand("node -v")`
-# until the first successful stdout byte, against a pre-built sandbox image.
-# We mirror that here with `gocracker run --dockerfile ... --wait` pointed
-# at a tiny node:20-alpine image whose CMD is `node -v`, and a warm artifact
-# cache (the image is built on the first iteration and reused after).
+# Times `gocracker run --dockerfile ... --wait` pointed at a tiny
+# node:20-alpine image whose CMD is `node -v`, from process start to
+# the first stdout byte. Uses a warm artifact cache so the image is
+# built on the first iteration and reused after.
 #
 # Usage:
 #   ./tools/bench-node-tti.sh [ITERATIONS]          # default: 10 timed runs
@@ -43,8 +41,8 @@ if [[ -n "$TTI_PIN_CPUS" ]] && command -v taskset >/dev/null 2>&1; then
     fi
 fi
 
-# Dockerfile is the same sandbox shape computesdk's leaderboard assumes:
-# a node runtime already installed, booted, first stdout is the version.
+# Tiny sandbox shape: a node runtime already installed, booted, first
+# stdout is the version.
 mkdir -p "$WORKDIR"
 cat > "$WORKDIR/Dockerfile" <<'EOF'
 FROM node:20-alpine
@@ -53,8 +51,7 @@ EOF
 
 # Warm the cache: pulls node:20-alpine, extracts layers, builds the ext4
 # disk image. Subsequent iterations hit this cache and only pay VMM + VM
-# boot + node -v stdout, which is what ComputeSDK actually measures (their
-# providers also have pre-built sandbox images).
+# boot + node -v stdout.
 echo "warming artifact cache (first pull may take ~10-30s)..."
 sudo "${PIN_WRAPPER[@]}" "$GC_BIN" run \
     -dockerfile "$WORKDIR/Dockerfile" \

@@ -59,6 +59,8 @@ func cmdServe(args []string) {
 	previewKeyEnv := fs.String("preview-key-env", "GOCRACKER_PREVIEW_KEY", "Env var holding the preview-token HMAC key (≥32 bytes). Empty env = auto-gen a random key (tokens expire at sandboxd restart).")
 	previewTTL := fs.Duration("preview-ttl", 1*time.Hour, "Default TTL for minted preview tokens")
 	previewHost := fs.String("preview-host", "sbx.localhost", "DNS root for preview subdomains (<id>--<port>.<preview-host>)")
+	kernelPath := fs.String("kernel-path", "", "Path to the guest kernel. Used to auto-register base templates at startup. Defaults to $GOCRACKER_KERNEL.")
+	autoBaseTemplates := fs.Bool("auto-base-templates", true, "Build the canonical base-python / base-node / base-bun / base-go templates at startup (requires -kernel-path).")
 	fs.Parse(args)
 
 	if err := os.MkdirAll(*stateDir, 0o755); err != nil {
@@ -118,9 +120,22 @@ func cmdServe(args []string) {
 	if len(previewKey) > 0 {
 		previewKeySource = "env " + *previewKeyEnv
 	}
+	resolvedKernel := *kernelPath
+	if resolvedKernel == "" {
+		resolvedKernel = sandboxd.BaseTemplateKernelPathFromEnv()
+	}
 	fmt.Printf("gocracker-sandboxd: listening on %s state=%s vmm=%s jailer=%s\n",
 		*addr, *stateDir, resolvedVMM, resolvedJailer)
 	fmt.Printf("  preview: host=%s ttl=%s key=%s\n", *previewHost, previewTTL.String(), previewKeySource)
+	if *autoBaseTemplates && resolvedKernel != "" {
+		fmt.Printf("  base templates: ensuring base-python / base-node / base-bun / base-go (kernel=%s)\n", resolvedKernel)
+		// Fire-and-forget: HTTP listener comes up immediately, template
+		// builds run in the background. First base-template lease sees
+		// a warm cache once this finishes.
+		go mgr.EnsureBaseTemplates(context.Background(), resolvedKernel, nil)
+	} else if *autoBaseTemplates {
+		fmt.Printf("  base templates: skipped (no kernel configured — set -kernel-path or GOCRACKER_KERNEL to enable)\n")
+	}
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintln(os.Stderr, "serve:", err)
 		os.Exit(1)

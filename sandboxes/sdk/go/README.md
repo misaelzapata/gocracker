@@ -1,7 +1,13 @@
 # gocracker Go SDK
 
-Stdlib-only client for the gocracker sandboxd HTTP control plane +
-the in-guest toolbox agent over UDS. No third-party dependencies.
+Zero-external-dep Go client for the sandboxd HTTP control plane + the
+in-guest toolbox agent over UDS + CONNECT. Stdlib only (`net/http`,
+`net`, `encoding/json`).
+
+Warm-lease latency (measured 2026-04-22 on x86, pool of 8):
+
+- `CreateSandbox(Template=base-python)` p95 = **1.5 ms**
+- full `Create → Process.Exec("echo") → Delete` p95 = **~35 ms**
 
 ## Install
 
@@ -11,47 +17,101 @@ import gocracker "github.com/gocracker/gocracker/sandboxes/sdk/go"
 
 ## Quick start
 
+Start `gocracker-sandboxd` with `-kernel-path` (or `GOCRACKER_KERNEL`
+in env) so `base-python / base-node / base-bun / base-go` auto-register.
+Then:
+
 ```go
-ctx := context.Background()
-client := gocracker.NewClient("http://127.0.0.1:9091")
+package main
 
-sb, err := client.CreateSandbox(ctx, gocracker.CreateSandboxRequest{
+import (
+    "context"
+    "fmt"
+    gocracker "github.com/gocracker/gocracker/sandboxes/sdk/go"
+)
+
+func main() {
+    ctx := context.Background()
+    c := gocracker.NewClient("http://127.0.0.1:9091")
+
+    sb, err := c.CreateSandbox(ctx, gocracker.CreateSandboxRequest{
+        Template: "base-python",
+    })
+    if err != nil { panic(err) }
+    defer sb.Delete(ctx)
+
+    res, err := sb.Process().Exec(ctx, `python3 -c "print(2+2)"`)
+    if err != nil { panic(err) }
+    fmt.Println(string(res.Stdout)) // "4\n"
+
+    if err := sb.FS().WriteFile(ctx, "/tmp/hi.txt", []byte("hello")); err != nil { panic(err) }
+    data, _ := sb.FS().ReadFile(ctx, "/tmp/hi.txt")
+    fmt.Println(string(data))
+
+    url, _ := sb.PreviewURL(ctx, 8080)
+    fmt.Println(url)
+}
+```
+
+Low-level / escape hatch — `sb.Toolbox()` returns the flat
+`ToolboxClient` (same methods v3 originally exposed):
+
+```go
+sb, _ := c.CreateSandbox(ctx, gocracker.CreateSandboxRequest{
     Image:      "alpine:3.20",
-    KernelPath: "/abs/path/to/vmlinux",
+    KernelPath: "/abs/vmlinux",
 })
-if err != nil { log.Fatal(err) }
-defer sb.Delete(ctx)
-
-result, err := sb.Toolbox().Exec(ctx, []string{"echo", "hello"})
-if err != nil { log.Fatal(err) }
-fmt.Println(string(result.Stdout))  // "hello\n"
+sb.Toolbox().Exec(ctx, []string{"echo", "hi"})
 ```
 
 ## Surface
 
-Mirrors Python + JS SDKs. Same endpoint + error shape.
+### Client
 
-**Control plane** (`client.`):
-- `CreateSandbox` / `ListSandboxes` / `GetSandbox` / `Delete`
-- `RegisterPool` / `ListPools` / `UnregisterPool` / `LeaseSandbox`
-- `CreateTemplate` / `ListTemplates` / `GetTemplate` / `DeleteTemplate`
-- `MintPreview`
-- `Healthz`
+| Method | What |
+|---|---|
+| `CreateSandbox(ctx, req)` with `Template: "base-python"` | Warm-restore from registered template. |
+| `CreateSandbox(ctx, req)` with `Image`+`KernelPath` | Cold-boot. |
+| `LeaseSandbox(ctx, req)` | Warm lease (<5 ms) from a pool. |
+| `ListSandboxes / GetSandbox / Delete` | Inventory + teardown. |
+| `RegisterPool / ListPools / UnregisterPool` | Warm pool. |
+| `CreateTemplate / ListTemplates / GetTemplate / DeleteTemplate` | Template lifecycle. |
+| `MintPreview(ctx, id, port)` | Raw signed URL (prefer `sb.PreviewURL`). |
 
-**Toolbox** (`sb.Toolbox()`):
-- `Health` · `Exec` · `ExecStream` (returns a channel of Frames)
-- `ListFiles` · `Download` · `Upload` · `DeleteFile`
-- `Mkdir` · `Rename` · `Chmod`
-- `GitClone` · `GitStatus`
-- `SetSecret` · `ListSecrets` · `DeleteSecret`
+### `Sandbox`
 
-**Errors**: concrete type `*Error` with `.Status` and `.Body`;
-sentinel values for `errors.Is` matching:
+| Method | What |
+|---|---|
+| `sb.Process().Exec(ctx, cmd)` | `cmd` may be `string` or `[]string`; non-zero exit → `*ProcessExitError`. |
+| `sb.Process().ExecStream(ctx, cmd)` / `.Start(ctx, cmd)` | Frame channel. |
+| `sb.FS().WriteFile / ReadFile / ListDir / Remove / Mkdir / Chmod / Rename` | Canonical file ops. |
+| `sb.PreviewURL(ctx, port)` | Absolute signed URL. |
+| `sb.Delete(ctx)` | Async teardown. |
+| `sb.Toolbox()` | Flat low-level client (escape hatch). |
+
+### Typed errors
 
 ```go
-_, err := client.GetTemplate(ctx, "missing")
-if errors.Is(err, gocracker.ErrTemplateNotFound) { ... }
+Error                 // base, carries HTTP Status + Body
+ErrSandboxNotFound    // 404
+ErrInvalidRequest     // 400
+ErrConflict           // 409
+ErrTemplateNotFound   // CreateSandbox(Template=X) where X is unknown
+ErrPoolNotFound       // lease against unregistered pool
+ErrPoolExhausted      // pool drained
+ErrRuntimeUnreachable // sandboxd can't reach gocracker runtime
+ErrSandboxTimeout     // operation deadline exceeded
+*ProcessExitError     // carries .ExitCode + .Stdout + .Stderr
 ```
 
-Sentinels: `ErrSandboxNotFound`, `ErrTemplateNotFound`,
-`ErrPoolNotFound`, `ErrInvalidRequest`, `ErrConflict`.
+Use `errors.Is(err, gocracker.ErrTemplateNotFound)` to branch.
+
+## SDK parity
+
+- Python: `sandboxes/sdk/python/`
+- JS/Node: `sandboxes/sdk/js/`
+
+Same surface (`template=`, `.process`, `.fs`, `preview_url`, typed
+errors). Different language idioms: Go uses `defer sb.Delete(ctx)`
+where Python/JS use context managers, and methods are functions
+rather than properties.

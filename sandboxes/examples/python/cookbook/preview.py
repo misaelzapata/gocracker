@@ -13,10 +13,7 @@ from __future__ import annotations
 import sys
 import time
 import urllib.request
-from pathlib import Path
-
-repo_root = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(repo_root / "sdk" / "python"))
+from _common import resolve_kernel, sandboxd_url
 
 from gocracker import Client  # noqa: E402
 
@@ -37,8 +34,8 @@ HTTPServer(("0.0.0.0", 8080), H).serve_forever()
 
 
 def main() -> int:
-    kernel = sys.argv[1] if len(sys.argv) > 1 else "/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-standard-vmlinux"
-    client = Client("http://127.0.0.1:9091")
+    kernel = resolve_kernel()
+    client = Client(sandboxd_url())
 
     sb = client.create_sandbox(image="python:3.12-alpine", kernel_path=kernel)
     print(f"sandbox id={sb.id}")
@@ -50,7 +47,10 @@ def main() -> int:
         # so we fire and forget via /bin/sh -c '... &' + tiny sleep to
         # give the server time to bind.
         print("starting guest HTTP server on :8080...")
-        tb.exec(["/bin/sh", "-c", f"({GUEST_SERVER_SCRIPT}) &"], timeout=5.0)
+        tb.exec(
+            ["/bin/sh", "-c", f"({GUEST_SERVER_SCRIPT}) >/dev/null 2>&1 </dev/null &"],
+            timeout=5.0,
+        )
         time.sleep(2)
 
         # Mint the preview URL.
@@ -60,7 +60,7 @@ def main() -> int:
         print(f"expires:     {preview.expires_at}")
 
         # Fetch via the path-based URL.
-        full_url = "http://127.0.0.1:9091" + preview.url
+        full_url = sandboxd_url() + preview.url
         with urllib.request.urlopen(full_url, timeout=5.0) as resp:
             body = resp.read()
         print(f"GET {full_url} → {resp.status} {body!r}")

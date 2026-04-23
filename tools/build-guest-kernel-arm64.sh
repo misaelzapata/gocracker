@@ -17,12 +17,12 @@ ARTIFACT_KERNELS_DIR="$ROOT_DIR/artifacts/kernels"
 ARTIFACT_BUILD_DIR="$ROOT_DIR/artifacts/kernel-build"
 ARTIFACT_SOURCE_DIR="$ROOT_DIR/artifacts/linux-src"
 ARTIFACT_ARCHIVE_DIR="$ROOT_DIR/artifacts/linux-archives"
-ARM64_FRAGMENT="$TOOLS_DIR/guest-common-arm64.fragment"
 
+PROFILE="standard"
 SOURCE_DIR=""
 BASE_CONFIG=""
 JOBS="$(nproc)"
-KERNEL_NAME="gocracker-guest-standard-arm64"
+KERNEL_NAME=""
 BUILD_DIR=""
 CROSS_COMPILE=""
 
@@ -32,17 +32,25 @@ Usage:
   tools/build-guest-kernel-arm64.sh [options]
 
 Options:
+  --profile standard|minimal
+                          Guest kernel profile (default: standard)
+                          standard: full Ubuntu AWS arm64 base + common fragment
+                          minimal:  saved minimal arm64 config + minimal fragment
+                                    (~5 MB Image vs ~55 MB standard)
   --source-dir PATH       Linux source tree to build from
-  --base-config PATH      Base .config (default: /boot/config-$(uname -r))
+  --base-config PATH      Base .config override (default: profile-specific)
   --build-dir PATH        Out-of-tree build directory
-  --name NAME             Artifact basename (default: gocracker-guest-standard-arm64)
+  --name NAME             Artifact basename (default: gocracker-guest-<profile>-arm64)
   --cross-compile PREFIX  Cross-compiler prefix (e.g. aarch64-linux-gnu-)
   -j, --jobs N            Parallel jobs (default: nproc)
   -h, --help              Show help
 
 Examples:
-  # On ARM64 host (a1.metal, Graviton):
+  # Standard build on ARM64 host (a1.metal, Graviton):
   ./tools/build-guest-kernel-arm64.sh
+
+  # Minimal build (smaller Image, faster cold boot):
+  ./tools/build-guest-kernel-arm64.sh --profile minimal
 
   # Cross-compile from x86:
   ./tools/build-guest-kernel-arm64.sh --cross-compile aarch64-linux-gnu-
@@ -56,6 +64,7 @@ fail() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --profile)      PROFILE="${2:-}"; shift 2 ;;
     --source-dir)   SOURCE_DIR="${2:-}"; shift 2 ;;
     --base-config)  BASE_CONFIG="${2:-}"; shift 2 ;;
     --build-dir)    BUILD_DIR="${2:-}"; shift 2 ;;
@@ -66,6 +75,27 @@ while [[ $# -gt 0 ]]; do
     *)              fail "unknown argument: $1" ;;
   esac
 done
+
+case "$PROFILE" in
+  standard)
+    ARM64_FRAGMENT="$TOOLS_DIR/guest-common-arm64.fragment"
+    ;;
+  minimal)
+    ARM64_FRAGMENT="$TOOLS_DIR/guest-minimal-arm64.fragment"
+    # For minimal we default the base to the saved minimal config so the
+    # trim survives across builds. User can still override with --base-config.
+    if [[ -z "$BASE_CONFIG" ]]; then
+      BASE_CONFIG="$ARTIFACT_KERNELS_DIR/gocracker-guest-minimal-arm64.config"
+    fi
+    ;;
+  *)
+    fail "invalid --profile '$PROFILE' (expected standard or minimal)"
+    ;;
+esac
+
+if [[ -z "$KERNEL_NAME" ]]; then
+  KERNEL_NAME="gocracker-guest-${PROFILE}-arm64"
+fi
 
 [[ -f "$ARM64_FRAGMENT" ]] || fail "missing ARM64 fragment: $ARM64_FRAGMENT"
 
@@ -167,7 +197,7 @@ fi
 [[ -f "$SOURCE_DIR/Makefile" ]] || fail "missing Makefile in source dir: $SOURCE_DIR"
 
 if [[ -z "$BUILD_DIR" ]]; then
-  BUILD_DIR="$ARTIFACT_BUILD_DIR/arm64-standard"
+  BUILD_DIR="$ARTIFACT_BUILD_DIR/arm64-${PROFILE}"
 fi
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
