@@ -303,6 +303,12 @@ class ToolboxClient:
         if not line.startswith(b"OK"):
             s.close()
             raise ToolboxError(f"CONNECT rejected: {line.strip()!r}")
+        # dial_timeout only bounds the handshake; long-running operations
+        # (git clone, large uploads) set their own deadline via the
+        # per-call timeout or exec_stream. Leaving a 5s read timeout here
+        # truncates any request that waits longer than 5s for its
+        # response body.
+        s.settimeout(None)
         return s
 
     def _request(
