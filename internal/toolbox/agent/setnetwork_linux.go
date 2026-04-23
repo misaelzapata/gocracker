@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 )
 
 // handleSetNetwork applies a host-supplied IP/MAC/gateway to the
@@ -65,39 +64,50 @@ func handleSetNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Only touch the MAC if it actually differs — the snapshot-restored
+	// MAC usually matches the requested one (both come from the same
+	// host allocator), and LinkSetDown+SetHardwareAddr+LinkSetUp is the
+	// most expensive triplet in this handler (~3-5ms of netlink RTT
+	// each). Skipping when MAC is already correct brings the warm-lease
+	// SetNetwork down to 2 netlink ops: AddrReplace + RouteReplace.
 	if req.MAC != "" {
 		mac, err := net.ParseMAC(req.MAC)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("setnetwork: parse mac %q: %w", req.MAC, err))
 			return
 		}
-		if err := netlink.LinkSetDown(link); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: link down: %w", err))
+		if link.Attrs().HardwareAddr.String() != mac.String() {
+			if err := netlink.LinkSetDown(link); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: link down: %w", err))
+				return
+			}
+			if err := netlink.LinkSetHardwareAddr(link, mac); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: set mac: %w", err))
+				return
+			}
+			if err := netlink.LinkSetUp(link); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: link up: %w", err))
+				return
+			}
+		} else if link.Attrs().Flags&net.FlagUp == 0 {
+			// MAC matches but interface is down — bring it up without the
+			// down/up dance.
+			if err := netlink.LinkSetUp(link); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: link up: %w", err))
+				return
+			}
+		}
+	} else if link.Attrs().Flags&net.FlagUp == 0 {
+		if err := netlink.LinkSetUp(link); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: link up: %w", err))
 			return
 		}
-		if err := netlink.LinkSetHardwareAddr(link, mac); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: set mac: %w", err))
-			return
-		}
 	}
-
-	if err := netlink.LinkSetUp(link); err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: link up: %w", err))
-		return
-	}
-	// Flush IPv4 addresses before adding the new one so back-to-back
-	// SetNetwork calls don't accumulate stale IPs (the snapshot-restore
-	// case is the canonical example: every restore brings back the
-	// original IP + we layer the new lease on top, polluting routing).
-	// Family 0 = ALL, but we only flush v4 here — IPv6 link-local is
-	// kernel-managed and will be re-derived from the MAC anyway.
-	if existing, err := netlink.AddrList(link, unix.AF_INET); err == nil {
-		for _, a := range existing {
-			_ = netlink.AddrDel(link, &a)
-		}
-	}
-	if err := netlink.AddrAdd(link, addr); err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: addr add: %w", err))
+	// AddrReplace is a single-syscall atomic "replace or add". Cheaper
+	// than AddrList+AddrDel loop + AddrAdd, and it handles the
+	// snapshot-restore case (stale IP layered with new one) in one op.
+	if err := netlink.AddrReplace(link, addr); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: addr replace: %w", err))
 		return
 	}
 
