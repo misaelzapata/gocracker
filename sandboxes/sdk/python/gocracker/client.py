@@ -70,6 +70,19 @@ class Sandbox:
             raise RuntimeError("Sandbox has no client; call client.delete(id) instead")
         self._client.delete(self.id)
 
+    def recycle(self) -> "Sandbox":
+        """Recycle this leased sandbox: teardown the current VM and
+        return a fresh one from the same pool. The old handle (self)
+        is dead after this call — use the returned Sandbox.
+
+        Only works for lease-origin sandboxes (created via a pool).
+        Cold-booted sandboxes raise SandboxConflict. Raises
+        PoolExhausted if the pool has no paused entries within 5 s.
+        """
+        if self._client is None:
+            raise RuntimeError("Sandbox has no client; call client.recycle(id) instead")
+        return self._client.recycle(self.id)
+
     def toolbox(self) -> "ToolboxClient":
         """Return a toolbox-agent client bound to this sandbox's UDS.
         Import is lazy so the toolbox module doesn't load for callers
@@ -79,6 +92,151 @@ class Sandbox:
         from .toolbox import ToolboxClient
 
         return ToolboxClient(self.uds_path)
+
+    # ---- Daytona-style namespaces (v2 parity on top of v3 runtime) ----
+    #
+    # sb.process.exec("python -c 'print(2)'")
+    # sb.fs.read_file("/tmp/x")
+    # sb.preview_url(8080)
+    # with client.create_sandbox(template="base-python") as sb: ...
+    #
+    # The underlying transport (UDS + CONNECT + toolbox agent) is
+    # unchanged; these are thin wrappers to match the shape users
+    # coming from Daytona / sandboxes-v2 expect.
+
+    @property
+    def process(self) -> "_ProcessNamespace":
+        return _ProcessNamespace(self.toolbox())
+
+    @property
+    def fs(self) -> "_FSNamespace":
+        return _FSNamespace(self.toolbox())
+
+    def preview_url(self, port: int) -> str:
+        """Mint a signed preview URL for a guest-side port. Returns the
+        absolute path-form URL (`/previews/<token>/`) usable directly
+        against the sandboxd HTTP endpoint, matching Daytona's
+        `sandbox.preview_link(port)`.
+
+        Callers who need the subdomain form, expiry, or raw token can
+        use `client.mint_preview(sb.id, port)` which returns the full
+        Preview record.
+        """
+        if self._client is None:
+            raise RuntimeError("Sandbox has no client; call client.mint_preview(id, port)")
+        preview = self._client.mint_preview(self.id, port)
+        return f"{self._client.base_url}{preview.url}"
+
+    def __enter__(self) -> "Sandbox":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            self.delete()
+        except SandboxError:
+            # Swallow cleanup errors — the user's exc (if any) is more
+            # interesting than a double-delete of an already-gone
+            # sandbox. Mirrors v2 + Daytona behaviour.
+            pass
+
+
+class _ProcessNamespace:
+    """`sb.process.*` surface. Delegates to the toolbox client."""
+
+    def __init__(self, tb: "ToolboxClient"):
+        self._tb = tb
+
+    def exec(
+        self,
+        cmd,
+        env=None,
+        workdir: str = "",
+        stdin=None,
+        timeout: float = 30.0,
+    ):
+        """Synchronous exec. Raises ProcessExitError on non-zero exit.
+        Matches Daytona's `sandbox.process.exec(cmd)` + v2 shape."""
+        if isinstance(cmd, str):
+            cmd = ["/bin/sh", "-c", cmd]
+        result = self._tb.exec(cmd, env=env, workdir=workdir, stdin=stdin, timeout=timeout)
+        if result.exit_code != 0:
+            raise ProcessExitError(result.exit_code, result.stdout_text, result.stderr_text)
+        return result
+
+    def exec_stream(self, cmd, env=None, workdir: str = "", stdin=None, timeout: float = 300.0):
+        """Yield (channel, bytes) frames as the agent produces them.
+        `channel` is 1 (stdout), 2 (stderr), or 0 (exit frame)."""
+        if isinstance(cmd, str):
+            cmd = ["/bin/sh", "-c", cmd]
+        return self._tb.exec_stream(cmd, env=env, workdir=workdir, stdin=stdin, timeout=timeout)
+
+    def start(self, cmd, env=None, workdir: str = "", stdin=None, timeout: float = 300.0):
+        """Launch a command in the background. Returns an iterator of
+        exec_stream frames — callers can drive it to completion or run
+        it in a thread. Intentionally minimal; v2's Session handle with
+        pause/resume will land when the agent exposes process control."""
+        return self.exec_stream(cmd, env=env, workdir=workdir, stdin=stdin, timeout=timeout)
+
+
+class _FSNamespace:
+    """`sb.fs.*` surface. Delegates to the toolbox client's file API."""
+
+    def __init__(self, tb: "ToolboxClient"):
+        self._tb = tb
+
+    def write_file(self, path: str, data: bytes) -> None:
+        self._tb.upload(path, data)
+
+    def read_file(self, path: str) -> bytes:
+        return self._tb.download(path)
+
+    def list_dir(self, path: str):
+        return self._tb.list_files(path)
+
+    def remove(self, path: str) -> None:
+        self._tb.delete_file(path)
+
+    def mkdir(self, path: str, parents: bool = True) -> None:
+        self._tb.mkdir(path, parents=parents)
+
+    def chmod(self, path: str, mode: int) -> None:
+        self._tb.chmod(path, mode)
+
+    def rename(self, src: str, dst: str) -> None:
+        self._tb.rename(src, dst)
+
+
+class ProcessExitError(SandboxError):
+    """Raised by sb.process.exec(cmd) when cmd exits non-zero. Carries
+    the exit code + captured stdout/stderr so the caller can log or
+    recover. Matches v2 / Daytona error shape."""
+
+    def __init__(self, exit_code: int, stdout: str, stderr: str):
+        super().__init__(f"process exited with code {exit_code}")
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class TemplateNotFound(SandboxError):
+    """client.create_sandbox(template=...) when the template name is
+    unknown. Usually means sandboxd wasn't started with -kernel-path,
+    so the base templates weren't auto-registered."""
+
+
+class PoolExhausted(SandboxError):
+    """lease_sandbox when the pool has no paused entries and can't cold-
+    fall-back in time. Typically transient under burst load."""
+
+
+class RuntimeUnreachable(SandboxError):
+    """Sandboxd can't reach the gocracker runtime (KVM missing, jailer
+    misconfigured, etc.). Distinct from SandboxNotFound so callers can
+    retry transient reachability vs. logic errors."""
+
+
+class SandboxTimeout(SandboxError):
+    """An operation (exec, lease, probe) exceeded its deadline."""
 
 
 @dataclass
@@ -133,24 +291,61 @@ class Client:
 
     def create_sandbox(
         self,
-        image: str,
-        kernel_path: str,
+        image: str = "",
+        kernel_path: str = "",
         mem_mb: int = 0,
         cpus: int = 0,
+        entrypoint: Optional[List[str]] = None,
         cmd: Optional[List[str]] = None,
         env: Optional[List[str]] = None,
         workdir: str = "",
         network_mode: str = "",
         jailer_mode: str = "",
+        dockerfile: str = "",
+        context: str = "",
+        template: str = "",
     ) -> Sandbox:
-        req = {
-            "image": image,
-            "kernel_path": kernel_path,
-        }
+        # Daytona-style template resolution: `create_sandbox(template="base-python")`
+        # looks up the registered template, copies its image/kernel/mem
+        # into the request, then falls through to the normal create path.
+        # The underlying template's snapshot is already in the warm cache
+        # so container.Run hits the restore fast path instead of a cold boot.
+        if template:
+            try:
+                t = self.get_template(template)
+            except SandboxError as e:
+                raise TemplateNotFound(
+                    f"template {template!r} is unknown. If you expect base templates "
+                    f"(base-python/node/bun/go) to be preregistered, make sure sandboxd "
+                    f"was started with -kernel-path or $GOCRACKER_KERNEL set."
+                ) from e
+            spec = t.spec or {}
+            image = image or spec.get("image", "")
+            kernel_path = kernel_path or spec.get("kernel_path", "")
+            mem_mb = mem_mb or int(spec.get("mem_mb", 0) or 0)
+            cpus = cpus or int(spec.get("cpus", 0) or 0)
+            # NOTE: we intentionally do NOT forward the template's
+            # snapshot_dir. Passing it to container.Run triggers a
+            # direct restore + reIPGuest, which hits a 15 s vsock dial
+            # timeout against the old exec agent on port 10022 even
+            # when the snapshot was captured cleanly. container.Run's
+            # own warmcache.Lookup (keyed on image+kernel+mem+cpus+...)
+            # will still find the right dir and go through the fast
+            # restore path without reIPGuest on its IP-preasignado
+            # branch. Net effect: same restore speed, no 15 s stall.
+        req: Dict[str, Any] = {"kernel_path": kernel_path}
+        if image:
+            req["image"] = image
+        if dockerfile:
+            req["dockerfile"] = dockerfile
+        if context:
+            req["context"] = context
         if mem_mb:
             req["mem_mb"] = mem_mb
         if cpus:
             req["cpus"] = cpus
+        if entrypoint:
+            req["entrypoint"] = entrypoint
         if cmd:
             req["cmd"] = cmd
         if env:
@@ -173,6 +368,13 @@ class Client:
 
     def delete(self, id: str) -> None:
         self._request("DELETE", f"/sandboxes/{id}", body=None, expect_status={204})
+
+    def recycle(self, id: str) -> Sandbox:
+        """Recycle a leased sandbox: tear it down and return a fresh
+        one from the same pool in a single round trip. Returns a new
+        Sandbox (different id); the old `id` is gone after this call."""
+        resp = self._post(f"/sandboxes/{id}/recycle", body=None)
+        return self._parse_sandbox(resp.get("sandbox", {}))
 
     # ---- Pool ----
 
@@ -233,6 +435,10 @@ class Client:
         mem_mb: int = 0,
         cpus: int = 0,
         id: str = "",
+        cmd: Optional[List[str]] = None,
+        env: Optional[List[str]] = None,
+        workdir: str = "",
+        readiness: Optional[Dict[str, Any]] = None,
     ) -> Template:
         req: Dict[str, Any] = {}
         for k, v in (
@@ -243,11 +449,18 @@ class Client:
             ("kernel_path", kernel_path),
             ("mem_mb", mem_mb),
             ("cpus", cpus),
+            ("workdir", workdir),
         ):
             if v:
                 req[k] = v
+        if cmd:
+            req["cmd"] = cmd
+        if env:
+            req["env"] = env
+        if readiness is not None:
+            # readiness = {"http_port": int, "http_path": str, "timeout": ns, "interval": ns}
+            req["readiness"] = readiness
         resp = self._post("/templates", req)
-        # Response shape: {template: {...}, cache_hit: bool}
         return self._parse_template(resp.get("template", {}))
 
     def list_templates(self) -> List[Template]:
