@@ -257,7 +257,13 @@ func (c *Client) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*
 // stringFromSpec / uint64FromSpec / intFromSpec are tiny helpers for
 // reading a field out of a template's Spec map (the SDK models the
 // template's Spec as map[string]interface{} for wire flexibility).
+// All three treat a nil spec as empty so callers don't need to
+// nil-check — sandboxd can return a Template with Spec unset if the
+// stored spec was evicted or the template predated the spec field.
 func stringFromSpec(spec map[string]interface{}, key string) string {
+	if spec == nil {
+		return ""
+	}
 	if v, ok := spec[key].(string); ok {
 		return v
 	}
@@ -265,6 +271,9 @@ func stringFromSpec(spec map[string]interface{}, key string) string {
 }
 
 func uint64FromSpec(spec map[string]interface{}, key string) uint64 {
+	if spec == nil {
+		return 0
+	}
 	switch v := spec[key].(type) {
 	case float64:
 		return uint64(v)
@@ -277,6 +286,9 @@ func uint64FromSpec(spec map[string]interface{}, key string) uint64 {
 }
 
 func intFromSpec(spec map[string]interface{}, key string) int {
+	if spec == nil {
+		return 0
+	}
 	switch v := spec[key].(type) {
 	case float64:
 		return int(v)

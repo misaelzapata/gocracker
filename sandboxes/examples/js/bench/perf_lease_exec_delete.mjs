@@ -1,7 +1,26 @@
-import { Client } from '/home/misael/Desktop/projects/gocracker/sandboxes/sdk/js/src/index.js';
-const c = new Client('http://127.0.0.1:9091', { timeoutMs: 120000 });
+// lease → process.exec("echo") → delete micro-bench (JS SDK).
+// Kernel path resolves from argv[2] → $GOCRACKER_KERNEL → repo default.
+// Sandboxd URL from $GOCRACKER_SANDBOXD → http://127.0.0.1:9091.
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { existsSync } from 'node:fs';
+
+const _repo = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..');
+function resolveKernel() {
+  if (process.argv[2]) return process.argv[2];
+  if (process.env.GOCRACKER_KERNEL) return process.env.GOCRACKER_KERNEL;
+  const def = resolve(_repo, 'artifacts', 'kernels', 'gocracker-guest-standard-vmlinux');
+  if (existsSync(def)) return def;
+  console.error('error: pass kernel path as arg 1 or set $GOCRACKER_KERNEL');
+  process.exit(2);
+}
+const KERNEL = resolveKernel();
+const SANDBOXD = process.env.GOCRACKER_SANDBOXD ?? 'http://127.0.0.1:9091';
+
+const { Client } = await import(resolve(_repo, 'sandboxes', 'sdk', 'js', 'src', 'index.js'));
+const c = new Client(SANDBOXD, { timeoutMs: 120000 });
 try { await c.unregisterPool('perfbench-js'); } catch {}
-await c.registerPool({ templateId: 'perfbench-js', image: 'alpine:3.20', kernelPath: '/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-standard-vmlinux', minPaused: 8, maxPaused: 8 });
+await c.registerPool({ templateId: 'perfbench-js', image: 'alpine:3.20', kernelPath: KERNEL, minPaused: 8, maxPaused: 8 });
 const deadline = Date.now() + 90000;
 while (Date.now() < deadline) {
   const pools = await c.listPools();

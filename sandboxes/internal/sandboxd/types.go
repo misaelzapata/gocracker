@@ -101,9 +101,10 @@ type CreateSandboxRequest struct {
 	JailerMode  string   `json:"jailer_mode,omitempty"`   // "on" | "off" — default "off"
 	// SnapshotDir, when set, tells container.Run to restore from the
 	// named snapshot dir instead of cold-booting. The SDK's
-	// create_sandbox(template=...) flow fills this in automatically so
-	// templates built with a Readiness probe come up with the user's
-	// app already running.
+	// create_sandbox(template=...) flow does NOT forward this — it
+	// resolves the template's spec fields client-side and lets the
+	// runtime's warmcache lookup find the snapshot by key. API
+	// consumers can still set it directly to pin a specific dir.
 	SnapshotDir string   `json:"snapshot_dir,omitempty"`
 }
 

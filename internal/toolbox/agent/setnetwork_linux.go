@@ -103,9 +103,24 @@ func handleSetNetwork(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// AddrReplace is a single-syscall atomic "replace or add". Cheaper
-	// than AddrList+AddrDel loop + AddrAdd, and it handles the
-	// snapshot-restore case (stale IP layered with new one) in one op.
+	// AddrReplace only replaces an address with a *matching* IPNet — it
+	// won't delete a different IPv4 restored from the snapshot. Flush
+	// stale IPv4s that don't match the target before the replace, so
+	// the interface ends up with exactly the caller-supplied address.
+	existing, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: addr list: %w", err))
+		return
+	}
+	for i := range existing {
+		if existing[i].IPNet != nil && existing[i].IPNet.String() == addr.IPNet.String() {
+			continue
+		}
+		if err := netlink.AddrDel(link, &existing[i]); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: addr del %s: %w", existing[i].IPNet, err))
+			return
+		}
+	}
 	if err := netlink.AddrReplace(link, addr); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("setnetwork: addr replace: %w", err))
 		return

@@ -1,19 +1,50 @@
+// lease → sb.Process().Exec → sb.Delete micro-bench (Go SDK).
+// Kernel path resolves from os.Args[1] → $GOCRACKER_KERNEL → repo default.
+// Sandboxd URL from $GOCRACKER_SANDBOXD → http://127.0.0.1:9091.
 package main
 
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"time"
 
 	gocracker "github.com/gocracker/gocracker/sandboxes/sdk/go"
 )
 
+func resolveKernel() string {
+	if len(os.Args) > 1 && os.Args[1] != "" {
+		return os.Args[1]
+	}
+	if v := os.Getenv("GOCRACKER_KERNEL"); v != "" {
+		return v
+	}
+	// Repo-relative default: this file is at
+	// <repo>/sandboxes/examples/go/bench/perf_lease_exec_delete.go
+	_, f, _, _ := runtime.Caller(0)
+	repo := filepath.Join(filepath.Dir(f), "..", "..", "..", "..")
+	def := filepath.Join(repo, "artifacts", "kernels", "gocracker-guest-standard-vmlinux")
+	if _, err := os.Stat(def); err == nil {
+		return def
+	}
+	fmt.Fprintln(os.Stderr, "error: pass kernel path as arg 1 or set $GOCRACKER_KERNEL")
+	os.Exit(2)
+	return ""
+}
+
 func main() {
+	kernel := resolveKernel()
+	sandboxdURL := os.Getenv("GOCRACKER_SANDBOXD")
+	if sandboxdURL == "" {
+		sandboxdURL = "http://127.0.0.1:9091"
+	}
 	ctx := context.Background()
-	c := gocracker.NewClient("http://127.0.0.1:9091")
+	c := gocracker.NewClient(sandboxdURL)
 	_ = c.UnregisterPool(ctx, "perfbench-go")
-	_, _ = c.RegisterPool(ctx, gocracker.CreatePoolRequest{TemplateID: "perfbench-go", Image: "alpine:3.20", KernelPath: "/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-standard-vmlinux", MinPaused: 8, MaxPaused: 8})
+	_, _ = c.RegisterPool(ctx, gocracker.CreatePoolRequest{TemplateID: "perfbench-go", Image: "alpine:3.20", KernelPath: kernel, MinPaused: 8, MaxPaused: 8})
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		pools, _ := c.ListPools(ctx)

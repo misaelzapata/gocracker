@@ -1,10 +1,33 @@
-import sys, time, statistics
-sys.path.insert(0, '/home/misael/Desktop/projects/gocracker/sandboxes/sdk/python')
+"""lease → process.exec("echo") → delete micro-bench (Python SDK).
+
+Kernel path resolves from argv[1] → $GOCRACKER_KERNEL → repo default.
+Sandboxd URL from $GOCRACKER_SANDBOXD → http://127.0.0.1:9091.
+"""
+import os, sys, time, statistics
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(_REPO / "sandboxes" / "sdk" / "python"))
+
+def resolve_kernel() -> str:
+    if len(sys.argv) > 1 and sys.argv[1]:
+        return sys.argv[1]
+    if os.environ.get("GOCRACKER_KERNEL"):
+        return os.environ["GOCRACKER_KERNEL"]
+    default = _REPO / "artifacts" / "kernels" / "gocracker-guest-standard-vmlinux"
+    if default.exists():
+        return str(default)
+    print(f"error: pass kernel path as arg 1 or set $GOCRACKER_KERNEL", file=sys.stderr)
+    sys.exit(2)
+
+KERNEL = resolve_kernel()
+SANDBOXD = os.environ.get("GOCRACKER_SANDBOXD", "http://127.0.0.1:9091")
+
 from gocracker import Client
-c = Client('http://127.0.0.1:9091', timeout=60)
+c = Client(SANDBOXD, timeout=60)
 try: c.unregister_pool('perfbench')
 except: pass
-c.register_pool(template_id='perfbench', image='alpine:3.20', kernel_path='/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-standard-vmlinux', min_paused=8, max_paused=8)
+c.register_pool(template_id='perfbench', image='alpine:3.20', kernel_path=KERNEL, min_paused=8, max_paused=8)
 deadline = time.time() + 90
 while time.time() < deadline:
     p = [x for x in c.list_pools() if x.template_id == 'perfbench']
