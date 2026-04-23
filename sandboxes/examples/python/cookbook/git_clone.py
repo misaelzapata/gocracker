@@ -10,22 +10,21 @@ Usage:
 from __future__ import annotations
 
 import sys
-from pathlib import Path
-
-repo_root = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(repo_root / "sdk" / "python"))
+from _common import resolve_kernel, sandboxd_url
 
 from gocracker import Client  # noqa: E402
 
 
 def main() -> int:
-    kernel = sys.argv[1] if len(sys.argv) > 1 else "/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-standard-vmlinux"
-    client = Client("http://127.0.0.1:9091")
+    kernel = resolve_kernel()
+    client = Client(sandboxd_url())
 
-    # Use an alpine image that has git pre-installed. alpine:3.20 doesn't;
-    # alpine/git:latest does.
+    # Plain alpine + apk add git. We can't use alpine/git:latest because
+    # its ENTRYPOINT=["git"] runs at boot and exits immediately, which
+    # panics the guest kernel (PID 1 exit). Sandboxd doesn't yet surface
+    # a way to override image ENTRYPOINT, so we install git at runtime.
     sb = client.create_sandbox(
-        image="alpine/git:latest",
+        image="alpine:3.20",
         kernel_path=kernel,
         network_mode="auto",
     )
@@ -33,6 +32,11 @@ def main() -> int:
 
     try:
         tb = sb.toolbox()
+        print("installing git...")
+        r = tb.exec(["apk", "add", "--no-cache", "git"], timeout=60)
+        if r.exit_code != 0:
+            print(f"apk add failed: exit={r.exit_code} stderr={r.stderr_text[:300]}")
+            return 1
         print("cloning https://github.com/octocat/Hello-World.git...")
         resp = tb.git_clone("https://github.com/octocat/Hello-World.git", "/tmp/hello")
         print(f"clone response: {resp}")
