@@ -476,8 +476,8 @@ func (s *System) CreateVMFromSnapshotFileMemfd(memFilePath string, memMB uint64,
 // per-page minor fault on first access. For a warm snapshot file sitting in
 // the page cache the cost of restore becomes O(1) instead of O(mem), which
 // is the difference between ~5–15 ms and ~60–100 ms on a 128 MiB guest.
-// Net effect: resumes inherit the sandbox-pool advantage that published
-// leaderboards (e.g. Daytona) otherwise reserve for themselves.
+// Net effect: resumes feel instant to the caller — no O(mem) memcpy,
+// no up-front read from the snapshot file.
 //
 // Caveats: the snapshot file's mapping is referenced by the kernel until
 // the VM is closed; caller must not unlink / truncate / rewrite it during

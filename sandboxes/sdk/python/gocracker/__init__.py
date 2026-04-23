@@ -4,7 +4,7 @@ Minimal client for the sandboxd HTTP control plane + the in-guest
 toolbox agent. Designed to match the HTTP shape exactly so the
 existing Go server tests double as reference behaviour.
 
-Usage (Daytona-style):
+Usage:
 
     from gocracker import Client
 

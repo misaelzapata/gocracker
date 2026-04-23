@@ -1,15 +1,14 @@
 package gocracker
 
-// Daytona-style namespaces on *Sandbox so Go callers can write:
+// Convenience namespaces on *Sandbox so Go callers can write:
 //
 //	sb.Process().Exec(ctx, "python -c 'print(2+2)'")
 //	sb.FS().WriteFile(ctx, "/tmp/x", []byte("hi"))
 //	url, _ := sb.PreviewURL(ctx, 8080)
 //
 // These wrap the existing Toolbox() methods and MintPreview RPC so the
-// surface matches the Python + JS SDKs (and, by extension, Daytona
-// users' muscle memory). The flat ToolboxClient API keeps working —
-// this is additive, not a breaking rename.
+// surface matches the Python + JS SDKs. The flat ToolboxClient API
+// keeps working — this is additive, not a breaking rename.
 
 import (
 	"context"
@@ -18,9 +17,9 @@ import (
 	"strings"
 )
 
-// Additional typed errors for Daytona parity. Composed with the
-// existing Error type via errors.Is — concrete returned values stay
-// *Error so Status / Body remain accessible.
+// Additional typed errors. Composed with the existing Error type via
+// errors.Is — concrete returned values stay *Error so Status / Body
+// remain accessible.
 var (
 	ErrPoolExhausted      = errors.New("sandboxd: pool exhausted")
 	ErrRuntimeUnreachable = errors.New("sandboxd: runtime unreachable")
@@ -40,7 +39,7 @@ func (e *ProcessExitError) Error() string {
 	return fmt.Sprintf("process exited with code %d", e.ExitCode)
 }
 
-// ProcessNamespace wraps ToolboxClient with v2 / Daytona-shaped method
+// ProcessNamespace wraps ToolboxClient with process-oriented method
 // names. Accessed via Sandbox.Process().
 type ProcessNamespace struct {
 	tb *ToolboxClient
@@ -96,8 +95,7 @@ func normalizeExecCmd(cmd interface{}) ([]string, error) {
 	}
 }
 
-// FSNamespace wraps ToolboxClient's file ops with Daytona-shaped
-// method names. Accessed via Sandbox.FS().
+// FSNamespace wraps ToolboxClient's file ops. Accessed via Sandbox.FS().
 type FSNamespace struct {
 	tb *ToolboxClient
 }
@@ -130,8 +128,8 @@ func (f *FSNamespace) Rename(ctx context.Context, src, dst string) error {
 	return f.tb.Rename(ctx, src, dst)
 }
 
-// Process returns the Daytona-style process namespace for this
-// sandbox. Returns nil if the sandbox has no UDS path (unready state).
+// Process returns the process namespace for this sandbox. Returns nil
+// if the sandbox has no UDS path (unready state).
 func (s *Sandbox) Process() *ProcessNamespace {
 	tb := s.Toolbox()
 	if tb == nil {
@@ -140,8 +138,8 @@ func (s *Sandbox) Process() *ProcessNamespace {
 	return &ProcessNamespace{tb: tb}
 }
 
-// FS returns the Daytona-style file-system namespace for this sandbox.
-// Returns nil if the sandbox has no UDS path (unready state).
+// FS returns the file-system namespace for this sandbox. Returns nil
+// if the sandbox has no UDS path (unready state).
 func (s *Sandbox) FS() *FSNamespace {
 	tb := s.Toolbox()
 	if tb == nil {
@@ -150,10 +148,9 @@ func (s *Sandbox) FS() *FSNamespace {
 	return &FSNamespace{tb: tb}
 }
 
-// PreviewURL returns a signed preview URL for a guest-side port.
-// Matches Daytona's `sandbox.preview_link(port)` shape. The URL is
-// absolute (includes scheme + host + the `/previews/<token>/` path)
-// and usable directly with any HTTP client.
+// PreviewURL returns a signed preview URL for a guest-side port. The
+// URL is absolute (includes scheme + host + the `/previews/<token>/`
+// path) and usable directly with any HTTP client.
 //
 // Returns an error if the sandbox has no owning Client (e.g. it was
 // constructed directly without going through Client.CreateSandbox /

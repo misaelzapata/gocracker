@@ -17,7 +17,7 @@ cd sandboxes/sdk/js
 npm link   # or copy src/index.js into your project — no deps
 ```
 
-## Quick start (Daytona-style)
+## Quick start
 
 Start `gocracker-sandboxd` with `-kernel-path` (or `GOCRACKER_KERNEL`)
 so `base-python / base-node / base-bun / base-go` auto-register.
@@ -106,6 +106,6 @@ SandboxError
 - Python: `sandboxes/sdk/python/`
 - Go: `sandboxes/sdk/go/`
 
-Same surface (Daytona-style `template=`, `.process`, `.fs`,
-`previewUrl`, typed errors). JS-specific: `Symbol.asyncDispose` for
-`await using`, camelCase field names.
+Same surface (`template=`, `.process`, `.fs`, `previewUrl`, typed
+errors). JS-specific: `Symbol.asyncDispose` for `await using`,
+camelCase field names.

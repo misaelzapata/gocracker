@@ -17,7 +17,7 @@ pip install -e .
 
 (or copy the `gocracker/` directory into your project — no deps).
 
-## Quick start (Daytona-style)
+## Quick start
 
 Start `gocracker-sandboxd` with `-kernel-path` (or `GOCRACKER_KERNEL` in
 env) so the `base-python / base-node / base-bun / base-go` templates
@@ -71,7 +71,7 @@ sb.delete()
 |---|---|
 | `sb.process.exec(cmd)` | Synchronous exec. `cmd` may be `str` (wrapped in `sh -c`) or `list[str]`. Non-zero exit → `ProcessExitError`. |
 | `sb.process.exec_stream(cmd)` | Iterator of `(channel, bytes)` frames — channel 1 = stdout, 2 = stderr, 0 = exit. |
-| `sb.process.start(cmd)` | Alias for `exec_stream` — kept for Daytona familiarity. |
+| `sb.process.start(cmd)` | Alias for `exec_stream`. |
 | `sb.fs.write_file(path, bytes)` | Upload. |
 | `sb.fs.read_file(path) -> bytes` | Download. |
 | `sb.fs.list_dir(path) -> list[FileEntry]` | Directory listing. |

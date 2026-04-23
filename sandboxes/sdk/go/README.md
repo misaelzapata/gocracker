@@ -15,7 +15,7 @@ Warm-lease latency (measured 2026-04-22 on x86, pool of 8):
 import gocracker "github.com/gocracker/gocracker/sandboxes/sdk/go"
 ```
 
-## Quick start (Daytona-style)
+## Quick start
 
 Start `gocracker-sandboxd` with `-kernel-path` (or `GOCRACKER_KERNEL`
 in env) so `base-python / base-node / base-bun / base-go` auto-register.
@@ -111,7 +111,7 @@ Use `errors.Is(err, gocracker.ErrTemplateNotFound)` to branch.
 - Python: `sandboxes/sdk/python/`
 - JS/Node: `sandboxes/sdk/js/`
 
-Same surface (Daytona-style `template=`, `.process`, `.fs`,
-`preview_url`, typed errors). Different language idioms: Go uses
-`defer sb.Delete(ctx)` where Python/JS use context managers, and
-methods are functions rather than properties.
+Same surface (`template=`, `.process`, `.fs`, `preview_url`, typed
+errors). Different language idioms: Go uses `defer sb.Delete(ctx)`
+where Python/JS use context managers, and methods are functions
+rather than properties.

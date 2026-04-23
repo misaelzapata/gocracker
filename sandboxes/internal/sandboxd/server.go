@@ -271,9 +271,9 @@ func (s *Server) handleLeaseSandbox(pl PoolLifecycle) http.HandlerFunc {
 
 // handleRecycleSandbox serves `POST /sandboxes/{id}/recycle`. Tears
 // down the current leased sandbox and returns a fresh one from the
-// same pool. Error-status mapping mirrors handleLeaseSandbox so
-// Daytona-style SDK callers get a consistent experience across the
-// lease and recycle endpoints.
+// same pool. Error-status mapping mirrors handleLeaseSandbox so SDK
+// callers get a consistent experience across the lease and recycle
+// endpoints.
 func (s *Server) handleRecycleSandbox(pl PoolLifecycle) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")

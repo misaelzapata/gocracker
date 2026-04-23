@@ -2,10 +2,10 @@
 """Cookbook: shell commands against an alpine sandbox.
 
 Runs a battery of common shell verbs (ls, cat, grep, pipe, redirect,
-subshell) through `sb.process.exec` so the Daytona-style `.process`
-surface gets a real workout. Pattern mirrors v2's `06_shell_commands.py`
-but builds on the warm `base-python` template so each command runs in
-~20 ms after lease.
+subshell) through `sb.process.exec` so the `.process` surface gets a
+real workout. Pattern mirrors v2's `06_shell_commands.py` but builds
+on the warm `base-python` template so each command runs in ~20 ms
+after lease.
 
 Usage:
   sudo python3 shell_commands.py [KERNEL_PATH]

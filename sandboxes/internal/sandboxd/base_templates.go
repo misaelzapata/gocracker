@@ -14,9 +14,9 @@ import (
 // BaseTemplate is a canonical template preregistered at sandboxd
 // startup so the SDK can call create_sandbox(template="base-python")
 // without the caller having to POST a fully-specified Dockerfile +
-// image string. Matches the Daytona-style "built-in language runtimes"
-// surface — users land in a familiar Python/Node/Bun/Go sandbox with
-// the toolbox agent already live.
+// image string. Provides a "built-in language runtimes" surface —
+// users land in a familiar Python/Node/Bun/Go sandbox with the toolbox
+// agent already live.
 type BaseTemplate struct {
 	ID    string // well-known name: "base-python", "base-node", ...
 	Image string // OCI ref with the language runtime baked in

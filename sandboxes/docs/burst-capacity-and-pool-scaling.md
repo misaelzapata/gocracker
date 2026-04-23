@@ -291,131 +291,23 @@ The code explicitly avoids letting interactive cold creates wait behind the warm
 
 That can keep the system in a degraded state longer.
 
-## How Other Sandbox Systems Approach This
+## Patterns That Work
 
-The recurring pattern across commercial sandbox products is not "keep everything hot all the time." It is:
+The recurring pattern for handling burst capacity in VM-backed sandbox systems is not "keep everything hot all the time." It is:
 
-- prebuilt base environments
-- snapshotting or forking
-- cheap suspend/hibernate tiers
-- fast handoff from already-prepared state
-- strong distinction between reproducible base templates and dynamic snapshots/forks
-
-### Daytona
-
-Daytona's sandbox model is snapshot-first. Their docs describe snapshots as the reusable base for sandboxes, and their changelog explicitly mentions work on:
-
-- warm-pool checks
-- warm-pool sandbox networking
-- caching warm-pool checks
-
-Relevant sources:
-
-- Daytona snapshots:
-  - <https://www.daytona.io/docs/en/snapshots/>
-- Daytona sandboxes:
-  - <https://www.daytona.io/docs/en/sandboxes/>
-- Daytona changelog:
-  - <https://www.daytona.io/changelog/feature-flags-org-labels>
-  - <https://www.daytona.io/changelog/playground-opencode-plugin>
-
-Takeaway:
-
-- Daytona treats warm pools as a first-class system with dedicated correctness and performance work
-- the snapshot is the baseline product artifact, not an afterthought
-- they also invest in caching around the control-plane checks, not just the VM layer
-
-### E2B
-
-E2B distinguishes clearly between:
-
-- templates: reproducible definitions
-- snapshots: captured runtime state
-- pause/resume: one-to-one continuity
-
-Most importantly, E2B templates can include a start command that is captured in the snapshot so the process is already running when the sandbox is created.
-
-Relevant sources:
-
-- E2B template quickstart:
-  - <https://e2b.dev/docs/template/quickstart>
-- E2B snapshots:
-  - <https://e2b.dev/docs/sandbox/snapshots>
-
-Takeaway:
-
-- expensive startup work should be baked into the template or snapshot
-- the request path should not be reinstalling or reinitializing core runtime tools
-- pause/resume and snapshot/fork are different products and should be treated differently
-
-### Runloop
-
-Runloop distinguishes:
-
-- Blueprints: reproducible, fast-to-boot, layer-cached base images
-- Snapshots: runtime branching points
-- Suspend/Resume: cheap continuity
-
-Their docs explicitly say Blueprints are the thing to use when you want future devboxes to avoid setup/install time. Their overview also states that base devbox images are optimized to boot in less than `200ms`.
-
-Relevant sources:
-
-- Runloop devbox overview:
-  - <https://docs.runloop.ai/devboxes/overview>
-- Runloop blueprints overview:
-  - <https://docs.runloop.ai/docs/devboxes/blueprints/overview>
-- Runloop snapshots:
-  - <https://docs.runloop.ai/devboxes/snapshots>
-- Runloop suspend/resume tutorial:
-  - <https://docs.runloop.ai/docs/tutorials/running-agents-on-sandboxes/suspend-resume-workflow>
-
-Takeaway:
-
-- base-image optimization and runtime snapshots solve different latency problems
-- fast boot alone is not enough; suspend/resume is still valuable for repeated use
-- the platform surface should expose the distinction directly
-
-### CodeSandbox SDK
-
-CodeSandbox focuses heavily on:
-
-- near-instant VM forking
-- templates
-- hibernation
-
-Their official SDK launch post emphasizes that the infrastructure was built specifically for instant cloning and launching of VMs.
-
-Relevant sources:
-
-- CodeSandbox SDK:
-  - <https://codesandbox.io/sdk>
-- CodeSandbox SDK release post:
-  - <https://codesandbox.io/blog/codesandbox-sdk>
-
-Takeaway:
-
-- "fork" is a core primitive, not just snapshot restore
-- hibernation is treated as a normal lifecycle operation
-- fast control-plane handoff matters as much as fast VM mechanics
-
-### Docker Sandboxes
-
-Docker's sandbox product treats templates as reusable environments and also supports saving an existing sandbox as a template. The docs also call out template caching and pull policies explicitly.
-
-Relevant sources:
-
-- Docker Sandboxes overview:
-  - <https://docs.docker.com/ai/sandboxes/>
-- Docker templates:
-  - <https://docs.docker.com/ai/sandboxes/templates/>
-- `docker sandbox save`:
-  - <https://docs.docker.com/reference/cli/docker/sandbox/save/>
-
-Takeaway:
-
-- image/template caching is part of the user-facing performance story
-- it is normal to convert a working sandbox into a reusable base
-- pull/cache policy is part of burst behavior, not just an implementation detail
+- prebuilt base environments, cached on the host
+- snapshot/restore or VM-forking as the reusable base product artifact
+- cheap suspend/hibernate tiers separate from snapshot and from cold-boot
+- fast handoff from already-prepared state — the request path should not
+  be reinstalling or reinitializing core runtime tools
+- a strong distinction between reproducible base templates and dynamic
+  snapshots/forks; they solve different latency problems and deserve
+  different API surfaces
+- template caching and pull policy are part of the user-facing performance
+  story, not an implementation detail
+- warm pools treated as a first-class system with dedicated correctness
+  and performance work; control-plane checks also matter, not just VM
+  mechanics
 
 ## What VM Systems Teach Us
 
@@ -950,19 +842,6 @@ The cold-boot path is a known area for future improvement (see Recommended Archi
 
 ### Sandbox systems
 
-- Daytona snapshots: <https://www.daytona.io/docs/en/snapshots/>
-- Daytona sandboxes: <https://www.daytona.io/docs/en/sandboxes/>
-- Daytona changelog, warm-pool networking/checks:
-  - <https://www.daytona.io/changelog/feature-flags-org-labels>
-  - <https://www.daytona.io/changelog/playground-opencode-plugin>
-- E2B templates: <https://e2b.dev/docs/template/quickstart>
-- E2B snapshots: <https://e2b.dev/docs/sandbox/snapshots>
-- Runloop devbox overview: <https://docs.runloop.ai/devboxes/overview>
-- Runloop blueprints: <https://docs.runloop.ai/docs/devboxes/blueprints/overview>
-- Runloop snapshots: <https://docs.runloop.ai/devboxes/snapshots>
-- Runloop suspend/resume: <https://docs.runloop.ai/docs/tutorials/running-agents-on-sandboxes/suspend-resume-workflow>
-- CodeSandbox SDK: <https://codesandbox.io/sdk>
-- CodeSandbox SDK release: <https://codesandbox.io/blog/codesandbox-sdk>
 - Docker Sandboxes overview: <https://docs.docker.com/ai/sandboxes/>
 - Docker templates: <https://docs.docker.com/ai/sandboxes/templates/>
 - Docker sandbox save: <https://docs.docker.com/reference/cli/docker/sandbox/save/>

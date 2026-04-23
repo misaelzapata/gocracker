@@ -77,8 +77,7 @@ type CreateSandboxRequest struct {
 
 	// Template, when set, names a registered template (e.g. "base-python",
 	// "base-node"). The SDK resolves the template's spec client-side and
-	// fills in Image/KernelPath/MemMB/CPUs if the caller left them zero.
-	// This is the field Daytona-style callers use:
+	// fills in Image/KernelPath/MemMB/CPUs if the caller left them zero:
 	//
 	//	c.CreateSandbox(ctx, gocracker.CreateSandboxRequest{Template: "base-python"})
 	//
@@ -224,10 +223,10 @@ func NewClient(baseURL string) *Client {
 // Sandbox lifecycle --------------------------------------------------
 
 func (c *Client) CreateSandbox(ctx context.Context, req CreateSandboxRequest) (*Sandbox, error) {
-	// Daytona-style template resolution: look up the named template
-	// and fill in the spec fields the caller didn't set. The template's
-	// snapshot is already in the warm cache so container.Run hits the
-	// restore fast path instead of cold-booting from scratch.
+	// Template resolution: look up the named template and fill in the
+	// spec fields the caller didn't set. The template's snapshot is
+	// already in the warm cache so container.Run hits the restore fast
+	// path instead of cold-booting from scratch.
 	if req.Template != "" {
 		t, err := c.GetTemplate(ctx, req.Template)
 		if err != nil {

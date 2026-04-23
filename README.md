@@ -422,11 +422,11 @@ The ~300 ms above is ~3× Firecracker's CI number for these reasons:
 
 The ratio between runtimes on the same host is the useful number, and there gocracker is neck-and-neck with Firecracker. No single-VM public Firecracker figure supports a 2× jailer penalty — the 2× in their docs is specifically about parallel jail creation at scale.
 
-## Time-to-Interactive benchmark (ComputeSDK methodology)
+## Time-to-Interactive benchmark
 
-The Firecracker head-to-head above measures at the VMM level. [ComputeSDK's leaderboard](https://www.computesdk.com/benchmarks/) publishes a higher-level **Time-to-Interactive (TTI)** — the wall-clock time from `compute.sandbox.create()` returning to the first successful `runCommand("node -v")` stdout byte, against a pre-built sandbox image. [Their methodology doc](https://github.com/computesdk/benchmarks/blob/master/METHODOLOGY.md) specifies the exact test.
+The Firecracker head-to-head above measures at the VMM level. **Time-to-Interactive (TTI)** is the higher-level number most sandbox callers actually care about: the wall-clock time from `sandbox.create()` returning a handle to the first successful stdout byte of `runCommand("node -v")`, against a pre-built sandbox image.
 
-[tools/bench-node-tti.sh](tools/bench-node-tti.sh) in this repo replicates it: a `node:20-alpine` Dockerfile with `CMD ["node","-v"]`, warm artifact cache standing in for their pre-built images, and `gocracker run ... --wait` timed to the first stdout byte starting with `v`.
+[tools/bench-node-tti.sh](tools/bench-node-tti.sh) in this repo runs that test: a `node:20-alpine` Dockerfile with `CMD ["node","-v"]`, warm artifact cache, and `gocracker run ... --wait` timed to the first stdout byte starting with `v`.
 
 ### Setup
 
@@ -456,28 +456,9 @@ The bench pins `gocracker` to CPU 0 with `taskset -c 0` and SCHED_FIFO priority 
 
 The median is ~35 ms slower than the pre-toolbox 218 ms baseline because [internal/guest/init.go](internal/guest/init.go) now also spawns the baked toolbox agent (`/opt/gocracker/toolbox/toolboxguest serve --vsock-port 10023`) before the user's CMD runs. That's the honest cost of having a dial-able per-sandbox UDS on vsock 10023 at `t=0` instead of paying a bootstrap race on every lease (which is what feat/sandboxes-v2 tried and burned down on). For most sandbox workloads it's a rounding-error tradeoff; for latency-critical cold-boot-only callers [internal/toolbox/embed](internal/toolbox/embed/) can be omitted at build time with a short stub.
 
-### ComputeSDK leaderboard (reference)
-
-For context, ComputeSDK publishes these medians on its own infrastructure and methodology (not on the host used above — different hardware, different orchestration layer):
-
-| provider | TTI median |
-|---|---:|
-| Daytona | 100 ms |
-| Vercel | 380 ms |
-| Blaxel | 440 ms |
-| E2B | 440 ms |
-| Hopx | 1,050 ms |
-| Modal | 1,520 ms |
-| Cloudflare | 1,720 ms |
-| Namespace | 1,770 ms |
-| Runloop | 1,960 ms |
-| CodeSandbox | 3,790 ms |
-
-These numbers are **not directly comparable** to the 218 ms above — ComputeSDK runs each provider on the provider's own infrastructure (cloud VMs, different CPUs, their own network path). The measurement here was taken on an AMD Ryzen AI 9 HX 370 laptop with the bench harness in this repo. The shared piece is the workload: a `node:20-alpine` sandbox whose CMD is `node -v`, timed from the VM spawn to the first stdout byte.
-
 ## Sandboxd performance (2026-04-22)
 
-`gocracker-sandboxd` is the sandbox control plane on top of the runtime. It wraps a warm pool, a snapshot-backed template registry, an HMAC-signed preview proxy, and SDKs in Python / Go / JS that match Daytona's surface (`sb.process.exec`, `sb.fs.read_file`, `sb.preview_url`, `with client.create_sandbox(template="base-python") as sb:`). All numbers below were measured on the same laptop as the TTI benchmark above, on `feat/sandboxd-v3-followups`.
+`gocracker-sandboxd` is the sandbox control plane on top of the runtime. It wraps a warm pool, a snapshot-backed template registry, an HMAC-signed preview proxy, and SDKs in Python / Go / JS (`sb.process.exec`, `sb.fs.read_file`, `sb.preview_url`, `with client.create_sandbox(template="base-python") as sb:`). All numbers below were measured on the same laptop as the TTI benchmark above, on `feat/sandboxd-v3-followups`.
 
 Reproduce with the bench scripts in [sandboxes/examples/python/bench/](sandboxes/examples/python/bench/) (Python), [sandboxes/examples/go/bench/](sandboxes/examples/go/bench/) (Go) and [sandboxes/examples/js/bench/](sandboxes/examples/js/bench/) (Node).
 
@@ -499,9 +480,9 @@ Reproduce with the bench scripts in [sandboxes/examples/python/bench/](sandboxes
 
 ¹ One Go p95 outlier of 103 ms while the refiller was concurrently catching up after the previous sample drained the pool. The other 7/8 samples were ≤ 2 ms. Node's exec is slower than Python/Go because the JS SDK currently doesn't connection-pool the UDS bridge — every call pays the CONNECT handshake from scratch.
 
-### Time-to-Interactive (ComputeSDK methodology)
+### Time-to-Interactive (via SDK)
 
-ComputeSDK's [benchmark](https://www.computesdk.com/benchmarks/) times wall-clock from `sandbox.create()` returning a handle → first stdout byte of `runCommand("node", "-v")`. Pre-built sandbox image == our `base-node` template (auto-registered when sandboxd starts with `-kernel-path`).
+Wall-clock from `sandbox.create()` returning a handle → first stdout byte of `runCommand("node", "-v")`. The pre-built sandbox image is our `base-node` template (auto-registered when sandboxd starts with `-kernel-path`).
 
 10 timed runs after one warmup, against a pool of 8 paused base-node VMs:
 
@@ -517,23 +498,7 @@ Per-workload breakdown (same path, different command):
 | `sb.process.exec(['echo','hi'])` | ~19 ms | same as `/bin/true` within noise |
 | `sb.process.exec(['node','-v'])` | **277 ms** | **node startup on alpine/musl** (~258 ms of the total) |
 
-Vs ComputeSDK's published medians (their hardware, not ours — direct comparison requires equal infrastructure):
-
-| provider | TTI median |
-|---|---:|
-| Daytona | 100 ms |
-| **gocracker (this bench)** | **277 ms** |
-| Vercel | 380 ms |
-| Blaxel | 440 ms |
-| E2B | 440 ms |
-| Hopx | 1,050 ms |
-| Modal | 1,520 ms |
-| Cloudflare | 1,720 ms |
-| Namespace | 1,770 ms |
-| Runloop | 1,960 ms |
-| CodeSandbox | 3,790 ms |
-
-Where Daytona wins is probably a post-ready snapshot (node already parsed and resident in the page cache). The post-ready feature is wired in this branch (`PLAN_SANDBOXD.md §10.5`) but currently has a known issue at restore — once fixed, a snapshot of `node:22-alpine` with node already running should cut TTI to < 50 ms.
+The 258 ms node-startup floor is inside the guest process — our boot path and agent overhead account for ~19 ms of the total. A post-ready snapshot (node already parsed and resident in the page cache) would drop the outer total under 50 ms; that work is wired in this branch (`PLAN_SANDBOXD.md §10.5`) but has a known issue at restore.
 
 ### Before/after (IP-preasignado + async delete landed 2026-04-22)
 
@@ -657,12 +622,12 @@ A ~0.3 ms p50 gap at the low end of the latency budget, from a pure-Go VMM again
 
 | scenario | gocracker | Firecracker v1.10.1 | notes |
 |---|---:|---:|---|
-| Cold boot (Node TTI) | **253 ms** p50 | — | `gocracker run` to first `node -v` stdout (ComputeSDK methodology). +35 ms over the pre-toolbox baseline — that's the cost of init spawning the baked toolbox agent before the user's CMD. |
+| Cold boot (Node TTI) | **253 ms** p50 | — | `gocracker run` to first `node -v` stdout. +35 ms over the pre-toolbox baseline — that's the cost of init spawning the baked toolbox agent before the user's CMD. |
 | Snapshot-resume | **1.33 ms** p50 | 1.92 ms p50 | `bench-rtt` measurement of `RestoreFromSnapshotWithOptions → vm.Start` on this branch; the older head-to-head row on Firecracker v1.10.1 used `curl -w '%{time_total}'` including HTTP layer. |
 | Warm restore + SetNetwork re-IP | **~55 ms** p50 | — | Full lease-style path: `Restore` (40-45 ms) + toolbox SetNetwork (11-13 ms). Now **bypassed** in the warm-pool path: see next row. |
 | Sandboxd warm lease (pool paused→ready) | **1.5 ms** p95 | — | Measured 2026-04-22 on feat/sandboxd-v3-followups, pool of 8, sequential. The pool reuses the IP baked into each VM's cold-boot snapshot and skips SetNetwork on the hot path. See [Sandboxd performance](#sandboxd-performance-2026-04-22). |
 | Sandboxd E2E `create → exec echo → delete` | **~35 ms** p95 | — | Same bench, full round trip from the Python/Go/Node SDK. Async delete lands the HTTP response in 1.9 ms; the ~22 ms residual is UDS+vsock CONNECT + the agent's fork/exec for `echo`. |
-| Sandboxd warm TTI (`node -v` against `base-node`) | **277 ms** p50 | — | ComputeSDK methodology: warm pool of 8, lease handle then time `sb.process.exec(['node','-v'])` to first byte. ~258 ms is node's own startup on alpine/musl; agent + UDS overhead is ~20 ms (echo measured at ~19 ms p50). See [Sandboxd performance](#sandboxd-performance-2026-04-22). |
+| Sandboxd warm TTI (`node -v` against `base-node`) | **277 ms** p50 | — | Warm pool of 8, lease handle then time `sb.process.exec(['node','-v'])` to first byte. ~258 ms is node's own startup on alpine/musl; agent + UDS overhead is ~20 ms (echo measured at ~19 ms p50). See [Sandboxd performance](#sandboxd-performance-2026-04-22). |
 
 Both benches run with the VMM pinned to a dedicated CPU (`taskset`) and boosted to SCHED_FIFO (`chrt -r 50`), with `mlockall(MCL_CURRENT)` locking the VMM's working set. The snapshot path deliberately does NOT set `MCL_FUTURE` because that would eager-fault the `MAP_PRIVATE` memory snapshot and turn a ~2 ms lazy-COW restore into ~30 ms.
 

@@ -107,7 +107,7 @@ export class Sandbox {
     return new ToolboxClient(this.udsPath);
   }
 
-  // ---- Daytona-style namespaces (v2 parity on v3 runtime) ----
+  // ---- Convenience namespaces (v2 parity on v3 runtime) ----
   //
   // const sb = await client.createSandbox({ template: 'base-python' });
   // await sb.process.exec('python -c "print(2+2)"');
@@ -119,8 +119,7 @@ export class Sandbox {
   get fs() { return new _FSNamespace(this.toolbox()); }
 
   /** Mint a signed preview URL for a guest-side port and return the
-   * absolute URL (includes scheme + host + `/previews/<token>/`).
-   * Matches Daytona's `sandbox.previewLink(port)` shape. */
+   * absolute URL (includes scheme + host + `/previews/<token>/`). */
   async previewUrl(port) {
     if (!this._client) throw new SandboxError('Sandbox has no client');
     const preview = await this._client.mintPreview(this.id, port);
@@ -185,7 +184,7 @@ export class Client {
 
   // Sandboxes
   async createSandbox(req) {
-    // Daytona-style template resolution: `createSandbox({template: 'base-python'})`
+    // Template resolution: `createSandbox({template: 'base-python'})`
     // looks up the registered template and fills in image/kernelPath/mem/cpus
     // from its spec. Subsequent request hits the warm-cache restore path.
     if (req.template) {

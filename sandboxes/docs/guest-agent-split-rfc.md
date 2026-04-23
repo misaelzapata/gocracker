@@ -34,8 +34,8 @@ This is the closest fit to patterns used by serious VM/sandbox systems:
 - Firecracker / crosvm / Cloud Hypervisor: transport only, custom agent above
 - QEMU Guest Agent: formal admin RPCs for guest operations
 - Kata agent: persistent runtime agent over vsock
-- Daytona / E2B / Docker Sandboxes: toolbox/controller baked into images,
-  templates, or snapshots instead of late bootstrap in the request path
+- Docker Sandboxes: toolbox/controller baked into images, templates, or
+  snapshots instead of late bootstrap in the request path
 
 ## Problem Statement
 
@@ -186,7 +186,8 @@ For v1 of the split, HTTP over vsock is acceptable because:
 
 - it is easy to debug
 - the SDK shape already maps well to resource endpoints
-- it aligns with Daytona's toolbox model
+- it is cheap to replace — framed RPC can land later without touching
+  the transport boundary or the client SDKs
 
 Longer term, a ttrpc/Kata-style RPC layer may be better for lower overhead and
 typed APIs, but it is not required to fix the current problem.
@@ -485,8 +486,7 @@ This phase is optional and should happen only after the split is paying off.
   its full surface is broader than what `gocracker` needs in the runtime.
 - **Kata agent**: validates the persistent in-guest runtime-agent model over
   vsock and is the strongest architectural reference for long-term evolution.
-- **Daytona**: validates the toolbox-as-service model inside the sandbox.
-- **E2B / Docker Sandboxes**: validate baking the controller/tooling into
+- **Docker Sandboxes**: validates baking the controller/tooling into
   templates/snapshots instead of re-installing on every create.
 
 ## Decision
@@ -516,12 +516,6 @@ grow richer without destabilizing the VM control path.
   - https://www.cloudhypervisor.org/docs/prologue/commands/
 - crosvm / ChromiumOS vsock docs:
   - https://chromium.googlesource.com/chromiumos/platform2/+/HEAD/vm_tools/docs/vsock.md
-- Daytona:
-  - https://www.daytona.io/docs/en/sandboxes/
-  - https://www.daytona.io/docs/ja/architecture/
-- E2B:
-  - https://e2b.dev/docs/template/how-it-works
-  - https://e2b.dev/docs/sandbox/snapshots
 - Docker Sandboxes:
   - https://docs.docker.com/ai/sandboxes/templates/
   - https://docs.docker.com/ai/sandboxes/agents/

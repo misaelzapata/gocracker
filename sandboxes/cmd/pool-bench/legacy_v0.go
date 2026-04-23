@@ -2,7 +2,7 @@
 
 // pool-bench: pre-warms N VMs from a warm-cache snapshot and benchmarks
 // exec latency against the live pool — no CLI overhead, no restore cost per
-// request. This is the Daytona/Firecracker pool model.
+// request.
 //
 // Usage:
 //

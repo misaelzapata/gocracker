@@ -93,7 +93,7 @@ class Sandbox:
 
         return ToolboxClient(self.uds_path)
 
-    # ---- Daytona-style namespaces (v2 parity on top of v3 runtime) ----
+    # ---- Convenience namespaces (v2 parity on top of v3 runtime) ----
     #
     # sb.process.exec("python -c 'print(2)'")
     # sb.fs.read_file("/tmp/x")
@@ -101,8 +101,8 @@ class Sandbox:
     # with client.create_sandbox(template="base-python") as sb: ...
     #
     # The underlying transport (UDS + CONNECT + toolbox agent) is
-    # unchanged; these are thin wrappers to match the shape users
-    # coming from Daytona / sandboxes-v2 expect.
+    # unchanged; these are thin wrappers that keep the shape v2 callers
+    # expect.
 
     @property
     def process(self) -> "_ProcessNamespace":
@@ -115,8 +115,7 @@ class Sandbox:
     def preview_url(self, port: int) -> str:
         """Mint a signed preview URL for a guest-side port. Returns the
         absolute path-form URL (`/previews/<token>/`) usable directly
-        against the sandboxd HTTP endpoint, matching Daytona's
-        `sandbox.preview_link(port)`.
+        against the sandboxd HTTP endpoint.
 
         Callers who need the subdomain form, expiry, or raw token can
         use `client.mint_preview(sb.id, port)` which returns the full
@@ -136,7 +135,7 @@ class Sandbox:
         except SandboxError:
             # Swallow cleanup errors — the user's exc (if any) is more
             # interesting than a double-delete of an already-gone
-            # sandbox. Mirrors v2 + Daytona behaviour.
+            # sandbox. Mirrors v2 behaviour.
             pass
 
 
@@ -154,8 +153,7 @@ class _ProcessNamespace:
         stdin=None,
         timeout: float = 30.0,
     ):
-        """Synchronous exec. Raises ProcessExitError on non-zero exit.
-        Matches Daytona's `sandbox.process.exec(cmd)` + v2 shape."""
+        """Synchronous exec. Raises ProcessExitError on non-zero exit."""
         if isinstance(cmd, str):
             cmd = ["/bin/sh", "-c", cmd]
         result = self._tb.exec(cmd, env=env, workdir=workdir, stdin=stdin, timeout=timeout)
@@ -209,7 +207,7 @@ class _FSNamespace:
 class ProcessExitError(SandboxError):
     """Raised by sb.process.exec(cmd) when cmd exits non-zero. Carries
     the exit code + captured stdout/stderr so the caller can log or
-    recover. Matches v2 / Daytona error shape."""
+    recover."""
 
     def __init__(self, exit_code: int, stdout: str, stderr: str):
         super().__init__(f"process exited with code {exit_code}")
@@ -305,7 +303,7 @@ class Client:
         context: str = "",
         template: str = "",
     ) -> Sandbox:
-        # Daytona-style template resolution: `create_sandbox(template="base-python")`
+        # Template resolution: `create_sandbox(template="base-python")`
         # looks up the registered template, copies its image/kernel/mem
         # into the request, then falls through to the normal create path.
         # The underlying template's snapshot is already in the warm cache

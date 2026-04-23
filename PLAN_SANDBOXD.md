@@ -489,9 +489,9 @@ Target aspiracional de la tabla de sección 6 (`p50 <10 ms`). **Resultado tras a
 - **Base templates** `base-python`, `base-node`, `base-bun`, `base-go` — venían en el plan original (sección 6 de este doc) pero no están implementadas. Multi-stage Dockerfile con toolbox agent ya baked, `python3/node/bun/go` preinstalados, snapshot post-ready. Reducen cold-boot a ~80–120 ms (saltan el apk/apt install).
 - **Entrypoint override en `CreateSandboxRequest`** — hoy sandboxd solo expone `Cmd`; para imágenes como `alpine/git` que tienen `ENTRYPOINT=["git"]`, no hay forma de evitar el panic de kernel sin reescribir la imagen. Agregar `Entrypoint []string` al request y propagarlo a `container.RunOptions` (ya existe el campo allá).
 
-### 10.5.1 SDK shape estilo Daytona (traer de vuelta de v2)
+### 10.5.1 SDK shape con namespaces (traer de vuelta de v2)
 
-v3 cortó la SDK Daytona-style que v2 ya tenía (se mató por problemas de transporte, no por la API). Los usuarios esperan ver algo reconocible — esto trae la forma de v2 encima del runtime estable de v3. Objetivo: que un dev que conoce Daytona lo agarre sin leer docs.
+v3 cortó la forma con namespaces que v2 ya tenía (se mató por problemas de transporte, no por la API). Esto trae esa forma encima del runtime estable de v3: `sb.process.exec`, `sb.fs.read_file`, `sb.preview_url`, context-manager, errores tipados.
 
 **Forma pública objetivo (Python, con equivalentes en Go + JS/TS)**:
 
@@ -572,12 +572,12 @@ Manteniendo el principio del plan original (cada commit mergeable + verde):
 34. `perf(vmm): UFFD lazy memory restore` — opt 10.4 #3 (mayor esfuerzo, último).
 35. `feat(sandboxd): POST /sandboxes/{id}/recycle` — vuelve el slot al pool sin tirar la VM, para SDK 10.5.1.
 36. `feat(sandboxd): autoregistrar los 4 base templates al arranque` — 10.5.1.
-37. `feat(sdk): Daytona-style surface (template=, .process, .fs, preview_url, with-context, typed errors, pause/resume/recycle)` — Python + Go + JS/TS en el mismo commit para paridad.
-38. `docs(cookbook): traer 14 ejemplos de v2 adaptados al SDK Daytona-style` — lista en 10.5.1.
+37. `feat(sdk): namespaced surface (template=, .process, .fs, preview_url, with-context, typed errors, pause/resume/recycle)` — Python + Go + JS/TS en el mismo commit para paridad.
+38. `docs(cookbook): traer 14 ejemplos de v2 adaptados al SDK nuevo` — lista en 10.5.1.
 
 **Gate de velocidad** tras commit 27 (IP preasignado): pool-bench warm-lease **p95 < 10 ms** en x86. ✅ **CUMPLIDO 2026-04-22: p95=1.5 ms** — 6× mejor que el gate.
 
-**Gate de SDK** tras commit 37: los 14 ejemplos de 10.5.1 corren verdes + un dev de Daytona entiende la API leyendo el README en 2 minutos. ✅ **API Daytona-shape mergeada 2026-04-22**: `with client.create_sandbox(template="base-python") as sb: sb.process.exec("..."); sb.fs.read_file("..."); sb.preview_url(8080)` funciona end-to-end. Los 14 ejemplos específicos de v2 faltan por portar.
+**Gate de SDK** tras commit 37: los 14 ejemplos de 10.5.1 corren verdes + la API se entiende leyendo el README en 2 minutos. ✅ **API con namespaces mergeada 2026-04-22**: `with client.create_sandbox(template="base-python") as sb: sb.process.exec("..."); sb.fs.read_file("..."); sb.preview_url(8080)` funciona end-to-end. Los 14 ejemplos específicos de v2 faltan por portar.
 
 ### 10.7 Trabajo completado 2026-04-22 (sesión de consolidación)
 
@@ -594,7 +594,7 @@ Lo que landeó en esta sesión, para diferenciarlo del roadmap futuro:
 6. **KSM opt-in** — `GOCRACKER_KSM=1` aplica `MADV_MERGEABLE` al memfd de restore, dedupe ~30–60 % de RSS entre clones del mismo template.
 
 **Features de UX (1)**:
-7. **SDK Daytona-style** en Python: `sb.process.exec/.exec_stream`, `sb.fs.read_file/.write_file/.list_dir/.remove/.mkdir/.chmod/.rename`, `sb.preview_url(port)`, context-manager `with ... as sb`, errores tipados (`ProcessExitError`, `TemplateNotFound`, `PoolExhausted`, `RuntimeUnreachable`, `SandboxTimeout`), y `create_sandbox(template="base-python")` que resuelve por nombre. Equivalentes en Go/TS pendientes.
+7. **SDK con namespaces** en Python: `sb.process.exec/.exec_stream`, `sb.fs.read_file/.write_file/.list_dir/.remove/.mkdir/.chmod/.rename`, `sb.preview_url(port)`, context-manager `with ... as sb`, errores tipados (`ProcessExitError`, `TemplateNotFound`, `PoolExhausted`, `RuntimeUnreachable`, `SandboxTimeout`), y `create_sandbox(template="base-python")` que resuelve por nombre. Equivalentes en Go/TS pendientes.
 
 **Cookbook**: 10/10 verdes tras los fixes. Los 14 ejemplos adicionales de v2 (`run_python_code`, `pause_resume`, `session_wait`, `nextjs_preview`, etc.) quedan para la próxima sesión.
 
@@ -603,6 +603,6 @@ Lo que landeó en esta sesión, para diferenciarlo del roadmap futuro:
 - io_uring restore (big effort, restore ya es ~40 ms)
 - Compose caching (moderate effort)
 - UFFD lazy restore (biggest effort, baja restore a <10 ms)
-- SDK Daytona-style en Go + TS (paridad)
+- SDK con namespaces en Go + TS (paridad)
 - 14 ejemplos faltantes de v2 (portar a SDK nueva)
 - `recycle` endpoint (`POST /sandboxes/{id}/recycle`) para v2-style slot reuse

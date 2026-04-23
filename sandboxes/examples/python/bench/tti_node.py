@@ -1,10 +1,9 @@
-"""ComputeSDK-style TTI bench.
+"""Time-to-Interactive bench.
 
 TTI = wall-clock from `create()` returning the sandbox handle to the
 first stdout byte of `runCommand("node", "-v")`. Ten timed runs after
 one warmup, against the auto-registered `base-node` template (warm
-pool of 8). Pre-warmed pool stands in for ComputeSDK's "pre-built
-sandbox image" so the comparison stays apples-to-apples.
+pool of 8).
 """
 import sys, time, statistics
 sys.path.insert(0, '/home/misael/Desktop/projects/gocracker/sandboxes/sdk/python')
@@ -12,8 +11,8 @@ from gocracker import Client
 
 c = Client('http://127.0.0.1:9091', timeout=60)
 
-# Register a warm pool from base-node so create_sandbox lands a warm
-# restore (matches "pre-built sandbox image" in ComputeSDK).
+# Register a warm pool from base-node so lease_sandbox lands a warm
+# restore.
 try: c.unregister_pool('tti-bench')
 except Exception: pass
 c.register_pool(template_id='tti-bench', from_template='base-node', min_paused=8, max_paused=8)
