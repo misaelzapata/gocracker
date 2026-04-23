@@ -1,0 +1,86 @@
+# Minimal ARM64 microVM guest — trims on top of the saved minimal arm64 base
+# config (artifacts/kernels/gocracker-guest-minimal-arm64.config). Mirrors the
+# x86_64 standard/minimal split.
+#
+# The minimal arm64 base config was hand-trimmed from a full Ubuntu AWS arm64
+# config to ~2475 lines (vs ~14k for standard). That trim removed several
+# subsystems the microVM path doesn't use, but it also dropped DMA-layer
+# helpers that arm64 + virtio-mmio + virtio-blk DO require — without them the
+# guest fails its first vda read with "I/O error sector N op 0x0:(READ)" and
+# reboots before init runs.
+#
+# This fragment re-asserts the gocracker baseline (virtio, vsock, overlay,
+# PL031 RTC — same as guest-common-arm64.fragment) PLUS the DMA bits that
+# must stay built-in for virtio-blk to function on arm64.
+
+# -------- baseline (matches guest-common-arm64.fragment) --------
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_TMPFS=y
+CONFIG_BINFMT_ELF=y
+
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+
+CONFIG_EXT4_FS=y
+CONFIG_OVERLAY_FS=y
+CONFIG_RD_GZIP=y
+CONFIG_RD_XZ=y
+CONFIG_RD_ZSTD=y
+CONFIG_RD_LZ4=y
+
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y
+# CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES is not set
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_HW_RANDOM_VIRTIO=y
+
+CONFIG_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS_COMMON=y
+
+CONFIG_PACKET=y
+CONFIG_UNIX=y
+CONFIG_INET=y
+CONFIG_IPV6=y
+CONFIG_NET=y
+CONFIG_DNS_RESOLVER=y
+
+CONFIG_ARM_GIC_V2M=y
+CONFIG_ARM_GIC_V3=y
+CONFIG_ARM_GIC_V3_ITS=y
+CONFIG_ARM_ARCH_TIMER=y
+CONFIG_ARCH_VIRT=y
+CONFIG_ARM_PSCI_FW=y
+
+CONFIG_RTC_CLASS=y
+CONFIG_RTC_DRV_PL031=y
+
+# -------- DMA layer required by arm64 + virtio-mmio + virtio-blk --------
+# Without these, virtio-blk descriptors land at addresses the host VMM
+# rejects ("guest memory access below base"), and the guest panics on its
+# first rootfs read. CONFIG_CMA + CONFIG_DMA_CMA give the kernel a
+# contiguous-allocator pool for virtqueue setup; CONFIG_DMA_OPS_HELPERS
+# pulls in the helpers swiotlb_dma_ops needs on arm64; ARCH_HAS_DMA_OPS
+# enables the dispatch path. CONFIG_DMA_DIRECT_REMAP is the fallback
+# remap path when SWIOTLB bounce buffers are required.
+CONFIG_CMA=y
+CONFIG_CMA_AREAS=20
+CONFIG_CMA_ALIGNMENT=8
+CONFIG_CMA_SIZE_MBYTES=0
+CONFIG_CMA_SIZE_SEL_MBYTES=y
+CONFIG_CMA_SYSFS=y
+CONFIG_DMA_CMA=y
+CONFIG_DMA_OPS_HELPERS=y
+CONFIG_DMA_DIRECT_REMAP=y
+CONFIG_ARCH_HAS_DMA_OPS=y
+
+# -------- size discipline --------
+CONFIG_DEBUG_INFO_NONE=y
+# CONFIG_DEBUG_INFO is not set
+# CONFIG_DEBUG_INFO_BTF is not set
+# CONFIG_MODULE_SIG is not set
+CONFIG_SYSTEM_TRUSTED_KEYS=""
+CONFIG_SYSTEM_REVOCATION_KEYS=""
