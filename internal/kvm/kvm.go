@@ -392,6 +392,16 @@ func (s *System) CreateVMFromSnapshotFileMemfd(memFilePath string, memMB uint64,
 		return nil, fmt.Errorf("mmap restore memfd: %w", err)
 	}
 	_ = unix.Madvise(mem, unix.MADV_HUGEPAGE)
+	// Opt-in KSM via GOCRACKER_KSM=1: tag the guest RAM as mergeable so
+	// the kernel's KSM thread deduplicates identical pages across VMs
+	// that restored from the same snapshot. Typical savings: 30–60% RSS
+	// on a pool of N clones of the same template (the kernel text,
+	// initrd, idle userspace pages are byte-identical). Costs ~2–5%
+	// CPU on the host's ksmd for the dedup scan; off by default so the
+	// non-pool path doesn't pay for it.
+	if ksmEnabled() {
+		_ = unix.Madvise(mem, unix.MADV_MERGEABLE)
+	}
 	// Prefault the first 8 MiB: kernel text, page tables, vCPU stack live
 	// in the first few pages of guest RAM. Matches the COW-path heuristic
 	// so virtio-fs restores don't take a latency hit vs non-virtiofs ones.
@@ -1471,5 +1481,17 @@ func vmIoctl(fd int, nr uintptr, arg uintptr) (uintptr, error) {
 		return 0, errno
 	}
 	return r, nil
+}
+
+// ksmEnabled reports whether the caller opted into KSM page merging
+// for guest RAM. Honours GOCRACKER_KSM=1|true|yes|on (case-insensitive).
+// Off by default so the single-VM path doesn't pay ksmd CPU cost; pools
+// running many clones of the same template are the primary benefactor.
+func ksmEnabled() bool {
+	switch os.Getenv("GOCRACKER_KSM") {
+	case "1", "true", "TRUE", "True", "yes", "YES", "on", "ON":
+		return true
+	}
+	return false
 }
 
