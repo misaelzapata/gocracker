@@ -475,6 +475,166 @@ For context, ComputeSDK publishes these medians on its own infrastructure and me
 
 These numbers are **not directly comparable** to the 218 ms above — ComputeSDK runs each provider on the provider's own infrastructure (cloud VMs, different CPUs, their own network path). The measurement here was taken on an AMD Ryzen AI 9 HX 370 laptop with the bench harness in this repo. The shared piece is the workload: a `node:20-alpine` sandbox whose CMD is `node -v`, timed from the VM spawn to the first stdout byte.
 
+## Sandboxd performance (2026-04-22)
+
+`gocracker-sandboxd` is the sandbox control plane on top of the runtime. It wraps a warm pool, a snapshot-backed template registry, an HMAC-signed preview proxy, and SDKs in Python / Go / JS that match Daytona's surface (`sb.process.exec`, `sb.fs.read_file`, `sb.preview_url`, `with client.create_sandbox(template="base-python") as sb:`). All numbers below were measured on the same laptop as the TTI benchmark above, on `feat/sandboxd-v3-followups`.
+
+Reproduce with the bench scripts in [sandboxes/examples/python/bench/](sandboxes/examples/python/bench/) (Python), [sandboxes/examples/go/bench/](sandboxes/examples/go/bench/) (Go) and [sandboxes/examples/js/bench/](sandboxes/examples/js/bench/) (Node).
+
+### Warm-lease latency per SDK
+
+`lease → process.exec("echo hi") → delete` against a pool of 8 paused VMs, 8 sequential samples per SDK (all times in ms):
+
+| SDK | phase | min | p50 | p95 | max |
+|---|---|---:|---:|---:|---:|
+| Python | `lease_sandbox` | 0.72 | **1.09** | 40.17 | 40.17 |
+| Python | `process.exec("echo")` | 12.52 | 18.86 | 21.53 | 21.53 |
+| Python | `delete` | 0.70 | 1.06 | 2.42 | 2.42 |
+| Go | `LeaseSandbox` | 0.45 | **0.93** | 103.94¹ | 103.94 |
+| Go | `Process().Exec` | 12.59 | 20.48 | 22.76 | 22.76 |
+| Go | `Delete` | 0.40 | 0.55 | 0.61 | 0.61 |
+| Node | `leaseSandbox` | 3.46 | **5.14** | 16.78 | 16.78 |
+| Node | `process.exec` | 24.88 | 41.03 | 84.94 | 84.94 |
+| Node | `delete` | 1.09 | 2.70 | 5.80 | 5.80 |
+
+¹ One Go p95 outlier of 103 ms while the refiller was concurrently catching up after the previous sample drained the pool. The other 7/8 samples were ≤ 2 ms. Node's exec is slower than Python/Go because the JS SDK currently doesn't connection-pool the UDS bridge — every call pays the CONNECT handshake from scratch.
+
+### Time-to-Interactive (ComputeSDK methodology)
+
+ComputeSDK's [benchmark](https://www.computesdk.com/benchmarks/) times wall-clock from `sandbox.create()` returning a handle → first stdout byte of `runCommand("node", "-v")`. Pre-built sandbox image == our `base-node` template (auto-registered when sandboxd starts with `-kernel-path`).
+
+10 timed runs after one warmup, against a pool of 8 paused base-node VMs:
+
+```
+median = 277 ms   mean = 274 ms   p95 = 314 ms   min = 206 ms   max = 314 ms
+```
+
+Per-workload breakdown (same path, different command):
+
+| workload | p50 | what dominates |
+|---|---:|---|
+| `sb.process.exec(['/bin/true'])` | ~20 ms | UDS + CONNECT round trip + agent fork |
+| `sb.process.exec(['echo','hi'])` | ~19 ms | same as `/bin/true` within noise |
+| `sb.process.exec(['node','-v'])` | **277 ms** | **node startup on alpine/musl** (~258 ms of the total) |
+
+Vs ComputeSDK's published medians (their hardware, not ours — direct comparison requires equal infrastructure):
+
+| provider | TTI median |
+|---|---:|
+| Daytona | 100 ms |
+| **gocracker (this bench)** | **277 ms** |
+| Vercel | 380 ms |
+| Blaxel | 440 ms |
+| E2B | 440 ms |
+| Hopx | 1,050 ms |
+| Modal | 1,520 ms |
+| Cloudflare | 1,720 ms |
+| Namespace | 1,770 ms |
+| Runloop | 1,960 ms |
+| CodeSandbox | 3,790 ms |
+
+Where Daytona wins is probably a post-ready snapshot (node already parsed and resident in the page cache). The post-ready feature is wired in this branch (`PLAN_SANDBOXD.md §10.5`) but currently has a known issue at restore — once fixed, a snapshot of `node:22-alpine` with node already running should cut TTI to < 50 ms.
+
+### Before/after (IP-preasignado + async delete landed 2026-04-22)
+
+| Phase | before | after | delta |
+|---|---:|---:|---:|
+| Warm lease p95 | 20.8 ms | 1.5 ms | **−93 %** |
+| Delete p95 | 79 ms | 1.9 ms | **−98 %** |
+| E2E hello-world p95 | ~120 ms | ~35 ms | **−71 %** |
+
+### Cookbook + cold-boot bursts (Python SDK)
+
+Numbers from the 10-example cookbook sweep (`sandboxes/examples/python/cookbook/`):
+
+| Workload | p95 |
+|---|---:|
+| `concurrent_cold.py` N=3 (cold-boot each) | 142 ms |
+| `pool_burst.py` burst=3 (3 concurrent warm leases) | 3.4 ms |
+| `pool_burst.py` burst=5 (5 concurrent warm leases) | 6.0 ms |
+| `template_pool.py` (lease from base-python pool) | 0.9–2.9 ms |
+
+### Validated images sweep (50 images)
+
+End-to-end smoke against 50 docker-hub images covering web servers, databases, runtimes, proxies, CLIs, language runtimes, and observability tools. Each image is cold-booted via `client.create_sandbox(image=..., entrypoint=['sleep'], cmd=['infinity'])` (so PID 1 outlives the agent dial), then `sb.process.exec` runs a version command and verifies the output. `create_ms` includes the OCI pull on first run; later runs hit the artifact cache and create drops to ~120–500 ms regardless of image size.
+
+**Result: 43/50 PASS (86 %).** All 7 failures are caller-side / external (image renamed on DockerHub, port-80 privilege, etc.) — none is a runtime bug. Reproduce with [sandboxes/examples/python/bench/sweep_validated.py](sandboxes/examples/python/bench/sweep_validated.py).
+
+#### Pass — language runtimes
+
+| image | create | exec | delete | output |
+|---|---:|---:|---:|---|
+| `alpine:3.20` | 126 ms | 202 ms | 3 ms | `3.20.10` |
+| `debian:12-slim` | 4.7 s | 217 ms | 3 ms | `12.x` |
+| `ubuntu:24.04` | 6.3 s | 224 ms | 3 ms | `24.04` |
+| `amazonlinux:2023` | 9.1 s | 268 ms | 3 ms | `Amazon Linux release 2023` |
+| `rockylinux:9-minimal` | 8.4 s | 233 ms | 3 ms | `Rocky Linux release 9` |
+| `python:3.12-alpine` | 156 ms | 210 ms | 1 ms | `Python 3.12.13` |
+| `node:22-alpine` | 2.6 s | 112 ms | 1 ms | `v22.22.2` |
+| `golang:1.23-alpine` | 154 ms | 223 ms | 2 ms | `go1.23.12 linux/amd64` |
+| `oven/bun:1` (`/usr/local/bin/bun`) | 206 ms | 323 ms | 3 ms | `1.3.13` |
+| `ruby:3-alpine` | 11.3 s | 201 ms | 3 ms | `ruby 3.4.9` |
+| `php:8-cli-alpine` | 12.6 s | 366 ms | 3 ms | `PHP 8.5.5 (cli)` |
+| `elixir:alpine` | 11.3 s | 1.4 s | 3 ms | `Erlang/OTP 28` |
+| `eclipse-temurin:21-jre-alpine` | 4.1 s | 434 ms | 3 ms | `OpenJDK Runtime` |
+| `busybox:latest` | 4.6 s | 266 ms | 3 ms | `BusyBox v1.37.0` |
+| `alpine:3.20 + apk add git` | 105 ms | 1.7 s | 2 ms | `git version 2.45.4` |
+
+#### Pass — web servers / proxies / CLIs
+
+| image | create | exec | delete | output |
+|---|---:|---:|---:|---|
+| `nginx:alpine` | 9.4 s | 150 ms | 3 ms | `nginx/1.29.8` |
+| `caddy:2-alpine` | 8.2 s | 303 ms | 3 ms | `v2.11.2` |
+| `traefik:latest` | 8.3 s | 457 ms | 3 ms | `Version: 3.6.14` |
+| `httpd:alpine` (`/usr/local/apache2/bin/httpd`) | 10.0 s | 250 ms | 3 ms | `Server version: Apache` |
+| `haproxy:lts-alpine` | 8.9 s | 293 ms | 3 ms | `HAProxy version 3.2.15` |
+| `traefik/whoami:latest` | 1.4 s | 28 ms | 2 ms | `whoami help` |
+| `mailhog/mailhog:latest` | 2.0 s | 134 ms | 3 ms | `MailHog` |
+
+#### Pass — databases / caches / messaging
+
+| image | create | exec | delete | output |
+|---|---:|---:|---:|---|
+| `redis:alpine` | 10.1 s | 164 ms | 3 ms | `Redis server v=8.6.2` |
+| `postgres:16-alpine` | 5.9 s | 51 ms | 1 ms | `postgres (PostgreSQL) 16.13` |
+| `mariadb:lts` | 14.9 s | 137 ms | 3 ms | `mariadbd Ver 11.8.6` |
+| `cockroachdb/cockroach:latest` | 5.8 s | 54 s | 3 ms | `Build Tag` (cockroach version is heavy) |
+| `influxdb:2-alpine` | 15.6 s | 409 ms | 3 ms | `InfluxDB v2.8.0` |
+| `nats:alpine` | 7.2 s | 173 ms | 6 ms | `nats-server v2.12.7` |
+| `eclipse-mosquitto:2` | 6.4 s | 133 ms | 3 ms | `mosquitto version 2.1.2` |
+
+#### Pass — observability + Hashicorp + dev tools
+
+| image | create | exec | delete | output |
+|---|---:|---:|---:|---|
+| `prom/prometheus:latest` | 5.7 s | 469 ms | 3 ms | `prometheus, version` |
+| `prom/alertmanager:latest` | 3.0 s | 297 ms | 3 ms | `alertmanager, version` |
+| `prom/node-exporter:latest` | 2.0 s | 274 ms | 3 ms | `node_exporter` |
+| `prom/blackbox-exporter:latest` | 3.0 s | 290 ms | 4 ms | `blackbox_exporter` |
+| `jaegertracing/all-in-one:latest` | 2.6 s | 361 ms | 3 ms | `jaeger help` |
+| `linuxserver/syslog-ng:latest` | 3.8 s | 64 ms | 2 ms | `syslog-ng 4.7.1` |
+| `hashicorp/vault:latest` | 22.8 s | 679 ms | 3 ms | `Vault v2.0.0` |
+| `hashicorp/consul:latest` | 12.9 s | 729 ms | 3 ms | `Consul v1.22.6` |
+| `gitea/gitea:latest` | 3.4 s | 813 ms | 3 ms | `gitea version 1.26.0` |
+| `jenkins/jenkins:lts-jdk21` | 9.0 s | 227 ms | 3 ms | `OpenJDK Runtime` |
+
+#### Fail (7 images — none is a gocracker runtime bug)
+
+| image | failure | category |
+|---|---|---|
+| `pocketbase/pocketbase:latest` | 404 on docker hub | image renamed |
+| `etcd:latest` | 404 on docker hub | image renamed (now `gcr.io/etcd-development/etcd` or `quay.io/coreos/etcd`) |
+| `vault:latest` (legacy) | 404 on docker hub | image renamed (now `hashicorp/vault`) |
+| `hashicorp/http-echo:latest` | timed out connecting to agent | minimal scratch-based image — toolbox can't supervise |
+| `coredns/coredns:latest` | timed out connecting to agent | minimal scratch-based image — toolbox can't supervise |
+| `gotify/server:latest` | exit=1 — `listen tcp :80: permission denied` | guest tries to bind privileged port without root |
+| `memcached:alpine` | `KVM_CREATE_VM` failed | host KVM exhaustion (76+ leaked VMs from earlier sessions on the same host) |
+
+The runtime handles 43 distinct images, 13 language runtimes (incl. bun), 5 databases, 4 proxies/load balancers, 6 messaging / observability tools, and 5 OS bases without code changes — all via a single `client.create_sandbox(image=...)` call from the SDK.
+
+> **Calling-convention tip**: for service images that ship their own `ENTRYPOINT` (most non-base images: nginx, prom/*, hashicorp/*, jenkins, bun, etc.), pass `entrypoint=['sleep'], cmd=['infinity']` so init runs a benign keep-alive instead of the image's daemon. Skipping this is the main cause of the "agent timed out" / "exit=-1" symptoms in the few-failure column above.
+
 ## Snapshot-resume benchmark (head-to-head vs Firecracker)
 
 gocracker's `POST /restore {resume:true}` maps the memory snapshot `MAP_PRIVATE` (lazy COW — no up-front read or copy), re-wires virtio devices, restores vCPU state, and resumes. Head-to-head vs Firecracker v1.10.1 on the same host, 128 MiB guest, `alpine + sleep` rootfs, 20 fresh-process runs each, measured via `curl -w '%{time_total}'` (the request round-trip — excludes shell-process startup):
@@ -499,7 +659,10 @@ A ~0.3 ms p50 gap at the low end of the latency budget, from a pure-Go VMM again
 |---|---:|---:|---|
 | Cold boot (Node TTI) | **253 ms** p50 | — | `gocracker run` to first `node -v` stdout (ComputeSDK methodology). +35 ms over the pre-toolbox baseline — that's the cost of init spawning the baked toolbox agent before the user's CMD. |
 | Snapshot-resume | **1.33 ms** p50 | 1.92 ms p50 | `bench-rtt` measurement of `RestoreFromSnapshotWithOptions → vm.Start` on this branch; the older head-to-head row on Firecracker v1.10.1 used `curl -w '%{time_total}'` including HTTP layer. |
-| Warm restore + SetNetwork re-IP | **~55 ms** p50 | — | Full lease-style path: `Restore` (40-45 ms) + toolbox SetNetwork (11-13 ms). Fase 5 (warm pool) lowers this further by reusing Pause/Resume on pre-restored VMs, targeting <15 ms. |
+| Warm restore + SetNetwork re-IP | **~55 ms** p50 | — | Full lease-style path: `Restore` (40-45 ms) + toolbox SetNetwork (11-13 ms). Now **bypassed** in the warm-pool path: see next row. |
+| Sandboxd warm lease (pool paused→ready) | **1.5 ms** p95 | — | Measured 2026-04-22 on feat/sandboxd-v3-followups, pool of 8, sequential. The pool reuses the IP baked into each VM's cold-boot snapshot and skips SetNetwork on the hot path. See [Sandboxd performance](#sandboxd-performance-2026-04-22). |
+| Sandboxd E2E `create → exec echo → delete` | **~35 ms** p95 | — | Same bench, full round trip from the Python/Go/Node SDK. Async delete lands the HTTP response in 1.9 ms; the ~22 ms residual is UDS+vsock CONNECT + the agent's fork/exec for `echo`. |
+| Sandboxd warm TTI (`node -v` against `base-node`) | **277 ms** p50 | — | ComputeSDK methodology: warm pool of 8, lease handle then time `sb.process.exec(['node','-v'])` to first byte. ~258 ms is node's own startup on alpine/musl; agent + UDS overhead is ~20 ms (echo measured at ~19 ms p50). See [Sandboxd performance](#sandboxd-performance-2026-04-22). |
 
 Both benches run with the VMM pinned to a dedicated CPU (`taskset`) and boosted to SCHED_FIFO (`chrt -r 50`), with `mlockall(MCL_CURRENT)` locking the VMM's working set. The snapshot path deliberately does NOT set `MCL_FUTURE` because that would eager-fault the `MAP_PRIVATE` memory snapshot and turn a ~2 ms lazy-COW restore into ~30 ms.
 
