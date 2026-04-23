@@ -36,6 +36,34 @@ export class SandboxNotFound extends SandboxError {
 export class SandboxInvalidRequest extends SandboxError {
   constructor(...args) { super(...args); this.name = 'SandboxInvalidRequest'; }
 }
+/** Raised by sb.process.exec when the command exits non-zero. Carries
+ * exitCode + stdout/stderr so callers can log or recover without re-running.
+ * Matches the Python SDK's ProcessExitError shape. */
+export class ProcessExitError extends SandboxError {
+  constructor(exitCode, stdout, stderr) {
+    super(`process exited with code ${exitCode}`);
+    this.name = 'ProcessExitError';
+    this.exitCode = exitCode;
+    this.stdout = stdout;
+    this.stderr = stderr;
+  }
+}
+/** The named template was not registered with sandboxd. */
+export class TemplateNotFound extends SandboxError {
+  constructor(...args) { super(...args); this.name = 'TemplateNotFound'; }
+}
+/** LeaseSandbox when the warm pool has no paused entries. */
+export class PoolExhausted extends SandboxError {
+  constructor(...args) { super(...args); this.name = 'PoolExhausted'; }
+}
+/** sandboxd can't reach the gocracker runtime (KVM/jailer missing). */
+export class RuntimeUnreachable extends SandboxError {
+  constructor(...args) { super(...args); this.name = 'RuntimeUnreachable'; }
+}
+/** An operation exceeded its deadline. */
+export class SandboxTimeout extends SandboxError {
+  constructor(...args) { super(...args); this.name = 'SandboxTimeout'; }
+}
 /** 409 — pool template_id already registered, etc. */
 export class SandboxConflict extends SandboxError {
   constructor(...args) { super(...args); this.name = 'SandboxConflict'; }
@@ -66,10 +94,77 @@ export class Sandbox {
     return this._client.delete(this.id);
   }
 
+  /** Recycle this leased sandbox: tear down the current VM and return
+   * a fresh one from the same pool. The old handle (`this`) is dead
+   * after this call — use the returned Sandbox. */
+  async recycle() {
+    if (!this._client) throw new SandboxError('Sandbox has no client');
+    return this._client.recycle(this.id);
+  }
+
   toolbox() {
     if (!this.udsPath) throw new SandboxError('sandbox has no uds_path — not ready?');
     return new ToolboxClient(this.udsPath);
   }
+
+  // ---- Daytona-style namespaces (v2 parity on v3 runtime) ----
+  //
+  // const sb = await client.createSandbox({ template: 'base-python' });
+  // await sb.process.exec('python -c "print(2+2)"');
+  // await sb.fs.writeFile('/tmp/x', Buffer.from('hi'));
+  // const url = await sb.previewUrl(8080);
+  // await using sb = ... ;   // TC39 explicit-resource-management (Node 24+)
+
+  get process() { return new _ProcessNamespace(this.toolbox()); }
+  get fs() { return new _FSNamespace(this.toolbox()); }
+
+  /** Mint a signed preview URL for a guest-side port and return the
+   * absolute URL (includes scheme + host + `/previews/<token>/`).
+   * Matches Daytona's `sandbox.previewLink(port)` shape. */
+  async previewUrl(port) {
+    if (!this._client) throw new SandboxError('Sandbox has no client');
+    const preview = await this._client.mintPreview(this.id, port);
+    return `${this._client.baseUrl}${preview.url}`;
+  }
+
+  /** Symbol.asyncDispose — supports `await using sb = await client.createSandbox(...)`
+   * (TC39 explicit-resource-management proposal, Node 24+). Older
+   * runtimes fall back to explicit `await sb.delete()`. */
+  async [Symbol.asyncDispose]() {
+    try { await this.delete(); } catch (_) { /* swallow double-delete */ }
+  }
+}
+
+function _normalizeExecCmd(cmd) {
+  if (typeof cmd === 'string') return ['/bin/sh', '-c', cmd];
+  if (Array.isArray(cmd)) return cmd;
+  throw new SandboxError(`exec: cmd must be string or string[], got ${typeof cmd}`);
+}
+
+class _ProcessNamespace {
+  constructor(tb) { this._tb = tb; }
+  async exec(cmd, opts = {}) {
+    const res = await this._tb.exec(_normalizeExecCmd(cmd), opts);
+    if (res.exitCode !== 0) {
+      throw new ProcessExitError(res.exitCode, res.stdoutText ?? '', res.stderrText ?? '');
+    }
+    return res;
+  }
+  execStream(cmd, opts = {}) {
+    return this._tb.execStream(_normalizeExecCmd(cmd), opts);
+  }
+  start(cmd, opts = {}) { return this.execStream(cmd, opts); }
+}
+
+class _FSNamespace {
+  constructor(tb) { this._tb = tb; }
+  writeFile(path, data) { return this._tb.upload(path, data); }
+  readFile(path) { return this._tb.download(path); }
+  listDir(path) { return this._tb.listFiles(path); }
+  remove(path) { return this._tb.deleteFile(path); }
+  mkdir(path, parents = true) { return this._tb.mkdir(path, { parents }); }
+  chmod(path, mode) { return this._tb.chmod(path, mode); }
+  rename(src, dst) { return this._tb.rename(src, dst); }
 }
 
 // ---- Control-plane client ----------------------------------------
@@ -90,17 +185,44 @@ export class Client {
 
   // Sandboxes
   async createSandbox(req) {
+    // Daytona-style template resolution: `createSandbox({template: 'base-python'})`
+    // looks up the registered template and fills in image/kernelPath/mem/cpus
+    // from its spec. Subsequent request hits the warm-cache restore path.
+    if (req.template) {
+      let t;
+      try {
+        t = await this.getTemplate(req.template);
+      } catch (err) {
+        throw new TemplateNotFound(
+          `template ${JSON.stringify(req.template)} is unknown. ` +
+          `If you expect base templates (base-python/node/bun/go) to be preregistered, ` +
+          `make sure sandboxd was started with -kernel-path or $GOCRACKER_KERNEL set.`,
+          { status: err.status ?? 0, body: err.body ?? '' }
+        );
+      }
+      const spec = t.spec ?? {};
+      req = {
+        ...req,
+        image: req.image ?? spec.image,
+        kernelPath: req.kernelPath ?? spec.kernel_path,
+        memMB: req.memMB ?? spec.mem_mb,
+        cpus: req.cpus ?? spec.cpus,
+      };
+    }
     const body = {
       image: req.image,
       kernel_path: req.kernelPath,
     };
     if (req.memMB) body.mem_mb = req.memMB;
     if (req.cpus) body.cpus = req.cpus;
+    if (req.entrypoint) body.entrypoint = req.entrypoint;
     if (req.cmd) body.cmd = req.cmd;
     if (req.env) body.env = req.env;
     if (req.workdir) body.workdir = req.workdir;
     if (req.networkMode) body.network_mode = req.networkMode;
     if (req.jailerMode) body.jailer_mode = req.jailerMode;
+    if (req.dockerfile) body.dockerfile = req.dockerfile;
+    if (req.context) body.context = req.context;
     const resp = await this._post('/sandboxes', body);
     return new Sandbox(resp.sandbox ?? {}, this);
   }
@@ -116,6 +238,14 @@ export class Client {
 
   async delete(id) {
     await this._request('DELETE', `/sandboxes/${id}`, null, [204]);
+  }
+
+  /** Recycle a leased sandbox: tear it down and return a fresh one
+   * from the same pool in a single round trip. Returns a new Sandbox
+   * (different id); the old `id` is gone after this call. */
+  async recycle(id) {
+    const resp = await this._request('POST', `/sandboxes/${id}/recycle`, null, [200, 201]);
+    return new Sandbox(resp.sandbox ?? {}, this);
   }
 
   // Pools
@@ -434,6 +564,47 @@ export class ToolboxClient {
   }
 
   // ---- Internals ----
+  //
+  // Per-call UDS + CONNECT is ~5 ms of round trips in practice. The
+  // agent speaks HTTP/1.0 with `Connection: close`, so we can't keep
+  // the socket open across requests. What we CAN do is pipeline the
+  // CONNECT header and the HTTP request into a single write so the
+  // guest agent sees both bytes together — saves one round trip
+  // (the "wait for OK\n before sending HTTP") per call. On a warm
+  // pool that's a ~5 ms drop in p50 exec latency.
+  async _dialPipelined(httpHead, body = null) {
+    return new Promise((resolve, reject) => {
+      const sock = net.createConnection({ path: this.udsPath });
+      const timer = setTimeout(() => { sock.destroy(); reject(new ToolboxError(`dial timeout: ${this.udsPath}`)); }, this.dialTimeoutMs);
+
+      sock.once('error', (e) => { clearTimeout(timer); reject(new ToolboxError(`dial ${this.udsPath}: ${e.message}`)); });
+      sock.once('connect', async () => {
+        try {
+          sock.write(`CONNECT ${this.port}\n` + httpHead);
+          if (body) sock.write(body);
+          const reader = new StreamReader(sock);
+          const line = await reader.readLine();
+          clearTimeout(timer);
+          if (!line.startsWith('OK')) {
+            sock.destroy();
+            reject(new ToolboxError(`CONNECT rejected: ${line}`));
+            return;
+          }
+          sock.__gcReader = reader;
+          resolve(sock);
+        } catch (err) {
+          clearTimeout(timer);
+          sock.destroy();
+          reject(err);
+        }
+      });
+    });
+  }
+
+  // _dialConnect is the classic round-trip-then-send dial used by exec
+  // (which streams a body in multiple writes). Kept separate from
+  // _dialPipelined so the simpler one-shot request path can use the
+  // faster one.
   async _dialConnect() {
     return new Promise((resolve, reject) => {
       const sock = net.createConnection({ path: this.udsPath });
@@ -451,8 +622,6 @@ export class ToolboxClient {
             reject(new ToolboxError(`CONNECT rejected: ${line}`));
             return;
           }
-          // Swap in whatever bytes the reader already has back onto the
-          // socket so subsequent fresh reads see them.
           sock.__gcReader = reader;
           resolve(sock);
         } catch (err) {
@@ -465,16 +634,16 @@ export class ToolboxClient {
   }
 
   async _request(method, path, body = null, contentType = 'application/json') {
-    const sock = await this._dialConnect();
+    // Pipeline: CONNECT + HTTP headers + body in one shot. Saves the
+    // OK round trip on every request.
+    const hdrs = [`${method} ${path} HTTP/1.0`, 'Host: x', 'Connection: close'];
+    if (body) {
+      hdrs.push(`Content-Length: ${body.length}`);
+      hdrs.push(`Content-Type: ${contentType}`);
+    }
+    const httpHead = hdrs.join('\r\n') + '\r\n\r\n';
+    const sock = await this._dialPipelined(httpHead, body);
     try {
-      const hdrs = [`${method} ${path} HTTP/1.0`, 'Host: x', 'Connection: close'];
-      if (body) {
-        hdrs.push(`Content-Length: ${body.length}`);
-        hdrs.push(`Content-Type: ${contentType}`);
-      }
-      sock.write(hdrs.join('\r\n') + '\r\n\r\n');
-      if (body) sock.write(body);
-
       const reader = sock.__gcReader ?? new StreamReader(sock);
       const statusLine = await reader.readLine();
       if (!statusLine.startsWith('HTTP/')) throw new ToolboxError(`unexpected response: ${statusLine}`);
