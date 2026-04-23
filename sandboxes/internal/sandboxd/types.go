@@ -82,16 +82,29 @@ func (s *Sandbox) snapshot() Sandbox {
 // subset of container.RunOptions that makes sense for sandbox
 // orchestration — internal flags like InteractiveExec / WarmCapture
 // are derived inside sandboxd, not exposed here.
+//
+// EITHER Image or Dockerfile is required. When Dockerfile is set,
+// container.Run builds the image locally from (Dockerfile, Context)
+// before booting — same flow gocracker's CLI uses.
 type CreateSandboxRequest struct {
-	Image       string   `json:"image"`                  // OCI ref, required
-	KernelPath  string   `json:"kernel_path"`            // path to the guest kernel image, required. Absolute recommended; relative paths resolve against the sandboxd CWD.
-	MemMB       uint64   `json:"mem_mb,omitempty"`       // default 256
-	CPUs        int      `json:"cpus,omitempty"`         // default 1
-	Cmd         []string `json:"cmd,omitempty"`          // optional override
-	Env         []string `json:"env,omitempty"`          // KEY=VALUE
+	Image       string   `json:"image,omitempty"`         // OCI ref, or use Dockerfile
+	Dockerfile  string   `json:"dockerfile,omitempty"`    // path to a Dockerfile (alternative to Image)
+	Context     string   `json:"context,omitempty"`       // build context dir (used with Dockerfile)
+	KernelPath  string   `json:"kernel_path"`             // path to the guest kernel image, required. Absolute recommended; relative paths resolve against the sandboxd CWD.
+	MemMB       uint64   `json:"mem_mb,omitempty"`        // default 256
+	CPUs        int      `json:"cpus,omitempty"`          // default 1
+	Entrypoint  []string `json:"entrypoint,omitempty"`    // override the image's ENTRYPOINT (needed for images like alpine/git whose default entrypoint exits and panics PID 1)
+	Cmd         []string `json:"cmd,omitempty"`           // optional override
+	Env         []string `json:"env,omitempty"`           // KEY=VALUE
 	WorkDir     string   `json:"workdir,omitempty"`
-	NetworkMode string   `json:"network_mode,omitempty"` // "" (none), "auto", or "none" — default "auto"
-	JailerMode  string   `json:"jailer_mode,omitempty"`  // "on" | "off" — default "off"
+	NetworkMode string   `json:"network_mode,omitempty"`  // "" (none), "auto", or "none" — default "auto"
+	JailerMode  string   `json:"jailer_mode,omitempty"`   // "on" | "off" — default "off"
+	// SnapshotDir, when set, tells container.Run to restore from the
+	// named snapshot dir instead of cold-booting. The SDK's
+	// create_sandbox(template=...) flow fills this in automatically so
+	// templates built with a Readiness probe come up with the user's
+	// app already running.
+	SnapshotDir string   `json:"snapshot_dir,omitempty"`
 }
 
 // CreateSandboxResponse is what POST /sandboxes returns — Sandbox is
