@@ -28,11 +28,12 @@ func resolveKernel() string {
 	}
 	// Repo-relative default: this file is at
 	// <repo>/sandboxes/examples/go/hello_world/main.go
-	_, f, _, _ := runtime.Caller(0)
-	repo := filepath.Join(filepath.Dir(f), "..", "..", "..", "..")
-	def := filepath.Join(repo, "artifacts", "kernels", "gocracker-guest-standard-vmlinux")
-	if _, err := os.Stat(def); err == nil {
-		return def
+	if _, f, _, ok := runtime.Caller(0); ok && f != "" {
+		repo := filepath.Join(filepath.Dir(f), "..", "..", "..", "..")
+		def := filepath.Join(repo, "artifacts", "kernels", "gocracker-guest-standard-vmlinux")
+		if _, err := os.Stat(def); err == nil {
+			return def
+		}
 	}
 	fmt.Fprintln(os.Stderr, "error: pass kernel path as arg 1 or set $GOCRACKER_KERNEL")
 	os.Exit(2)

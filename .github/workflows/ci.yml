@@ -86,18 +86,22 @@ jobs:
         run: |
           sudo chown "$USER" coverage-integration.out 2>/dev/null || true
           go tool cover -func=coverage-integration.out | tail -1 | tee coverage-integration-summary.txt
-      - name: Template-bench gate (cache-hit performance)
+      - name: Template-bench gate (cache-hit performance, informational)
         if: steps.prereq.outputs.run == 'true'
-        # The first CreateTemplate runs a real cold-boot + jailer setup
-        # on the runner, which has hit a deterministic post-pivot_root
-        # failure on some GitHub hosted runner SKUs (the VMM worker
-        # child exits with "exec binary not found in jail" — same code
-        # passes on the other matrix instance and locally). The fault
-        # is inside Linux mount-namespace semantics on the shared runner
-        # kernel, not in gocracker logic. continue-on-error keeps a
-        # failed-runner-pairing from blocking merges; the parallel job
-        # still measures the gate, and the original bench errors surface
-        # in the step log for manual review.
+        # Performance gate — INFORMATIONAL only (continue-on-error:
+        # true). Correctness is gated by the `go test -tags integration`
+        # step above; this step runs the second-create cache-hit bench
+        # and prints timings into the run log for manual review.
+        #
+        # Why informational: the first CreateTemplate runs a real
+        # cold-boot + jailer pivot_root, which fails deterministically
+        # on some GitHub hosted runner SKUs with "exec binary not
+        # found in jail" (reproduced on commits that only touched
+        # docs — Linux mount-namespace semantics on the shared runner
+        # kernel, not gocracker logic). The dev-machine reference is
+        # ~70 µs; CI runs should land under 10 ms when the runner
+        # cooperates, so any real regression still surfaces in the
+        # step log.
         continue-on-error: true
         run: |
           # Target: "second create identical-spec == cache hit, < 10 ms".
@@ -108,17 +112,14 @@ jobs:
             -kernel "$GITHUB_WORKSPACE/artifacts/kernels/gocracker-guest-standard-vmlinux" \
             -iterations 5 \
             -p95-budget-ms 10
-      - name: Pool-bench gate (lease p95 performance)
+      - name: Pool-bench gate (lease p95 performance, informational)
         if: steps.prereq.outputs.run == 'true'
-        # Steady-state burst against a warm pool. Target is p95 <500 ms
-        # on CI (vs 17 ms on a dev laptop — shared runners are ~19× slower
-        # on vsock + netlink). Same class of CI-infra-flake as template-
-        # bench: if one of N VMM boots fails transiently, the pool settles
-        # at N-1 and the step errors with "pool didn't reach N paused".
-        # Mark continue-on-error so an intermittent pool-fill miss
-        # doesn't block merges; correctness is covered by `go test
-        # -tags integration` above. The failure still surfaces in the
-        # step log for manual review.
+        # Performance gate — INFORMATIONAL only (continue-on-error:
+        # true), same rationale as Template-bench above. Dev-machine
+        # p95 is ~17 ms; target on CI is <500 ms (shared runners are
+        # ~19× slower on vsock + netlink). Any real regression shows
+        # up in the step log; an occasional missing pool-fill boot is
+        # not a merge blocker.
         continue-on-error: true
         run: |
           # Absolute kernel path is required: warm-cache snapshot

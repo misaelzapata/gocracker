@@ -59,7 +59,8 @@ CMD ["/usr/local/bin/listener"]
 EOF
 
 # Module boilerplate so go build works against the vendored unix
-(cd "$WORK" && cp "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."; pwd)/go.mod" . && cp "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."; pwd)/go.sum" . 2>/dev/null)
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."; pwd)"
+(cd "$WORK" && cp "$REPO/go.mod" . && cp "$REPO/go.sum" . 2>/dev/null)
 (cd "$WORK" && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o listener listener.go 2>&1) | tail -5
 
 sudo -E "$GC" serve -addr "127.0.0.1:$PORT" -cache-dir "$WORK/cache" \

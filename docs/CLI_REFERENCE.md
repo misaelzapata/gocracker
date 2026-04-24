@@ -251,5 +251,4 @@ sudo gocracker serve --sock /tmp/gocracker.sock
 - [API Reference](API.md) | [CLI Reference](CLI_REFERENCE.md) | [Snapshots](SNAPSHOTS.md)
 - [Examples](EXAMPLES.md) | [Validated Projects](VALIDATED_PROJECTS.md) | [Troubleshooting](TROUBLESHOOTING.md)
 - [Security Policy](../SECURITY.md)
-| [Security Policy](../SECURITY.md)
 
