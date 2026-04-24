@@ -70,7 +70,7 @@ const (
 // All zero-value-friendly: a Config{} produces a 0-element pool that
 // refuses Acquire. Callers set the fields they care about.
 //
-// Defaults (matching PLAN_SANDBOXD Fase 5 step 3) are applied by
+// Defaults are applied by
 // NewPool — explicit zero values are preserved, only unset fields
 // get defaulted.
 type Config struct {

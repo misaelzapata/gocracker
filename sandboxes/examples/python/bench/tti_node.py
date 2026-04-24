@@ -5,11 +5,14 @@ first stdout byte of `runCommand("node", "-v")`. Ten timed runs after
 one warmup, against the auto-registered `base-node` template (warm
 pool of 8).
 """
-import sys, time, statistics
-sys.path.insert(0, '/home/misael/Desktop/projects/gocracker/sandboxes/sdk/python')
+import os, sys, time, statistics
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(_REPO / "sandboxes" / "sdk" / "python"))
 from gocracker import Client
 
-c = Client('http://127.0.0.1:9091', timeout=60)
+c = Client(os.environ.get("GOCRACKER_SANDBOXD", "http://127.0.0.1:9091"), timeout=60)
 
 # Register a warm pool from base-node so lease_sandbox lands a warm
 # restore.

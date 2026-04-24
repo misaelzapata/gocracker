@@ -5,7 +5,7 @@ set -u
 GC=/tmp/gocracker-fixed
 JAILER=/tmp/gocracker-jailer-bin
 VMM=/tmp/gocracker-vmm-bin
-KERNEL=/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-minimal-vmlinux
+: "${KERNEL:=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."; pwd)/artifacts/kernels/gocracker-guest-minimal-vmlinux}"
 WORK=/tmp/gc-manual-jail
 CHROOT=/tmp/gc-manual-jail-chroot
 PORT=8580
@@ -21,7 +21,7 @@ if [[ "$(id -u)" != "0" ]]; then
 fi
 
 # Build jailer + vmm binaries
-cd /home/misael/Desktop/projects/gocracker
+cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."
 go build -o "$JAILER" ./cmd/gocracker-jailer 2>&1 | tail -5
 go build -o "$VMM"    ./cmd/gocracker-vmm    2>&1 | tail -5
 

@@ -4,7 +4,7 @@
 # on B, exec on B returns a file that was written on A (state preserved).
 set -u
 GC=/tmp/gocracker-fixed
-KERNEL=/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-minimal-vmlinux
+: "${KERNEL:=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."; pwd)/artifacts/kernels/gocracker-guest-minimal-vmlinux}"
 WORK_A=/tmp/gc-manual-mig-A
 WORK_B=/tmp/gc-manual-mig-B
 MIGR_DIR=/tmp/gc-manual-mig-bundle

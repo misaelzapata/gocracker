@@ -180,7 +180,7 @@ tests/manual-smoke/run_all.sh
 To test a real app + database case outside the full harness:
 
 ```bash
-cd /home/misael/Desktop/projects/gocracker
+cd <your-gocracker-checkout>
 go build -o ./gocracker ./cmd/gocracker
 sudo -v
 

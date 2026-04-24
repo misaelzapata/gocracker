@@ -41,7 +41,7 @@ El exit code del runner es `0` solo si no hay `FAIL`.
 Setup único (build + kernel + sudo cred):
 
 ```bash
-cd /home/misael/Desktop/projects/gocracker
+cd <your-gocracker-checkout>
 ./tools/build-guest-kernel.sh
 go build -o gocracker ./cmd/gocracker
 sudo -v
