@@ -4,7 +4,7 @@
 // SpecHash, then memoizes the resulting warm-cache snapshot under
 // that hash. A second Build of the same Spec is a no-op (cache hit).
 //
-// Why templates exist (PLAN_SANDBOXD §6):
+// Why templates exist:
 //   - Pool registration on a template_id can skip the per-pool
 //     prewarm cold-boot — the snapshot already exists.
 //   - Identical template specs across processes / sandboxd restarts

@@ -8,7 +8,7 @@
 # PASS when every step works; cleanup via trap on any exit.
 set -u
 GC=/tmp/gocracker-fixed
-KERNEL=/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-minimal-vmlinux
+: "${KERNEL:=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."; pwd)/artifacts/kernels/gocracker-guest-minimal-vmlinux}"
 WORK=/tmp/gc-manual-sandbox
 PORT=8600
 

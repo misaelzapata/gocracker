@@ -1397,12 +1397,11 @@ func writeRuntimeSpecToRootfs(rootfsDir string, spec runtimecfg.GuestSpec) error
 // guest rootfs at toolboxembed.Path. Every disk gocracker builds gets
 // the agent for free — there is no opt-out and no per-image config.
 //
-// Why baked, not bootstrapped: feat/sandboxes-v2 used a runtime.Exec +
-// base64 upload flow to install the agent post-boot, which introduced a
-// ~200 ms race window that then required EnsureToolbox-on-lease,
-// ToolboxVersion stamps, and event-refill workarounds. PLAN_SANDBOXD §1
-// table row 1 makes the lesson explicit. Baking eliminates the entire
-// failure class.
+// Why baked, not bootstrapped: an earlier sandbox-agent branch used a
+// runtime.Exec + base64 upload flow to install the agent post-boot,
+// which introduced a ~200 ms race window that then required
+// EnsureToolbox-on-lease, ToolboxVersion stamps, and event-refill
+// workarounds. Baking eliminates the entire failure class.
 //
 // Best-effort: if the embedded binary is empty (e.g. a host arch we
 // don't ship a binary for) the disk boots without the agent — old

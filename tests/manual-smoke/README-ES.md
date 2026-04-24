@@ -175,7 +175,7 @@ tests/manual-smoke/run_all.sh
 Para probar un caso real de app + base de datos fuera del harness completo:
 
 ```bash
-cd /home/misael/Desktop/projects/gocracker
+cd <your-gocracker-checkout>
 go build -o ./gocracker ./cmd/gocracker
 sudo -v
 

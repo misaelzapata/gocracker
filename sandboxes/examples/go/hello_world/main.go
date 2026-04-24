@@ -1,5 +1,8 @@
 // Cookbook 1/N (Go): create + exec `echo hello`.
 //
+// Kernel resolves from os.Args[1] -> $GOCRACKER_KERNEL -> repo default.
+// Sandboxd URL from $GOCRACKER_SANDBOXD -> http://127.0.0.1:9091.
+//
 // Usage:
 //
 //	sudo go run ./sandboxes/examples/go/hello_world [KERNEL_PATH]
@@ -9,18 +12,42 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	gocracker "github.com/gocracker/gocracker/sandboxes/sdk/go"
 )
 
+func resolveKernel() string {
+	if len(os.Args) > 1 && os.Args[1] != "" {
+		return os.Args[1]
+	}
+	if v := os.Getenv("GOCRACKER_KERNEL"); v != "" {
+		return v
+	}
+	// Repo-relative default: this file is at
+	// <repo>/sandboxes/examples/go/hello_world/main.go
+	if _, f, _, ok := runtime.Caller(0); ok && f != "" {
+		repo := filepath.Join(filepath.Dir(f), "..", "..", "..", "..")
+		def := filepath.Join(repo, "artifacts", "kernels", "gocracker-guest-standard-vmlinux")
+		if _, err := os.Stat(def); err == nil {
+			return def
+		}
+	}
+	fmt.Fprintln(os.Stderr, "error: pass kernel path as arg 1 or set $GOCRACKER_KERNEL")
+	os.Exit(2)
+	return ""
+}
+
 func main() {
-	kernel := "/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-standard-vmlinux"
-	if len(os.Args) > 1 {
-		kernel = os.Args[1]
+	kernel := resolveKernel()
+	sandboxdURL := os.Getenv("GOCRACKER_SANDBOXD")
+	if sandboxdURL == "" {
+		sandboxdURL = "http://127.0.0.1:9091"
 	}
 	ctx := context.Background()
-	client := gocracker.NewClient("http://127.0.0.1:9091")
+	client := gocracker.NewClient(sandboxdURL)
 
 	ok, err := client.Healthz(ctx)
 	if err != nil || !ok {

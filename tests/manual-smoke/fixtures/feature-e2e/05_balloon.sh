@@ -5,7 +5,7 @@
 # wired for /run-created VMs — verified by hitting /vms/{id}/balloon → 404.)
 set -u
 GC=/tmp/gocracker-fixed
-KERNEL=/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-minimal-vmlinux
+: "${KERNEL:=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."; pwd)/artifacts/kernels/gocracker-guest-minimal-vmlinux}"
 WORK=/tmp/gc-manual-balloon
 PORT=8570
 

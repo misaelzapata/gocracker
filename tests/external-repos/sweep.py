@@ -5,7 +5,7 @@ import argparse, csv, os, queue, re, signal, subprocess, sys, threading, time
 from dataclasses import dataclass
 from pathlib import Path
 
-REPO_ROOT = Path(os.environ.get("REPO_ROOT", "/home/misael/Desktop/projects/gocracker"))
+REPO_ROOT = Path(os.environ.get("REPO_ROOT") or Path(__file__).resolve().parents[2])
 GC_BIN = REPO_ROOT / "gocracker"
 KERNEL = REPO_ROOT / "artifacts/kernels/gocracker-guest-standard-vmlinux"
 MANIFEST = REPO_ROOT / "tests/external-repos/manifest.tsv"

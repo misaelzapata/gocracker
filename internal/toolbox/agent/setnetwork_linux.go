@@ -18,7 +18,7 @@ import (
 // guest's primary interface. Used after warm restore to re-IP a
 // snapshot-restored VM whose serialized network config is stale.
 //
-// Sequence (PLAN_SANDBOXD §3 step 2):
+// Sequence:
 //   1. LinkByName → resolve the interface
 //   2. LinkSetDown — required before changing MAC
 //   3. LinkSetHardwareAddr (optional, only if MAC present)
