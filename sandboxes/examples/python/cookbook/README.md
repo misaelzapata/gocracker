@@ -1,7 +1,6 @@
 # gocracker Python cookbook
 
-5 canonical examples per `PLAN_SANDBOXD.md` §8, end-to-end against
-a running sandboxd.
+End-to-end examples against a running sandboxd.
 
 ## Setup
 

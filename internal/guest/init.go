@@ -206,7 +206,7 @@ func effectivePID1Mode(spec runtimecfg.GuestSpec) string {
 // fail dial with a clear error from the host UDS bridge instead of
 // silently hanging.
 //
-// Past failure context (PLAN_SANDBOXD §1 row 1): feat/sandboxes-v2 ran
+// Past failure context: an earlier sandbox-agent branch ran
 // the equivalent install via runtime.Exec + base64 upload AFTER boot,
 // causing a ~200 ms race that triggered EnsureToolbox-on-lease, version
 // stamps, and event-refill workarounds. Baking + spawning from PID 1

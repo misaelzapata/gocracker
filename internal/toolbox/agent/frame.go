@@ -7,7 +7,7 @@ import (
 	"io"
 )
 
-// Wire format for the toolbox /exec data plane (PLAN_SANDBOXD §4):
+// Wire format for the toolbox /exec data plane:
 //
 //	[1 byte channel] [4 bytes length BE] [length bytes payload]
 //

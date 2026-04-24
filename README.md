@@ -67,7 +67,7 @@ sudo ./gocracker run --image alpine:latest --kernel ./artifacts/kernels/gocracke
 
 **Devices** -- virtio-net, virtio-blk, virtio-rng, virtio-vsock, virtio-balloon (manual + auto reclaim), virtio-fs, UART 16550A serial console, memory hotplug.
 
-**Sandbox control plane** -- [gocracker-sandboxd](sandboxes/cmd/gocracker-sandboxd/) — minimal HTTP server (`POST /sandboxes`, `GET`, `DELETE`) that cold-boots a sandbox VM in ~80 ms, generates a per-sandbox Firecracker-style UDS at `<state-dir>/sandboxes/<id>.sock`, and exposes it for framed exec + file / git / secrets RPCs. Every disk gocracker builds ships a baked-in toolbox agent on vsock port 10023 — no post-boot install, no bootstrap race. A `SetNetwork` RPC re-IPs the guest's interface in 11-13 ms after warm restore for pool-resume flows.
+**Sandbox control plane** -- [gocracker-sandboxd](sandboxes/cmd/gocracker-sandboxd/) — HTTP daemon that wraps the runtime with warm pools (`~1.5 ms p95 lease`), content-addressed templates (`~80 µs cache hit`), HMAC-signed preview URLs, and Python / Go / JS SDKs with typed errors and context-manager sandbox lifecycle. Per-sandbox Firecracker-style UDS at `<state-dir>/sandboxes/<id>.sock` speaks directly to a baked-in toolbox agent on vsock 10023 (framed exec + files + git + secrets + `SetNetwork` re-IP). See the [Sandboxd overview](#sandboxd-sandbox-control-plane).
 
 ## Examples
 
@@ -196,9 +196,9 @@ See [docs/SNAPSHOTS.md#sandbox-template-flow](docs/SNAPSHOTS.md#sandbox-template
 and the pkg/warmcache / pkg/warmpool primitives (content-addressable snapshot cache + pre-spawned VMM pool)
 that make this pattern sub-100 ms on the hot path.
 
-### 10. Sandbox control plane (`gocracker-sandboxd`)
+### 10. Sandbox control plane — raw HTTP
 
-A higher-level HTTP service on top of `pkg/container` + the baked toolbox agent. Each `POST /sandboxes` cold-boots a VM in ~80 ms (or ~40 ms on warm restore), auto-generates a per-sandbox Firecracker-style UDS, and exposes the toolbox agent for framed exec / files / git / re-IP RPCs.
+`gocracker-sandboxd` is a small HTTP service that wraps the runtime with sandbox-specific lifecycle (see the [Sandboxd](#sandboxd-sandbox-control-plane) overview below for the high-level description and perf numbers). Each `POST /sandboxes` cold-boots a VM in ~80 ms (or ~40 ms on warm restore), auto-generates a per-sandbox Firecracker-style UDS, and exposes the toolbox agent for framed exec / files / git / re-IP RPCs. Most users will reach it through the Python/Go/JS SDKs rather than curl.
 
 ```bash
 sudo ./gocracker-sandboxd serve --addr 127.0.0.1:9091 \
@@ -456,11 +456,18 @@ The bench pins `gocracker` to CPU 0 with `taskset -c 0` and SCHED_FIFO priority 
 
 The median is ~35 ms slower than the pre-toolbox 218 ms baseline because [internal/guest/init.go](internal/guest/init.go) now also spawns the baked toolbox agent (`/opt/gocracker/toolbox/toolboxguest serve --vsock-port 10023`) before the user's CMD runs. That's the honest cost of having a dial-able per-sandbox UDS on vsock 10023 at `t=0` instead of paying a bootstrap race on every lease (which is what feat/sandboxes-v2 tried and burned down on). For most sandbox workloads it's a rounding-error tradeoff; for latency-critical cold-boot-only callers [internal/toolbox/embed](internal/toolbox/embed/) can be omitted at build time with a short stub.
 
-## Sandboxd performance (2026-04-22)
+## Sandboxd (sandbox control plane)
 
-`gocracker-sandboxd` is the sandbox control plane on top of the runtime. It wraps a warm pool, a snapshot-backed template registry, an HMAC-signed preview proxy, and SDKs in Python / Go / JS (`sb.process.exec`, `sb.fs.read_file`, `sb.preview_url`, `with client.create_sandbox(template="base-python") as sb:`). All numbers below were measured on the same laptop as the TTI benchmark above, on `feat/sandboxd-v3-followups`.
+`gocracker-sandboxd` is a separate daemon that turns the runtime into a hosted sandbox platform. It exposes a small HTTP API on top of gocracker that does four things the raw runtime doesn't:
 
-Reproduce with the bench scripts in [sandboxes/examples/python/bench/](sandboxes/examples/python/bench/) (Python), [sandboxes/examples/go/bench/](sandboxes/examples/go/bench/) (Go) and [sandboxes/examples/js/bench/](sandboxes/examples/js/bench/) (Node).
+1. **Warm pools** — register a template, and sandboxd keeps N paused VMs ready. A `POST /sandboxes/lease` returns a handle in single-digit milliseconds because the VM is already booted, the IP is already baked into the snapshot, and the exec agent is already listening on vsock.
+2. **Content-addressed templates** — register a Dockerfile or image once, sandboxd cold-boots it, takes a warm snapshot, and indexes it by `SpecHash`. Subsequent `CreateTemplate` calls with the same spec are a no-op (microsecond cache hit). `LeaseSandbox` against a pool backed by that template restores from the snapshot.
+3. **Signed preview URLs** — `sb.preview_url(8080)` mints an HMAC-signed token that lets callers hit a guest-side port via a dedicated proxy path (`/previews/<token>/...`) or one-label subdomain (`<id>.<preview-host>/...`).
+4. **Daytona-shaped SDKs** in Python / Go / JS — `with client.create_sandbox(template="base-python") as sb: sb.process.exec("python -c '…'"); sb.fs.read_file("/tmp/x"); sb.preview_url(8080)`. Context managers, typed errors (`ProcessExitError`, `PoolExhausted`, `TemplateNotFound`, `RuntimeUnreachable`, `SandboxTimeout`), and zero third-party runtime deps in each SDK.
+
+The runtime does VM lifecycle. The sandbox daemon does pool lifecycle, template caching, preview auth, and per-sandbox UDS routing. They're separate processes talking over the runtime's HTTP API, so either one can be swapped out.
+
+Reproduce the numbers below with the scripts in [sandboxes/examples/python/bench/](sandboxes/examples/python/bench/) (Python), [sandboxes/examples/go/bench/](sandboxes/examples/go/bench/) (Go), and [sandboxes/examples/js/bench/](sandboxes/examples/js/bench/) (Node). All were measured on a Ryzen AI 9 HX 370 laptop, Linux 6.17, `/dev/kvm` available, `feat/sandboxd-v3-arm64-and-cleanup` head.
 
 ### Warm-lease latency per SDK
 
@@ -498,15 +505,7 @@ Per-workload breakdown (same path, different command):
 | `sb.process.exec(['echo','hi'])` | ~19 ms | same as `/bin/true` within noise |
 | `sb.process.exec(['node','-v'])` | **277 ms** | **node startup on alpine/musl** (~258 ms of the total) |
 
-The 258 ms node-startup floor is inside the guest process — our boot path and agent overhead account for ~19 ms of the total. A post-ready snapshot (node already parsed and resident in the page cache) would drop the outer total under 50 ms; that work is wired in this branch (`PLAN_SANDBOXD.md §10.5`) but has a known issue at restore.
-
-### Before/after (IP-preasignado + async delete landed 2026-04-22)
-
-| Phase | before | after | delta |
-|---|---:|---:|---:|
-| Warm lease p95 | 20.8 ms | 1.5 ms | **−93 %** |
-| Delete p95 | 79 ms | 1.9 ms | **−98 %** |
-| E2E hello-world p95 | ~120 ms | ~35 ms | **−71 %** |
+The 258 ms node-startup floor is inside the guest process — our boot path and agent overhead account for ~19 ms of the total. A post-ready snapshot (node already parsed and resident in the page cache) would drop the outer total under 50 ms; the wiring is in tree (`ReadinessProbe` in the template spec) but has a known issue at restore.
 
 ### Cookbook + cold-boot bursts (Python SDK)
 
@@ -625,9 +624,9 @@ A ~0.3 ms p50 gap at the low end of the latency budget, from a pure-Go VMM again
 | Cold boot (Node TTI) | **253 ms** p50 | — | `gocracker run` to first `node -v` stdout. +35 ms over the pre-toolbox baseline — that's the cost of init spawning the baked toolbox agent before the user's CMD. |
 | Snapshot-resume | **1.33 ms** p50 | 1.92 ms p50 | `bench-rtt` measurement of `RestoreFromSnapshotWithOptions → vm.Start` on this branch; the older head-to-head row on Firecracker v1.10.1 used `curl -w '%{time_total}'` including HTTP layer. |
 | Warm restore + SetNetwork re-IP | **~55 ms** p50 | — | Full lease-style path: `Restore` (40-45 ms) + toolbox SetNetwork (11-13 ms). Now **bypassed** in the warm-pool path: see next row. |
-| Sandboxd warm lease (pool paused→ready) | **1.5 ms** p95 | — | Measured 2026-04-22 on feat/sandboxd-v3-followups, pool of 8, sequential. The pool reuses the IP baked into each VM's cold-boot snapshot and skips SetNetwork on the hot path. See [Sandboxd performance](#sandboxd-performance-2026-04-22). |
+| Sandboxd warm lease (pool paused→ready) | **1.5 ms** p95 | — | Pool of 8, sequential. The pool reuses the IP baked into each VM's cold-boot snapshot and skips SetNetwork on the hot path. See [Sandboxd](#sandboxd-sandbox-control-plane). |
 | Sandboxd E2E `create → exec echo → delete` | **~35 ms** p95 | — | Same bench, full round trip from the Python/Go/Node SDK. Async delete lands the HTTP response in 1.9 ms; the ~22 ms residual is UDS+vsock CONNECT + the agent's fork/exec for `echo`. |
-| Sandboxd warm TTI (`node -v` against `base-node`) | **277 ms** p50 | — | Warm pool of 8, lease handle then time `sb.process.exec(['node','-v'])` to first byte. ~258 ms is node's own startup on alpine/musl; agent + UDS overhead is ~20 ms (echo measured at ~19 ms p50). See [Sandboxd performance](#sandboxd-performance-2026-04-22). |
+| Sandboxd warm TTI (`node -v` against `base-node`) | **277 ms** p50 | — | Warm pool of 8, lease handle then time `sb.process.exec(['node','-v'])` to first byte. ~258 ms is node's own startup on alpine/musl; agent + UDS overhead is ~20 ms (echo measured at ~19 ms p50). See [Sandboxd](#sandboxd-sandbox-control-plane). |
 
 Both benches run with the VMM pinned to a dedicated CPU (`taskset`) and boosted to SCHED_FIFO (`chrt -r 50`), with `mlockall(MCL_CURRENT)` locking the VMM's working set. The snapshot path deliberately does NOT set `MCL_FUTURE` because that would eager-fault the `MAP_PRIVATE` memory snapshot and turn a ~2 ms lazy-COW restore into ~30 ms.
 
@@ -649,38 +648,27 @@ Cold-boot time here is dominated by OCI pull + ext4 build (~3 s for the alpine r
 
 ### Per-primitive RTT benchmark ([tools/bench-rtt](tools/bench-rtt/main.go))
 
-Unlike the end-to-end TTI and snapshot-resume benchmarks above, `bench-rtt` isolates each primitive on the warm-cache hot path so a regression can be attributed to a specific code path. Measured on a Ryzen AI 9 HX 370 laptop, N=30 iterations after 2 warmups, against the current `feat/sandboxd-v3` head:
+Unlike the end-to-end TTI and snapshot-resume numbers above, `bench-rtt` isolates each primitive on the warm-cache hot path so a regression can be attributed to a specific code path. Numbers below are from a fresh run on a Ryzen AI 9 HX 370 laptop, Linux 6.17, N=30 iterations after 3 warmups, against the branch head:
 
 | primitive | p50 | p90 | max | notes |
 |---|---:|---:|---:|---|
-| pause (`vm.Pause()`) | **10.5 ms** | 11.1 ms | 21.6 ms | floor is the 10 ms `time.Sleep` polling loop inside `(*VM).Pause()` — an architectural cost, not measurement noise. |
-| resume (`vm.Resume()`) | **2 µs** | 6 µs | 10 µs | near-instant — no vCPU state round-trip. |
-| snapshot capture (`vm.TakeSnapshot()`) | **134.5 ms** | 151 ms | 177 ms | median is ~40 ms faster than the previous branch thanks to the `SkipDiskBundle` plumbing landed on `feat/warm-cache`. |
-| snapshot restore (`vmm.RestoreFromSnapshotWithOptions → vm.Start`) | **1.33 ms** | 2.56 ms | 3.18 ms | consistent with the Firecracker-parity snapshot-resume RTT above. |
-| warmcache lookup hit | **7 µs** | 10 µs | 18 µs | `pkg/warmcache.Lookup()` — hashes + stats the snapshot dir. |
-| warmcache lookup miss | **1.5 µs** | 3 µs | 5 µs | early-out when the directory does not exist. |
-| UDS handshake (`CONNECT → OK`) | **0.13 ms** | 0.99 ms | 2.13 ms mean | Firecracker-style Unix socket: dial + `CONNECT <port>\n` + read `OK\n`. Measures the host→guest→host virtio-vsock round-trip the sandbox orchestrator pays per exec. Populated automatically when bench-rtt is run with `-uds <path>`. |
-| Toolbox framed exec stdout throughput | **50 MB/s** sustained | — | — | `POST /exec` on vsock 10023 with `[channel][len][payload]` framing (PLAN §4). Validated end-to-end 4 MB round-trips (64 KB 22 ms, 512 KB 31 ms, 1 MB 33 ms, 4 MB 83 ms). Prior to the `opCreditUpdate` fix in [internal/vsock/vsock.go](internal/vsock/vsock.go) any output >64 KiB stalled forever waiting for credits the host never emitted. |
-| SetNetwork RPC (re-IP post-restore) | **~12 ms** | ~15 ms | ~20 ms | Toolbox `POST /internal/setnetwork`: `netlink.LinkSetDown → LinkSetHardwareAddr → LinkSetUp → AddrFlush(v4) → AddrAdd → RouteReplace → arping -U` (async best-effort). Measured 11-13 ms p50 both jailer-off and jailer-on. |
+| pause (`vm.Pause()`) | **10.33 ms** | 10.36 ms | 10.44 ms | floor is the 10 ms `time.Sleep` polling loop inside `(*VM).Pause()` — an architectural cost, not measurement noise. |
+| resume (`vm.Resume()`) | **~1 µs** | ~2 µs | ~2 µs | near-instant — no vCPU state round-trip. |
+| snapshot capture (`vm.TakeSnapshot()`) | **170 ms** | 268 ms | 359 ms | O(memory size) — the cost is writing the 256 MB memory image to disk, bounded by page-cache + device speed. |
+| snapshot restore (`vmm.RestoreFromSnapshotWithOptions → vm.Start`) | **1.67 ms** | 3.08 ms | 3.23 ms | `MAP_PRIVATE` COW of the memory snapshot + vCPU state round-trip. O(1) in memory size — no eager page-in. |
+| warmcache lookup hit | **9 µs** | 11 µs | 18 µs | `pkg/warmcache.Lookup()` — hashes the spec + stats the snapshot dir. |
+| warmcache lookup miss | **4 µs** | 4 µs | 7 µs | early-out when the directory does not exist. |
+| UDS handshake (`CONNECT → OK`) | **~0.1 ms** | ~1 ms | ~2 ms | Firecracker-style Unix socket: dial + `CONNECT <port>\n` + read `OK\n`. Measures the host→guest→host virtio-vsock round-trip the sandbox orchestrator pays per exec. Populated when bench-rtt is run with `-uds <path>`. |
+| Toolbox framed exec stdout throughput | **50 MB/s** sustained | — | — | `POST /exec` on vsock 10023 with `[channel][len][payload]` framing. Validated end-to-end 4 MB round-trips (64 KB 22 ms, 512 KB 31 ms, 1 MB 33 ms, 4 MB 83 ms). |
+| SetNetwork RPC (re-IP post-restore) | **~12 ms** | ~15 ms | ~20 ms | Toolbox `POST /internal/setnetwork`: `LinkSetHardwareAddr → LinkSetUp → flush stale v4 addrs → AddrReplace → RouteReplace → arping -U` (async best-effort). Now **bypassed** on the warm-pool hot path because the IP is baked into the cold-boot snapshot. |
 
-### Reproducing
+Reproduce:
 
 ```bash
-make build
-./tools/bench-node-tti.sh               # 10 cold-boot TTI runs (default)
-./tools/bench-node-tti.sh 50            # 50 runs
-GC_KERNEL=/path/to/vmlinux ./tools/bench-node-tti.sh
-
-# Per-primitive RTT — isolates pause, snapshot capture/restore, warmcache
-# lookup. Useful for regression-hunting after touching pkg/vmm or pkg/container.
 sudo go run ./tools/bench-rtt \
-  -image alpine:3.20 \
   -kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux \
-  -iter 50 -warmups 3 -output /tmp/bench-rtt.json \
-  -uds /tmp/bench-vm.sock      # optional: adds uds_handshake_rtt
+  -iter 30 -warmups 3
 ```
-
-First run pulls `node:20-alpine` and builds the ext4 disk (~10–30 s). Every subsequent run hits the cache and measures only the boot path.
 
 ## Documentation
 
@@ -694,9 +682,7 @@ First run pulls `node:20-alpine` and builds the ext4 disk (~10–30 s). Every su
 - [Examples](docs/EXAMPLES.md) -- 16 example apps across 10 languages
 - [Validated Projects](docs/VALIDATED_PROJECTS.md) -- 378 real-world repos tested
 - [Troubleshooting](docs/TROUBLESHOOTING.md) -- common issues and fixes
-- [How gocracker Fits In](docs/COMPETITIVE_ANALYSIS.md) -- comparison with Firecracker, Kata, etc.
 - [Security Policy](SECURITY.md) -- isolation model, vulnerability reporting
-- [VFIO GPU Passthrough Plan](docs/VFIO_GPU_PASSTHROUGH_PLAN.md) -- future GPU support
 
 ## CLI Reference
 

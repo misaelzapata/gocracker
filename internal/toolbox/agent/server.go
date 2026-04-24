@@ -63,13 +63,13 @@ func Handler() http.Handler {
 	mux.HandleFunc("DELETE /secrets/{name}", handleDeleteSecret)
 	mux.HandleFunc("GET /secrets", handleListSecrets)
 	mux.Handle("/proxy/http/", http.HandlerFunc(handleHTTPProxy))
-	// /exec is the framed-binary data plane (PLAN_SANDBOXD §4). Unlike
-	// the other JSON endpoints above, this hijacks the conn after the
-	// handshake JSON and switches to the binary frame protocol — see
+	// /exec is the framed-binary data plane. Unlike the other JSON
+	// endpoints above, this hijacks the conn after the handshake JSON
+	// and switches to the binary frame protocol — see
 	// internal/toolbox/agent/exec.go and frame.go.
 	mux.HandleFunc("POST /exec", handleExec)
-	// /internal/* is host-only — sandboxd-side trusted callers (PLAN
-	// §3 SetNetwork after warm restore). Not exposed via any
+	// /internal/* is host-only — sandboxd-side trusted callers use it
+	// (e.g. SetNetwork after warm restore). Not exposed via any
 	// user-facing API surface; callers reach it via the same UDS
 	// CONNECT 10023 path as the other endpoints.
 	mux.HandleFunc("POST /internal/setnetwork", handleSetNetwork)
