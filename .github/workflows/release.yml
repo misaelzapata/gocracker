@@ -1,0 +1,131 @@
+name: release
+
+# Builds statically-linked binaries for amd64 + arm64 on every pushed
+# tag that looks like v*, attaches them to the corresponding GitHub
+# release, and records version + commit + date into the binary via
+# ldflags. Run `make build VERSION=v1.2.3` locally to produce the
+# same output without tagging.
+#
+# Trigger a release by pushing a tag:
+#   git tag v0.1.0
+#   git push origin v0.1.0
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Resolve version
+        id: version
+        run: |
+          # workflow_dispatch → use the user-supplied input.
+          # Tag push      → GITHUB_REF_NAME is the tag (v0.1.0).
+          # Anything else → fall back to dev-<short-sha>.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="$GITHUB_REF_NAME"
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
+          if [[ -z "$VERSION" ]]; then
+            echo "could not resolve VERSION (event=${{ github.event_name }}, ref=$GITHUB_REF)" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - name: Build binaries
+        env:
+          TARGET_GOOS: ${{ matrix.goos }}
+          TARGET_GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ steps.version.outputs.version }}
+          COMMIT: ${{ steps.version.outputs.commit }}
+          DATE: ${{ steps.version.outputs.date }}
+        run: make build
+      - name: Verify version stamp
+        # Skip on cross-arch matrix legs — the produced binary doesn't
+        # run on the amd64 ubuntu-latest runner. The tag/commit/date
+        # are still in the binary because they were injected via
+        # ldflags during `make build` above; downstream consumers can
+        # confirm with `gocracker version` after install.
+        if: matrix.goarch == 'amd64'
+        run: |
+          ./gocracker version
+          ./gocracker version | grep -q "${{ steps.version.outputs.version }}"
+      - name: Package tarball
+        id: pkg
+        run: |
+          STAGE="gocracker-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "$STAGE"
+          cp gocracker gocracker-vmm gocracker-jailer LICENSE README.md "$STAGE/"
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          echo "tarball=$STAGE.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha256=$STAGE.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gocracker-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.sha256 }}
+
+  release:
+    needs: build
+    # Publish on tag pushes AND on workflow_dispatch (manual releases).
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Tag push uses the pushed ref directly; workflow_dispatch
+          # uses the operator-supplied input.version. Either way the
+          # tag must exist on the repo for `gh release create` to bind.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.version }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            dist/*
