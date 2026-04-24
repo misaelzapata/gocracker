@@ -23,6 +23,7 @@ import (
 
 	"github.com/gocracker/gocracker/internal/api"
 	internalapi "github.com/gocracker/gocracker/internal/api"
+	"github.com/gocracker/gocracker/internal/buildinfo"
 	"github.com/gocracker/gocracker/internal/buildserver"
 	"github.com/gocracker/gocracker/internal/compose"
 	"github.com/gocracker/gocracker/internal/console"
@@ -56,6 +57,7 @@ Commands:
   vmm        Start the single-VM Firecracker-compatible API worker
   build-worker Start the jailed build worker
   jailer     Start a Firecracker-style jailer for a worker/VMM
+  version    Print build version, commit, date, and go runtime
 
 Examples:
   # From OCI image
@@ -125,6 +127,8 @@ func main() {
 		cmdBuildWorker(os.Args[2:])
 	case "jailer":
 		cmdJailer(os.Args[2:])
+	case "version", "-v", "--version":
+		fmt.Println(buildinfo.String())
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:
