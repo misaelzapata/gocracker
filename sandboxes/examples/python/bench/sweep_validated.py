@@ -1,12 +1,32 @@
 """Large sweep: 50 docker-hub images sampled from docs/VALIDATED_PROJECTS.md.
 Each: cold-boot via gocracker → exec a version command → verify → delete.
-Records full timing breakdown."""
-import sys, time, json
-sys.path.insert(0, '/home/misael/Desktop/projects/gocracker/sandboxes/sdk/python')
+Records full timing breakdown.
+
+Kernel path resolves from argv[1] -> $GOCRACKER_KERNEL -> repo default.
+Sandboxd URL from $GOCRACKER_SANDBOXD -> http://127.0.0.1:9091.
+"""
+import os, sys, time, json
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(_REPO / "sandboxes" / "sdk" / "python"))
 from gocracker import Client, ProcessExitError, SandboxError
 
-c = Client('http://127.0.0.1:9091', timeout=600)
-KERNEL = '/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-standard-vmlinux'
+
+def _resolve_kernel() -> str:
+    if len(sys.argv) > 1 and sys.argv[1]:
+        return sys.argv[1]
+    if os.environ.get("GOCRACKER_KERNEL"):
+        return os.environ["GOCRACKER_KERNEL"]
+    default = _REPO / "artifacts" / "kernels" / "gocracker-guest-standard-vmlinux"
+    if default.exists():
+        return str(default)
+    print("error: pass kernel path as arg 1 or set $GOCRACKER_KERNEL", file=sys.stderr)
+    sys.exit(2)
+
+
+KERNEL = _resolve_kernel()
+c = Client(os.environ.get("GOCRACKER_SANDBOXD", "http://127.0.0.1:9091"), timeout=600)
 
 # (image, cmd, expected substring) — picked from the 378-project list,
 # preferring images <300MB with predictable version commands.

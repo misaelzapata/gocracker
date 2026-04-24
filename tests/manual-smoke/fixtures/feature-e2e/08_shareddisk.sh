@@ -3,8 +3,9 @@
 # guest writes back, host reads it. Bidirectional bind via virtio-fs.
 set -u
 GC=/tmp/gocracker-fixed
-KERNEL=/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-virtiofs-vmlinux
-[[ -f "$KERNEL" ]] || KERNEL=/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-minimal-vmlinux
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."; pwd)"
+: "${KERNEL:=$REPO/artifacts/kernels/gocracker-guest-virtiofs-vmlinux}"
+[[ -f "$KERNEL" ]] || KERNEL="$REPO/artifacts/kernels/gocracker-guest-minimal-vmlinux"
 WORK=/tmp/gc-manual-shared
 PORT=8595
 

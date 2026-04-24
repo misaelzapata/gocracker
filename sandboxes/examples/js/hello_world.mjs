@@ -1,16 +1,30 @@
 #!/usr/bin/env node
 // Cookbook 1/N (JS): create + exec `echo hello`.
 //
+// Kernel resolves from argv[2] -> $GOCRACKER_KERNEL -> repo default.
+// Sandboxd URL from $GOCRACKER_SANDBOXD -> http://127.0.0.1:9091.
+//
 // Usage:
 //   sudo node hello_world.mjs [KERNEL_PATH]
 
 import { Client } from '../../sdk/js/src/index.js';
 import process from 'node:process';
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { existsSync } from 'node:fs';
 
-const kernel = process.argv[2]
-  || '/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-standard-vmlinux';
+function resolveKernel() {
+  if (process.argv[2]) return process.argv[2];
+  if (process.env.GOCRACKER_KERNEL) return process.env.GOCRACKER_KERNEL;
+  const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+  const def = resolve(repo, 'artifacts', 'kernels', 'gocracker-guest-standard-vmlinux');
+  if (existsSync(def)) return def;
+  console.error('error: pass kernel path as arg 1 or set $GOCRACKER_KERNEL');
+  process.exit(2);
+}
 
-const client = new Client('http://127.0.0.1:9091');
+const kernel = resolveKernel();
+const client = new Client(process.env.GOCRACKER_SANDBOXD ?? 'http://127.0.0.1:9091');
 
 if (!(await client.healthz())) {
   console.error('sandboxd not reachable at 127.0.0.1:9091');

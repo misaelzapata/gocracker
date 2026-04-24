@@ -4,7 +4,7 @@
 # sends bytes, reads echo.
 set -u
 GC=/tmp/gocracker-fixed
-KERNEL=/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-minimal-vmlinux
+: "${KERNEL:=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."; pwd)/artifacts/kernels/gocracker-guest-minimal-vmlinux}"
 WORK=/tmp/gc-manual-vsock
 PORT=8590
 
@@ -59,7 +59,7 @@ CMD ["/usr/local/bin/listener"]
 EOF
 
 # Module boilerplate so go build works against the vendored unix
-(cd "$WORK" && cp /home/misael/Desktop/projects/gocracker/go.mod . && cp /home/misael/Desktop/projects/gocracker/go.sum . 2>/dev/null)
+(cd "$WORK" && cp "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."; pwd)/go.mod" . && cp "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."; pwd)/go.sum" . 2>/dev/null)
 (cd "$WORK" && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o listener listener.go 2>&1) | tail -5
 
 sudo -E "$GC" serve -addr "127.0.0.1:$PORT" -cache-dir "$WORK/cache" \

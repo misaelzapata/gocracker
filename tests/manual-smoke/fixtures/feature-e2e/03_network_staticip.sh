@@ -4,7 +4,7 @@
 # an HTTP server the host spins up on the gateway IP.
 set -u
 GC=/tmp/gocracker-fixed
-KERNEL=/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-minimal-vmlinux
+: "${KERNEL:=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.."; pwd)/artifacts/kernels/gocracker-guest-minimal-vmlinux}"
 WORK=/tmp/gc-manual-net
 PORT=8550
 TAP=gcmantap0
