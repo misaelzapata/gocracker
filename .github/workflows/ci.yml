@@ -5,9 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel superseded runs on the same PR so a quick re-push doesn't
+# queue up three copies of the suite. Main-branch runs are never
+# cancelled (protect the post-merge signal).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   unit:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -20,6 +28,7 @@ jobs:
 
   coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -37,6 +46,7 @@ jobs:
 
   privileged-integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6

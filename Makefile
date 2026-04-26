@@ -4,7 +4,18 @@ CMD      := ./cmd/gocracker
 TARGET_GOOS ?= linux
 TARGET_GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: all build build-amd64 build-arm64 generate tidy test test-uds coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs kernel-guest-arm64 kernel-guest-arm64-minimal hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed
+# Version stamp injected via -ldflags. VERSION takes the git tag if
+# the working tree is clean at a tag, else "dev-<short-sha>-dirty?".
+# COMMIT is the short SHA; DATE is ISO-8601 UTC. Override from the
+# command line for release builds (e.g. `make build VERSION=v1.2.3`).
+VERSION ?= $(shell git describe --tags --exact-match --dirty=-dirty 2>/dev/null || echo "dev-$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git diff --quiet 2>/dev/null || echo -dirty; fi)")
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+VERSION_LDFLAGS = -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
+                  -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
+                  -X $(MODULE)/internal/buildinfo.Date=$(DATE)
+
+.PHONY: all build build-amd64 build-arm64 generate tidy test test-uds coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs kernel-guest-arm64 kernel-guest-arm64-minimal kernel-unpack hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed
 
 all: build
 
@@ -17,12 +28,12 @@ generate:
 ## namespaces, seccomp, etc.) so we skip them when TARGET_GOOS != linux.
 build: tidy generate
 	CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
-	  go build -trimpath -ldflags="-s -w" -o $(BIN) $(CMD)
+	  go build -trimpath -ldflags="-s -w $(VERSION_LDFLAGS)" -o $(BIN) $(CMD)
 ifeq ($(TARGET_GOOS),linux)
 	CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
-	  go build -trimpath -ldflags="-s -w" -o gocracker-vmm ./cmd/gocracker-vmm
+	  go build -trimpath -ldflags="-s -w $(VERSION_LDFLAGS)" -o gocracker-vmm ./cmd/gocracker-vmm
 	CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
-	  go build -trimpath -ldflags="-s -w" -o gocracker-jailer ./cmd/gocracker-jailer
+	  go build -trimpath -ldflags="-s -w $(VERSION_LDFLAGS)" -o gocracker-jailer ./cmd/gocracker-jailer
 endif
 
 build-amd64:
@@ -65,6 +76,21 @@ kernel-guest-arm64:
 
 kernel-guest-arm64-minimal:
 	./tools/build-guest-kernel-arm64.sh --profile minimal
+
+## Decompress every artifacts/kernels/*.gz that ships with the repo,
+## leaving the uncompressed kernels next to the .gz so `gocracker run
+## --kernel artifacts/kernels/gocracker-guest-standard-vmlinux` works
+## with no further setup. Idempotent — gunzip -k preserves the .gz.
+kernel-unpack:
+	@for gz in artifacts/kernels/*.gz; do \
+	  if [ -f "$$gz" ]; then \
+	    out="$${gz%.gz}"; \
+	    if [ ! -f "$$out" ] || [ "$$gz" -nt "$$out" ]; then \
+	      echo "  unpack $$gz -> $$out"; \
+	      gunzip -kf "$$gz"; \
+	    fi; \
+	  fi; \
+	done
 
 hostcheck:
 	go run ./cmd/gocracker-hostcheck

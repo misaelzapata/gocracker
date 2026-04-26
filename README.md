@@ -30,7 +30,7 @@ any git repo, orchestrate Docker Compose stacks. Each service becomes a real
 Linux VM.
 
 ```
-gocracker run --image ubuntu:22.04 --kernel ./kernel --wait
+gocracker run --image ubuntu:22.04 --kernel artifacts/kernels/gocracker-guest-standard-vmlinux --wait
 ```
 
 No Docker daemon. No containerd. No runc. Just KVM.
@@ -43,15 +43,18 @@ Firecracker-compatible REST API. All in a single static binary.
 ## Quick Start
 
 ```bash
-# Build gocracker
-make build
+# Build gocracker + unpack the prebuilt guest kernel that ships with the repo
+make build kernel-unpack
 
-# Build a guest kernel (one time)
-make kernel-guest
-
-# Run your first microVM
-sudo ./gocracker run --image alpine:latest --kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux --cmd "echo hello from a real VM" --wait
+# Run your first microVM (uses the unpacked vmlinux from artifacts/kernels/)
+sudo ./gocracker run \
+  --image alpine:latest \
+  --kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux \
+  --cmd "echo hello from a real VM" \
+  --wait
 ```
+
+That's it — alpine boots in ~80 ms (warm OCI cache), runs the command, and exits. No kernel build required: the repo ships gzipped guest kernels under [artifacts/kernels/](artifacts/kernels/) for both x86_64 and arm64. `make kernel-unpack` decompresses them in place. To build a custom kernel from source, run `make kernel-guest` (x86_64) or `make kernel-guest-arm64` (arm64) instead — that takes ~10 min the first time.
 
 ## Features
 
@@ -71,10 +74,27 @@ sudo ./gocracker run --image alpine:latest --kernel ./artifacts/kernels/gocracke
 
 ## Examples
 
+1. [Run Alpine, print a message](#1-run-alpine-print-a-message)
+2. [Interactive Ubuntu session](#2-interactive-ubuntu-session)
+3. [Build from Dockerfile](#3-build-from-dockerfile)
+4. [Clone and boot a git repo](#4-clone-and-boot-a-git-repo)
+5. [Docker Compose (Flask + PostgreSQL)](#5-docker-compose-flask--postgresql)
+6. [Exec into a running Compose service](#6-exec-into-a-running-compose-service)
+7. [Networking (auto NAT)](#7-networking-auto-nat)
+8. [Multi-vCPU](#8-multi-vcpu)
+9. [Sandbox pool from template (REST API)](#9-sandbox-pool-from-template-rest-api)
+10. **[Sandbox control plane — raw HTTP](#10-sandbox-control-plane--raw-http)** — `gocracker-sandboxd` HTTP daemon + per-sandbox UDS + toolbox agent (exec / files / git / re-IP)
+
+The snippets below use `$KERNEL` for the guest kernel path. Set it once after running `make build kernel-unpack`:
+
+```bash
+export KERNEL=$PWD/artifacts/kernels/gocracker-guest-standard-vmlinux
+```
+
 ### 1. Run Alpine, print a message
 
 ```bash
-sudo ./gocracker run --image alpine:latest --kernel ./kernel --cmd "echo hello from a real VM" --wait
+sudo ./gocracker run --image alpine:latest --kernel "$KERNEL" --cmd "echo hello from a real VM" --wait
 ```
 
 ![Alpine one-shot demo](assets/demos/01-alpine-oneshot.gif)
@@ -82,7 +102,7 @@ sudo ./gocracker run --image alpine:latest --kernel ./kernel --cmd "echo hello f
 ### 2. Interactive Ubuntu session
 
 ```bash
-sudo ./gocracker run --image ubuntu:22.04 --kernel ./kernel
+sudo ./gocracker run --image ubuntu:22.04 --kernel "$KERNEL"
 ```
 
 Drops you into a shell inside the VM over the serial console.
@@ -93,7 +113,7 @@ Drops you into a shell inside the VM over the serial console.
 
 ```bash
 sudo ./gocracker run --dockerfile tests/examples/python-api/Dockerfile \
-  --context tests/examples/python-api --kernel ./kernel --wait
+  --context tests/examples/python-api --kernel "$KERNEL" --wait
 ```
 
 Parses the Dockerfile, builds layers, creates an ext4 disk, and boots the result.
@@ -103,7 +123,7 @@ Parses the Dockerfile, builds layers, creates an ext4 disk, and boots the result
 ### 4. Clone and boot a git repo
 
 ```bash
-sudo ./gocracker repo --url https://github.com/user/myapp --kernel ./kernel --wait
+sudo ./gocracker repo --url https://github.com/user/myapp --kernel "$KERNEL" --wait
 ```
 
 Clones the repo, auto-detects the Dockerfile, builds, and boots.
@@ -115,7 +135,7 @@ Clones the repo, auto-detects the Dockerfile, builds, and boots.
 ```bash
 sudo ./gocracker compose \
   --file tests/manual-smoke/fixtures/compose-todo-postgres/docker-compose.yml \
-  --kernel ./kernel --wait
+  --kernel "$KERNEL" --wait
 ```
 
 Each service runs in its own VM. PostgreSQL waits for healthcheck, then the app starts. Port 18081 is published to the host.
@@ -126,7 +146,7 @@ Each service runs in its own VM. PostgreSQL waits for healthcheck, then the app 
 
 ```bash
 # Start the API server + compose stack
-sudo ./gocracker compose --file docker-compose.yml --kernel ./kernel --server http://127.0.0.1:8080
+sudo ./gocracker compose --file docker-compose.yml --kernel "$KERNEL" --server http://127.0.0.1:8080
 
 # In another terminal, exec into a service
 sudo ./gocracker compose exec --server http://127.0.0.1:8080 --file docker-compose.yml app
@@ -139,7 +159,7 @@ Opens an interactive shell inside the running VM.
 ### 7. Networking (auto NAT)
 
 ```bash
-sudo ./gocracker run --image nginx:alpine --kernel ./kernel --net auto --wait
+sudo ./gocracker run --image nginx:alpine --kernel "$KERNEL" --net auto --wait
 ```
 
 Creates a TAP device, assigns IPv4 addresses, sets up NAT. The guest gets internet access automatically.
@@ -149,7 +169,7 @@ Creates a TAP device, assigns IPv4 addresses, sets up NAT. The guest gets intern
 ### 8. Multi-vCPU
 
 ```bash
-sudo ./gocracker run --image alpine:latest --kernel ./kernel --cpus 4 --mem 512 \
+sudo ./gocracker run --image alpine:latest --kernel "$KERNEL" --cpus 4 --mem 512 \
   --cmd "nproc && free -m" --wait
 ```
 
@@ -233,35 +253,12 @@ The toolbox agent binary is baked into every disk gocracker builds (`/opt/gocrac
 | ARM64 Linux | Full support | AWS a1.metal (Graviton 1), Ubuntu 24.04 |
 | macOS | Planned | Hypervisor.framework |
 
-### ARM64 / x86-64 Subsystem Comparison
-
-| Subsystem | x86-64 | ARM64 | Notes |
-|-----------|--------|-------|-------|
-| KVM bindings | `KVM_GET/SET_REGS` | `KVM_GET/SET_ONE_REG` | ARM64 uses per-register ioctls |
-| Interrupt controller | IOAPIC + LAPIC | GICv2 / GICv3 (in-kernel) | Auto-probed; GICv2 preferred on Graviton 1 |
-| IRQ delivery | `KVM_IRQ_LINE` | irqfd (eventfd) | ARM64 matches Firecracker's irqfd approach |
-| Serial console | UART 16550A (I/O port 0x3F8) | UART 16550A (MMIO 0x40002000) | Same device, different transport |
-| Boot protocol | bzImage / ELF vmlinux | ARM64 Image / Image.gz / ELF | PC=entry, X0=DTB address |
-| Device tree | ACPI (x86) | FDT/DTB (generated) | GIC, timer, PSCI, UART, virtio nodes |
-| SMP boot | INIT/SIPI sequence | PSCI CPU_ON | Secondary vCPUs start POWER_OFF |
-| Virtio MMIO transport | 0xD0000000+ | 0x40003000+ | Firecracker-compatible layout on ARM64 |
-| virtio-net | Done | Done | |
-| virtio-blk | Done | Done | |
-| virtio-rng | Done | Done | |
-| virtio-vsock | Done | Done | |
-| virtio-balloon | Done | Done | |
-| virtio-fs | Done | Done | Cold-boot only; snapshot + active virtio-fs mount is not supported (Linux driver queue state cannot migrate to a fresh virtiofsd) — use virtio-blk for per-sandbox state |
-| Snapshot / Restore | Done | Done | memfd-backed restore when SharedFS is in the snapshot; MAP_PRIVATE COW otherwise |
-| Jailer + seccomp | Done | Done | seccomp filter compiled per-arch |
-| Compose networking | Done | Done | TAP + bridge + userspace port proxy |
-| Memory layout | RAM at GPA 0x0 | RAM at GPA 0x80000000 | ARM64 reserves low 2 GB for MMIO |
-
 ## Networking
 
 ### One-command networking
 
 ```bash
-sudo ./gocracker run --net auto --image nginx:alpine --kernel ./kernel --wait
+sudo ./gocracker run --net auto --image nginx:alpine --kernel "$KERNEL" --wait
 ```
 
 Automatic TAP creation, IPv4 assignment, and NAT. The guest gets internet access with no manual setup.
@@ -320,107 +317,33 @@ gocracker builds on Firecracker's proven security model and adds the developer e
 
 ## Boot-time benchmark
 
-gocracker was benchmarked against Firecracker v1.10.1 on the same host, across the matrix of `{standard, minimal}` guest kernels × `{none, tap}` network × `{off, on}` TTY, 10 runs per cell (3 warmups), all driven through the same Firecracker REST API so the comparison is apples-to-apples at the VMM level.
+End-to-end wall clock for `gocracker run --image alpine:3.20 --wait --cmd "echo OK"`, measured from process start to the first stdout byte of the user CMD. Warm OCI artifact cache (so the run pays only VMM setup + guest boot + first output, not OCI pull or ext4 build).
 
-> **Note** — this section was re-measured on 2026-04-13 on the `perf/x86-slim-kernel-boot-bench` branch (commit preceding the README update). The earlier run is preserved in git history.
+Host: AMD Ryzen AI 9 HX 370, Linux 6.17, `/dev/kvm` available. Guest: 1 vCPU, 128 MiB RAM, alpine 3.20, `jailer=off`. 10 samples per cell after 1 warmup.
 
-### Setup
+| kernel | network | p50 | p90 | max |
+|---|---|---:|---:|---:|
+| standard | `--net none` | 77 ms | 86 ms | 108 ms |
+| standard | `--net auto` (tap) | 89 ms | 90 ms | 91 ms |
+| minimal | `--net none` | 77 ms | 83 ms | 93 ms |
+| minimal | `--net auto` (tap) | 79 ms | 81 ms | 84 ms |
 
-- **Host**: AMD Ryzen AI 9 HX 370 (24 threads), Linux 6.17, `/dev/kvm` available
-- **Firecracker**: v1.10.1 ([official release tarball](https://github.com/firecracker-microvm/firecracker/releases/tag/v1.10.1))
-- **gocracker**: this branch (includes the virtio-net shutdown-race fix from this PR; the earlier vsock-side fix landed in PR #2)
-- **Kernels measured**:
-  - [artifacts/kernels/gocracker-guest-standard-vmlinux](artifacts/kernels/gocracker-guest-standard-vmlinux) (ELF vmlinux, Linux 6.1.102, 41 MiB)
-  - [artifacts/kernels/gocracker-guest-minimal-vmlinux](artifacts/kernels/gocracker-guest-minimal-vmlinux) (new minimal profile — committed config drops ACPI NUMA + SLEEP, AMD NUMA, HIBERNATION + snapshot dev, PROFILING, USB (entire subsystem), PM_SLEEP, and the `bzip2`/`lzma`/`lzo` decompressors. Some symbols the fragment requests off — e.g. `PERF_EVENTS`, `VT`, `INPUT` — stay `=y` because other Kconfig options (`HARDLOCKUP_DETECTOR_PERF`, `HID`, legacy console selectors) transitively select them. Full functional baseline — virtio + vsock + DNS + IPv6 + TLS — still works: `apk update` inside Alpine boots green. 40 MiB.)
-- **Shared rootfs**: 64 MiB ext4 built from alpine-minirootfs 3.20.3 with a custom `/init` that mounts `/proc` and calls `/sbin/reboot -f` (triggers `KVM_EXIT_SHUTDOWN` via triple fault on `reboot=t`)
-- **Guest**: 1 vCPU, 128 MiB RAM
-- **Kernel cmdline**: `console=ttyS0 reboot=t panic=-1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda rw init=/init 8250.nr_uarts=1`
+`standard` is the default guest kernel ([artifacts/kernels/gocracker-guest-standard-vmlinux](artifacts/kernels/gocracker-guest-standard-vmlinux)) — works against any OCI image the user might throw at it. `minimal` ([artifacts/kernels/gocracker-guest-minimal-vmlinux](artifacts/kernels/gocracker-guest-minimal-vmlinux)) trims subsystems the microVM path never uses (ACPI NUMA, USB, hibernation, bzip2/lzma/lzo decompressors, etc.); virtio + vsock + DNS + IPv6 + TLS still work — `apk update` inside Alpine boots green.
 
-**Scope of this update**: the matrix here is reduced to `jailer=off` only (the jailer chroot needs root to set up and I did not want the bench to touch `/srv/jailer` silently). The jailer row from the older run is preserved in git history; its +8 ms overhead is unchanged.
+### Reproduce
 
-Both runtimes are driven by the same bash script which does:
-
-1. `fork-exec` of the VMM binary (`firecracker` or `gocracker-vmm`)
-2. Wait for the Unix socket to appear
-3. `PUT /boot-source`, `/drives/rootfs`, `/machine-config` (+ optional `/network-interfaces/eth0`)
-4. `PUT /actions {InstanceStart}`
-5. Wait for the VMM to report the guest has shut down (Firecracker exits; gocracker-vmm's `/vm` state transitions to `stopped`)
-
-Four timings per run:
-
-| metric | meaning |
-|---|---|
-| `spawn_ms`  | fork-exec → API socket accepts connections |
-| `api_ms`    | socket ready → last setup PUT complete (before `InstanceStart`) |
-| `boot_ms`   | `InstanceStart` response → host sees guest shutdown |
-| `total_ms`  | end-to-end wall clock (sum of the above) |
-
-### Results (medians over 10 runs per cell, 0 failures)
-
-```
-kernel    runtime      net   tty   spawn  api   boot   total   p95
----------------------------------------------------------------------
-standard  firecracker  none  off    3ms  19ms  315ms  338ms  378ms
-standard  firecracker  none  on     3ms  19ms  312ms  333ms  356ms
-standard  firecracker  tap   off    3ms  25ms  324ms  351ms  395ms
-standard  firecracker  tap   on     2ms  25ms  310ms  340ms  384ms
-standard  gocracker    none  off    6ms  18ms  389ms  417ms  498ms
-standard  gocracker    none  on     5ms  17ms  387ms  408ms  452ms
-standard  gocracker    tap   off    5ms  19ms  387ms  410ms  451ms
-standard  gocracker    tap   on     5ms  19ms  391ms  416ms  459ms
-minimal   firecracker  none  off    3ms  17ms  302ms  321ms  373ms
-minimal   firecracker  none  on     3ms  17ms  292ms  314ms  321ms
-minimal   firecracker  tap   off    3ms  24ms  303ms  329ms  348ms
-minimal   firecracker  tap   on     3ms  24ms  304ms  333ms  387ms
-minimal   gocracker    none  off    4ms  15ms  362ms  380ms  438ms
-minimal   gocracker    none  on     5ms  15ms  348ms  368ms  410ms
-minimal   gocracker    tap   off    4ms  19ms  372ms  395ms  498ms
-minimal   gocracker    tap   on     5ms  19ms  382ms  405ms  455ms
+```bash
+make build kernel-unpack
+KERNEL=$PWD/artifacts/kernels/gocracker-guest-standard-vmlinux
+for i in {1..10}; do
+  sudo ./gocracker run \
+    --image alpine:3.20 --kernel "$KERNEL" \
+    --mem 128 --cpus 1 --jailer off --net none \
+    --wait --cmd "echo OK" 2>&1 | grep -oP 'duration=\K[0-9]+ms'
+done
 ```
 
-| config (runtime/net/tty) | standard `boot` | minimal `boot` | Δ |
-|---|---:|---:|---:|
-| firecracker / none / off | 315 ms | 302 ms | −13 |
-| firecracker / none / on  | 312 ms | 292 ms | −20 |
-| firecracker / tap  / off | 324 ms | 303 ms | −21 |
-| firecracker / tap  / on  | 310 ms | 304 ms | −6  |
-| gocracker   / none / off | 389 ms | 362 ms | **−27** |
-| gocracker   / none / on  | 387 ms | 348 ms | **−39** |
-| gocracker   / tap  / off | 387 ms | 372 ms | −15 |
-| gocracker   / tap  / on  | 391 ms | 382 ms | −9  |
-
-### What the data shows
-
-1. **The minimal kernel is a real win**, most noticeable on gocracker: the headline no-net/no-tty cell drops from **389 ms → 362 ms** (−27 ms), and the no-net/tty-on cell drops from **387 ms → 348 ms** (−39 ms). Firecracker sees a smaller benefit (Firecracker's base config was already close to microVM-minimal).
-
-2. **Gocracker remains a bit slower than Firecracker** on the same host (~45 ms on the common case). Some of that is shutdown measurement methodology — gocracker measures to `state=stopped` (post-cleanup), while Firecracker measures to process exit. The slim kernel closes roughly half the gap.
-
-3. **TAP network adds ~5–15 ms** (an extra `/network-interfaces/eth0` PUT plus TAP fd setup); both runtimes pay the same amount.
-
-4. **TTY on/off is noise** (<10 ms in every configuration).
-
-5. **Functional sanity check** — running `gocracker run` on an Alpine Dockerfile with the minimal kernel, network `auto`, and a `CMD` of `apk update && date && echo APK_OK` prints `OK: 24175 distinct packages available` and the timestamp, confirming that the slim profile still supports DNS, HTTPS/TLS, virtio-blk, virtio-net, wall clock via kvm-clock, and the gocracker exec agent.
-
-### How these numbers compare to Firecracker's published figures
-
-Context from authoritative sources:
-
-| source | number | what it measures |
-|---|---:|---|
-| [Firecracker SPECIFICATION.md](https://github.com/firecracker-microvm/firecracker/blob/main/SPECIFICATION.md) | **≤ 125 ms** (SLO ceiling) | API `InstanceStart` → guest `/sbin/init`, m5d.metal / i3.metal, serial console **disabled**, minimal kernel+rootfs |
-| Firecracker [issue #877](https://github.com/firecracker-microvm/firecracker/issues/877) (i3.metal, 2019) | median **99.8 ms** (mean 105.3, σ 8.6) | `--boot-timer`, no network |
-| Firecracker [issue #877](https://github.com/firecracker-microvm/firecracker/issues/877) (m5d, 2021) | no net: **112.3 ms**; w/ net: **116 ms** | `--boot-timer` |
-| NSDI 2020 paper ([Agache et al.](https://www.usenix.org/system/files/nsdi20-paper-agache.pdf)) | ~125 ms | VMM boot to userspace |
-| [jailer.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md) | **2×** with 10 parallel jails, 0 mounts; **10×** with 500 mounts | Jail **creation** (parallel), *not* single-VM boot |
-
-The ~300 ms above is ~3× Firecracker's CI number for these reasons:
-
-- Test host is a consumer laptop, not an m5d.metal / i3.metal bare-metal instance.
-- The shared kernel is built from gocracker's generic guest config, not Firecracker's [stripped microvm-kernel config](https://github.com/firecracker-microvm/firecracker/tree/main/resources/guest_configs) (diff is ~37 options: PCI subsystem, ACPI NUMA, PCIe serial drivers, DMA engines, Intel perf counters — worth ~10–30 ms).
-- Serial console (`console=ttyS0`) is enabled. Firecracker's SLO number measures with it disabled.
-- Guest rootfs runs `alpine init` with a full mount sequence, not a static-linked noop init.
-
-The ratio between runtimes on the same host is the useful number, and there gocracker is neck-and-neck with Firecracker. No single-VM public Firecracker figure supports a 2× jailer penalty — the 2× in their docs is specifically about parallel jail creation at scale.
+The `duration=…` line in `[container:INFO] started …` is the end-to-end measurement the runtime reports. It breaks down into `orchestration_ms` (rootfs/initrd/disk reuse), `vmm_setup_ms` (KVM create + kernel load), and `guest_first_output_ms` (KVM_RUN → first serial byte from the guest CMD).
 
 ## Time-to-Interactive benchmark
 
@@ -599,36 +522,31 @@ The runtime handles 43 distinct images, 13 language runtimes (incl. bun), 5 data
 
 > **Calling-convention tip**: for service images that ship their own `ENTRYPOINT` (most non-base images: nginx, prom/*, hashicorp/*, jenkins, bun, etc.), pass `entrypoint=['sleep'], cmd=['infinity']` so init runs a benign keep-alive instead of the image's daemon. Skipping this is the main cause of the "agent timed out" / "exit=-1" symptoms in the few-failure column above.
 
-## Snapshot-resume benchmark (head-to-head vs Firecracker)
+## Snapshot / restore
 
-gocracker's `POST /restore {resume:true}` maps the memory snapshot `MAP_PRIVATE` (lazy COW — no up-front read or copy), re-wires virtio devices, restores vCPU state, and resumes. Head-to-head vs Firecracker v1.10.1 on the same host, 128 MiB guest, `alpine + sleep` rootfs, 20 fresh-process runs each, measured via `curl -w '%{time_total}'` (the request round-trip — excludes shell-process startup):
+`POST /restore {resume:true}` maps the memory snapshot `MAP_PRIVATE` (lazy COW — no up-front read or copy), re-wires virtio devices, restores vCPU state, and resumes. Because memory is page-faulted in lazily rather than eagerly copied, restore latency is O(1) in memory size rather than O(memory size).
 
-| VMM | min | p50 | p90 | mean | max |
-|---|---:|---:|---:|---:|---:|
-| Firecracker v1.10.1 | 1.11 ms | **1.92 ms** | 2.25 ms | 1.93 ms | 2.59 ms |
-| gocracker *(this branch)* | 1.42 ms | **2.24 ms** | 2.87 ms | 2.20 ms | 3.15 ms |
+Key design points that keep the restore fast ([bench-rtt numbers below](#per-primitive-rtt-benchmark)):
 
-A ~0.3 ms p50 gap at the low end of the latency budget, from a pure-Go VMM against a C/Rust production VMM. The key wins that landed to get here:
+- **`MAP_PRIVATE` COW memory restore** — [internal/kvm/kvm.go](internal/kvm/kvm.go). The snapshot file is mapped lazily; pages fault in as the guest touches them rather than up-front.
+- **Single-call `/restore {resume:true}`** — [internal/vmmserver/server.go](internal/vmmserver/server.go). Snapshot-load and vCPU-resume in one HTTP round-trip, not two.
+- **`SkipDiscardProbe` on restore** — [internal/virtio/blk.go](internal/virtio/blk.go). Skips the `FALLOC_FL_PUNCH_HOLE` probe because the guest already negotiated `VIRTIO_BLK_F_DISCARD` against the pre-snapshot `DeviceFeatures`.
+- **`postCreateVCPUs` in restore path** — [pkg/vmm/vmm.go](pkg/vmm/vmm.go). Wires per-device `KVM_IRQFD` against freshly-created vCPU GSIs so queue notifies don't take a reconfiguration VMexit on first use.
+- **`MADV_HUGEPAGE` + `MADV_WILLNEED`** on the first 8 MiB of the memory mapping — serves hot early pages from 2 MiB TLB entries without page-fault stalls.
 
-- **`MAP_PRIVATE` COW memory restore** — [internal/kvm/kvm.go](internal/kvm/kvm.go). Page-faults the snapshot file in lazily rather than reading+copying 128 MiB up front; saves ~60–100 ms.
-- **Single-call `/restore {resume:true}`** — [internal/vmmserver/server.go](internal/vmmserver/server.go). Snapshot-load and vCPU-resume in one HTTP round-trip; saves ~8 ms vs two-call load-then-start.
-- **`SkipDiscardProbe` on restore** — [internal/virtio/blk.go](internal/virtio/blk.go). Skips the `FALLOC_FL_PUNCH_HOLE` probe because the guest has already negotiated `VIRTIO_BLK_F_DISCARD` against the pre-snapshot `DeviceFeatures`; saves ~3 ms per writable drive.
-- **`postCreateVCPUs` in restore path** — [pkg/vmm/vmm.go](pkg/vmm/vmm.go). Wires per-device `KVM_IRQFD` against the freshly-created vCPU GSIs so queue notifies don't take a reconfiguration VMexit on first use.
-- **`MADV_HUGEPAGE` + `MADV_WILLNEED`** on the first 8 MiB of the memory mapping — tells the kernel to serve hot early pages from 2 MiB TLB entries without page-fault stalls.
-- **Minimal restore response** — drops `Events[]` + `DeviceList[]` from the hot-path response body.
+### Hot-path numbers (sandboxd)
 
-### Speed summary
+Measurements from the end-to-end sandboxd path on the same host:
 
-| scenario | gocracker | Firecracker v1.10.1 | notes |
-|---|---:|---:|---|
-| Cold boot (Node TTI) | **253 ms** p50 | — | `gocracker run` to first `node -v` stdout. +35 ms over the pre-toolbox baseline — that's the cost of init spawning the baked toolbox agent before the user's CMD. |
-| Snapshot-resume | **1.33 ms** p50 | 1.92 ms p50 | `bench-rtt` measurement of `RestoreFromSnapshotWithOptions → vm.Start` on this branch; the older head-to-head row on Firecracker v1.10.1 used `curl -w '%{time_total}'` including HTTP layer. |
-| Warm restore + SetNetwork re-IP | **~55 ms** p50 | — | Full lease-style path: `Restore` (40-45 ms) + toolbox SetNetwork (11-13 ms). Now **bypassed** in the warm-pool path: see next row. |
-| Sandboxd warm lease (pool paused→ready) | **1.5 ms** p95 | — | Pool of 8, sequential. The pool reuses the IP baked into each VM's cold-boot snapshot and skips SetNetwork on the hot path. See [Sandboxd](#sandboxd-sandbox-control-plane). |
-| Sandboxd E2E `create → exec echo → delete` | **~35 ms** p95 | — | Same bench, full round trip from the Python/Go/Node SDK. Async delete lands the HTTP response in 1.9 ms; the ~22 ms residual is UDS+vsock CONNECT + the agent's fork/exec for `echo`. |
-| Sandboxd warm TTI (`node -v` against `base-node`) | **277 ms** p50 | — | Warm pool of 8, lease handle then time `sb.process.exec(['node','-v'])` to first byte. ~258 ms is node's own startup on alpine/musl; agent + UDS overhead is ~20 ms (echo measured at ~19 ms p50). See [Sandboxd](#sandboxd-sandbox-control-plane). |
+| scenario | latency | notes |
+|---|---:|---|
+| Cold boot (`gocracker run` to first `node -v` stdout) | **253 ms** p50 | +35 ms over the pre-toolbox baseline — cost of init spawning the baked toolbox agent before the user CMD. |
+| Snapshot resume (runtime call only) | **1.67 ms** p50 / 3.08 ms p90 | `RestoreFromSnapshotWithOptions → vm.Start`. See [bench-rtt](#per-primitive-rtt-benchmark) below for full distribution. |
+| Warm-pool lease (`POST /sandboxes/lease`) | **1.5 ms** p95 | Pool of 8, sequential. The pool reuses the IP baked into each VM's cold-boot snapshot and skips SetNetwork on the hot path. |
+| Sandboxd E2E `create → exec echo → delete` | **~35 ms** p95 | Full round trip from the Python/Go/Node SDK. Async delete lands the HTTP response in 1.9 ms; the ~22 ms residual is UDS+vsock CONNECT + agent fork/exec for `echo`. |
+| Sandboxd warm TTI (`node -v` against `base-node`) | **277 ms** p50 | Warm pool of 8, lease handle then time `sb.process.exec(['node','-v'])` to first byte. ~258 ms is node's own startup on alpine/musl; agent + UDS overhead is ~20 ms. |
 
-Both benches run with the VMM pinned to a dedicated CPU (`taskset`) and boosted to SCHED_FIFO (`chrt -r 50`), with `mlockall(MCL_CURRENT)` locking the VMM's working set. The snapshot path deliberately does NOT set `MCL_FUTURE` because that would eager-fault the `MAP_PRIVATE` memory snapshot and turn a ~2 ms lazy-COW restore into ~30 ms.
+The bench runs with the VMM pinned to a dedicated CPU (`taskset`) and boosted to SCHED_FIFO (`chrt -r 50`), with `mlockall(MCL_CURRENT)` locking the VMM's working set. The snapshot path deliberately does NOT set `MCL_FUTURE` because that would eager-fault the `MAP_PRIVATE` memory snapshot and turn a ~2 ms lazy-COW restore into ~30 ms.
 
 ### ARM64 warm-cache benchmark
 
@@ -698,6 +616,7 @@ Commands:
   migrate    Live-migrate a VM between gocracker API servers
   serve      Start the REST API server
   snapshot   Take a snapshot of a running VM via the API
+  version    Print build version, commit, date, and Go runtime
 
 Common flags (run):
   --image       OCI image ref (e.g. ubuntu:22.04)
