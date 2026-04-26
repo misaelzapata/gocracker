@@ -1,8 +1,11 @@
 // Package buildinfo exposes the build-time identity of the binary:
-// a semver Version, the git commit it was built from, and the build
-// date. Each field is injected via -ldflags at build time; bare `go
-// build` leaves the defaults in place so development binaries still
-// produce a readable `gocracker version` output.
+// a Version string, the git commit it was built from, and the build
+// date. Release builds inject a semver tag via -ldflags (set by the
+// Makefile from `git describe --tags --dirty` or an explicit
+// `VERSION=…` override); bare `go build` leaves the defaults in
+// place, so development binaries report values like `dev` or
+// `dev-<sha>-dirty` while still producing a readable
+// `gocracker version` output.
 //
 // Wire it into a binary via:
 //

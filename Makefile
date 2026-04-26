@@ -8,7 +8,7 @@ TARGET_GOARCH ?= $(shell go env GOARCH)
 # the working tree is clean at a tag, else "dev-<short-sha>-dirty?".
 # COMMIT is the short SHA; DATE is ISO-8601 UTC. Override from the
 # command line for release builds (e.g. `make build VERSION=v1.2.3`).
-VERSION ?= $(shell git describe --tags --exact-match --dirty=-dirty 2>/dev/null || echo "dev-$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet 2>/dev/null || echo -dirty)")
+VERSION ?= $(shell git describe --tags --exact-match --dirty=-dirty 2>/dev/null || echo "dev-$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git diff --quiet 2>/dev/null || echo -dirty; fi)")
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 VERSION_LDFLAGS = -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
