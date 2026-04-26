@@ -1,379 +1,379 @@
 # id	kind	url	ref	path	stack	mode	probe_type	probe_target	probe_expect	mem_mb	disk_mb	notes	dockerfile
 traefik-whoami	dockerfile	https://github.com/traefik/whoami.git	3c6fc4814630c9645affe0e2ff42c8bc2d8aadae	.	go	service	none			128	4096	small http service
 minio-minio	dockerfile	https://github.com/minio/minio.git	7aac2a2c5b7c882e68c1ce017d8256be2feea27f	.	go	service	none			256	4096	object storage
-go-gitea-gitea	dockerfile	https://github.com/go-gitea/gitea.git	4fa319b9dca4	.	go	service	none			256	4096	forge
-distribution-registry	dockerfile	https://github.com/distribution/distribution.git	4045624d53b8	.	go	service	none			256	4096	registry
-caddyserver-caddy	dockerfile	https://github.com/caddyserver/caddy.git	4f504588669e28373f455b694539475ffe4d2926	.	go	service	none			256	4096	web server
+go-gitea-gitea	dockerfile	https://github.com/go-gitea/gitea.git	683f8c0014f03c7fe94c0d3b36d77b7fc3c2eac9	.	go	service	none			256	4096	forge
+distribution-registry	dockerfile	https://github.com/distribution/distribution.git	f3af4de047a01241bea867e755be18ac8b109f91	.	go	service	none			256	4096	registry
+caddyserver-caddy	dockerfile	https://github.com/caddyserver/caddy.git	2a3ed96f8cbf0c72ce4621de84939e8828726d59	.	go	service	none			256	4096	web server
 mailhog-mailhog	dockerfile	https://github.com/mailhog/MailHog.git	e6fa06877ef61ea82bbef234d94bdc75cca478d1	.	go	service	none			128	4096	smtp sink
-prometheus-node-exporter	dockerfile	https://github.com/prometheus/node_exporter.git	b99dcb64f95f	.	go	service	none			128	4096	exporter
-prom-prometheus	dockerfile	https://github.com/prometheus/prometheus.git	f1b226a2f355	.	go	service	none			256	4096	metrics server
-grafana-grafana	dockerfile	https://github.com/grafana/grafana.git	04aa182bf8fe	.	go	service	none			512	4096	dashboard
-grafana-loki	dockerfile	https://github.com/grafana/loki.git	a2c96224b3d0	cmd/loki/Dockerfile	go	service	none			512	4096	logs
-grafana-tempo	dockerfile	https://github.com/grafana/tempo.git	7f19357e6803c3f5777fa8f088f0bf2543d5bf93	.	go	service	none			512	4096	tracing
-influxdata-telegraf	dockerfile	https://github.com/influxdata/telegraf.git	bfd46ca8648d798f59f6cf87ba5ab4f7b8ab9d1c	.	go	service	none			256	4096	agent
-influxdata-influxdb	dockerfile	https://github.com/influxdata/influxdb.git	79a63cc7d5d77a8a1b00cadf1f6cd62ce20832f5	.	go	service	none			512	4096	database
-open-policy-agent-opa	dockerfile	https://github.com/open-policy-agent/opa.git	7d266cb687ca	.	go	service	none			128	4096	policy engine
-ollama-ollama	dockerfile	https://github.com/ollama/ollama.git	3536ef58f613	.	go	service	none			512	4096	llm runtime
+prometheus-node-exporter	dockerfile	https://github.com/prometheus/node_exporter.git	d6d0e710bb7daf07a2743fde060f0d5f32c565f3	.	go	service	none			128	4096	exporter
+prom-prometheus	dockerfile	https://github.com/prometheus/prometheus.git	ca578101aff0022c64d8a47827de6fcca0a168f2	.	go	service	none			256	4096	metrics server
+grafana-grafana	dockerfile	https://github.com/grafana/grafana.git	b27e91ca617ae874555eb5555798fec0e443d1ed	.	go	service	none			512	4096	dashboard
+grafana-loki	dockerfile	https://github.com/grafana/loki.git	fc33fde7bfa457ea583f3ebdbc476e60aaeb819d	cmd/loki/Dockerfile	go	service	none			512	4096	logs
+grafana-tempo	dockerfile	https://github.com/grafana/tempo.git	715f18b1e7158b98e37668cfc3a078df3c5ea9f2	.	go	service	none			512	4096	tracing
+influxdata-telegraf	dockerfile	https://github.com/influxdata/telegraf.git	d378008b9007000ec3107df2352a6e35278f2a87	.	go	service	none			256	4096	agent
+influxdata-influxdb	dockerfile	https://github.com/influxdata/influxdb.git	b66fe858e3758b45c615e76e53cfedc73ef0c1c2	.	go	service	none			512	4096	database
+open-policy-agent-opa	dockerfile	https://github.com/open-policy-agent/opa.git	4cfb8da6cced4b6f3737a84ae6dd7ab5805cc211	.	go	service	none			128	4096	policy engine
+ollama-ollama	dockerfile	https://github.com/ollama/ollama.git	ea01af6f76fc03ba737aec1f9a49e82f6063bab1	.	go	service	none			512	4096	llm runtime
 hashicorp-http-echo	dockerfile	https://github.com/hashicorp/http-echo.git	767bbd9c3d1905acb04891d5c5e208de17b34a71	.	go	service	none			128	4096	tiny service
 chartmuseum-chartmuseum	dockerfile	https://github.com/helm/chartmuseum.git	7508866ec40195cbcb285e4981c092bcb9451944	.	go	service	none			256	4096	chart repo
 qdrant-qdrant	dockerfile	https://github.com/qdrant/qdrant.git	eabee371fda447974a94d29fbaa675a6a596cc7b	.	rust	service	none			512	4096	vector db
-meilisearch-meilisearch	dockerfile	https://github.com/meilisearch/meilisearch.git	14efbaeef1b87491707e396950be57ef0587f743	.	rust	service	none			512	4096	search engine
-coredns-coredns	dockerfile	https://github.com/coredns/coredns.git	510977c476609f4c75ffb924deb5101556069761	.	go	service	none			128	4096	dns server
-gotenberg-gotenberg	dockerfile	https://github.com/gotenberg/gotenberg.git	4811a005439f	.	go	service	none			512	4096	document api	build/Dockerfile
-gogs-gogs	dockerfile	https://github.com/gogs/gogs.git	b53d316233f9447309c2d8140e263e147d720e01	.	go	service	none			256	4096	forge
-woodpecker-ci-woodpecker	dockerfile	https://github.com/woodpecker-ci/woodpecker.git	2496287790b7	.	go	service	none			256	4096	ci
-drone-drone	dockerfile	https://github.com/drone/drone.git	20da7b5320d9	.	go	service	none			256	4096	ci
+meilisearch-meilisearch	dockerfile	https://github.com/meilisearch/meilisearch.git	c9c7adde915da6cebf91eaaa3d228a81306061d9	.	rust	service	none			512	4096	search engine
+coredns-coredns	dockerfile	https://github.com/coredns/coredns.git	a669d74088de29366b72eba2561e6ea69b1a4b0d	.	go	service	none			128	4096	dns server
+gotenberg-gotenberg	dockerfile	https://github.com/gotenberg/gotenberg.git	68e0f88d5b6ffe9cb8adc37104b01f958ea93457	.	go	service	none			512	4096	document api	build/Dockerfile
+gogs-gogs	dockerfile	https://github.com/gogs/gogs.git	7297aee50d4c115836c7de8a3a233daaef87b911	.	go	service	none			256	4096	forge
+woodpecker-ci-woodpecker	dockerfile	https://github.com/woodpecker-ci/woodpecker.git	4dd3be7f96a976d19facfc86837bfbc18a974f6f	.	go	service	none			256	4096	ci
+drone-drone	dockerfile	https://github.com/drone/drone.git	43f15baee6ae7490f69feb4a797f0b0e459c4805	.	go	service	none			256	4096	ci
 openfaas-faas	dockerfile	https://github.com/openfaas/faas.git	f4dc39f8d87bf666fd5702791d752b382d90163b	.	go	service	none			256	4096	faas gateway
-etcd-io-etcd	dockerfile	https://github.com/etcd-io/etcd.git	c64f8fd68c2e75cc65b88bc0d956547a5f77cab1	.	go	service	none			256	4096	kv store
-cockroachdb-cockroach	dockerfile	https://github.com/cockroachdb/cockroach.git	aa7c2d664ef5	.	go	service	none			512	4096	sql db
-victoria-metrics	dockerfile	https://github.com/VictoriaMetrics/VictoriaMetrics.git	3e51f277bd4f	.	go	service	none			256	4096	time series
-seaweedfs-seaweedfs	dockerfile	https://github.com/seaweedfs/seaweedfs.git	059bee683f6b	.	go	service	none			256	4096	object store
-apache-apisix	dockerfile	https://github.com/apache/apisix.git	636100ec7e88c670655119d73181357cf1d49545	.	lua	service	none			256	4096	api gateway
-rabbitmq-server	dockerfile	https://github.com/rabbitmq/rabbitmq-server.git	83866edcc995602f546f3c4147078b3a610b0075	.	erlang	service	none			512	4096	broker
-redis-redis	dockerfile	https://github.com/redis/redis.git	fe3ae0ccacc5c9473fb2e98902ac8f673c11e7ee	.	c	service	none			128	4096	cache
-valkey-valkey	dockerfile	https://github.com/valkey-io/valkey.git	1db8bab50851cc22aa97d91aeccb4b8385be1672	.	c	service	none			128	4096	cache fork
+etcd-io-etcd	dockerfile	https://github.com/etcd-io/etcd.git	411d0fcb8f2d5cda43857bc6111ca1713460609f	.	go	service	none			256	4096	kv store
+cockroachdb-cockroach	dockerfile	https://github.com/cockroachdb/cockroach.git	eb8f019262c438d83266cf3e1d668a00ff6399d8	.	go	service	none			512	4096	sql db
+victoria-metrics	dockerfile	https://github.com/VictoriaMetrics/VictoriaMetrics.git	2336c7e72f2e5a16a82bb4af9571fa646bff6c51	.	go	service	none			256	4096	time series
+seaweedfs-seaweedfs	dockerfile	https://github.com/seaweedfs/seaweedfs.git	5eead9409a03a813b275d2f4ab8a86a17cbb586d	.	go	service	none			256	4096	object store
+apache-apisix	dockerfile	https://github.com/apache/apisix.git	08bf6248ad2196109b4cf73f22f98a502362161c	.	lua	service	none			256	4096	api gateway
+rabbitmq-server	dockerfile	https://github.com/rabbitmq/rabbitmq-server.git	ffc043a73e759832d84f5ba07d57ff86b00529ac	.	erlang	service	none			512	4096	broker
+redis-redis	dockerfile	https://github.com/redis/redis.git	47c51369eeffd55e1baf20df7955a3dfbe842fc4	.	c	service	none			128	4096	cache
+valkey-valkey	dockerfile	https://github.com/valkey-io/valkey.git	a7d495352ac0ba724eeec51fd57b615e8e805f52	.	c	service	none			128	4096	cache fork
 memcached-memcached	dockerfile	https://github.com/memcached/memcached.git	3824603965ecbd38e552a725dbfc4ff38ab40cb2	.	c	service	none			128	4096	cache
-envoy-envoy	dockerfile	https://github.com/envoyproxy/envoy.git	6b29862c77b55e17f0bc7b5a4e0f08355cdcd967	.	cpp	service	none			512	4096	proxy
-haproxy-haproxy	dockerfile	https://github.com/haproxy/haproxy.git	774d0dfe1454a73346a3fbd7f8a7f04e2972e6c0	.	c	service	none			256	4096	proxy
-eclipse-mosquitto	dockerfile	https://github.com/eclipse-mosquitto/mosquitto.git	b3b4d77ef3faef6dfcdfac3fb00a9b5a42859aca	docker/2.1-alpine	c	service	none			128	4096	mqtt broker
-nats-server	dockerfile	https://github.com/nats-io/nats-server.git	74cbb964b5545f8230c370fddabe108260e079e5	.	go	service	none			128	4096	messaging
-emqx-emqx	dockerfile	https://github.com/emqx/emqx.git	941e17fdadcd8a4754bcedf050f35306f5365110	.	erlang	service	none			512	4096	mqtt platform
-dragonflydb-dragonfly	dockerfile	https://github.com/dragonflydb/dragonfly.git	1304655b16f6ffc8ac8eb0dcde833d30f26aa103	.	cpp	service	none			512	4096	cache
-milvus-milvus	dockerfile	https://github.com/milvus-io/milvus.git	79672130af3a0ba1249914f6b6fb272af2ea22d6	.	go	service	none			512	4096	vector db
-typesense-typesense	dockerfile	https://github.com/typesense/typesense.git	6fb9090409a0b4d80fadc25434e27a852f8bfd70	.	cpp	service	none			256	4096	search
-quickwit-quickwit	dockerfile	https://github.com/quickwit-oss/quickwit.git	cfb53e97707222c7143e545ae5b09a8c8b461e7f	.	rust	service	none			512	4096	search
-kestra-kestra	dockerfile	https://github.com/kestra-io/kestra.git	4a0ca9dd47243408afe0f24d8deac9b6a461b9f4	.	java	service	none			512	4096	orchestrator
-mlflow-mlflow	dockerfile	https://github.com/mlflow/mlflow.git	7c7d56d1bb5502bcef3ffed7678cd94f9169d61e	.	python	service	none			256	4096	ml platform
-bentoml-bentoml	dockerfile	https://github.com/bentoml/BentoML.git	009d68ea713cce4203f5ad8bb734ff55b15a2f2c	.	python	service	none			256	4096	model serving
-prefect-prefect	dockerfile	https://github.com/PrefectHQ/prefect.git	34f66a7cfc986e5b47688ea8ea7a91f8fc58e01f	.	python	service	none			256	4096	orchestration
-dagster-dagster	dockerfile	https://github.com/dagster-io/dagster.git	0d5dff797216f249786df149d8040b99c8eb7254	.	python	service	none			256	4096	orchestration
-gradio-gradio	dockerfile	https://github.com/gradio-app/gradio.git	b4c801ef3c9aa94127e02d248e6a2857ae3ca0c8	.	python	service	none			256	4096	ui
-streamlit-streamlit	dockerfile	https://github.com/streamlit/streamlit.git	3b6b46bc2bca82d7b8d4b7666c48ab1d08c102c9	.	python	service	none			256	4096	ui
+envoy-envoy	dockerfile	https://github.com/envoyproxy/envoy.git	90594f45b3ed30bfd4bdf8bb300944b93e40959f	.	cpp	service	none			512	4096	proxy
+haproxy-haproxy	dockerfile	https://github.com/haproxy/haproxy.git	fa17a50c620237c88b7e1ca3ca3905c0e67217e4	.	c	service	none			256	4096	proxy
+eclipse-mosquitto	dockerfile	https://github.com/eclipse-mosquitto/mosquitto.git	2a06f4434ce2af243f76b84c7079ea733865c6c9	docker/2.1-alpine	c	service	none			128	4096	mqtt broker
+nats-server	dockerfile	https://github.com/nats-io/nats-server.git	cf2fd384c00d47da7d9c9ac84075d02f9ce4d91d	.	go	service	none			128	4096	messaging
+emqx-emqx	dockerfile	https://github.com/emqx/emqx.git	a47621b95ee0fc030f1d4e4133a81d338ddb1aee	.	erlang	service	none			512	4096	mqtt platform
+dragonflydb-dragonfly	dockerfile	https://github.com/dragonflydb/dragonfly.git	6a9ac29208aa53811e6d2911c43670e58c0b5e13	.	cpp	service	none			512	4096	cache
+milvus-milvus	dockerfile	https://github.com/milvus-io/milvus.git	f538b4b47e2cc24955fc0c23816d1823687434d4	.	go	service	none			512	4096	vector db
+typesense-typesense	dockerfile	https://github.com/typesense/typesense.git	2bd7f9f80a8ba5f7f0676d94c15d8ab96e3527bc	.	cpp	service	none			256	4096	search
+quickwit-quickwit	dockerfile	https://github.com/quickwit-oss/quickwit.git	b0155f8626b7ce5241043ea1d29b811bc72f18f8	.	rust	service	none			512	4096	search
+kestra-kestra	dockerfile	https://github.com/kestra-io/kestra.git	6058589233debf02f1075ba06641e1a8b6fc98cc	.	java	service	none			512	4096	orchestrator
+mlflow-mlflow	dockerfile	https://github.com/mlflow/mlflow.git	aad3f0ce173042a2c56c2ea5184d9902ef05acb1	.	python	service	none			256	4096	ml platform
+bentoml-bentoml	dockerfile	https://github.com/bentoml/BentoML.git	f488962c791c5c5ab842b96f73338e071110d59b	.	python	service	none			256	4096	model serving
+prefect-prefect	dockerfile	https://github.com/PrefectHQ/prefect.git	efb35bfbc80ccd7322ff33c6e3324450376af401	.	python	service	none			256	4096	orchestration
+dagster-dagster	dockerfile	https://github.com/dagster-io/dagster.git	4b5a9b8cfa3a2060a3e44aa163ecd24c38e881fc	.	python	service	none			256	4096	orchestration
+gradio-gradio	dockerfile	https://github.com/gradio-app/gradio.git	fffd4c661f5d3becb864d4b78d93d24eb3c94aab	.	python	service	none			256	4096	ui
+streamlit-streamlit	dockerfile	https://github.com/streamlit/streamlit.git	543575f59dd45709a1844d842f1125c860c4aa54	.	python	service	none			256	4096	ui
 locust-locust	dockerfile	https://github.com/locustio/locust.git	2c8f587a60a0c5b0bb27ee395b0d1ca5149ca6f2	.	python	service	none			128	4096	load testing
-celery-celery	dockerfile	https://github.com/celery/celery.git	f9ea6771e67205a4fbb8b4dc3890f3ad5d704924	.	python	service	none			128	4096	worker
+celery-celery	dockerfile	https://github.com/celery/celery.git	6988692bc2985811854ddf00bcefbd0956c74830	.	python	service	none			128	4096	worker
 httpbin	dockerfile	https://github.com/postmanlabs/httpbin.git	f8ec666b4d1b654e4ff6aedd356f510dcac09f83	.	python	service	none			128	4096	test api
 uvicorn-gunicorn-fastapi	dockerfile	https://github.com/tiangolo/uvicorn-gunicorn-fastapi-docker.git	339a5c92e9eff025fd9fceaf4bf1a04d43b56be7	docker-images	python	service	none			128	4096	fastapi base	python3.11-slim.dockerfile
-plotly-dash	dockerfile	https://github.com/plotly/dash.git	fa21fcb2e955e13cbc98b06479b95378e524ec13	.	python	service	none			256	4096	dashboard
-wger	dockerfile	https://github.com/wger-project/wger.git	3b58d398a28d47965549eaf0a5c7cfa0da8c4d47	.	python	service	none			256	4096	django app
-semaphore	dockerfile	https://github.com/semaphoreui/semaphore.git	84c9b8ae186afaec46694be871bc80fb8ab9f7f3	.	go	service	none			256	4096	ansible ui
-paperless-ngx	dockerfile	https://github.com/paperless-ngx/paperless-ngx.git	64debc87a594ae339a5ac725550de3d4c9bcfaeb	.	python	service	none			512	4096	documents
-jupyterhub-jupyterhub	dockerfile	https://github.com/jupyterhub/jupyterhub.git	af91ff62fca9ff014e3fc1544050147084bc1fa9	.	python	service	none			256	4096	notebooks
-jupyter-docker-stacks	dockerfile	https://github.com/jupyter/docker-stacks.git	d759cbb265fc3790878f8dfc5b78cc0b4b9fe564	images/base-notebook	python	service	none			512	4096	notebook image
-livebook	dockerfile	https://github.com/livebook-dev/livebook.git	131ef751ddb6ba86642f01584fb6461684aae0db	.	elixir	service	none			256	4096	notebook
-umami	dockerfile	https://github.com/umami-software/umami.git	0a838649b773122cc68cbd0c3df78d4251b981c5	.	node	service	none			256	4096	analytics
-metabase	dockerfile	https://github.com/metabase/metabase.git	e82a4d027c7ce85f938f2827a009f15db17f0118	.	java	service	none			512	4096	analytics
-directus	dockerfile	https://github.com/directus/directus.git	80bca160e04314e964b245351f62c21ecce97071	.	node	service	none			256	4096	headless cms
-strapi	dockerfile	https://github.com/strapi/strapi.git	4ff54bff36fed071f2eeae06dfb1af8eb340485f	.	node	service	none			256	4096	cms
-n8n	dockerfile	https://github.com/n8n-io/n8n.git	fb4c2631b214bd1e5e9e03292ac0d3bac73d3e2d	.	node	service	none			256	4096	automation
-hoppscotch	dockerfile	https://github.com/hoppscotch/hoppscotch.git	d45903d2e5363a0993f6aafa503ab20fb1b6bec5	.	node	service	none			256	4096	api client
-outline	dockerfile	https://github.com/outline/outline.git	5d5213101ef5ea5b5f2a5844edf74aa8bfcff7df	.	node	service	none			512	4096	knowledge base
-chatwoot	dockerfile	https://github.com/chatwoot/chatwoot.git	6f5ad8f3724b68fec3780b22047c539c06520fb2	.	ruby	service	none			512	4096	support inbox
-pocketbase	dockerfile	https://github.com/pocketbase/pocketbase.git	78dc12dc29716de3d59dab15686d97b48e5130c3	.	go	service	none			128	4096	backend
-bookstack	dockerfile	https://github.com/BookStackApp/BookStack.git	25790fd0245257ffaffe6690b8e12d56b326af9b	.	php	service	none			256	4096	docs wiki
-nextcloud-server	dockerfile	https://github.com/nextcloud/server.git	92e4c882fc0491a5f4860453a064ec4b099af0f6	.	php	service	none			512	4096	groupware
-wallabag	dockerfile	https://github.com/wallabag/wallabag.git	52ac14ae9f8f61c93fee8cba1ed1632d1a0c27a6	.	php	service	none			256	4096	read later
-gotify	dockerfile	https://github.com/gotify/server.git	143438055db4b8bba721ce79cacae84f37aff950	.	go	service	none			128	4096	notifications
+plotly-dash	dockerfile	https://github.com/plotly/dash.git	96969d1ee0ef34e48aeb09a9fe964cfc892c8b05	.	python	service	none			256	4096	dashboard
+wger	dockerfile	https://github.com/wger-project/wger.git	0091ab43d8e29f13581e4419747cfe40fc58c01c	.	python	service	none			256	4096	django app
+semaphore	dockerfile	https://github.com/semaphoreui/semaphore.git	aa839123339af168261b441398c3e6089558df6a	.	go	service	none			256	4096	ansible ui
+paperless-ngx	dockerfile	https://github.com/paperless-ngx/paperless-ngx.git	8cab1d0c13ed68615d64e6569d6ed0d1842b96fa	.	python	service	none			512	4096	documents
+jupyterhub-jupyterhub	dockerfile	https://github.com/jupyterhub/jupyterhub.git	9928efd66dedc0fed181093396e3a829f16ee808	.	python	service	none			256	4096	notebooks
+jupyter-docker-stacks	dockerfile	https://github.com/jupyter/docker-stacks.git	1ff0f4d9daf3c155406aaea9768c1d870483ef6a	images/base-notebook	python	service	none			512	4096	notebook image
+livebook	dockerfile	https://github.com/livebook-dev/livebook.git	68429d77ac641ae3fe357b12d14cf8d6451ecf5a	.	elixir	service	none			256	4096	notebook
+umami	dockerfile	https://github.com/umami-software/umami.git	c78ff36db0c82e13c86e5073020472c6546313a3	.	node	service	none			256	4096	analytics
+metabase	dockerfile	https://github.com/metabase/metabase.git	7c8d37830ba045ea032025101ab266615662060a	.	java	service	none			512	4096	analytics
+directus	dockerfile	https://github.com/directus/directus.git	8fdc6ce7b907b99cb55da4f2d6b34dda5344c088	.	node	service	none			256	4096	headless cms
+strapi	dockerfile	https://github.com/strapi/strapi.git	f78edc3bc9b1e6a622c6ff667a87d77b37a8e727	.	node	service	none			256	4096	cms
+n8n	dockerfile	https://github.com/n8n-io/n8n.git	35449aaa7b1ca016c919e555f9ba86ee0ea1db8f	.	node	service	none			256	4096	automation
+hoppscotch	dockerfile	https://github.com/hoppscotch/hoppscotch.git	6fc63d07929805331b1bd78d2237a50fceaafa79	.	node	service	none			256	4096	api client
+outline	dockerfile	https://github.com/outline/outline.git	c4d764e243277398822c9d0e7bf9eaaebd206a82	.	node	service	none			512	4096	knowledge base
+chatwoot	dockerfile	https://github.com/chatwoot/chatwoot.git	2ada713f29b2cf5f864cccd3f74d570e73f6b82f	.	ruby	service	none			512	4096	support inbox
+pocketbase	dockerfile	https://github.com/pocketbase/pocketbase.git	83e44a7cfbc7312c3f5e3d2f643da45512fcbc52	.	go	service	none			128	4096	backend
+bookstack	dockerfile	https://github.com/BookStackApp/BookStack.git	74aa897626e649cfa17b0c07c5fc1b985624e20a	.	php	service	none			256	4096	docs wiki
+nextcloud-server	dockerfile	https://github.com/nextcloud/server.git	354c641bd4867963b12813a379ff9068f43bff4d	.	php	service	none			512	4096	groupware
+wallabag	dockerfile	https://github.com/wallabag/wallabag.git	aadc66c09d79fe7be5ea9557274ec69fe9844316	.	php	service	none			256	4096	read later
+gotify	dockerfile	https://github.com/gotify/server.git	6e588f3c971e467ca76149097f0e7e14ea3b9a63	.	go	service	none			128	4096	notifications
 rustdesk-server	dockerfile	https://github.com/rustdesk/rustdesk-server.git	815c728837b8a091c9feeeabb423d543be3a7f8d	docker	rust	service	none			256	4096	remote desktop
-mealie	dockerfile	https://github.com/mealie-recipes/mealie.git	d24aa7f65ac06450ce0fe21d62f79ac301f30c65	.	python	service	none			256	4096	recipes
-spring-petclinic	compose	https://github.com/spring-projects/spring-petclinic.git	edf4db28affcc4741c79850a3d95bc3f177b5ff9	docker-compose.yml	java	compose	none			512	4096	petclinic dev databases
+mealie	dockerfile	https://github.com/mealie-recipes/mealie.git	a754693787a295c89189b6c4a895e83e50b632bc	.	python	service	none			256	4096	recipes
+spring-petclinic	compose	https://github.com/spring-projects/spring-petclinic.git	c7ee170434ec3e369fdc9201290ba2ea4c92b557	docker-compose.yml	java	compose	none			512	4096	petclinic dev databases
 eshoponweb	dockerfile	https://github.com/dotnet-architecture/eShopOnWeb.git	4da8212117e87d808d4bbc7da6286fd2147ce606	src/Web/Dockerfile	dotnet	service	none			512	4096	ecommerce
-nopcommerce	dockerfile	https://github.com/nopSolutions/nopCommerce.git	0e7832e65a3f4be3896d7b304c33b601c074cc4a	.	dotnet	service	none			512	4096	ecommerce
-mastodon	dockerfile	https://github.com/mastodon/mastodon.git	621628e2cf20d16c37a18f4783bd8ba823326b45	.	ruby	service	none			512	4096	social network
-plausible-analytics	compose	https://github.com/plausible/analytics.git	7a31d4447bb892c1d7d3fcb76140ea5c9244df45	compose.yml	node	compose	none			512	4096	compose analytics
-filebrowser	dockerfile	https://github.com/filebrowser/filebrowser.git	860c19ddf58665aafcf976f5299a907738214226	Dockerfile	go	service	none			128	4096	file manager
-fastapi-template	compose	https://github.com/fastapi/full-stack-fastapi-template.git	bba8d07c0cb4ac0e38a99d1de38090048fab8dee	docker-compose.yml	python	compose	none			512	4096	full stack fastapi
-fastapi-postgresql	compose	https://github.com/tiangolo/full-stack-fastapi-postgresql.git	bba8d07c0cb4ac0e38a99d1de38090048fab8dee	docker-compose.yml	python	compose	none			512	4096	fastapi postgres
-appsmith	compose	https://github.com/appsmithorg/appsmith.git	4325533a9ae4ae5d8c92217646bfee703423b9b5	deploy/docker/docker-compose.yml	node	compose	none			512	4096	low code
-appwrite	compose	https://github.com/appwrite/appwrite.git	c08e5f706c6939bbd2ebb705671087cc0eed93b0	docker-compose.yml	php	compose	none			512	8192	baas
-supabase	compose	https://github.com/supabase/supabase.git	cccae29569c129e52178837d6d4662baa11f5986	docker/docker-compose.yml	node	compose	none			512	8192	db platform
-dify	compose	https://github.com/langgenius/dify.git	cb9f4bb100787158d19c7c631709c5ea0943be4e	docker/docker-compose.yaml	python	compose	none			512	6144	llm stack
-open-webui	compose	https://github.com/open-webui/open-webui.git	9bd84258d09eefe7bf975878fb0e31a5dadfe0f8	docker-compose.yaml	python	compose	none			256	4096	ui
-immich	compose	https://github.com/immich-app/immich.git	95ef60628cd9c220b8c2e2fa1156dbd976cbec6a	docker-compose.yml	node	compose	none			512	4096	photos
-firezone	compose	https://github.com/firezone/firezone.git	5098d8ca7cff29c368de974e47642f940c2db9aa	docker-compose.yml	elixir	compose	none			512	4096	vpn
-coolify	compose	https://github.com/coollabsio/coolify.git	575b0766d12bad2a78febff72ab59c017772bcf7	docker-compose.yml	php	compose	none			512	4096	paas
-budibase	compose	https://github.com/Budibase/budibase.git	916f993226bb6951e5c6f3ce9dc6fb67c560b383	hosting/docker-compose.yml	node	compose	none			512	4096	low code
-calcom	compose	https://github.com/calcom/cal.com.git	e4aff2db453d42952db74f7f9e0f104339e57c55	docker-compose.yml	node	compose	none			512	6144	scheduling
-redmine	compose	https://github.com/redmine/redmine.git	327954f64ce62a2cf13ff1c99ec41a6300b66d2b	docker-compose.yml	ruby	compose	none			256	4096	project management
-hashicorp-consul	dockerfile	https://github.com/hashicorp/consul.git	403741db6341d1fda100bb6c62dfba18f99ea991	Dockerfile	go	service	none			256	4096	service discovery
-hashicorp-vault	dockerfile	https://github.com/hashicorp/vault.git	54d6d8426827104fdbf2a2b505901ae337a13090	Dockerfile	go	service	none			256	4096	secrets manager
-prometheus-blackbox-exporter	dockerfile	https://github.com/prometheus/blackbox_exporter.git	7dc1c3a55af7956e77be818281966380c34eeba0	Dockerfile	go	service	none			128	4096	exporter
-prometheus-alertmanager	dockerfile	https://github.com/prometheus/alertmanager.git	50708ffb4a2d6fd500d7c3ca0c053df21927a267	Dockerfile	go	service	none			256	4096	alerting
-thanos	dockerfile	https://github.com/thanos-io/thanos.git	0210859327673c75be28defa2f1d37f84fa0ae6a	Dockerfile	go	service	none			256	4096	metrics
-authelia-authelia	dockerfile	https://github.com/authelia/authelia.git	e68d7d184501362ce9d4bee88f8a273f6d0c18b3	Dockerfile	go	service	none			256	4096	auth gateway
-argoproj-argo-cd	dockerfile	https://github.com/argoproj/argo-cd.git	82789b70712e3f4da41ae106906f045c32c55d59	Dockerfile	go	service	none			256	4096	gitops
-anchore-grype	dockerfile	https://github.com/anchore/grype.git	03696ddbc45f6c183a3cc37c2d7dffdc7763c38d	Dockerfile	go	service	none			128	4096	scanner
-anchore-syft	dockerfile	https://github.com/anchore/syft.git	99158be0baba90d9beff0e311e947d0f03fb1876	Dockerfile	go	service	none			128	4096	sbom
-trufflesecurity-trufflehog	dockerfile	https://github.com/trufflesecurity/trufflehog.git	b0ee281ec37fa5b33470fad59b058e406a849cad	Dockerfile	go	service	none			128	4096	secrets scanner
-mikefarah-yq	dockerfile	https://github.com/mikefarah/yq.git	17f66dc6c6a177fafd8b71a6abea6d6340aa1e16	Dockerfile	go	service	none			128	4096	yaml tool
-rclone-rclone	dockerfile	https://github.com/rclone/rclone.git	829b06d39bbf2c889360da9257eec65489740df3	Dockerfile	go	service	none			128	4096	file sync
-owncast-owncast	dockerfile	https://github.com/owncast/owncast.git	c13eaf25dd305a90ca03bc5f0f9e062ff94cf255	Dockerfile	go	service	none			256	4096	streaming
-plane	compose	https://github.com/makeplane/plane.git	a18d90da86e2d66b6f07475218175b0132302359	docker-compose.yml	node	compose	none			512	4096	project management
-windmill	compose	https://github.com/windmill-labs/windmill.git	b96059843168c072f24072f93fecd80431e5d4cf	docker-compose.yml	node	compose	none			512	4096	workflow engine
-activepieces	compose	https://github.com/activepieces/activepieces.git	e26da6c8a8e3b48819670b9bbc3947b207d53f42	docker-compose.yml	node	compose	none			512	4096	automation
-nocobase	compose	https://github.com/nocobase/nocobase.git	7eece3785566207fcf9a29a9e65614a3c73371dc	docker-compose.yml	node	compose	none			512	4096	platform
-langfuse	compose	https://github.com/langfuse/langfuse.git	93e4a5184c86dd793fda793da080dbe7fbcb093b	docker-compose.yml	node	compose	none			512	4096	observability
-docmost	compose	https://github.com/docmost/docmost.git	642024ba9d1afcc7c14ad3c34da8495037faeaf1	docker-compose.yml	node	compose	none			512	4096	docs wiki
+nopcommerce	dockerfile	https://github.com/nopSolutions/nopCommerce.git	ed4c1339b67cadc694deefac1b867f41b2521338	.	dotnet	service	none			512	4096	ecommerce
+mastodon	dockerfile	https://github.com/mastodon/mastodon.git	3473b8a65278783bc74ce2738aea98cca0c7a5ed	.	ruby	service	none			512	4096	social network
+plausible-analytics	compose	https://github.com/plausible/analytics.git	4db97287c3a097ac9dcf93567110a38ac59736c9	compose.yml	node	compose	none			512	4096	compose analytics
+filebrowser	dockerfile	https://github.com/filebrowser/filebrowser.git	7bd27f5e823651420cedd87a6c6503b1a954a4dd	Dockerfile	go	service	none			128	4096	file manager
+fastapi-template	compose	https://github.com/fastapi/full-stack-fastapi-template.git	13652b51ea0acca7dfe243ac25e2bbdc066f3c4f	docker-compose.yml	python	compose	none			512	4096	full stack fastapi
+fastapi-postgresql	compose	https://github.com/tiangolo/full-stack-fastapi-postgresql.git	13652b51ea0acca7dfe243ac25e2bbdc066f3c4f	docker-compose.yml	python	compose	none			512	4096	fastapi postgres
+appsmith	compose	https://github.com/appsmithorg/appsmith.git	99d69180919981ed9bc5484050d809a5bec68acc	deploy/docker/docker-compose.yml	node	compose	none			512	4096	low code
+appwrite	compose	https://github.com/appwrite/appwrite.git	1b8123bf62844b8b2adfaf32aacffae35afd66ff	docker-compose.yml	php	compose	none			512	8192	baas
+supabase	compose	https://github.com/supabase/supabase.git	07d75d4e799f1df21a6c8debdaea75ebddd977a5	docker/docker-compose.yml	node	compose	none			512	8192	db platform
+dify	compose	https://github.com/langgenius/dify.git	f00512dd5d82023adba4d33ff9f44d926be9f50d	docker/docker-compose.yaml	python	compose	none			512	6144	llm stack
+open-webui	compose	https://github.com/open-webui/open-webui.git	8dae237a0bfdac4b7f55b463b3e2769ea4b94a0b	docker-compose.yaml	python	compose	none			256	4096	ui
+immich	compose	https://github.com/immich-app/immich.git	9263e2f2e101294b9b422a18cd2e62eb9cf5da0b	docker-compose.yml	node	compose	none			512	4096	photos
+firezone	compose	https://github.com/firezone/firezone.git	83c98fd22806ea7d7ba506b354f56e63a1b4124d	docker-compose.yml	elixir	compose	none			512	4096	vpn
+coolify	compose	https://github.com/coollabsio/coolify.git	37518813a60596190b08f3df562e82cd77182a98	docker-compose.yml	php	compose	none			512	4096	paas
+budibase	compose	https://github.com/Budibase/budibase.git	ac9d4ce1fc143a5b7ad2ced958132ea092d370a9	hosting/docker-compose.yml	node	compose	none			512	4096	low code
+calcom	compose	https://github.com/calcom/cal.com.git	07edb535e6799f6b70f463ce28a9618ce3c1b707	docker-compose.yml	node	compose	none			512	6144	scheduling
+redmine	compose	https://github.com/redmine/redmine.git	86b8773d3c2920660caf9c83be6ff881897091a3	docker-compose.yml	ruby	compose	none			256	4096	project management
+hashicorp-consul	dockerfile	https://github.com/hashicorp/consul.git	593aee23c32f4a4bcc0b28854261a639f9feb445	Dockerfile	go	service	none			256	4096	service discovery
+hashicorp-vault	dockerfile	https://github.com/hashicorp/vault.git	db2cc6218c4c50b80523b7f75224af1c4deeb13a	Dockerfile	go	service	none			256	4096	secrets manager
+prometheus-blackbox-exporter	dockerfile	https://github.com/prometheus/blackbox_exporter.git	74011ffee3b3d3f884efa47935b5f3e930f31d4b	Dockerfile	go	service	none			128	4096	exporter
+prometheus-alertmanager	dockerfile	https://github.com/prometheus/alertmanager.git	c769adc531a4f7f6f2d7cd41df844379e7c15bce	Dockerfile	go	service	none			256	4096	alerting
+thanos	dockerfile	https://github.com/thanos-io/thanos.git	a1c5191720d9ffaa5e48c893dc29c253068076bf	Dockerfile	go	service	none			256	4096	metrics
+authelia-authelia	dockerfile	https://github.com/authelia/authelia.git	b52fef97da90790c24951f3e00c03a0090c999d2	Dockerfile	go	service	none			256	4096	auth gateway
+argoproj-argo-cd	dockerfile	https://github.com/argoproj/argo-cd.git	82f71400a473d8cfdeca121c7cb8acd126d1a856	Dockerfile	go	service	none			256	4096	gitops
+anchore-grype	dockerfile	https://github.com/anchore/grype.git	6d0b66c527ee116e36f642456c98c10639c20ca1	Dockerfile	go	service	none			128	4096	scanner
+anchore-syft	dockerfile	https://github.com/anchore/syft.git	3562dab445a4708abd945e8305e74288c2a7564f	Dockerfile	go	service	none			128	4096	sbom
+trufflesecurity-trufflehog	dockerfile	https://github.com/trufflesecurity/trufflehog.git	3fc0c2aa6648d54242e4af6fbfde0701796e4fb0	Dockerfile	go	service	none			128	4096	secrets scanner
+mikefarah-yq	dockerfile	https://github.com/mikefarah/yq.git	6679d3c02b673227733847b48eead82f4d00d777	Dockerfile	go	service	none			128	4096	yaml tool
+rclone-rclone	dockerfile	https://github.com/rclone/rclone.git	96760f1c14ab1c136dd15c69fc6e5e41c198e206	Dockerfile	go	service	none			128	4096	file sync
+owncast-owncast	dockerfile	https://github.com/owncast/owncast.git	c9d552b2873dfb3a2c21b3b361a0cc9929204e30	Dockerfile	go	service	none			256	4096	streaming
+plane	compose	https://github.com/makeplane/plane.git	32fb88ab2480d9f7d1a37282739df920cef921b0	docker-compose.yml	node	compose	none			512	4096	project management
+windmill	compose	https://github.com/windmill-labs/windmill.git	612a39bcfc04f328241794afdf0ef30bbed87ea8	docker-compose.yml	node	compose	none			512	4096	workflow engine
+activepieces	compose	https://github.com/activepieces/activepieces.git	9c2be8fa0d810a88c533e63ec8af0474f747868f	docker-compose.yml	node	compose	none			512	4096	automation
+nocobase	compose	https://github.com/nocobase/nocobase.git	ed7af7eb6ba4f0b8e95e2e00ef0c6a07ccf068a4	docker-compose.yml	node	compose	none			512	4096	platform
+langfuse	compose	https://github.com/langfuse/langfuse.git	9cfaa7571a064f7ef63317213aad228f7df0d158	docker-compose.yml	node	compose	none			512	4096	observability
+docmost	compose	https://github.com/docmost/docmost.git	a573acedd0317f3472cb0f8b95f6aa15315312e5	docker-compose.yml	node	compose	none			512	4096	docs wiki
 automatisch	compose	https://github.com/automatisch/automatisch.git	41f3c56a163103cae761bb44f03638cb84e859ee	docker-compose.yml	node	compose	none			512	4096	automation
-appflowy-cloud	compose	https://github.com/AppFlowy-IO/AppFlowy-Cloud.git	8fa850f6e93531eccebd14d7088911d64010f73d	docker-compose.yml	rust	compose	none			512	4096	collaboration
-openproject	compose	https://github.com/opf/openproject.git	fb9000eac37e33f2faf114be5d7c233101306434	docker-compose.yml	ruby	compose	none			512	4096	project management
+appflowy-cloud	compose	https://github.com/AppFlowy-IO/AppFlowy-Cloud.git	1ac3dcbcbfb98d8a0732a9ba255e88ae42602515	docker-compose.yml	rust	compose	none			512	4096	collaboration
+openproject	compose	https://github.com/opf/openproject.git	9569225e56d10ac7c40f31e476cfb6ff152475ba	docker-compose.yml	ruby	compose	none			512	4096	project management
 mattermost-docker	compose	https://github.com/mattermost/docker.git	1423a77bcd8059a81b5367c424194e4b7d09020e	docker-compose.yml	go	compose	none			512	4096	chat platform
-gitness-dockerfile	dockerfile	https://github.com/harness/gitness.git	58d7cc875adf7aaf773ca2fc5a2434c7b867ceaa	Dockerfile	go	service	none			256	4096	forge
-syncthing-syncthing	dockerfile	https://github.com/syncthing/syncthing.git	1a3cbca0170306541d3d1877cc1a9efbd8d8c017	Dockerfile	go	service	none			256	4096	sync
-binwiederhier-ntfy	dockerfile	https://github.com/binwiederhier/ntfy.git	17ec63df77ffbde3b2d52f746f90e7d8cc5445f6	Dockerfile	go	service	none			128	4096	notifications
-oauth2-proxy-oauth2-proxy	dockerfile	https://github.com/oauth2-proxy/oauth2-proxy.git	da9123f740d570374df9bf36ea66d3b94f712284	Dockerfile	go	service	none			128	4096	auth proxy
-vaultwarden	dockerfile	https://github.com/dani-garcia/vaultwarden.git	8f0e99b875bfde3bdf0f3eba8aff806da85d25e5	Dockerfile	rust	service	none			256	4096	password manager
-filebrowser-filebrowser	dockerfile	https://github.com/filebrowser/filebrowser.git	860c19ddf58665aafcf976f5299a907738214226	Dockerfile	go	service	none			128	4096	file manager
-healthchecks-dockerfile	dockerfile	https://github.com/healthchecks/healthchecks.git	9ff1c5afe52154a7c0c3f7d960f86ea305b8a785	docker/Dockerfile	python	service	none			256	4096	heartbeat monitoring
-snipeit	dockerfile	https://github.com/snipe/snipe-it.git	71b72eae103e452bb3901700dfdc50449ec7c3a9	Dockerfile	php	service	none			512	4096	asset management
-grist-core	dockerfile	https://github.com/gristlabs/grist-core.git	de972bd0455cb7caab3934a7f0a3282d3c3a5c89	Dockerfile	node	service	none			512	4096	spreadsheet
-fider-dockerfile	dockerfile	https://github.com/getfider/fider.git	00e3b52a3ced8be22fe00cc32a1ddbb24f0537d2	Dockerfile	go	service	none			256	4096	feedback
-changedetection-dockerfile	dockerfile	https://github.com/dgtlmoon/changedetection.io.git	43bba5a1b688cafa4ba591d0fb749d96f668067f	Dockerfile	python	service	none			256	4096	monitoring
-docuseal-dockerfile	dockerfile	https://github.com/docusealco/docuseal.git	4486f8040efeb57205687f0ba4ffbdd287547655	Dockerfile	ruby	service	none			256	4096	e-signature
-excalidraw-dockerfile	dockerfile	https://github.com/excalidraw/excalidraw.git	e18c1dd213000dde0ae94ef7eb00aab537b39708	Dockerfile	node	service	none			256	4096	whiteboard
-linkwarden-dockerfile	dockerfile	https://github.com/linkwarden/linkwarden.git	815d2faa885bba5f715e80424155e3927a626ea6	Dockerfile	node	service	none			256	4096	bookmarks
-traccar-dockerfile	dockerfile	https://github.com/traccar/traccar.git	d07f19643363eac8e1561186c6dc0fdf7768ea7c	docker/Dockerfile.alpine	java	service	none			256	4096	gps tracking
-typebot-compose	compose	https://github.com/baptisteArno/typebot.io.git	30e071da71d7a7015c9c74136d1d7b8209cc25f5	docker-compose.yml	node	compose	none			512	4096	forms
+gitness-dockerfile	dockerfile	https://github.com/harness/gitness.git	43f15baee6ae7490f69feb4a797f0b0e459c4805	Dockerfile	go	service	none			256	4096	forge
+syncthing-syncthing	dockerfile	https://github.com/syncthing/syncthing.git	1f57187461b36cfb6c59489f30409d80b9b11110	Dockerfile	go	service	none			256	4096	sync
+binwiederhier-ntfy	dockerfile	https://github.com/binwiederhier/ntfy.git	9fc96bfb8f19c22e8dc81ae017fc4b7ee035a9d1	Dockerfile	go	service	none			128	4096	notifications
+oauth2-proxy-oauth2-proxy	dockerfile	https://github.com/oauth2-proxy/oauth2-proxy.git	65037b086c783903a8dfc31a6f16a995ff8cf007	Dockerfile	go	service	none			128	4096	auth proxy
+vaultwarden	dockerfile	https://github.com/dani-garcia/vaultwarden.git	7cf0c5d67eb81c8b4f2e86b5c8d030bb330faa28	Dockerfile	rust	service	none			256	4096	password manager
+filebrowser-filebrowser	dockerfile	https://github.com/filebrowser/filebrowser.git	7bd27f5e823651420cedd87a6c6503b1a954a4dd	Dockerfile	go	service	none			128	4096	file manager
+healthchecks-dockerfile	dockerfile	https://github.com/healthchecks/healthchecks.git	3a7ee98d681c474a42f1530355fe6b8f528cd893	docker/Dockerfile	python	service	none			256	4096	heartbeat monitoring
+snipeit	dockerfile	https://github.com/snipe/snipe-it.git	5db9d67e658ac1c0e7abc5df5593303a45bd40ee	Dockerfile	php	service	none			512	4096	asset management
+grist-core	dockerfile	https://github.com/gristlabs/grist-core.git	1dd26fa1ac882bba99a9159685832a0aa43a22a1	Dockerfile	node	service	none			512	4096	spreadsheet
+fider-dockerfile	dockerfile	https://github.com/getfider/fider.git	dd5da5b0d40dc037bc028163606c22c4f2c9a575	Dockerfile	go	service	none			256	4096	feedback
+changedetection-dockerfile	dockerfile	https://github.com/dgtlmoon/changedetection.io.git	e9e8c8d218d800517696b6130f37f87f203c5306	Dockerfile	python	service	none			256	4096	monitoring
+docuseal-dockerfile	dockerfile	https://github.com/docusealco/docuseal.git	eea44bda347ea13515554fefd0225e79603c64ac	Dockerfile	ruby	service	none			256	4096	e-signature
+excalidraw-dockerfile	dockerfile	https://github.com/excalidraw/excalidraw.git	2e1a529c6781b1534d27ca79198dccd40b97ec7b	Dockerfile	node	service	none			256	4096	whiteboard
+linkwarden-dockerfile	dockerfile	https://github.com/linkwarden/linkwarden.git	22723575b04503eb67c9733c63d55179c069903d	Dockerfile	node	service	none			256	4096	bookmarks
+traccar-dockerfile	dockerfile	https://github.com/traccar/traccar.git	a9d0c7f17be87b8050e612dc14cc65ec5268496f	docker/Dockerfile.alpine	java	service	none			256	4096	gps tracking
+typebot-compose	compose	https://github.com/baptisteArno/typebot.io.git	60a77f0296fe4a3f3b21691f152c0734e3ae2b93	docker-compose.yml	node	compose	none			512	4096	forms
 actual-server-compose	compose	https://github.com/actualbudget/actual-server.git	7bd499c5be758c47958e351fa62faf91e0bc2b80	docker-compose.yml	node	compose	none			256	4096	budgeting
-tooljet-compose	compose	https://github.com/ToolJet/ToolJet.git	861115284fb84182be7551496d6f61f66ad56ea1	docker-compose.yaml	node	compose	none			512	4096	low code
-fider-compose	compose	https://github.com/getfider/fider.git	00e3b52a3ced8be22fe00cc32a1ddbb24f0537d2	docker-compose.yml	go	compose	none			512	4096	feedback
-formbricks-compose-alt	compose	https://github.com/formbricks/formbricks.git	b5eaa4c7fd59740c8f50426e12d472e64457f9f5	docker/docker-compose.yml	node	compose	none			512	4096	surveys
-twentyhq-twenty-alt	compose	https://github.com/twentyhq/twenty.git	0b44c9e4e588378d3de5cb7cd94baf64bbd5c1d4	packages/twenty-docker/docker-compose.yml	node	compose	none			512	4096	crm
-jitsi-docker-jitsi-meet	compose	https://github.com/jitsi/docker-jitsi-meet.git	44116c613b6dbbb09dc01af9616a0855efc6c917	docker-compose.yml	node	compose	none			512	6144	video conferencing
-changedetection-compose	compose	https://github.com/dgtlmoon/changedetection.io.git	43bba5a1b688cafa4ba591d0fb749d96f668067f	docker-compose.yml	python	compose	none			256	4096	monitoring
-docuseal-compose	compose	https://github.com/docusealco/docuseal.git	4486f8040efeb57205687f0ba4ffbdd287547655	docker-compose.yml	ruby	compose	none			512	4096	e-signature
-excalidraw-compose	compose	https://github.com/excalidraw/excalidraw.git	e18c1dd213000dde0ae94ef7eb00aab537b39708	docker-compose.yml	node	compose	none			512	4096	whiteboard
-penpot-compose-alt	compose	https://github.com/penpot/penpot.git	650762556f0c0cb2b205c9a3278a177d000ccbd6	docker/images/docker-compose.yaml	clojure	compose	none			512	6144	design
-langflow-compose-alt	compose	https://github.com/langflow-ai/langflow.git	65c313909c640d8e112fecf2fbbc749befcaad4a	docker_example/docker-compose.yml	python	compose	none			512	4096	llm ui
-linkwarden-compose	compose	https://github.com/linkwarden/linkwarden.git	815d2faa885bba5f715e80424155e3927a626ea6	docker-compose.yml	node	compose	none			512	4096	bookmarks
+tooljet-compose	compose	https://github.com/ToolJet/ToolJet.git	8ce1dcca884601405c26f4e049cda27e68dfb5d0	docker-compose.yaml	node	compose	none			512	4096	low code
+fider-compose	compose	https://github.com/getfider/fider.git	dd5da5b0d40dc037bc028163606c22c4f2c9a575	docker-compose.yml	go	compose	none			512	4096	feedback
+formbricks-compose-alt	compose	https://github.com/formbricks/formbricks.git	4128731c5f9fb273860cd0e80224ce11ebb16dad	docker/docker-compose.yml	node	compose	none			512	4096	surveys
+twentyhq-twenty-alt	compose	https://github.com/twentyhq/twenty.git	41571ea37766326b4134118d333860114f5b8b86	packages/twenty-docker/docker-compose.yml	node	compose	none			512	4096	crm
+jitsi-docker-jitsi-meet	compose	https://github.com/jitsi/docker-jitsi-meet.git	43ec99cb5b386cd05e6e21162ed8343c5da89be8	docker-compose.yml	node	compose	none			512	6144	video conferencing
+changedetection-compose	compose	https://github.com/dgtlmoon/changedetection.io.git	e9e8c8d218d800517696b6130f37f87f203c5306	docker-compose.yml	python	compose	none			256	4096	monitoring
+docuseal-compose	compose	https://github.com/docusealco/docuseal.git	eea44bda347ea13515554fefd0225e79603c64ac	docker-compose.yml	ruby	compose	none			512	4096	e-signature
+excalidraw-compose	compose	https://github.com/excalidraw/excalidraw.git	2e1a529c6781b1534d27ca79198dccd40b97ec7b	docker-compose.yml	node	compose	none			512	4096	whiteboard
+penpot-compose-alt	compose	https://github.com/penpot/penpot.git	700f3e9c105071bdfe769edb651f91ae365c7f75	docker/images/docker-compose.yaml	clojure	compose	none			512	6144	design
+langflow-compose-alt	compose	https://github.com/langflow-ai/langflow.git	dc26d19c1ed5b2779a3a759f78a747f47089c534	docker_example/docker-compose.yml	python	compose	none			512	4096	llm ui
+linkwarden-compose	compose	https://github.com/linkwarden/linkwarden.git	22723575b04503eb67c9733c63d55179c069903d	docker-compose.yml	node	compose	none			512	4096	bookmarks
 monica-compose	compose	https://github.com/monicahq/monica.git	e08e91734170b6bbd582cb578532c3948196124e	docker-compose.yml	php	compose	none			512	4096	personal crm
-snipeit-compose	compose	https://github.com/snipe/snipe-it.git	71b72eae103e452bb3901700dfdc50449ec7c3a9	docker-compose.yml	php	compose	none			512	4096	asset management
-miniflux-dockerfile	dockerfile	https://github.com/miniflux/v2.git	8df6b823eeea33f362ce7c75fb245f7447d4186a	packaging/docker/distroless/Dockerfile	go	service	none			128	4096	rss reader
+snipeit-compose	compose	https://github.com/snipe/snipe-it.git	5db9d67e658ac1c0e7abc5df5593303a45bd40ee	docker-compose.yml	php	compose	none			512	4096	asset management
+miniflux-dockerfile	dockerfile	https://github.com/miniflux/v2.git	a684b6ac738202498afdfc6db47bbae2e0afb5b7	packaging/docker/distroless/Dockerfile	go	service	none			128	4096	rss reader
 actual-server-dockerfile-alt	dockerfile	https://github.com/actualbudget/actual-server.git	7bd499c5be758c47958e351fa62faf91e0bc2b80	Dockerfile	node	service	none			256	4096	budgeting alt
-bookstack-compose	compose	https://github.com/BookStackApp/BookStack.git	25790fd0245257ffaffe6690b8e12d56b326af9b	docker-compose.yml	php	compose	none			256	4096	wiki
-bookstack-dockerfile-alt	dockerfile	https://github.com/BookStackApp/BookStack.git	25790fd0245257ffaffe6690b8e12d56b326af9b	dev/docker/Dockerfile	php	service	none			256	4096	wiki alt
-bookstack-dockerfile-dbtesting	dockerfile	https://github.com/BookStackApp/BookStack.git	25790fd0245257ffaffe6690b8e12d56b326af9b	dev/docker/db-testing/Dockerfile	php	service	none			256	4096	wiki db test
-chatwoot-compose	compose	https://github.com/chatwoot/chatwoot.git	6f5ad8f3724b68fec3780b22047c539c06520fb2	docker-compose.yaml	ruby	compose	none			512	6144	customer support
-directus-compose	compose	https://github.com/directus/directus.git	80bca160e04314e964b245351f62c21ecce97071	docker-compose.yml	node	compose	none			512	4096	headless cms
-directus-dockerfile-alt	dockerfile	https://github.com/directus/directus.git	80bca160e04314e964b245351f62c21ecce97071	Dockerfile	node	service	none			512	4096	cms alt
-docker-mailserver-dockerfile	dockerfile	https://github.com/docker-mailserver/docker-mailserver.git	b81e2b526f0541769614f06d7feb635b3c59751f	Dockerfile	shell	service	none			256	4096	mail server
+bookstack-compose	compose	https://github.com/BookStackApp/BookStack.git	74aa897626e649cfa17b0c07c5fc1b985624e20a	docker-compose.yml	php	compose	none			256	4096	wiki
+bookstack-dockerfile-alt	dockerfile	https://github.com/BookStackApp/BookStack.git	74aa897626e649cfa17b0c07c5fc1b985624e20a	dev/docker/Dockerfile	php	service	none			256	4096	wiki alt
+bookstack-dockerfile-dbtesting	dockerfile	https://github.com/BookStackApp/BookStack.git	74aa897626e649cfa17b0c07c5fc1b985624e20a	dev/docker/db-testing/Dockerfile	php	service	none			256	4096	wiki db test
+chatwoot-compose	compose	https://github.com/chatwoot/chatwoot.git	2ada713f29b2cf5f864cccd3f74d570e73f6b82f	docker-compose.yaml	ruby	compose	none			512	6144	customer support
+directus-compose	compose	https://github.com/directus/directus.git	8fdc6ce7b907b99cb55da4f2d6b34dda5344c088	docker-compose.yml	node	compose	none			512	4096	headless cms
+directus-dockerfile-alt	dockerfile	https://github.com/directus/directus.git	8fdc6ce7b907b99cb55da4f2d6b34dda5344c088	Dockerfile	node	service	none			512	4096	cms alt
+docker-mailserver-dockerfile	dockerfile	https://github.com/docker-mailserver/docker-mailserver.git	e532b37a689a1a047b17afacdd5f689ff1928492	Dockerfile	shell	service	none			256	4096	mail server
 flaresolverr-compose	compose	https://github.com/flaresolverr/flaresolverr.git	e3c300ee0f2a44e8461660d0f777df956ea1b86d	docker-compose.yml	python	compose	none			128	4096	anti-bot helper
 flaresolverr-dockerfile	dockerfile	https://github.com/flaresolverr/flaresolverr.git	e3c300ee0f2a44e8461660d0f777df956ea1b86d	Dockerfile	python	service	none			128	4096	anti-bot helper
-gitea-dockerfile-alt	dockerfile	https://github.com/go-gitea/gitea.git	74060bb8498698bae0fc4d57444a310b4651b232	Dockerfile	go	service	none			256	4096	forge alt
+gitea-dockerfile-alt	dockerfile	https://github.com/go-gitea/gitea.git	683f8c0014f03c7fe94c0d3b36d77b7fc3c2eac9	Dockerfile	go	service	none			256	4096	forge alt
 glance-dockerfile	dockerfile	https://github.com/glanceapp/glance.git	6c5b7a3f4cc409e31739b2914bb6636d08299126	Dockerfile	go	service	none			128	4096	dashboard
 inbucket-dockerfile	dockerfile	https://github.com/inbucket/inbucket.git	e56c6d5f837b350089305690c80377ceba024989	Dockerfile	go	service	none			128	4096	smtp inbox
-ittools-dockerfile	dockerfile	https://github.com/sharevb/it-tools.git	f3dfdc13b48c650c6b7d49f9c70f9dd0fd361777	Dockerfile	node	service	none			256	4096	utilities
-kanboard-dockerfile	dockerfile	https://github.com/kanboard/kanboard.git	87a6e07ea414d3b289056fd8cf18ce0265bb8ffe	Dockerfile	php	service	none			256	4096	kanban
-leantime-compose-alt2	compose	https://github.com/Leantime/leantime.git	37c66e05a31ed2e5b39eb9d87f14bedcfe7fa992	.docker/docker-compose.yml	php	compose	none			256	4096	project mgmt alt
-leantime-dockerfile-alt2	dockerfile	https://github.com/Leantime/leantime.git	37c66e05a31ed2e5b39eb9d87f14bedcfe7fa992	.docker/Dockerfile	php	service	none			256	4096	project mgmt alt
-leantime-dockerfile-alt3	dockerfile	https://github.com/Leantime/leantime.git	37c66e05a31ed2e5b39eb9d87f14bedcfe7fa992	.dev/dockerfile	php	service	none			256	4096	project mgmt dev
-librespeed-dockerfile	dockerfile	https://github.com/librespeed/speedtest.git	e1310d88a3f02b735ec1b49ae7f5964d1181ebc2	Dockerfile	go	service	none			128	4096	speedtest
-mailpit-dockerfile	dockerfile	https://github.com/axllent/mailpit.git	4c6bf1b845e921edcac036478c1c28114efd57a4	Dockerfile	go	service	none			128	4096	mail test
-meilisearch-dockerfile	dockerfile	https://github.com/meilisearch/meilisearch.git	14efbaeef1b87491707e396950be57ef0587f743	Dockerfile	rust	service	none			256	4096	search
-open-webui-dockerfile-alt	dockerfile	https://github.com/open-webui/open-webui.git	9bd84258d09eefe7bf975878fb0e31a5dadfe0f8	Dockerfile	python	service	none			512	4096	ui alt
-outline-compose	compose	https://github.com/outline/outline.git	5d5213101ef5ea5b5f2a5844edf74aa8bfcff7df	docker-compose.yml	node	compose	none			512	4096	knowledge base
-outline-dockerfile-alt	dockerfile	https://github.com/outline/outline.git	5d5213101ef5ea5b5f2a5844edf74aa8bfcff7df	Dockerfile	node	service	none			512	4096	knowledge base alt
-paperless-dockerfile-alt	dockerfile	https://github.com/paperless-ngx/paperless-ngx.git	64debc87a594ae339a5ac725550de3d4c9bcfaeb	Dockerfile	python	service	none			256	4096	docs alt
-photoprism-dockerfile	dockerfile	https://github.com/photoprism/photoprism.git	0759dfc946b9f1ea9a84591f74a7690329fcee49	Dockerfile	go	service	none			512	4096	photos
-freshrss-dockerfile	dockerfile	https://github.com/FreshRSS/FreshRSS.git	3fac1bdf201f120d42e26e274d396610ad4386a1	Docker/Dockerfile	php	service	none			256	4096	rss reader
-redisinsight-dockerfile	dockerfile	https://github.com/RedisInsight/RedisInsight.git	21bc9759019b2d244954bdb6dad3f9af4ba94e2d	Dockerfile	node	service	none			256	4096	redis ui
+ittools-dockerfile	dockerfile	https://github.com/sharevb/it-tools.git	7b151188328dbfca39c70ac1a3036a1f1689cdd2	Dockerfile	node	service	none			256	4096	utilities
+kanboard-dockerfile	dockerfile	https://github.com/kanboard/kanboard.git	a12dbfe2bc2598a3dd03e5c274f41663eda784af	Dockerfile	php	service	none			256	4096	kanban
+leantime-compose-alt2	compose	https://github.com/Leantime/leantime.git	9630eb7db682fb1b4e23cdabf3428d03ec6f5094	.docker/docker-compose.yml	php	compose	none			256	4096	project mgmt alt
+leantime-dockerfile-alt2	dockerfile	https://github.com/Leantime/leantime.git	9630eb7db682fb1b4e23cdabf3428d03ec6f5094	.docker/Dockerfile	php	service	none			256	4096	project mgmt alt
+leantime-dockerfile-alt3	dockerfile	https://github.com/Leantime/leantime.git	9630eb7db682fb1b4e23cdabf3428d03ec6f5094	.dev/dockerfile	php	service	none			256	4096	project mgmt dev
+librespeed-dockerfile	dockerfile	https://github.com/librespeed/speedtest.git	853214db6c939e4c33431c5d4c8f266c6761ab15	Dockerfile	go	service	none			128	4096	speedtest
+mailpit-dockerfile	dockerfile	https://github.com/axllent/mailpit.git	d904e7fd98fe4f3492d914481e2bc1e62ad7c6a4	Dockerfile	go	service	none			128	4096	mail test
+meilisearch-dockerfile	dockerfile	https://github.com/meilisearch/meilisearch.git	c9c7adde915da6cebf91eaaa3d228a81306061d9	Dockerfile	rust	service	none			256	4096	search
+open-webui-dockerfile-alt	dockerfile	https://github.com/open-webui/open-webui.git	8dae237a0bfdac4b7f55b463b3e2769ea4b94a0b	Dockerfile	python	service	none			512	4096	ui alt
+outline-compose	compose	https://github.com/outline/outline.git	c4d764e243277398822c9d0e7bf9eaaebd206a82	docker-compose.yml	node	compose	none			512	4096	knowledge base
+outline-dockerfile-alt	dockerfile	https://github.com/outline/outline.git	c4d764e243277398822c9d0e7bf9eaaebd206a82	Dockerfile	node	service	none			512	4096	knowledge base alt
+paperless-dockerfile-alt	dockerfile	https://github.com/paperless-ngx/paperless-ngx.git	8cab1d0c13ed68615d64e6569d6ed0d1842b96fa	Dockerfile	python	service	none			256	4096	docs alt
+photoprism-dockerfile	dockerfile	https://github.com/photoprism/photoprism.git	c489ea5b0bea29f22f48accb8755544fd22d7ded	Dockerfile	go	service	none			512	4096	photos
+freshrss-dockerfile	dockerfile	https://github.com/FreshRSS/FreshRSS.git	244d9169665994fe148048e773099e241c9a5d09	Docker/Dockerfile	php	service	none			256	4096	rss reader
+redisinsight-dockerfile	dockerfile	https://github.com/RedisInsight/RedisInsight.git	d9285f20b6e79165595974533a1e15b21f15b9ad	Dockerfile	node	service	none			256	4096	redis ui
 restic-server-dockerfile	dockerfile	https://github.com/restic/rest-server.git	4e4e8c0f4c85a71edc4379613120cd4e1bf4006a	Dockerfile	go	service	none			128	4096	backup server
 restya-board-dockerfile	dockerfile	https://github.com/RestyaPlatform/board.git	aca4421fc08467433279367d3b3a3524b7b7f8d3	Dockerfile	php	service	none			256	4096	board
-sftpgo-dockerfile	dockerfile	https://github.com/drakkan/sftpgo.git	4f8369954e454d32c66b509aaf64a3457a20500e	Dockerfile	go	service	none			256	4096	sftp server
-shlink-compose	compose	https://github.com/shlinkio/shlink.git	6ad599be7f212067902b7e302234bfae651cc116	docker-compose.yml	php	compose	none			256	4096	url shortener
-shlink-dockerfile	dockerfile	https://github.com/shlinkio/shlink.git	6ad599be7f212067902b7e302234bfae651cc116	Dockerfile	php	service	none			256	4096	url shortener
-silverbullet-dockerfile	dockerfile	https://github.com/silverbulletmd/silverbullet.git	2ad3172568bb3e0cd4d76fd7e0c5300cae52e1c3	Dockerfile	deno	service	none			128	4096	notes
-stirlingpdf-compose	compose	https://github.com/Stirling-Tools/Stirling-PDF.git	436c8cbed22f7a1f22c2fe5ff5087ffe7ef30510	docker/compose/docker-compose.yml	java	compose	none			512	4096	pdf tools
-stirlingpdf-dockerfile-base	dockerfile	https://github.com/Stirling-Tools/Stirling-PDF.git	436c8cbed22f7a1f22c2fe5ff5087ffe7ef30510	docker/base/Dockerfile	java	service	none			512	4096	pdf tools base
-stirlingpdf-dockerfile-embedded	dockerfile	https://github.com/Stirling-Tools/Stirling-PDF.git	436c8cbed22f7a1f22c2fe5ff5087ffe7ef30510	docker/embedded/Dockerfile	java	service	none			512	4096	pdf tools embedded
-stirlingpdf-dockerfile-engine	dockerfile	https://github.com/Stirling-Tools/Stirling-PDF.git	436c8cbed22f7a1f22c2fe5ff5087ffe7ef30510	engine/Dockerfile	java	service	none			512	4096	pdf tools engine
-stirlingpdf-dockerfile-fat	dockerfile	https://github.com/Stirling-Tools/Stirling-PDF.git	436c8cbed22f7a1f22c2fe5ff5087ffe7ef30510	docker/embedded/Dockerfile.fat	java	service	none			512	4096	pdf tools fat
-stirlingpdf-dockerfile-frontend	dockerfile	https://github.com/Stirling-Tools/Stirling-PDF.git	436c8cbed22f7a1f22c2fe5ff5087ffe7ef30510	docker/frontend/Dockerfile	java	service	none			512	4096	pdf tools frontend
-stirlingpdf-dockerfile-ultralite	dockerfile	https://github.com/Stirling-Tools/Stirling-PDF.git	436c8cbed22f7a1f22c2fe5ff5087ffe7ef30510	docker/embedded/Dockerfile.ultra-lite	java	service	none			512	4096	pdf tools ultra lite
-synapse-complement-dockerfile	dockerfile	https://github.com/element-hq/synapse.git	8291a493c735d56f2f81d69c544fffea0bb8088f	docker/complement/Dockerfile	python	service	none			512	4096	matrix complement
-synapse-dockerfile	dockerfile	https://github.com/element-hq/synapse.git	8291a493c735d56f2f81d69c544fffea0bb8088f	docker/Dockerfile	python	service	none			512	4096	matrix homeserver
-synapse-dockerfile-dhvirtualenv	dockerfile	https://github.com/element-hq/synapse.git	8291a493c735d56f2f81d69c544fffea0bb8088f	docker/Dockerfile-dhvirtualenv	python	service	none			512	4096	matrix dhvirtualenv
-synapse-editable-dockerfile	dockerfile	https://github.com/element-hq/synapse.git	8291a493c735d56f2f81d69c544fffea0bb8088f	docker/editable.Dockerfile	python	service	none			512	4096	matrix editable
-synapse-workers-dockerfile	dockerfile	https://github.com/element-hq/synapse.git	8291a493c735d56f2f81d69c544fffea0bb8088f	docker/Dockerfile-workers	python	service	none			512	4096	matrix workers
-typebot-dockerfile-alt	dockerfile	https://github.com/baptisteArno/typebot.io.git	30e071da71d7a7015c9c74136d1d7b8209cc25f5	Dockerfile	node	service	none			512	4096	forms alt
-umami-compose	compose	https://github.com/umami-software/umami.git	0a838649b773122cc68cbd0c3df78d4251b981c5	docker-compose.yml	node	compose	none			512	4096	analytics
-vikunja-dockerfile	dockerfile	https://github.com/go-vikunja/vikunja.git	b69564a77c02a878dc6c82c0da84ff24655b4191	Dockerfile	go	service	none			256	4096	tasks
-wekan-compose	compose	https://github.com/wekan/wekan.git	60657c6e948257e3f5ecdf7057b0f0be3ba6f026	docker-compose.yml	node	compose	none			512	4096	kanban
-wekan-dockerfile	dockerfile	https://github.com/wekan/wekan.git	60657c6e948257e3f5ecdf7057b0f0be3ba6f026	Dockerfile	node	service	none			512	4096	kanban
-jesseduffield-lazygit	dockerfile	https://github.com/jesseduffield/lazygit.git	bb5d5f2deb88d495b4613328816fbfea954ba9bc	.	go	service	none			256	2048	terminal git UI, multistage
-go-acme-lego	dockerfile	https://github.com/go-acme/lego.git	1274ec8741d7ac0b4232775e358bc95db44d961c	.	go	service	none			256	2048	ACME/LE client, alpine multistage
+sftpgo-dockerfile	dockerfile	https://github.com/drakkan/sftpgo.git	d2e15ea2073a8e8322fd94e305af410f3ab40067	Dockerfile	go	service	none			256	4096	sftp server
+shlink-compose	compose	https://github.com/shlinkio/shlink.git	2f4ca04f992250a048e037c188a47951d6036c24	docker-compose.yml	php	compose	none			256	4096	url shortener
+shlink-dockerfile	dockerfile	https://github.com/shlinkio/shlink.git	2f4ca04f992250a048e037c188a47951d6036c24	Dockerfile	php	service	none			256	4096	url shortener
+silverbullet-dockerfile	dockerfile	https://github.com/silverbulletmd/silverbullet.git	4d38ca3a22d136f11556f00a3fe349001aadf7c9	Dockerfile	deno	service	none			128	4096	notes
+stirlingpdf-compose	compose	https://github.com/Stirling-Tools/Stirling-PDF.git	1e3da140812f19ec8b044f1f6f043a6f928394d8	docker/compose/docker-compose.yml	java	compose	none			512	4096	pdf tools
+stirlingpdf-dockerfile-base	dockerfile	https://github.com/Stirling-Tools/Stirling-PDF.git	1e3da140812f19ec8b044f1f6f043a6f928394d8	docker/base/Dockerfile	java	service	none			512	4096	pdf tools base
+stirlingpdf-dockerfile-embedded	dockerfile	https://github.com/Stirling-Tools/Stirling-PDF.git	1e3da140812f19ec8b044f1f6f043a6f928394d8	docker/embedded/Dockerfile	java	service	none			512	4096	pdf tools embedded
+stirlingpdf-dockerfile-engine	dockerfile	https://github.com/Stirling-Tools/Stirling-PDF.git	1e3da140812f19ec8b044f1f6f043a6f928394d8	engine/Dockerfile	java	service	none			512	4096	pdf tools engine
+stirlingpdf-dockerfile-fat	dockerfile	https://github.com/Stirling-Tools/Stirling-PDF.git	1e3da140812f19ec8b044f1f6f043a6f928394d8	docker/embedded/Dockerfile.fat	java	service	none			512	4096	pdf tools fat
+stirlingpdf-dockerfile-frontend	dockerfile	https://github.com/Stirling-Tools/Stirling-PDF.git	1e3da140812f19ec8b044f1f6f043a6f928394d8	docker/frontend/Dockerfile	java	service	none			512	4096	pdf tools frontend
+stirlingpdf-dockerfile-ultralite	dockerfile	https://github.com/Stirling-Tools/Stirling-PDF.git	1e3da140812f19ec8b044f1f6f043a6f928394d8	docker/embedded/Dockerfile.ultra-lite	java	service	none			512	4096	pdf tools ultra lite
+synapse-complement-dockerfile	dockerfile	https://github.com/element-hq/synapse.git	3a2680681851c732563f038d21d750b4b316d7e4	docker/complement/Dockerfile	python	service	none			512	4096	matrix complement
+synapse-dockerfile	dockerfile	https://github.com/element-hq/synapse.git	3a2680681851c732563f038d21d750b4b316d7e4	docker/Dockerfile	python	service	none			512	4096	matrix homeserver
+synapse-dockerfile-dhvirtualenv	dockerfile	https://github.com/element-hq/synapse.git	3a2680681851c732563f038d21d750b4b316d7e4	docker/Dockerfile-dhvirtualenv	python	service	none			512	4096	matrix dhvirtualenv
+synapse-editable-dockerfile	dockerfile	https://github.com/element-hq/synapse.git	3a2680681851c732563f038d21d750b4b316d7e4	docker/editable.Dockerfile	python	service	none			512	4096	matrix editable
+synapse-workers-dockerfile	dockerfile	https://github.com/element-hq/synapse.git	3a2680681851c732563f038d21d750b4b316d7e4	docker/Dockerfile-workers	python	service	none			512	4096	matrix workers
+typebot-dockerfile-alt	dockerfile	https://github.com/baptisteArno/typebot.io.git	60a77f0296fe4a3f3b21691f152c0734e3ae2b93	Dockerfile	node	service	none			512	4096	forms alt
+umami-compose	compose	https://github.com/umami-software/umami.git	c78ff36db0c82e13c86e5073020472c6546313a3	docker-compose.yml	node	compose	none			512	4096	analytics
+vikunja-dockerfile	dockerfile	https://github.com/go-vikunja/vikunja.git	6ed4e759b0ef239023ca596358af32f064d7270a	Dockerfile	go	service	none			256	4096	tasks
+wekan-compose	compose	https://github.com/wekan/wekan.git	b717e5d7ad187d32071d7e919f4c4dd1d15ad1d1	docker-compose.yml	node	compose	none			512	4096	kanban
+wekan-dockerfile	dockerfile	https://github.com/wekan/wekan.git	b717e5d7ad187d32071d7e919f4c4dd1d15ad1d1	Dockerfile	node	service	none			512	4096	kanban
+jesseduffield-lazygit	dockerfile	https://github.com/jesseduffield/lazygit.git	0ecf818a739606d4255e009b66309e6e508ce08a	.	go	service	none			256	2048	terminal git UI, multistage
+go-acme-lego	dockerfile	https://github.com/go-acme/lego.git	670eb2746409f6895b756084f4c30aec52371eee	.	go	service	none			256	2048	ACME/LE client, alpine multistage
 restic-rest-server	dockerfile	https://github.com/restic/rest-server.git	4e4e8c0f4c85a71edc4379613120cd4e1bf4006a	.	go	service	none			256	2048	REST backend for restic
-muety-wakapi	dockerfile	https://github.com/muety/wakapi.git	eaac400a75ebb7742badf43d40276ff568596c65	.	go	service	none			256	3072	self-hosted wakatime
-projectdiscovery-nuclei	dockerfile	https://github.com/projectdiscovery/nuclei.git	a2fb27aae2e4e12002dac3da88e98a4aaaaccc1a	.	go	service	none			256	3072	vuln scanner
-dexidp-dex	dockerfile	https://github.com/dexidp/dex.git	cda5c3771762bb2b224d393d0eddd872d12170bc	.	go	service	none			256	3072	OIDC identity provider
-schollz-croc	dockerfile	https://github.com/schollz/croc.git	9a3d42ae7d4eecbf99266dafb79330e5774f81f3	.	go	service	none			256	2048	file transfer relay
+muety-wakapi	dockerfile	https://github.com/muety/wakapi.git	7e36ad4509d2704d3b797b17a95ad2bb8ed2311e	.	go	service	none			256	3072	self-hosted wakatime
+projectdiscovery-nuclei	dockerfile	https://github.com/projectdiscovery/nuclei.git	5450b03a99a998232d3cf3ed311615860db26950	.	go	service	none			256	3072	vuln scanner
+dexidp-dex	dockerfile	https://github.com/dexidp/dex.git	d7ba134f84c0c5705ff73101f15354ec0aff082f	.	go	service	none			256	3072	OIDC identity provider
+schollz-croc	dockerfile	https://github.com/schollz/croc.git	1b7e260f61df0e10eca788d3593378233be74bcd	.	go	service	none			256	2048	file transfer relay
 gitleaks-gitleaks	dockerfile	https://github.com/gitleaks/gitleaks.git	8863af47d64c3681422523e36837957c74d4af4b	.	go	service	none			256	2048	secret scanner
-wader-fq	dockerfile	https://github.com/wader/fq.git	2c1b935857ef3929a5cc0df386db9c1795b4f130	.	go	service	none			256	2048	jq for binary formats
+wader-fq	dockerfile	https://github.com/wader/fq.git	153a8461494bc42a762542a2b5e1929846b42829	.	go	service	none			256	2048	jq for binary formats
 nsqio-nsq	dockerfile	https://github.com/nsqio/nsq.git	9ea507128926c83b7dd8f32d8c38bbbe8ef41beb	.	go	service	none			256	2048	distributed message queue
-sigstore-rekor	dockerfile	https://github.com/sigstore/rekor.git	d5157644690af94138f4d4f2d419f5ec74833f65	.	go	service	none			256	3072	transparency log
-treeverse-lakefs	dockerfile	https://github.com/treeverse/lakeFS.git	837951a0294b233d799fe9ade8e3512ea3128086	.	go	service	none			256	4096	git-like data lake
-go-gost-gost	dockerfile	https://github.com/go-gost/gost.git	340ba32ef0bebc7293908007cc423dd5f33dd88c	.	go	service	none			256	2048	tunneling proxy server
+sigstore-rekor	dockerfile	https://github.com/sigstore/rekor.git	8a2f3a2dd023b81ad8b63e2f365676ec438dc9fa	.	go	service	none			256	3072	transparency log
+treeverse-lakefs	dockerfile	https://github.com/treeverse/lakeFS.git	5a4100459c71d1eef6e63ef42e852048c43d8db5	.	go	service	none			256	4096	git-like data lake
+go-gost-gost	dockerfile	https://github.com/go-gost/gost.git	bc96fe39182fb39cc4bcaf61104c220a2b0f72cf	.	go	service	none			256	2048	tunneling proxy server
 gping-rs	dockerfile	https://github.com/orf/gping.git	d9a4e49fb3a7ed1667838d07687a701841bcca81	.	rust	service	none			128	2048	ping with graph
 sonic-rs	dockerfile	https://github.com/valeriansaliou/sonic.git	05b8ddbbf0986519a1d59ea21ccbeabe414d097f	.	rust	service	none			256	3072	Sonic search backend
-git-cliff-rs	dockerfile	https://github.com/orhun/git-cliff.git	39cd76e1854c4c0a2e5ef1cedc80ef16731a096d	.	rust	service	none			256	3072	changelog generator
-oha-rs	dockerfile	https://github.com/hatoo/oha.git	339ec32558273cf65377b4c4564125160030ba67	.	rust	service	none			256	3072	HTTP load tester
-dufs-rs	dockerfile	https://github.com/sigoden/dufs.git	a118c1348e07bf8312e2ea5b7edabd3b2dca0e11	.	rust	service	none			128	2048	HTTP file server
-gitness	dockerfile	https://github.com/harness/gitness.git	cc2a0810460671c9ccc02e85694648332c5c88eb	.	go	service	none			256	4096	harness gitness git platform
-navidrome	dockerfile	https://github.com/navidrome/navidrome.git	1de4e43d29cb0e3c1945641915eeda23916dde31	.	go	service	none			256	4096	navidrome music server
-rqlite	dockerfile	https://github.com/rqlite/rqlite.git	4fb3d44c191b1eade453d768002565871729f5ca	.	go	service	none			256	3072	rqlite distributed sqlite
+git-cliff-rs	dockerfile	https://github.com/orhun/git-cliff.git	9b5e73232d164294d701003ed1f6b690fa6f4bc7	.	rust	service	none			256	3072	changelog generator
+oha-rs	dockerfile	https://github.com/hatoo/oha.git	d07ff6bcde762d5cf6ef738509109824bce291af	.	rust	service	none			256	3072	HTTP load tester
+dufs-rs	dockerfile	https://github.com/sigoden/dufs.git	b87f87646a10b9ab6d131818c49673e6a067f6d9	.	rust	service	none			128	2048	HTTP file server
+gitness	dockerfile	https://github.com/harness/gitness.git	43f15baee6ae7490f69feb4a797f0b0e459c4805	.	go	service	none			256	4096	harness gitness git platform
+navidrome	dockerfile	https://github.com/navidrome/navidrome.git	251cc71e2dabf56cd8ef59cf107f6e732ea7262c	.	go	service	none			256	4096	navidrome music server
+rqlite	dockerfile	https://github.com/rqlite/rqlite.git	bf310f31e9c9538ad877940961e406cac786b135	.	go	service	none			256	3072	rqlite distributed sqlite
 prest	dockerfile	https://github.com/prest/prest.git	65f3645ee8aaee075c6d5fe104b7ea3383c8fff7	.	go	service	none			192	2048	pREST postgres REST API
-fabio	dockerfile	https://github.com/fabiolb/fabio.git	26631d7b7d5b3237d218f47dd52b6ff609d20562	.	go	service	none			192	2048	fabio reverse proxy
+fabio	dockerfile	https://github.com/fabiolb/fabio.git	7b4eec546dd9aa6d4f6e72f974b956599b1cb0ee	.	go	service	none			192	2048	fabio reverse proxy
 nsq	dockerfile	https://github.com/nsqio/nsq.git	9ea507128926c83b7dd8f32d8c38bbbe8ef41beb	.	go	service	none			192	2048	NSQ message broker
-gatekeeper	dockerfile	https://github.com/open-policy-agent/gatekeeper.git	99783a685197d8f2042b46600ec77d1db42984c5	.	go	service	none			256	3072	OPA Gatekeeper admission controller
-kong-kic	dockerfile	https://github.com/Kong/kubernetes-ingress-controller.git	bc5e417dc2926cc82cee11add4e2dd05ab5d78a2	.	go	service	none			256	3072	Kong Kubernetes ingress controller
+gatekeeper	dockerfile	https://github.com/open-policy-agent/gatekeeper.git	c344f997c67621cda8796d219f5d2ec9b4cd8775	.	go	service	none			256	3072	OPA Gatekeeper admission controller
+kong-kic	dockerfile	https://github.com/Kong/kubernetes-ingress-controller.git	0c0013e764eb7f91adef63ef66c52ca3f6553c57	.	go	service	none			256	3072	Kong Kubernetes ingress controller
 answer	dockerfile	https://github.com/apache/incubator-answer.git	fca80abbaf3807cf50c2927982033f282dc7effa	.	go	service	none			256	4096	Apache Answer Q and A platform
-kube-vip	dockerfile	https://github.com/kube-vip/kube-vip.git	cd87a8e9a0c77932d931bdbd9c0faf978b2e31d2	.	go	service	none			192	2048	kube-vip HA VIP for k8s
-keda	dockerfile	https://github.com/kedacore/keda.git	accbfb675fcf43aaaaac10867aa3ddb4d2ced756	.	go	service	none			256	3072	KEDA event-driven autoscaler
-argo-workflows	dockerfile	https://github.com/argoproj/argo-workflows.git	b5e8a3e6d2edeab91657d4cd2d2863431b615631	.	go	service	none			256	4096	Argo Workflows scheduler
-argocd	dockerfile	https://github.com/argoproj/argo-cd.git	8c29202f1c60e75de976760cf96817c1f9f88a75	.	go	service	none			256	4096	Argo CD GitOps controller
+kube-vip	dockerfile	https://github.com/kube-vip/kube-vip.git	17512aca2eacd8f507890e1d7d15dcd0a2a34196	.	go	service	none			192	2048	kube-vip HA VIP for k8s
+keda	dockerfile	https://github.com/kedacore/keda.git	b74c1cbed8e6e1f056bd36b745489efca00920cc	.	go	service	none			256	3072	KEDA event-driven autoscaler
+argo-workflows	dockerfile	https://github.com/argoproj/argo-workflows.git	7a7e60839796b0cb3a1343f2ec0968bd2ac2d694	.	go	service	none			256	4096	Argo Workflows scheduler
+argocd	dockerfile	https://github.com/argoproj/argo-cd.git	82f71400a473d8cfdeca121c7cb8acd126d1a856	.	go	service	none			256	4096	Argo CD GitOps controller
 litefs	dockerfile	https://github.com/superfly/litefs.git	a51e72d84eeb96ad210ef407230161192120ab96	.	go	service	none			192	2048	LiteFS distributed sqlite FUSE
 traefik-forward-auth	dockerfile	https://github.com/thomseddon/traefik-forward-auth.git	83f06df0f64d12e974f5cdd390134c8b80c7365b	.	go	service	none			128	2048	Traefik forward auth SSO middleware
-netmaker	dockerfile	https://github.com/gravitl/netmaker.git	81398cdd440851f7dbbefc2d3ad347dc3f810b85	.	go	service	none			256	3072	Netmaker WireGuard mesh controller
-artalk	dockerfile	https://github.com/ArtalkJS/Artalk.git	71a651153bc68267a8b86c4ee88c597bd4097071	.	go	service	none			192	3072	Artalk self-hosted comment system
-openfga	dockerfile	https://github.com/openfga/openfga.git	80ce922758f05d8a9c3f2eebefd60af958edfc4c	.	go	service	none			192	2048	OpenFGA fine-grained authz service
-permify	dockerfile	https://github.com/permify/permify.git	50a56d79b5b6ec426206339d9202ef4b60c4470d	.	go	service	none			192	2048	Permify authorization service
-spicedb	dockerfile	https://github.com/authzed/spicedb.git	c069f9786a427895ad122256759e114d80173c9f	.	go	service	none			256	3072	AuthZed SpiceDB permissions database
+netmaker	dockerfile	https://github.com/gravitl/netmaker.git	31d003ce9dcbfe3b5133381d423bdab2516477f3	.	go	service	none			256	3072	Netmaker WireGuard mesh controller
+artalk	dockerfile	https://github.com/ArtalkJS/Artalk.git	6ba19150df4af30e4482d220ceb88bcf2470adc4	.	go	service	none			192	3072	Artalk self-hosted comment system
+openfga	dockerfile	https://github.com/openfga/openfga.git	b3090314a5033b350ad1aa7fd21d04a9110fc897	.	go	service	none			192	2048	OpenFGA fine-grained authz service
+permify	dockerfile	https://github.com/permify/permify.git	bdac564baf9db71d2dc7cc992cab19fd54b52508	.	go	service	none			192	2048	Permify authorization service
+spicedb	dockerfile	https://github.com/authzed/spicedb.git	75b2b72381100d2e85ca61840933da87ba1a4bbc	.	go	service	none			256	3072	AuthZed SpiceDB permissions database
 mox	dockerfile	https://github.com/mjl-/mox.git	9795c4e77c15cdabaf97c6f788e96b4ef1013b6c	.	go	service	none			192	2048	mox modern mail server
-maddy	dockerfile	https://github.com/foxcpp/maddy.git	fd44177a913068decd519ac405f23683235c70e0	.	go	service	none			192	2048	maddy composable mail server
-roadrunner	dockerfile	https://github.com/roadrunner-server/roadrunner.git	bf2e70e84490b826ade9894bcd02b886acab2e21	.	go	service	none			192	2048	RoadRunner PHP app server in Go
-yorkie	dockerfile	https://github.com/yorkie-team/yorkie.git	933cc2697a136abd67043d8d7d45dfdd178ec743	.	go	service	none			192	2048	Yorkie realtime collaboration backend
+maddy	dockerfile	https://github.com/foxcpp/maddy.git	88e41ffa2c75d6f183e0eb0c6ee30edfdf2807f7	.	go	service	none			192	2048	maddy composable mail server
+roadrunner	dockerfile	https://github.com/roadrunner-server/roadrunner.git	56898f8cb8c4de56aaad5d34e4f75f21f313d9e0	.	go	service	none			192	2048	RoadRunner PHP app server in Go
+yorkie	dockerfile	https://github.com/yorkie-team/yorkie.git	a42fdbf1774ba7f5a205a58b2e085aa9ea46bf43	.	go	service	none			192	2048	Yorkie realtime collaboration backend
 dendrite	dockerfile	https://github.com/matrix-org/dendrite.git	084181332b5c364e2442d3c98522ad8848bc4d36	.	go	service	none			256	3072	Dendrite Matrix homeserver
 lnx	dockerfile	https://github.com/lnx-search/lnx.git	885e6727196aa1dda9bb88fedcb45d14a9284770	.	rust	service	none			256	3072	lnx search engine, cargo build release
-lychee	dockerfile	https://github.com/lycheeverse/lychee.git	623f9458f199f30ce923523214cfaf97663c6152	.	rust	service	none			256	3072	link checker, cargo build release
+lychee	dockerfile	https://github.com/lycheeverse/lychee.git	6eb99e8d5e49f8c93d8d71d9ddd8ebebfd4e361a	.	rust	service	none			256	3072	link checker, cargo build release
 rumqtt	dockerfile	https://github.com/bytebeamio/rumqtt.git	2167da05a66137cf4933ab7b2aba8b205671f58b	.	rust	service	none			256	3072	rumqttd MQTT broker, alpine musl build
 websocat	dockerfile	https://github.com/vi/websocat.git	29c8c54d6f275519abc28f4cb90e1fa69e2fbcae	.	rust	service	none			192	2560	websocket tool/daemon, alpine musl
 rathole	dockerfile	https://github.com/rapiz1/rathole.git	5a9dd6d939744859af322aeff7fd60f7483a68bc	.	rust	service	none			192	2560	reverse proxy tunnel, cargo build release
-wasmcloud	dockerfile	https://github.com/wasmCloud/wasmCloud.git	33fa1990f9d4fbc85cac2a2b5f7f8be7b4fab83e	.	rust	service	none			256	4096	wasmcloud host, chainguard rust builder
+wasmcloud	dockerfile	https://github.com/wasmCloud/wasmCloud.git	b9758b2dc095fa29132192532fc46deae15aa963	.	rust	service	none			256	4096	wasmcloud host, chainguard rust builder
 tremor	dockerfile	https://github.com/tremor-rs/tremor-runtime.git	bf4564193df81c01eab2b78bfed8a3e1c5765348	.	rust	service	none			256	4096	tremor event processing runtime
-parse-server	dockerfile	https://github.com/parse-community/parse-server.git	f184f76bce086385a5d94e824ce9e741a88d65be	.	node	service	none			256	3072	Parse Server backend, multi-stage npm build
-homepage	dockerfile	https://github.com/gethomepage/homepage.git	5f4b0b4e33399499b75cd7b15960bb63ffd02168	.	node	service	none			192	2560	dashboard, pnpm next build
-postgres-meta	dockerfile	https://github.com/supabase/postgres-meta.git	f0c0bb006dc608277d87e34f5c24b033073b0e20	.	node	service	none			192	2560	supabase pg metadata REST API
-verdaccio	dockerfile	https://github.com/verdaccio/verdaccio.git	32d3b59dc3e71757144a6eee27b7d0ec5c99143e	.	node	service	none			256	3072	private npm registry, pnpm build
-logto	dockerfile	https://github.com/logto-io/logto.git	41b0dc8a55fd69804ff648f57f96b33385641d21	.	node	service	none			256	4096	auth/identity server, pnpm build
-ghostfolio	dockerfile	https://github.com/ghostfolio/ghostfolio.git	c202671287889bc571844c5c1c67b88a1c5cbd74	.	node	service	none			256	4096	wealth management dashboard, npm build
+parse-server	dockerfile	https://github.com/parse-community/parse-server.git	0980ab1a40da187368539a83f6305bf273a94ed7	.	node	service	none			256	3072	Parse Server backend, multi-stage npm build
+homepage	dockerfile	https://github.com/gethomepage/homepage.git	9b8e7712683580cb8140794fa9c27667f2b66269	.	node	service	none			192	2560	dashboard, pnpm next build
+postgres-meta	dockerfile	https://github.com/supabase/postgres-meta.git	cd825bc39d8513ca2a1fba545da81495021758b7	.	node	service	none			192	2560	supabase pg metadata REST API
+verdaccio	dockerfile	https://github.com/verdaccio/verdaccio.git	5e64d64df21a01aa90bc907a7a6b1f3c0e7fe99c	.	node	service	none			256	3072	private npm registry, pnpm build
+logto	dockerfile	https://github.com/logto-io/logto.git	cd0b6ce670a3169ba50fb14480b067cc2969d9f2	.	node	service	none			256	4096	auth/identity server, pnpm build
+ghostfolio	dockerfile	https://github.com/ghostfolio/ghostfolio.git	75e2b855c0880ed443f39b490c4842a8eba83b1c	.	node	service	none			256	4096	wealth management dashboard, npm build
 actual-server	dockerfile	https://github.com/actualbudget/actual-server.git	7bd499c5be758c47958e351fa62faf91e0bc2b80	.	node	service	none			192	2560	Actual Budget sync server, yarn
-standardnotes-server	dockerfile	https://github.com/standardnotes/server.git	c6c8691612cd6952e0f915e5ae1ae65b015977c5	.	node	service	none			256	3072	Standard Notes backend, yarn supervisord
-photoview	dockerfile	https://github.com/photoview/photoview.git	bfd7a5b9566b02f3c7de5e98f3dabb9427173c18	.	node	service	none			256	4096	photo gallery UI build stage npm
-misskey	dockerfile	https://github.com/misskey-dev/misskey.git	60018d16daf8cf2c86a9ac347968ef1f617463cf	.	node	service	none			256	4096	ActivityPub server, pnpm workspace build
-linkwarden	dockerfile	https://github.com/linkwarden/linkwarden.git	815d2faa885bba5f715e80424155e3927a626ea6	.	node	service	none			256	4096	bookmark manager, node+rust monolith
+standardnotes-server	dockerfile	https://github.com/standardnotes/server.git	31d2b8a092d8e85982c367197ffcf97cc07e2669	.	node	service	none			256	3072	Standard Notes backend, yarn supervisord
+photoview	dockerfile	https://github.com/photoview/photoview.git	1d29e96be07060a8062ad5ae44d3bec4602911f9	.	node	service	none			256	4096	photo gallery UI build stage npm
+misskey	dockerfile	https://github.com/misskey-dev/misskey.git	3a3057a1b10e6dc04364bd2cff70ee0370408b1d	.	node	service	none			256	4096	ActivityPub server, pnpm workspace build
+linkwarden	dockerfile	https://github.com/linkwarden/linkwarden.git	22723575b04503eb67c9733c63d55179c069903d	.	node	service	none			256	4096	bookmark manager, node+rust monolith
 ton-q-server	dockerfile	https://github.com/tonlabs/ton-q-server.git	723e89c00a5af4bf84571b3daed58ac29a6cacca	.	node	service	none			192	2560	TON GraphQL API server
-librechat	dockerfile	https://github.com/danny-avila/LibreChat.git	8ed0bcf5ca5c1a42f0ee91cdbc61091a67581f86	.	node	service	none			256	4096	LibreChat AI chat UI/server, npm build
-perplexica	dockerfile	https://github.com/ItzCrazyKns/Perplexica.git	3098622cb016b6eb9bf0cd3650c6924f6d56e9e6	.	node	service	none			256	4096	AI search engine, yarn next build
-lobe-chat	dockerfile	https://github.com/lobehub/lobe-chat.git	a2eab24536d49d08eb0c25be3841ac84b4bb24b5	.	node	service	none			256	4096	LobeChat UI/server, pnpm next build
-chat-ui	dockerfile	https://github.com/huggingface/chat-ui.git	ce11de3edd6026bfb6de8d30eedaecf64f5b2490	.	node	service	none			256	4096	HuggingFace chat-ui, npm svelte build
-superset	dockerfile	https://github.com/apache/superset.git	5ccfc530b2678db6136f50ff4baefee72d969675	.	python	service	none			256	4096	Apache Superset BI dashboard, multi-stage Python+Node
+librechat	dockerfile	https://github.com/danny-avila/LibreChat.git	738003b220a91ec724286dab0354080e22f8aac9	.	node	service	none			256	4096	LibreChat AI chat UI/server, npm build
+perplexica	dockerfile	https://github.com/ItzCrazyKns/Perplexica.git	7dc5d088f7262fbc5e39037f84940a8a2193c5fb	.	node	service	none			256	4096	AI search engine, yarn next build
+lobe-chat	dockerfile	https://github.com/lobehub/lobe-chat.git	998c22890d4b5c6189418f94916cd036863fdfd8	.	node	service	none			256	4096	LobeChat UI/server, pnpm next build
+chat-ui	dockerfile	https://github.com/huggingface/chat-ui.git	f0fa8c859d91b77980d947aa958cdc407d59e4e3	.	node	service	none			256	4096	HuggingFace chat-ui, npm svelte build
+superset	dockerfile	https://github.com/apache/superset.git	f255f63953cad337a6af74a87a8130d3695236eb	.	python	service	none			256	4096	Apache Superset BI dashboard, multi-stage Python+Node
 redash	dockerfile	https://github.com/getredash/redash.git	e2437d8db8c8d12eaf23b7800b58ed3e9ea50353	.	python	service	none			256	4096	Redash data viz service, Python Flask + pnpm frontend
-errbit	dockerfile	https://github.com/errbit/errbit.git	2e10521faadeb0025565544386913cb0cd8a438e	.	ruby	service	none			256	3072	Errbit Rails error catcher, bundle install in container
-pixelfed	dockerfile	https://github.com/pixelfed/pixelfed.git	421babacaef83a068cb840c8630f113bb5ad2d80	.	php	service	none			256	3072	Pixelfed Laravel photo-sharing federated server
-plausible	dockerfile	https://github.com/plausible/analytics.git	95e0cbec62ffa10a42db1cabcbcb4219b04d94c0	.	elixir	service	none			256	3072	Plausible Phoenix analytics, mix release
+errbit	dockerfile	https://github.com/errbit/errbit.git	243c2cf092c69c5f0b45ccb76a1e34b484b83a8d	.	ruby	service	none			256	3072	Errbit Rails error catcher, bundle install in container
+pixelfed	dockerfile	https://github.com/pixelfed/pixelfed.git	0e07fd744ccfdabda7a88b37cf82c348694a67ba	.	php	service	none			256	3072	Pixelfed Laravel photo-sharing federated server
+plausible	dockerfile	https://github.com/plausible/analytics.git	4db97287c3a097ac9dcf93567110a38ac59736c9	.	elixir	service	none			256	3072	Plausible Phoenix analytics, mix release
 papercups	dockerfile	https://github.com/papercups-io/papercups.git	6a6f5adc7f0cef5813b2c2f1c0659922defaf976	.	elixir	service	none			256	3072	Papercups Elixir/Phoenix live chat server
-civetweb	dockerfile	https://github.com/civetweb/civetweb.git	3c0fb6ad582224b91959caf79a25dd98389c084d	.	c	service	none			128	2048	Civetweb embedded C HTTP server, make build
-whoogle	dockerfile	https://github.com/benbusby/whoogle-search.git	bf44f2ec18f8085d30660f5cd2fb82a0338da026	.	python	service	none			192	2048	Whoogle Flask search proxy, alpine pip build
-changedetection	dockerfile	https://github.com/dgtlmoon/changedetection.io.git	84d97ec9cf1bf77523fc6c13d451b6ed2f3807a0	.	python	service	none			256	3072	changedetection.io Python web monitoring service
-kanboard	dockerfile	https://github.com/kanboard/kanboard.git	1a9a32da1118a095325ecec50d4c0a784dcd46f8	.	php	service	none			192	2048	Kanboard PHP project management with nginx+php-fpm
-rubygems	dockerfile	https://github.com/rubygems/rubygems.org.git	836a18d40fb49df0a7ce19b27ed130cd2e04c9c1	.	ruby	service	none			256	3072	RubyGems.org Rails registry, alpine multi-stage
+civetweb	dockerfile	https://github.com/civetweb/civetweb.git	588860e30721bf5453b0440c390865a8e85dcae5	.	c	service	none			128	2048	Civetweb embedded C HTTP server, make build
+whoogle	dockerfile	https://github.com/benbusby/whoogle-search.git	efa36b111dc3035f2129e255040fbe1c7d8470f9	.	python	service	none			192	2048	Whoogle Flask search proxy, alpine pip build
+changedetection	dockerfile	https://github.com/dgtlmoon/changedetection.io.git	e9e8c8d218d800517696b6130f37f87f203c5306	.	python	service	none			256	3072	changedetection.io Python web monitoring service
+kanboard	dockerfile	https://github.com/kanboard/kanboard.git	a12dbfe2bc2598a3dd03e5c274f41663eda784af	.	php	service	none			192	2048	Kanboard PHP project management with nginx+php-fpm
+rubygems	dockerfile	https://github.com/rubygems/rubygems.org.git	95b9c7a8001e29e189a085468b76b4b95da91824	.	ruby	service	none			256	3072	RubyGems.org Rails registry, alpine multi-stage
 pterodactyl	dockerfile	https://github.com/pterodactyl/panel.git	760c3db300b6ff51378edff4d0e74b3855f57ca0	.	php	service	none			256	3072	Pterodactyl Laravel game panel, yarn+composer
-znc	dockerfile	https://github.com/znc/znc.git	8566db72dd94e9ca9a93e2f375a87fc44578063f	.	cpp	service	none			192	2048	ZNC IRC bouncer, cmake build from source
-openapigen	dockerfile	https://github.com/OpenAPITools/openapi-generator.git	7973088e3002b4a2be26b1a144e9bfff58dae7b5	.	java	service	none			256	4096	OpenAPI Generator online Java service, maven build
-pyload	dockerfile	https://github.com/pyload/pyload.git	f602032ec22783e116db9dcf44f1005788a3c9c8	.	python	service	none			192	2048	pyLoad Python download manager daemon, alpine
-shaarli	dockerfile	https://github.com/shaarli/Shaarli.git	105a692a64541aff5bf87a454105bfd1496fbb07	.	php	service	none			192	2048	Shaarli PHP bookmark service, composer+yarn multistage
+znc	dockerfile	https://github.com/znc/znc.git	8f5425f99c2609413568e80ba1a89943164c3eb1	.	cpp	service	none			192	2048	ZNC IRC bouncer, cmake build from source
+openapigen	dockerfile	https://github.com/OpenAPITools/openapi-generator.git	6be478dd7d89865c76c8df38182363f1e61ec65b	.	java	service	none			256	4096	OpenAPI Generator online Java service, maven build
+pyload	dockerfile	https://github.com/pyload/pyload.git	e60472ac91b09a099dff085ec3e4f6cd4628ee34	.	python	service	none			192	2048	pyLoad Python download manager daemon, alpine
+shaarli	dockerfile	https://github.com/shaarli/Shaarli.git	4bac13b31b5076cda09514ce0cf6755e77cc75a0	.	php	service	none			192	2048	Shaarli PHP bookmark service, composer+yarn multistage
 sickchill	dockerfile	https://github.com/sickchill/sickchill.git	846adafdfab579281353ea08a27bbb813f9a9872	.	python	service	none			192	2048	SickChill Python TV show PVR daemon, poetry install
-zammad	dockerfile	https://github.com/zammad/zammad.git	5bb84828f87294d127078f729cddff5c99eeace3	.	ruby	service	none			256	4096	Zammad Rails ticketing, bundle+node build
+zammad	dockerfile	https://github.com/zammad/zammad.git	2aa2ce682ec6fda2cb5b38540672438904613c13	.	ruby	service	none			256	4096	Zammad Rails ticketing, bundle+node build
 microblog	dockerfile	https://github.com/miguelgrinberg/microblog.git	a975ef64864354867c88e0ed3a17ba7d17dca752	.	python	service	none			128	2048	Flask Mega-Tutorial microblog, simple gunicorn app
-openwisp	dockerfile	https://github.com/openwisp/openwisp-controller.git	b8c4d3c65e884dfd3f4e938dcb0d13630428a67f	.	python	service	none			192	3072	OpenWISP Django network controller, pip install
-radicale	dockerfile	https://github.com/Kozea/Radicale.git	eae9dbefb11ee9aaa053da439ecd362041b193e0	.	python	service	none			128	2048	Radicale Python CalDAV/CardDAV server, alpine venv
+openwisp	dockerfile	https://github.com/openwisp/openwisp-controller.git	ceb63ad3641e226851752b0f33c1ff209dd2f7c9	.	python	service	none			192	3072	OpenWISP Django network controller, pip install
+radicale	dockerfile	https://github.com/Kozea/Radicale.git	146d4b4a9a5b9ebdd81d6684d9a9b9f1a96cef22	.	python	service	none			128	2048	Radicale Python CalDAV/CardDAV server, alpine venv
 djangooscar	dockerfile	https://github.com/django-oscar/django-oscar.git	eeb5a7dd4af447f5fa9b08652e9a256bca326a56	.	python	service	none			256	3072	django-oscar e-commerce sandbox, uwsgi app
-litellm	dockerfile	https://github.com/BerriAI/litellm.git	bf8b615b6461d36e107abc60613a46973c419ff6	.	python	service	none			256	3072	LiteLLM Python LLM gateway proxy, wolfi multi-stage
+litellm	dockerfile	https://github.com/BerriAI/litellm.git	25513b9e43af563f032c8cfe1a0819e002d5e630	.	python	service	none			256	3072	LiteLLM Python LLM gateway proxy, wolfi multi-stage
 opengist	dockerfile	https://github.com/thomiceli/opengist.git	ec26888487dc5c26f6316750b7e114ac1ed98c80	.	go	service	none			256	3072	Self-hosted pastebin
-rclone	dockerfile	https://github.com/rclone/rclone.git	1ac0c3eecb2b7517dcd792f4a8e878046ab124a3	.	go	service	none			256	3072	rclone rcd HTTP daemon
-minify	dockerfile	https://github.com/tdewolff/minify.git	a324e726d7a35523430054b44ec74090530b42de	.	go	service	none			128	2048	minify HTTP service
-dry	dockerfile	https://github.com/moncho/dry.git	f2b8a4dc2bc961e3549ce42265fb594d42c03798	.	go	service	none			128	2048	Docker TUI dashboard
-kubo	dockerfile	https://github.com/ipfs/kubo.git	d60cbc1c74eb4694f5e56efea8e8f4ca5c5435b8	.	go	service	none			256	4096	IPFS daemon
-alist	dockerfile	https://github.com/alist-org/alist.git	2f903c4c5b35f1b41f5bc346b02668953c98a895	.	go	service	none			256	3072	File list webdav server
-docmost	dockerfile	https://github.com/docmost/docmost.git	4966f9b152a9275ddbc12732e09864ca445e3ea7	.	node	service	none			256	4096	Wiki/docs collab
-mailpit	dockerfile	https://github.com/axllent/mailpit.git	9ba51d0ab2ccbf40e830139fd5237d564f135511	.	go	service	none			128	2048	SMTP testing daemon
-psitransfer	dockerfile	https://github.com/psi-4ward/psitransfer.git	51bb781ed802070c9a3779955b58469bcf31baf8	.	node	service	none			192	2048	File upload service
-gokapi	dockerfile	https://github.com/Forceu/Gokapi.git	9eb8a880e14027d8c21df3335a4a25544a51524e	.	go	service	none			128	2048	File sharing service
-gatus	dockerfile	https://github.com/TwiN/gatus.git	64116ce3daa9fb943bf224f84435740db3ad9683	.	go	service	none			128	2048	Health/uptime monitoring
-webdav	dockerfile	https://github.com/hacdias/webdav.git	20606cd79527dc1d4425b5354a9bd9caacd1ecc1	.	go	service	none			128	2048	Standalone webdav server
-conftest	dockerfile	https://github.com/open-policy-agent/conftest.git	2d5f1c266a5695698982394b4dc1a7d7b5084270	.	go	service	none			128	2048	OPA conftest
-zoekt	dockerfile	https://github.com/sourcegraph/zoekt.git	2fb345a6c2e58e54fe090028d0bd58bcd9288ea6	.	go	service	none			256	3072	Code search engine
+rclone	dockerfile	https://github.com/rclone/rclone.git	96760f1c14ab1c136dd15c69fc6e5e41c198e206	.	go	service	none			256	3072	rclone rcd HTTP daemon
+minify	dockerfile	https://github.com/tdewolff/minify.git	98dea98c57f463c8bb4b2b3bf756717ffa404ed3	.	go	service	none			128	2048	minify HTTP service
+dry	dockerfile	https://github.com/moncho/dry.git	8aaa648c24d557186d69d2c8d3ebe285201f9ef7	.	go	service	none			128	2048	Docker TUI dashboard
+kubo	dockerfile	https://github.com/ipfs/kubo.git	8387e66d23478ed7d91037cfe0389207d7e356fd	.	go	service	none			256	4096	IPFS daemon
+alist	dockerfile	https://github.com/alist-org/alist.git	527ad89362a8f3d51a35c5e4b6672cf05c983a5b	.	go	service	none			256	3072	File list webdav server
+docmost	dockerfile	https://github.com/docmost/docmost.git	a573acedd0317f3472cb0f8b95f6aa15315312e5	.	node	service	none			256	4096	Wiki/docs collab
+mailpit	dockerfile	https://github.com/axllent/mailpit.git	d904e7fd98fe4f3492d914481e2bc1e62ad7c6a4	.	go	service	none			128	2048	SMTP testing daemon
+psitransfer	dockerfile	https://github.com/psi-4ward/psitransfer.git	8b547bf3e09757122efa00aab90281e3915aa0c6	.	node	service	none			192	2048	File upload service
+gokapi	dockerfile	https://github.com/Forceu/Gokapi.git	ea4dc60635707b33898288ad96f92795e0585eb4	.	go	service	none			128	2048	File sharing service
+gatus	dockerfile	https://github.com/TwiN/gatus.git	447c7ad321431a8ccb6cdc7147aa40b51398fa62	.	go	service	none			128	2048	Health/uptime monitoring
+webdav	dockerfile	https://github.com/hacdias/webdav.git	4fe4703e028dcde108314bf8abfb04a73cc4dca1	.	go	service	none			128	2048	Standalone webdav server
+conftest	dockerfile	https://github.com/open-policy-agent/conftest.git	2f126efdd824d6c37d24d10fa28985c3474df689	.	go	service	none			128	2048	OPA conftest
+zoekt	dockerfile	https://github.com/sourcegraph/zoekt.git	1f9ef56bc379c14e9581667a5f7ca2a319889a9b	.	go	service	none			256	3072	Code search engine
 amass	dockerfile	https://github.com/owasp-amass/amass.git	79299dce87b0085db0f2f4ef3e9c52cccb49f514	.	go	service	none			256	3072	OWASP attack surface mapper
 gobuster	dockerfile	https://github.com/OJ/gobuster.git	c77583fbb8824058d74d38240896eff610683c8e	.	go	service	none			128	2048	HTTP/DNS brute forcer
-httpx	dockerfile	https://github.com/projectdiscovery/httpx.git	490f141ed2c90c3bb38296037d50d6c60cad2284	.	go	service	none			128	2048	HTTP toolkit
-dnsx	dockerfile	https://github.com/projectdiscovery/dnsx.git	54a076d23fa5547d940c1e4e1e722072fd8378a8	.	go	service	none			128	2048	DNS toolkit
-subfinder	dockerfile	https://github.com/projectdiscovery/subfinder.git	85929ab9ee7719c5f26926a876df1418ec334584	.	go	service	none			128	2048	Subdomain discovery
-naabu	dockerfile	https://github.com/projectdiscovery/naabu.git	4d2bdcc5bcecbe383525ce4a74d5592816309924	.	go	service	none			192	2048	Port scanner
+httpx	dockerfile	https://github.com/projectdiscovery/httpx.git	99b2321efb3e95eaba48a0be2297898cba46f033	.	go	service	none			128	2048	HTTP toolkit
+dnsx	dockerfile	https://github.com/projectdiscovery/dnsx.git	e90a4f96435d8e0d4182debf09fd0008593c28cf	.	go	service	none			128	2048	DNS toolkit
+subfinder	dockerfile	https://github.com/projectdiscovery/subfinder.git	0ed1b0b622fd94ac96877af3a7082117fca60772	.	go	service	none			128	2048	Subdomain discovery
+naabu	dockerfile	https://github.com/projectdiscovery/naabu.git	f1aa33e4b8d12ccd7de68abdf1571ba93419fa7a	.	go	service	none			192	2048	Port scanner
 node-express-boilerplate	dockerfile	https://github.com/hagopj13/node-express-boilerplate.git	179ae84efec61b14206d0305d941daed6c6d07f9	.	node	service	none			256	3072	Express boilerplate
 nestjs-boilerplate	dockerfile	https://github.com/brocoders/nestjs-boilerplate.git	dd0034750fc7f6ec15712afbecf50fa9828018a2	.	node	service	none			256	4096	NestJS production boilerplate
 node-express-realworld	dockerfile	https://github.com/gothinkster/node-express-realworld-example-app.git	30b68e1e881462b2f4164ea09ab4c4f5699c7b0b	.	node	service	none			256	3072	Express RealWorld
-docker-django-example	dockerfile	https://github.com/nickjj/docker-django-example.git	5ec131067797cf9f95652c8f2652bfc540a2abd6	.	python	service	none			256	3072	Production Django example
-djangox	dockerfile	https://github.com/wsvincent/djangox.git	cdeec72d7e080a024c9887302c6d636fdb3440ef	.	python	service	none			256	3072	Django starter
-docker-flask-example	dockerfile	https://github.com/nickjj/docker-flask-example.git	28ae2cdb07a3981ac4b688fc0416983511fede11	.	python	service	none			256	3072	Production Flask example
+docker-django-example	dockerfile	https://github.com/nickjj/docker-django-example.git	496cf72faf84f3c64c8d6fab120f0d64e865a020	.	python	service	none			256	3072	Production Django example
+djangox	dockerfile	https://github.com/wsvincent/djangox.git	14c0374eaab52dc49898229ffe9a3e8f0e0e51c2	.	python	service	none			256	3072	Django starter
+docker-flask-example	dockerfile	https://github.com/nickjj/docker-flask-example.git	8b1dcecbfb620f12f60371f73cc7a5698dc6dd46	.	python	service	none			256	3072	Production Flask example
 flasky	dockerfile	https://github.com/miguelgrinberg/flasky.git	3beedd640b9146b0bd65c8c2ecf402b01798bc33	.	python	service	none			256	3072	Flask Web Dev book app
 fastapi-realworld	dockerfile	https://github.com/nsidnev/fastapi-realworld-example-app.git	029eb7781c60d5f563ee8990a0cbfb79b244538c	.	python	service	none			256	3072	FastAPI RealWorld
 fastapi-sqlalchemy-asyncpg	dockerfile	https://github.com/grillazz/fastapi-sqlalchemy-asyncpg.git	5d0207cb9b531f4dde28dec62fd5505e9e9c24b5	.	python	service	none			256	3072	FastAPI async SQLAlchemy
-docker-rails-example	dockerfile	https://github.com/nickjj/docker-rails-example.git	e3edbb4d00b16f45d88db27f055938f5279a6ec0	.	ruby	service	none			256	4096	Production Rails example
+docker-rails-example	dockerfile	https://github.com/nickjj/docker-rails-example.git	b22ae34996f9db3d15f8d230a24d68d7db21e814	.	ruby	service	none			256	4096	Production Rails example
 rails-docked	dockerfile	https://github.com/rails/docked.git	d8ed20a46954a28b5d1ecaaf5564519e11d7ee54	.	ruby	service	none			256	4096	Official rails docked starter
 docker-phoenix-example	dockerfile	https://github.com/nickjj/docker-phoenix-example.git	b3ebb7a5509d41b238e9dc7c06ce617b0309710f	.	elixir	service	none			256	4096	Production Phoenix example
 phoenix-todo-list	dockerfile	https://github.com/dwyl/phoenix-todo-list-tutorial.git	850e51ae23af404e09e925ae4ab6d76cd4f1aed6	.	elixir	service	none			256	4096	Phoenix todo tutorial
-symfony-docker	dockerfile	https://github.com/dunglas/symfony-docker.git	71423ed5e37faead77a777b38441b6a6a146d050	.	php	service	none			256	4096	Canonical Symfony Docker
+symfony-docker	dockerfile	https://github.com/dunglas/symfony-docker.git	777be58d05333c40642a7d530b45ae5b376d7dc7	.	php	service	none			256	4096	Canonical Symfony Docker
 zero-to-production	dockerfile	https://github.com/LukeMathWalker/zero-to-production.git	970987c5f793af6fc8e557731c9bbb23b620451e	.	rust	service	none			256	4096	Actix-web Rust book project
 rust-web-example	dockerfile	https://github.com/zupzup/rust-web-example.git	ae230ce2e77dc0306fea5a342f75aaa856ebb191	.	rust	service	none			256	4096	Warp Rust web example
 docker-gs-ping	dockerfile	https://github.com/docker/docker-gs-ping.git	fbee2036cc90b84f87e8a95b7de2a1c4065c87c7	.	go	service	none			128	2048	Official Docker Go sample (Echo)
 fiber-go-template	dockerfile	https://github.com/create-go-app/fiber-go-template.git	286d0d84d3373668634fcc30a3cec60740a8f4dc	.	go	service	none			128	2048	Go Fiber production template
 go-gin-example	dockerfile	https://github.com/eddycjy/go-gin-example.git	4f5174ca325b37f23edadad7c88d49586816a69c	.	go	service	none			128	2048	Popular Gin tutorial example
-charmbracelet-gum	dockerfile	https://github.com/charmbracelet/gum.git	ed78cffe351cc67609111ec54e19aa0d1c396365	.		service	none			256	4096	auto-curated
-charmbracelet-soft-serve	dockerfile	https://github.com/charmbracelet/soft-serve.git	c01f4ebaf201e28bf6fa190da610a3674192e4d8	.		service	none			256	4096	auto-curated
-sigstore-cosign	dockerfile	https://github.com/sigstore/cosign.git	1d5c7a6d34ce6ec314400c33c1e8d1a2ffde3eeb	.		service	none			256	4096	auto-curated
-google-ko	dockerfile	https://github.com/ko-build/ko.git	21305f1fd5a399962f0d8751cd041501e8b3fca2	.		service	none			256	4096	auto-curated
-hairyhenderson-gomplate	dockerfile	https://github.com/hairyhenderson/gomplate.git	d09b2062e6765aff1347411f260a99dd385603cf	.		service	none			256	4096	auto-curated
+charmbracelet-gum	dockerfile	https://github.com/charmbracelet/gum.git	30cc51695bcd05e03bf5e09aa411e2e78c7aea7e	.		service	none			256	4096	auto-curated
+charmbracelet-soft-serve	dockerfile	https://github.com/charmbracelet/soft-serve.git	ac135366727f5b9ebecb23113faa789a84b47bce	.		service	none			256	4096	auto-curated
+sigstore-cosign	dockerfile	https://github.com/sigstore/cosign.git	13a3d79e6386832103e070d392cae8dd16d97b34	.		service	none			256	4096	auto-curated
+google-ko	dockerfile	https://github.com/ko-build/ko.git	c63784bd68a6683edada345d11c899bd426c4ede	.		service	none			256	4096	auto-curated
+hairyhenderson-gomplate	dockerfile	https://github.com/hairyhenderson/gomplate.git	5f5dfbc286df26adb1127345c862c835e23ddead	.		service	none			256	4096	auto-curated
 derailed-k9s	dockerfile	https://github.com/derailed/k9s.git	0da2636cc324b1d78ba120d21bf5831f8027f5c3	.		service	none			256	4096	auto-curated
-sharkdp-bat	dockerfile	https://github.com/sharkdp/bat.git	f822bd05cefc34e9eda943122c94880b0a600693	.		service	none			256	4096	auto-curated
+sharkdp-bat	dockerfile	https://github.com/sharkdp/bat.git	93c52a4f88c55955d809ffd3af85eaa6887fbfd5	.		service	none			256	4096	auto-curated
 BurntSushi-ripgrep	dockerfile	https://github.com/BurntSushi/ripgrep.git	4519153e5e461527f4bca45b042fff45c4ec6fb9	.		service	none			256	4096	auto-curated
 ogham-exa	dockerfile	https://github.com/ogham/exa.git	3d1edbb47052cb416ef9478106c3907586da5150	.		service	none			256	4096	auto-curated
-nushell-nushell	dockerfile	https://github.com/nushell/nushell.git	fa06e5434233a744b709f2780cb045740c2c866b	.		service	none			256	4096	auto-curated
-denoland-deno	dockerfile	https://github.com/denoland/deno.git	d98d2d8c51290aaefa20f9cb57ead146b0c8678d	.		service	none			256	4096	auto-curated
+nushell-nushell	dockerfile	https://github.com/nushell/nushell.git	a6026914ec9c82441cfcdd6da09177d867a532cd	.		service	none			256	4096	auto-curated
+denoland-deno	dockerfile	https://github.com/denoland/deno.git	0377f16bd400ca1fd09c4b76f3c46b57b258d9e3	.		service	none			256	4096	auto-curated
 plausible-analytics	dockerfile	https://github.com/plausible/community-edition.git	15529b26b8d692285184524241ba0825feb13c9a	.		service	none			256	4096	auto-curated
 pleroma	dockerfile	https://git.pleroma.social/pleroma/pleroma.git	683ab39160a2ff95d151887a89217bd1d4a6dcf5	.		service	none			256	4096	auto-curated
-koka-lang	dockerfile	https://github.com/koka-lang/koka.git	958cf72aebebc49b03aca4120dbad372d1ed37e1	util		service	none			512	6144	auto-curated; subdir fixed
-pandoc	dockerfile	https://github.com/jgm/pandoc.git	5caad90fc44669ced0abdd7a890108a995689a90	.		service	none			256	4096	auto-curated
+koka-lang	dockerfile	https://github.com/koka-lang/koka.git	461d066a853009011f4f393e556a6926dfec854e	util		service	none			512	6144	auto-curated; subdir fixed
+pandoc	dockerfile	https://github.com/jgm/pandoc.git	933b992d5b5268465c4e892d6e4eb582427bfe2b	.		service	none			256	4096	auto-curated
 mirage-skeleton	dockerfile	https://github.com/mirage/mirage-skeleton.git	f89ae9e1a80eaf983622cc8c192c1214b219b9e0	.		service	none			256	4096	auto-curated
-crystal-lang	dockerfile	https://github.com/crystal-lang/crystal.git	1a6ac44a515bb826a5b0d9fc843214e9bdf252b6	.		service	none			256	4096	auto-curated
-kemalcr-kemal	dockerfile	https://github.com/kemalcr/kemal.git	c4be7e41f602475723b52dc8d30b5c5ca68803f5	.		service	none			256	4096	auto-curated
-nim-lang	dockerfile	https://github.com/nim-lang/Nim.git	5b1a05e2826ae222b0cedce740b809ae318af392	.		service	none			256	4096	auto-curated
+crystal-lang	dockerfile	https://github.com/crystal-lang/crystal.git	b2684d7fd0c975f1aa8abf05cec24e9d4437529e	.		service	none			256	4096	auto-curated
+kemalcr-kemal	dockerfile	https://github.com/kemalcr/kemal.git	0acb52961f5f6080b0245bb0d617efe9c9f7676d	.		service	none			256	4096	auto-curated
+nim-lang	dockerfile	https://github.com/nim-lang/Nim.git	cbe8ce59ed205f6f8018c0dcc2a114d74cb2aff5	.		service	none			256	4096	auto-curated
 jester-nim	dockerfile	https://github.com/dom96/jester.git	ac9b8541dce64feff9b53b700cab8496c1816651	.		service	none			256	4096	auto-curated
-nushell-nu_scripts	dockerfile	https://github.com/nushell/nu_scripts.git	68af8db2fc540343affe089008c8292f767ca16e	.		service	none			256	4096	auto-curated
-racket-lang	dockerfile	https://github.com/racket/racket.git	9435b98316356ecda997f2e5f63e4e1178f0d151	.github/images		service	none			512	6144	auto-curated; subdir fixed (CI deps image)
-ktor-samples	dockerfile	https://github.com/ktorio/ktor-samples.git	59ab228bc321a1117985ecb70e736479522ecc24	.		service	none			256	4096	auto-curated
+nushell-nu_scripts	dockerfile	https://github.com/nushell/nu_scripts.git	c5387bd60ca63d26885ee73ceb8a84160bc6ca6b	.		service	none			256	4096	auto-curated
+racket-lang	dockerfile	https://github.com/racket/racket.git	3b0a3742199dc968ead94b14d9b30246a4e208a9	.github/images		service	none			512	6144	auto-curated; subdir fixed (CI deps image)
+ktor-samples	dockerfile	https://github.com/ktorio/ktor-samples.git	42a258b59afd1b2a53e42304b1c5b1bd1dc1cdcb	.		service	none			256	4096	auto-curated
 spring-petclinic-kotlin	dockerfile	https://github.com/spring-petclinic/spring-petclinic-kotlin.git	735df8697f18a5199170cf94e8e92599d9804e6b	.		service	none			256	4096	auto-curated
-nginx	dockerfile	https://github.com/nginx/nginx.git	abc72c5a57890ba4ce235fe3339dbf31af40604e	.		service	none			256	4096	auto-curated
-mongoose	dockerfile	https://github.com/cesanta/mongoose.git	1be11a981ca33359f713896c97824108ea5a7a60	.		service	none			256	4096	auto-curated
-h2o	dockerfile	https://github.com/h2o/h2o.git	df7915db85501798de7b104085f4ee790ba20a45	.		service	none			256	4096	non-canonical Dockerfile.ubuntu2404	misc/docker-ci/Dockerfile.ubuntu2404
-drogonframework	dockerfile	https://github.com/drogonframework/drogon.git	4c05658259a83dbaea2bdcd8fd6d713f24ed7bdc	docker/ubuntu		service	none			512	6144	auto-curated; subdir fixed
+nginx	dockerfile	https://github.com/nginx/nginx.git	bac04c1b66ad5e17d06ee6ce081a20325f94c6fc	.		service	none			256	4096	auto-curated
+mongoose	dockerfile	https://github.com/cesanta/mongoose.git	3eb38aeb4f0fd408f028c170c7e51a89c251a6b8	.		service	none			256	4096	auto-curated
+h2o	dockerfile	https://github.com/h2o/h2o.git	4aa96860e99cc2a2e2777433949bb05aed678ebe	.		service	none			256	4096	non-canonical Dockerfile.ubuntu2404	misc/docker-ci/Dockerfile.ubuntu2404
+drogonframework	dockerfile	https://github.com/drogonframework/drogon.git	ef1f34492d3cee70ec97faef785de171b170c2e0	docker/ubuntu		service	none			512	6144	auto-curated; subdir fixed
 CrowCpp	dockerfile	https://github.com/CrowCpp/Crow.git	21f8bcfa6b900fcc76ee01a5bc6823b129f1e63f	.		service	none			256	4096	auto-curated
 sinatra	dockerfile	https://github.com/sinatra/sinatra.git	f891dd2b6f4911e356600efe6c3b82af97d262c6	.		service	none			256	4096	auto-curated
-mastodon	dockerfile	https://github.com/mastodon/mastodon.git	2b93d19d2ca18366b015e3dcde412e67625fe8f5	.		service	none			256	4096	auto-curated
-huginn	dockerfile	https://github.com/huginn/huginn.git	420816f61a026cb845d8537e79c3f5fdc857e026	.		service	none			256	4096	Dockerfile needs repo-root context	docker/single-process/Dockerfile
-denoland-fresh	dockerfile	https://github.com/denoland/fresh.git	36dd6375ebb9414e8f040b4f888995526d070444	.		service	none			256	4096	auto-curated
+mastodon	dockerfile	https://github.com/mastodon/mastodon.git	3473b8a65278783bc74ce2738aea98cca0c7a5ed	.		service	none			256	4096	auto-curated
+huginn	dockerfile	https://github.com/huginn/huginn.git	5d64b710c9c2a5ac78127a69455bbfdb54ac45a4	.		service	none			256	4096	Dockerfile needs repo-root context	docker/single-process/Dockerfile
+denoland-fresh	dockerfile	https://github.com/denoland/fresh.git	b9a314ba1d41e7bcf8f153ce44fe7b226e1c5b1d	.		service	none			256	4096	auto-curated
 oakserver-oak	dockerfile	https://github.com/oakserver/oak.git	185baef02551a84798000f25d3bd01c2fdfcb1ce	.devcontainer		service	none			256	4096	auto-curated; subdir fixed (devcontainer)
 nixos-docker	dockerfile	https://github.com/nix-community/docker-nixpkgs.git	10b83cdcf12c7d37db50cd8d2c68b336881b91de	.		service	none			256	4096	auto-curated
 bottlepy	dockerfile	https://github.com/bottlepy/bottle.git	2a743a302a71460bfe4c0b8b7cb99a306b0328c6	.		service	none			256	4096	auto-curated
 pyscript	dockerfile	https://github.com/pyscript/pyscript.git	7f856a107e8c392ab20a1d917962a207c4dcc9a6	.		service	none			256	4096	auto-curated
-litestar	dockerfile	https://github.com/litestar-org/litestar.git	f416d1ecf2d953f2ab6ff6992b516af84b450e6b	.		service	none			256	4096	auto-curated
-gleam-lang	dockerfile	https://github.com/gleam-lang/gleam.git	9492968b5f28db40f9fc9003853972417dc1c3b7	.		service	none			256	4096	auto-curated
-vlang	dockerfile	https://github.com/vlang/v.git	55e8faaedf64ec9e77581af873479891baf249d1	.		service	none			256	4096	auto-curated
-janet-lang	dockerfile	https://github.com/janet-lang/janet.git	c6b802b082aa21b6e65e8c2729c85237b0cc8a24	.		service	none			256	4096	auto-curated
-idris-lang	dockerfile	https://github.com/idris-lang/Idris2.git	19a3f4ec0c957220e7a5c0f98923932cdfcc6a48	.		service	none			256	4096	auto-curated
+litestar	dockerfile	https://github.com/litestar-org/litestar.git	625d9b5e9351962b5bc4f755864e4c1306f68476	.		service	none			256	4096	auto-curated
+gleam-lang	dockerfile	https://github.com/gleam-lang/gleam.git	31ccb2fb26afe2ce51f1feae5645edf3b0413790	.		service	none			256	4096	auto-curated
+vlang	dockerfile	https://github.com/vlang/v.git	582217628ab04a5b0a08859dc1f8f3656df5e91f	.		service	none			256	4096	auto-curated
+janet-lang	dockerfile	https://github.com/janet-lang/janet.git	fcf3186c7d9c297d07df0c29563c8ec3b5aedba5	.		service	none			256	4096	auto-curated
+idris-lang	dockerfile	https://github.com/idris-lang/Idris2.git	214eb45472e15187e6f932c6820a0f0d5542a18e	.		service	none			256	4096	auto-curated
 zola	dockerfile	https://github.com/getzola/zola.git	5d2d821ab6509bc2e3e06d9e654ba58d0610b426	.		service	none			256	4096	auto-curated
-hugo	dockerfile	https://github.com/gohugoio/hugo.git	974772422258f1e8aab1c7603fc09bbb1a2c2571	.		service	none			256	4096	auto-curated
+hugo	dockerfile	https://github.com/gohugoio/hugo.git	633cc772e0e8a79205b1b268bd9bfc2b0f5b1473	.		service	none			256	4096	auto-curated
 act	dockerfile	https://github.com/nektos/act.git	bd86152165b976e89c24093ceb039d732b5ed95f	.		service	none			256	4096	auto-curated
 dive	dockerfile	https://github.com/wagoodman/dive.git	d6c691947f8fda635c952a17ee3b7555379d58f0	.		service	none			256	4096	auto-curated
-lazydocker	dockerfile	https://github.com/jesseduffield/lazydocker.git	2ebe3848d67720f641c1f2ff2a7fe0a7bcaf9422	.		service	none			256	4096	auto-curated
+lazydocker	dockerfile	https://github.com/jesseduffield/lazydocker.git	7e7aadc2071d58031bf2daafca1fbd4093efc23f	.		service	none			256	4096	auto-curated
 gotty	dockerfile	https://github.com/yudai/gotty.git	a080c85cbc59226c94c6941ad8c395232d72d517	.		service	none			256	4096	auto-curated
 shiori	dockerfile	https://github.com/go-shiori/shiori.git	585ea341aa59219b0477f991eadb545d24e3a121	.		service	none			256	4096	auto-curated
-memos	dockerfile	https://github.com/usememos/memos.git	ab5332901fd6626f0a2ae6b99671af9663f68078	.		service	none			256	4096	auto-curated
+memos	dockerfile	https://github.com/usememos/memos.git	34c90dd5e19135b4b0a8a7cba0220f7852d8fb35	.		service	none			256	4096	auto-curated
