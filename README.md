@@ -74,6 +74,17 @@ That's it — alpine boots in ~80 ms (warm OCI cache), runs the command, and exi
 
 ## Examples
 
+1. [Run Alpine, print a message](#1-run-alpine-print-a-message)
+2. [Interactive Ubuntu session](#2-interactive-ubuntu-session)
+3. [Build from Dockerfile](#3-build-from-dockerfile)
+4. [Clone and boot a git repo](#4-clone-and-boot-a-git-repo)
+5. [Docker Compose (Flask + PostgreSQL)](#5-docker-compose-flask--postgresql)
+6. [Exec into a running Compose service](#6-exec-into-a-running-compose-service)
+7. [Networking (auto NAT)](#7-networking-auto-nat)
+8. [Multi-vCPU](#8-multi-vcpu)
+9. [Sandbox pool from template (REST API)](#9-sandbox-pool-from-template-rest-api)
+10. **[Sandbox control plane — raw HTTP](#10-sandbox-control-plane--raw-http)** — `gocracker-sandboxd` HTTP daemon + per-sandbox UDS + toolbox agent (exec / files / git / re-IP)
+
 The snippets below use `$KERNEL` for the guest kernel path. Set it once after running `make build kernel-unpack`:
 
 ```bash
@@ -241,29 +252,6 @@ The toolbox agent binary is baked into every disk gocracker builds (`/opt/gocrac
 | x86-64 Linux | Full support | Ubuntu 22.04, 24.04 |
 | ARM64 Linux | Full support | AWS a1.metal (Graviton 1), Ubuntu 24.04 |
 | macOS | Planned | Hypervisor.framework |
-
-### ARM64 / x86-64 Subsystem Comparison
-
-| Subsystem | x86-64 | ARM64 | Notes |
-|-----------|--------|-------|-------|
-| KVM bindings | `KVM_GET/SET_REGS` | `KVM_GET/SET_ONE_REG` | ARM64 uses per-register ioctls |
-| Interrupt controller | IOAPIC + LAPIC | GICv2 / GICv3 (in-kernel) | Auto-probed; GICv2 preferred on Graviton 1 |
-| IRQ delivery | `KVM_IRQ_LINE` | irqfd (eventfd) | ARM64 matches Firecracker's irqfd approach |
-| Serial console | UART 16550A (I/O port 0x3F8) | UART 16550A (MMIO 0x40002000) | Same device, different transport |
-| Boot protocol | bzImage / ELF vmlinux | ARM64 Image / Image.gz / ELF | PC=entry, X0=DTB address |
-| Device tree | ACPI (x86) | FDT/DTB (generated) | GIC, timer, PSCI, UART, virtio nodes |
-| SMP boot | INIT/SIPI sequence | PSCI CPU_ON | Secondary vCPUs start POWER_OFF |
-| Virtio MMIO transport | 0xD0000000+ | 0x40003000+ | Firecracker-compatible layout on ARM64 |
-| virtio-net | Done | Done | |
-| virtio-blk | Done | Done | |
-| virtio-rng | Done | Done | |
-| virtio-vsock | Done | Done | |
-| virtio-balloon | Done | Done | |
-| virtio-fs | Done | Done | Cold-boot only; snapshot + active virtio-fs mount is not supported (Linux driver queue state cannot migrate to a fresh virtiofsd) — use virtio-blk for per-sandbox state |
-| Snapshot / Restore | Done | Done | memfd-backed restore when SharedFS is in the snapshot; MAP_PRIVATE COW otherwise |
-| Jailer + seccomp | Done | Done | seccomp filter compiled per-arch |
-| Compose networking | Done | Done | TAP + bridge + userspace port proxy |
-| Memory layout | RAM at GPA 0x0 | RAM at GPA 0x80000000 | ARM64 reserves low 2 GB for MMIO |
 
 ## Networking
 
