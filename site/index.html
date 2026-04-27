@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>gocracker(1) — real KVM-isolated microVMs in one binary</title>
+<meta name="description" content="A pure-Go runtime that builds, pulls, and runs any container image as a real Linux VM. Firecracker-compatible REST API, warm pools, snapshot/restore, live migration. ARM64 + x86-64.">
+
+<meta property="og:title" content="gocracker">
+<meta property="og:description" content="One binary, one command — real KVM-isolated microVMs.">
+<meta property="og:url" content="https://gocracker.dev/">
+<meta property="og:type" content="website">
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23000'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='ui-monospace,monospace' font-size='18' font-weight='700' fill='%2300ADD8'%3E%26gt;_%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<pre class="banner" aria-hidden="true">
+ ┌─┐┌─┐┌─┐┬─┐┌─┐┌─┐┬┌─┌─┐┬─┐
+ │ ┬│ ││  ├┬┘├─┤│  ├┴┐├┤ ├┬┘    one binary, one command,
+ └─┘└─┘└─┘┴└─┴ ┴└─┘┴ ┴└─┘┴└─    real KVM-isolated microVMs.
+</pre>
+
+<nav class="topnav">
+  <a href="#install">install</a> ·
+  <a href="#features">features</a> ·
+  <a href="#numbers">numbers</a> ·
+  <a href="#sdk">sdk</a> ·
+  <a href="https://github.com/misaelzapata/gocracker">github</a> ·
+  <a href="https://github.com/misaelzapata/gocracker/releases/tag/v0.1.0">download</a>
+</nav>
+
+<hr>
+
+<section>
+<p class="lede">
+A micro-VMM in pure Go that does everything Firecracker does at the KVM level
+— virtio devices, jailer, seccomp — and adds the developer experience on top.
+Pull any OCI image, build any Dockerfile, clone any git repo, orchestrate
+Compose stacks. Each service becomes a real Linux VM.
+</p>
+
+<pre class="term"><span class="prompt">$</span> sudo ./gocracker run --image alpine:latest --kernel ./vmlinux --wait
+<span class="muted">[oci] cache hit alpine:latest (linux/amd64)</span>
+<span class="muted">[container:INFO] started id=gc-26655 duration=</span><span class="ok">284ms</span>
+<span class="muted">[vmm:INFO] vm running id=gc-26655 vcpus=1 mem_mb=128</span>
+</pre>
+</section>
+
+<hr>
+
+<section id="install">
+<h2>── install ───────────────────────────────────────────</h2>
+
+<pre class="term"><span class="hash"># linux/amd64 — arm64 also published, just swap the arch</span>
+curl -L https://github.com/misaelzapata/gocracker/releases/download/v0.1.0/gocracker-v0.1.0-linux-amd64.tar.gz | tar xz
+cd gocracker-v0.1.0-linux-amd64
+
+<span class="hash"># grab a guest kernel (or build your own with `make kernel-guest`)</span>
+curl -L -o vmlinux.gz https://github.com/misaelzapata/gocracker/raw/main/artifacts/kernels/gocracker-guest-standard-vmlinux.gz
+gunzip vmlinux.gz
+
+<span class="hash"># boot</span>
+sudo ./gocracker run --image alpine:latest --kernel ./vmlinux \
+                    --cmd <span class="str">"echo hello from a real VM"</span> --wait
+</pre>
+
+<p class="note">no docker daemon · no containerd · no runc · just kvm</p>
+</section>
+
+<hr>
+
+<section id="features">
+<h2>── features ──────────────────────────────────────────</h2>
+
+<dl class="feat">
+  <dt>container sources</dt>
+  <dd>OCI registries, local Dockerfiles (BuildKit AST), git repos with auto-detected Dockerfiles, plain directories.</dd>
+
+  <dt>compose orchestration</dt>
+  <dd>Docker Compose stacks as microVMs. In-guest healthchecks. <code>depends_on</code> with <code>service_healthy</code> + <code>service_completed_successfully</code>.</dd>
+
+  <dt>networking</dt>
+  <dd><code>--net auto</code> creates TAP + IPv4 + NAT in one shot. Per-stack network namespaces. Deterministic per-VM MACs. Port publishing.</dd>
+
+  <dt>kvm isolation</dt>
+  <dd>Hardware virt + Firecracker-style jailer + per-arch seccomp + private mount namespaces + <code>pivot_root</code> for builds.</dd>
+
+  <dt>snapshot · restore · clone</dt>
+  <dd>Full RAM + vCPU + device snapshot. In-place <code>/clone</code> spawns a new VM with a fresh tap and re-IP'd guest. Live migration (stop-and-copy).</dd>
+
+  <dt>sandbox control plane</dt>
+  <dd><code>gocracker-sandboxd</code> — warm pools, content-addressed templates, HMAC-signed preview URLs. Python · Go · JS SDKs.</dd>
+</dl>
+</section>
+
+<hr>
+
+<section id="numbers">
+<h2>── numbers ───────────────────────────────────────────</h2>
+<p class="note">Ryzen AI 9 HX 370 · Linux 6.17 · /dev/kvm. Reproduce: <a href="https://github.com/misaelzapata/gocracker/tree/main/sandboxes/examples">sandboxes/examples</a></p>
+
+<pre class="table">
+cold boot       alpine, warm OCI cache           ~ <span class="ok">80 ms</span>
+warm restore    snapshot, in-place               ~ <span class="ok">40 ms</span>
+lease p95       warm pool, sandboxd              ~ <span class="ok">1.5 ms</span>
+template hit    content-addressed cache          ~ <span class="ok">80 µs</span>
+regression      real-world projects in the gate    <span class="ok">378</span>
+arch parity     x86-64 + ARM64 (Graviton 1)        <span class="ok">full</span>
+</pre>
+</section>
+
+<hr>
+
+<section id="sdk">
+<h2>── sdk ───────────────────────────────────────────────</h2>
+<p>Most users skip raw HTTP. Typed errors, context-manager lifecycle, pipelined CONNECT.</p>
+
+<pre class="term"><span class="kw">from</span> gocracker_sandboxes <span class="kw">import</span> Sandboxd
+
+sb = Sandboxd(<span class="str">"http://127.0.0.1:9091"</span>)
+<span class="kw">with</span> sb.create(image=<span class="str">"alpine:3.20"</span>, network_mode=<span class="str">"auto"</span>) <span class="kw">as</span> s:
+    out = s.run_command(<span class="str">"sh"</span>, <span class="str">"-lc"</span>, <span class="str">"wget -qO- https://example.com | head -1"</span>)
+    <span class="kw">print</span>(out.stdout)
+</pre>
+
+<p class="note">
+  <a href="https://github.com/misaelzapata/gocracker/tree/main/sandboxes/sdk/python">python</a> ·
+  <a href="https://github.com/misaelzapata/gocracker/tree/main/sandboxes/sdk/go">go</a> ·
+  <a href="https://github.com/misaelzapata/gocracker/tree/main/sandboxes/sdk/js">js / node</a>
+</p>
+</section>
+
+<hr>
+
+<section id="why">
+<h2>── why ───────────────────────────────────────────────</h2>
+<p>I fell in love with <a href="https://firecracker-microvm.github.io">Firecracker</a> — booting a real Linux VM in milliseconds with minimal overhead is brilliant. But every time I wanted to just run a container image as a microVM, I had to pull the image manually, extract the rootfs, build an ext4 disk, generate an initrd, write a JSON config, set up a TAP interface, configure iptables… and only then call the Firecracker API. I kept thinking: why can't I just type one command?</p>
+<p>So I built gocracker. Hobby project that grew into something that boots 378 real-world projects, runs Flask + PostgreSQL compose stacks on ARM64 bare metal, and ships a Firecracker-compatible REST API. All in a single static binary.</p>
+</section>
+
+<hr>
+
+<footer>
+<pre><span class="prompt">$</span> <span class="muted">## v0.1.0 · 2026-04-26 · Apache 2.0</span>
+<span class="prompt">$</span> <a href="https://github.com/misaelzapata/gocracker">git clone https://github.com/misaelzapata/gocracker.git</a>
+<span class="prompt">$</span> <span class="cursor">_</span></pre>
+</footer>
+
+</body>
+</html>
