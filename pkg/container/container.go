@@ -442,6 +442,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 				OverrideX86Boot:      opts.X86Boot,
 				OverrideVsockUDSPath: opts.VsockUDSPath,
 				SharedFSRebinds:      buildSharedFSRebinds(opts.Mounts),
+				AdditionalDrives:     codeDisksAsDriveConfigs(opts.CodeDisks),
 			})
 			if err == nil {
 				// Activate the freshly-allocated host-side tap (assigns the
@@ -467,6 +468,26 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 				if autoNet != nil && opts.ExecEnabled {
 					if ripErr := reIPGuest(vm, opts.StaticIP, opts.Gateway, 2*time.Second); ripErr != nil {
 						gclog.Container.Warn("restore re-IP failed", "error", ripErr)
+					}
+				}
+				// Phase 2 of code-disk-attach: the snapshot didn't have
+				// these drives, so the guest's init never mounted them.
+				// Drive the in-guest mount via toolbox.Exec now that
+				// the VM is resumed and its agent is reachable.
+				if len(opts.CodeDisks) > 0 {
+					udsPath := vsockUDSForCodeDiskMount(vm)
+					if udsPath != "" {
+						baseIdx := nonRootDriveCount(vm) - len(opts.CodeDisks)
+						if baseIdx < 0 {
+							baseIdx = 0
+						}
+						mountCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+						if mErr := MountAdditionalCodeDisks(mountCtx, udsPath, opts.CodeDisks, baseIdx, 5*time.Second); mErr != nil {
+							gclog.Container.Warn("post-restore code-disk mount failed", "error", mErr)
+						}
+						cancel()
+					} else {
+						gclog.Container.Warn("post-restore code-disk mount skipped: no vsock uds path on restored VM")
 					}
 				}
 				gclog.Container.Info("restored", "duration", time.Since(t0).Round(time.Millisecond))
@@ -879,6 +900,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 				ConsoleIn:            opts.ConsoleIn,
 				ConsoleOut:           opts.ConsoleOut,
 				SharedFSRebinds:      buildSharedFSRebinds(opts.Mounts),
+				AdditionalDrives:     codeDisksAsDriveConfigs(opts.CodeDisks),
 			}, worker.VMMOptions{
 				JailerBinary: opts.JailerBinary,
 				VMMBinary:    opts.VMMBinary,
@@ -905,6 +927,26 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 				tap := opts.TapName
 				if tap == "" {
 					tap = handle.VMConfig().TapName
+				}
+				// Phase 2 of code-disk-attach (worker path): drive the
+				// in-guest mount via toolbox.Exec for each AdditionalDrive
+				// that the snapshot did not include. See runLocal for
+				// the same logic on the direct vmm path.
+				if len(opts.CodeDisks) > 0 {
+					udsPath := vsockUDSForCodeDiskMount(handle)
+					if udsPath != "" {
+						baseIdx := nonRootDriveCount(handle) - len(opts.CodeDisks)
+						if baseIdx < 0 {
+							baseIdx = 0
+						}
+						mountCtx, mCancel := context.WithTimeout(context.Background(), 10*time.Second)
+						if mErr := MountAdditionalCodeDisks(mountCtx, udsPath, opts.CodeDisks, baseIdx, 5*time.Second); mErr != nil {
+							gclog.Container.Warn("post-restore code-disk mount failed (worker path)", "error", mErr)
+						}
+						mCancel()
+					} else {
+						gclog.Container.Warn("post-restore code-disk mount skipped: no vsock uds path on restored VM")
+					}
 				}
 				return &RunResult{
 					VM:           handle,

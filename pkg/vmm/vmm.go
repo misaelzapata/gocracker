@@ -1112,6 +1112,16 @@ type RestoreOptions struct {
 	// SharedFS entry whose Target matches; empty list means "use the
 	// snapshot's own sources unchanged".
 	SharedFSRebinds []SharedFSRebind
+	// AdditionalDrives are virtio-blk drives that were NOT present when
+	// the snapshot was taken — they get appended to the restored
+	// Config.Drives before setupDevices runs. Use this to land a fresh
+	// per-launch code disk on top of a frozen template snapshot. The
+	// guest's init has already finished by the time the snapshot was
+	// taken, so the disks will appear as /dev/vd[N..] without an
+	// automatic mount; callers are expected to drive the mount via
+	// `toolbox.Exec(["mount", DEV, MOUNT, "-t", FS])` after Resume. See
+	// docs/design/code-disk-attach.md (Phase 2).
+	AdditionalDrives []DriveConfig
 }
 
 // SharedFSRebind rewrites the Source behind a virtio-fs export that was
@@ -1160,6 +1170,42 @@ func applySharedFSRebinds(snap *Snapshot, rebinds []SharedFSRebind) error {
 		// fresh virtiofsd against the new Source (direct path) or requires
 		// the worker to re-populate it (worker path).
 		snap.Config.SharedFS[i].SocketPath = ""
+	}
+	return nil
+}
+
+// applyAdditionalDrives appends per-launch drives onto the snapshot's
+// Config.Drives before setupDevices reads it. The drives in extras must
+// not be flagged Root, must have unique IDs not already present in the
+// snapshot, and must point at host paths the caller has already
+// validated (existence, permissions). MMIO slot allocation in
+// setupDevices runs sequentially from the existing slot count, so
+// these drives land just past whatever the snapshot already had.
+func applyAdditionalDrives(snap *Snapshot, extras []DriveConfig) error {
+	if snap == nil || len(extras) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	for _, d := range snap.Config.Drives {
+		if d.ID != "" {
+			seen[d.ID] = struct{}{}
+		}
+	}
+	for i, d := range extras {
+		if d.Root {
+			return fmt.Errorf("AdditionalDrives[%d]: cannot inject a root drive at restore", i)
+		}
+		if d.ID == "" {
+			return fmt.Errorf("AdditionalDrives[%d]: drive ID is required", i)
+		}
+		if d.Path == "" {
+			return fmt.Errorf("AdditionalDrives[%d]: drive path is required", i)
+		}
+		if _, dup := seen[d.ID]; dup {
+			return fmt.Errorf("AdditionalDrives[%d]: drive ID %q collides with snapshot", i, d.ID)
+		}
+		seen[d.ID] = struct{}{}
+		snap.Config.Drives = append(snap.Config.Drives, d)
 	}
 	return nil
 }
@@ -1247,6 +1293,9 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		return nil, err
 	}
 	if err := applySharedFSRebinds(&snap, opts.SharedFSRebinds); err != nil {
+		return nil, err
+	}
+	if err := applyAdditionalDrives(&snap, opts.AdditionalDrives); err != nil {
 		return nil, err
 	}
 	if opts.OverrideX86Boot != "" {

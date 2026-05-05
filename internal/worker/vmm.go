@@ -492,6 +492,11 @@ func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, re
 		// to the caller's socket (sandboxd's per-sandbox UDS).
 		// Empty = keep the snapshot's original path.
 		VsockUDSPath: opts.OverrideVsockUDSPath,
+		// Phase 2 of code-disk-attach: drives that were not present
+		// when the snapshot was taken. The vmm appends them to the
+		// snapshot's drive list before setupDevices runs; the host
+		// is responsible for invoking the in-guest mount post-resume.
+		AdditionalDrives: opts.AdditionalDrives,
 	})
 	if err != nil {
 		_ = cmd.Process.Kill()
