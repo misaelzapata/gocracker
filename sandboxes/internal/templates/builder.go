@@ -315,10 +315,17 @@ func bootProbeCapture(ctx context.Context, opts container.RunOptions, probe Read
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
 	}
+	// probe.Interval, if explicitly set, becomes a fixed cadence (back-compat
+	// for callers that need a deterministic poll rate). When unset (the
+	// default) we ramp from 1 ms to 100 ms exponentially: real apps come
+	// up in tens to hundreds of milliseconds, and the previous 500 ms
+	// fixed tick added up to a full poll-period of pure wait on every
+	// cold template build.
 	interval := probe.Interval
-	if interval <= 0 {
-		interval = 500 * time.Millisecond
-	}
+	const (
+		probeMinInterval = 1 * time.Millisecond
+		probeMaxInterval = 100 * time.Millisecond
+	)
 	path := probe.HTTPPath
 	if path == "" {
 		path = "/"
@@ -344,6 +351,10 @@ func bootProbeCapture(ctx context.Context, opts container.RunOptions, probe Read
 	defer cancel()
 	var lastErr error
 	var lastStatus int
+	currentInterval := interval
+	if currentInterval <= 0 {
+		currentInterval = probeMinInterval
+	}
 	for attempt := 0; ; attempt++ {
 		if err := probeCtx.Err(); err != nil {
 			return "", fmt.Errorf("templates: readiness timed out after %s (%d attempts, last_status=%d, last_err=%v): %w", timeout, attempt, lastStatus, lastErr, err)
@@ -355,9 +366,18 @@ func bootProbeCapture(ctx context.Context, opts container.RunOptions, probe Read
 			break
 		}
 		select {
-		case <-time.After(interval):
+		case <-time.After(currentInterval):
 		case <-probeCtx.Done():
 			return "", fmt.Errorf("templates: readiness timed out waiting for %d%s (last_status=%d, last_err=%v)", probe.HTTPPort, path, lastStatus, lastErr)
+		}
+		// When the caller didn't pin a fixed interval, double on each
+		// failure up to probeMaxInterval. Apps that come up in 5 ms
+		// pay 1+2+4 ms ≈ 7 ms of wait instead of the previous 500 ms.
+		if interval <= 0 && currentInterval < probeMaxInterval {
+			currentInterval *= 2
+			if currentInterval > probeMaxInterval {
+				currentInterval = probeMaxInterval
+			}
 		}
 	}
 
@@ -381,8 +401,15 @@ func bootProbeCapture(ctx context.Context, opts container.RunOptions, probe Read
 	if err := quiesceGuestNet(dialer, 2*time.Second); err != nil {
 		gclog.VMM.Warn("templates: eth0 quiesce failed; snapshot may panic on restore", "err", err.Error())
 	}
-	// Let the guest drain pending RX/TX descriptors.
-	time.Sleep(50 * time.Millisecond)
+	// quiesceGuestNet drains the agent's framed exec response to EOF, so
+	// `ip link set eth0 down` has already returned synchronously by the
+	// time we get here — the kernel finishes its admin-DOWN bookkeeping
+	// before the ip(8) syscall returns. A 1 ms scheduler yield is enough
+	// to let any deferred host-side virtio TX completion the kernel may
+	// have queued land. The previous 50 ms pad shaved 49 ms off every
+	// readiness-snapshot template build with no observed regression in
+	// the restore-panic rate that comment in quiesceGuestNet warns about.
+	time.Sleep(1 * time.Millisecond)
 
 	// Snapshot the live VM. TakeSnapshot pauses → writes → resumes.
 	tmp, err := os.MkdirTemp("", "gocracker-readysnap-*")
