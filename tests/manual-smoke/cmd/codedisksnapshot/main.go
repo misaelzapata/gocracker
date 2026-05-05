@@ -11,15 +11,28 @@
 // Override with GC_KERNEL=/path/to/vmlinux when the default isn't
 // where the binary expects it.
 //
-// KNOWN LIMITATION (as of M1): the toolbox agent's /exec endpoint
-// closes the connection before the EXIT frame on the FIRST request
-// after a snapshot restore. The Health probe works, so the vsock
-// channel is up, but exec is failing — this is a pre-existing
-// toolbox/restore interaction (not introduced by Phase 2's
-// AdditionalDrives plumbing). This smoke surfaces the issue and is
-// expected to fail until that bug is fixed in a separate change.
-// The plumbing itself is covered by the unit tests in
-// pkg/vmm/restore_drives_test.go and pkg/container/codedisk_mount_test.go.
+// KNOWN LIMITATION (architectural, not a fix-in-this-PR bug):
+// the guest kernel parses `virtio_mmio.device=` cmdline entries at
+// boot and registers each device once. AdditionalDrives appended at
+// restore time create new MMIO regions in the host VMM, but the
+// guest kernel never re-scans the bus, so /dev/vdN never appears
+// inside the guest. The mount script in MountAdditionalCodeDisks
+// then waits for the device, mount fails, and the toolbox conn drops
+// mid-stream ("agent closed conn before EXIT frame").
+//
+// To verify the toolbox path itself is fine post-restore (no plumbing
+// regression), see ./snaprestoreexec — that smoke does snapshot +
+// restore + exec with NO AdditionalDrives and succeeds on every
+// invocation. The plumbing for Phase 2 (drive merge into
+// snap.Config.Drives, IRQFd registration, post-restore mount RPC)
+// is covered by the unit tests in pkg/vmm/restore_drives_test.go and
+// pkg/container/codedisk_mount_test.go, all of which pass.
+//
+// Real fix needs either (a) virtio-pci with ACPI PCI hotplug or
+// (b) a sysfs/ioctl path the guest kernel can use to register a new
+// virtio-mmio platform device at runtime. Both are multi-day
+// changes tracked separately. This smoke is left in place as the
+// canonical reproducer for that work.
 package main
 
 import (

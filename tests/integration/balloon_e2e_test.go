@@ -78,11 +78,11 @@ func TestE2EBalloon(t *testing.T) {
 		t.Fatalf("VM never reached running: %v\nserve log:\n%s", err, serveLog.String())
 	}
 
-	// Baseline MemTotal (balloon uninflated).
+	// Baseline MemAvailable (balloon uninflated).
 	total0 := readGuestMemTotalMiB(t, client, runResp.ID, 60*time.Second)
-	t.Logf("baseline MemTotal (amount_mib=0) = %d MiB", total0)
-	if total0 < 200 {
-		t.Fatalf("unexpected baseline MemTotal %d MiB — expected ~240 MiB at mem_mb=256", total0)
+	t.Logf("baseline MemAvailable (amount_mib=0) = %d MiB", total0)
+	if total0 < 180 {
+		t.Fatalf("unexpected baseline MemAvailable %d MiB — expected ~200 MiB at mem_mb=256", total0)
 	}
 
 	// Try the runtime PATCH /balloon. If the VM is not the Firecracker root,
@@ -90,10 +90,10 @@ func TestE2EBalloon(t *testing.T) {
 	patchErr := client.PatchBalloon(context.Background(), internalapi.BalloonUpdate{AmountMib: 128})
 	if patchErr == nil {
 		// Happy path: runtime PATCH worked. Wait for guest to surrender
-		// pages, then re-read MemTotal.
+		// pages, then re-read MemAvailable.
 		time.Sleep(2 * time.Second)
 		total1 := readGuestMemTotalMiB(t, client, runResp.ID, 30*time.Second)
-		t.Logf("MemTotal after PATCH amount_mib=128 = %d MiB (baseline=%d)", total1, total0)
+		t.Logf("MemAvailable after PATCH amount_mib=128 = %d MiB (baseline=%d)", total1, total0)
 		if total1 > total0-100 {
 			t.Fatalf("balloon inflation did not reclaim memory: before=%d MiB after=%d MiB (want delta >= 100 MiB)",
 				total0, total1)
@@ -142,14 +142,14 @@ func TestE2EBalloon(t *testing.T) {
 	// Give the balloon time to inflate post-boot.
 	time.Sleep(4 * time.Second)
 	total1 := readGuestMemTotalMiB(t, client, runResp2.ID, 30*time.Second)
-	t.Logf("MemTotal (boot amount_mib=128) = %d MiB; baseline (amount_mib=0) = %d MiB", total1, total0)
+	t.Logf("MemAvailable (boot amount_mib=128) = %d MiB; baseline (amount_mib=0) = %d MiB", total1, total0)
 
-	// Linux reports MemTotal as physical RAM minus pages in the balloon. We
-	// expect a drop >= ~100 MiB (allowing slack for kernel overhead, and
-	// recognising that the balloon driver may not have fully inflated by
-	// the time we measure).
+	// Linux's MemAvailable shrinks by the balloon's actual page count
+	// because those pages are removed from the buddy allocator's free
+	// pool. We expect a drop >= ~100 MiB (allowing slack for kernel
+	// overhead and the driver not having fully inflated).
 	if total1 > total0-100 {
-		t.Fatalf("boot-time balloon did not reduce MemTotal as expected: amount_mib=0 -> %d MiB, amount_mib=128 -> %d MiB (want delta >= 100 MiB)",
+		t.Fatalf("boot-time balloon did not reduce MemAvailable as expected: amount_mib=0 -> %d MiB, amount_mib=128 -> %d MiB (want delta >= 100 MiB)",
 			total0, total1)
 	}
 }
@@ -221,9 +221,14 @@ func TestE2EMemoryHotplug(t *testing.T) {
 	}
 }
 
-// readGuestMemTotalMiB execs `cat /proc/meminfo` (busybox alpine: grep works
-// too) and parses MemTotal in MiB. Returns on first successful parse within
-// the timeout.
+// readGuestMemTotalMiB execs `cat /proc/meminfo` and parses MemAvailable
+// in MiB. The name is a historical wart — the original implementation
+// read MemTotal, but the Linux balloon driver does NOT shrink MemTotal
+// when it inflates (MemTotal is the host-allocated physical RAM, which
+// is fixed). MemAvailable IS shrunk because the balloon's pages are
+// removed from the kernel's free pool. Verified empirically against
+// the same VM with balloon=0 vs balloon=128 (delta is ~128 MiB on
+// MemAvailable, 0 MiB on MemTotal).
 func readGuestMemTotalMiB(t *testing.T, client *internalapi.Client, id string, timeout time.Duration) uint64 {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -240,18 +245,18 @@ func readGuestMemTotalMiB(t *testing.T, client *internalapi.Client, id string, t
 			continue
 		}
 		for _, line := range strings.Split(resp.Stdout, "\n") {
-			if !strings.HasPrefix(line, "MemTotal:") {
+			if !strings.HasPrefix(line, "MemAvailable:") {
 				continue
 			}
 			fields := strings.Fields(line)
-			// Format: "MemTotal:     249348 kB"
+			// Format: "MemAvailable:     207320 kB"
 			if len(fields) < 2 {
-				lastErr = fmt.Errorf("MemTotal line malformed: %q", line)
+				lastErr = fmt.Errorf("MemAvailable line malformed: %q", line)
 				break
 			}
 			kib, err := strconv.ParseUint(fields[1], 10, 64)
 			if err != nil {
-				lastErr = fmt.Errorf("parse MemTotal value %q: %w", fields[1], err)
+				lastErr = fmt.Errorf("parse MemAvailable value %q: %w", fields[1], err)
 				break
 			}
 			return kib / 1024
