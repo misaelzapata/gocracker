@@ -335,6 +335,14 @@ type VM struct {
 	pausedVCPUs map[int]struct{}
 	vcpuTIDs    map[int]int
 
+	// pauseCond signals state transitions to and from StatePaused. It
+	// rides on m.mu — vCPU goroutines waitIfPaused() on it, and Pause()
+	// / Resume() / Stop() / cleanup() call Broadcast under the lock.
+	// Broadcast-instead-of-poll is what makes resume sub-millisecond:
+	// the previous design used a 10 ms time.Sleep loop, which capped
+	// resume-to-running latency at ~5 ms p50 and ~10 ms p99.
+	pauseCond *sync.Cond
+
 	// restoring is set while setupDevices runs as part of snapshot restore.
 	// It lets per-device constructors take shortcuts that are only safe when
 	// the guest already negotiated virtio features (e.g. skipping the ~3ms
@@ -417,6 +425,7 @@ func New(cfg Config) (*VM, error) {
 		vcpuTIDs:    make(map[int]int),
 		memDirty:    virtio.NewDirtyTracker(uint64(len(kvmVM.Memory()))),
 	}
+	m.pauseCond = sync.NewCond(&m.mu)
 	m.events.Emit(EventCreated, fmt.Sprintf("VM %s created, %d MiB RAM", cfg.ID, cfg.MemMB))
 	if err := m.setupMemoryHotplug(); err != nil {
 		return nil, fmt.Errorf("setup memory hotplug: %w", err)
@@ -519,6 +528,11 @@ func (m *VM) Stop() {
 		for _, vcpu := range m.vcpus {
 			vcpu.RunData.ImmediateExit = 1
 		}
+		// Wake any vCPUs parked in waitIfPaused so they observe
+		// StateStopped and exit instead of waiting on the cond forever.
+		if m.pauseCond != nil {
+			m.pauseCond.Broadcast()
+		}
 		go m.kickVCPUs()
 		select {
 		case <-m.stopCh: // already closed
@@ -552,8 +566,22 @@ func (m *VM) WaitStopped(ctx context.Context) error {
 	}
 }
 
+// ensurePauseCondLocked lazy-initializes m.pauseCond. Construction-site
+// tests build &VM{} directly and never call New/RestoreFromSnapshot, so we
+// can't assume the cond is set. The caller must already hold m.mu.
+func (m *VM) ensurePauseCondLocked() *sync.Cond {
+	if m.pauseCond == nil {
+		m.pauseCond = sync.NewCond(&m.mu)
+	}
+	return m.pauseCond
+}
+
 // Pause stops vCPU execution at a consistent boundary so guest state can be captured.
 // Like Firecracker, snapshotting and migration build on top of this paused state.
+//
+// Pause and Resume are designed for sub-millisecond wake-up: vCPUs park on
+// m.pauseCond and Resume broadcasts. The previous polling implementation
+// added a flat 0–10 ms latency on each side from the time.Sleep tick.
 func (m *VM) Pause() error {
 	m.mu.Lock()
 	switch m.state {
@@ -568,6 +596,7 @@ func (m *VM) Pause() error {
 	}
 	m.state = StatePaused
 	clear(m.pausedVCPUs)
+	cond := m.ensurePauseCondLocked()
 	vcpuCount := len(m.vcpus)
 	for _, vcpu := range m.vcpus {
 		vcpu.RunData.ImmediateExit = 1
@@ -576,30 +605,44 @@ func (m *VM) Pause() error {
 
 	m.kickVCPUs()
 
-	deadline := time.Now().Add(defaultPauseTimeout)
-	for time.Now().Before(deadline) {
+	// Wait for every vCPU to land in waitIfPaused. Each vCPU broadcasts on
+	// the cond as it enters; this loop wakes whenever that happens. To
+	// enforce defaultPauseTimeout without a busy-poll, schedule a single
+	// timer that broadcasts the cond once when it fires — the wait below
+	// then re-evaluates the deadline and bails out cleanly.
+	timer := time.AfterFunc(defaultPauseTimeout, func() {
 		m.mu.Lock()
-		paused := len(m.pausedVCPUs)
-		stopped := m.state == StateStopped
+		cond.Broadcast()
 		m.mu.Unlock()
-		if stopped {
+	})
+	defer timer.Stop()
+	deadline := time.Now().Add(defaultPauseTimeout)
+
+	m.mu.Lock()
+	for {
+		if m.state == StateStopped {
+			m.mu.Unlock()
 			return fmt.Errorf("vm stopped while pausing")
 		}
-		if paused == vcpuCount {
+		if len(m.pausedVCPUs) >= vcpuCount {
+			listener := m.udsListener
+			m.mu.Unlock()
 			// Close any active UDS bridges so clients observe the pause as
 			// EOF and reconnect after Resume. The listener itself stays up,
 			// accepting new connections that will block on DialVsock until
 			// the guest resumes.
-			if m.udsListener != nil {
-				m.udsListener.closeAllBridges()
+			if listener != nil {
+				listener.closeAllBridges()
 			}
 			m.events.Emit(EventPaused, fmt.Sprintf("%d vCPU(s) paused", vcpuCount))
 			return nil
 		}
-		time.Sleep(10 * time.Millisecond)
+		if !time.Now().Before(deadline) {
+			break
+		}
+		cond.Wait()
 	}
-
-	m.mu.Lock()
+	// Timeout: roll back.
 	if m.state == StatePaused {
 		m.state = StateRunning
 	}
@@ -607,11 +650,15 @@ func (m *VM) Pause() error {
 	for _, vcpu := range m.vcpus {
 		vcpu.RunData.ImmediateExit = 0
 	}
+	cond.Broadcast()
 	m.mu.Unlock()
 	return fmt.Errorf("timeout waiting for %d vCPU(s) to pause", vcpuCount)
 }
 
-// Resume restarts a previously paused VM.
+// Resume restarts a previously paused VM. Wake-up is delivered through
+// m.pauseCond.Broadcast under the lock, so all parked vCPU goroutines
+// re-enter their KVM_RUN loop in goroutine-handoff time (≪1 ms) instead
+// of waiting up to 10 ms for a polling tick.
 func (m *VM) Resume() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -623,6 +670,7 @@ func (m *VM) Resume() error {
 	for _, vcpu := range m.vcpus {
 		vcpu.RunData.ImmediateExit = 0
 	}
+	m.ensurePauseCondLocked().Broadcast()
 	m.events.Emit(EventResumed, fmt.Sprintf("%d vCPU(s) resumed", len(m.vcpus)))
 	return nil
 }
@@ -1267,6 +1315,7 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		vcpuTIDs:    make(map[int]int),
 		memDirty:    virtio.NewDirtyTracker(uint64(len(kvmVM.Memory()))),
 	}
+	m.pauseCond = sync.NewCond(&m.mu)
 
 	// Seed the per-device restore shortcuts before setupDevices runs so
 	// NewBlockDeviceWithOptions can skip the FALLOC_FL_PUNCH_HOLE probe
@@ -2026,26 +2075,31 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 	}
 }
 
+// waitIfPaused parks the calling vCPU goroutine until the VM exits the
+// Paused state. It rides on m.pauseCond so wake-up after Resume is
+// effectively immediate (microseconds for the goroutine handoff) instead
+// of bounded by a 10 ms polling tick. Returns true when the VM has been
+// stopped and the caller should exit its run loop.
 func (m *VM) waitIfPaused(vcpuID int) bool {
-	for {
-		m.mu.Lock()
-		paused := m.state == StatePaused
-		stopped := m.state == StateStopped
-		if paused {
-			m.pausedVCPUs[vcpuID] = struct{}{}
-		} else {
-			delete(m.pausedVCPUs, vcpuID)
-		}
-		m.mu.Unlock()
-
-		if stopped {
-			return true
-		}
-		if !paused {
-			return false
-		}
-		time.Sleep(10 * time.Millisecond)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state != StatePaused {
+		// Fast path: not paused, nothing to wait for. Clear stale
+		// pausedVCPUs membership in case the caller raced with a
+		// previous Pause/Resume cycle.
+		delete(m.pausedVCPUs, vcpuID)
+		return m.state == StateStopped
 	}
+	cond := m.ensurePauseCondLocked()
+	m.pausedVCPUs[vcpuID] = struct{}{}
+	// Wake any Pause() waiter that's counting how many vCPUs have
+	// observed the pause.
+	cond.Broadcast()
+	for m.state == StatePaused {
+		cond.Wait()
+	}
+	delete(m.pausedVCPUs, vcpuID)
+	return m.state == StateStopped
 }
 
 func (m *VM) cleanup() {
