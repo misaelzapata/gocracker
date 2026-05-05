@@ -228,9 +228,34 @@ func waitFirstOutput(h vmm.Handle, startedAt time.Time, maxWait time.Duration) t
 const (
 	NetworkModeNone = ""
 	NetworkModeAuto = "auto"
-	JailerModeOn    = "on"
-	JailerModeOff   = "off"
+	// NetworkModeSlirp routes guest traffic through an in-process userspace
+	// network stack (see internal/slirp). It does not need CAP_NET_ADMIN,
+	// /dev/net/tun, or any iptables rules — at the cost of being slower than
+	// the kernel TAP path and currently shipping an MVP feature set
+	// (ARP + DHCPv4 + ICMP echo + DHCP server; TCP/UDP outbound NAT deferred,
+	// see docs/design/slirp-tcp-udp.md).
+	NetworkModeSlirp = "slirp"
+	JailerModeOn     = "on"
+	JailerModeOff    = "off"
 )
+
+// Slirp default addressing — kept here so callers (CLI, API) can stamp the
+// guest cmdline with deterministic IPs without importing internal/slirp.
+const (
+	SlirpGuestCIDR = "10.0.2.15/24"
+	SlirpGatewayIP = "10.0.2.2"
+	SlirpDNSIP     = "10.0.2.3"
+)
+
+// vmmNetMode maps the public NetworkMode constants to vmm.Config.NetMode.
+// NetworkModeAuto stays "" because it uses the TAP code path — TapName
+// already drives that branch in pkg/vmm.
+func vmmNetMode(mode string) string {
+	if mode == NetworkModeSlirp {
+		return "slirp"
+	}
+	return ""
+}
 
 func defaultCacheDir() string {
 	return filepath.Join(os.TempDir(), "gocracker", "cache")
@@ -301,6 +326,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	}
 	if err := hostguard.CheckHostDevices(hostguard.DeviceRequirements{
 		NeedKVM: true,
+		// Slirp is rootless and does not touch /dev/net/tun.
 		NeedTun: opts.TapName != "" || opts.NetworkMode == NetworkModeAuto,
 	}); err != nil {
 		return nil, fmt.Errorf("host device preflight: %w", err)
@@ -314,7 +340,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	}
 
 	var autoNet *hostnet.AutoNetwork
-	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto {
+	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto && opts.NetworkMode != NetworkModeSlirp {
 		return nil, fmt.Errorf("invalid network mode %q", opts.NetworkMode)
 	}
 	// network_mode=auto allocates a fresh tap + /30 + guest IP + gateway.
@@ -334,6 +360,19 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		opts.TapName = autoNet.TapName()
 		opts.StaticIP = autoNet.GuestCIDR()
 		opts.Gateway = autoNet.GatewayIP()
+	}
+	// network_mode=slirp routes through an in-process userspace stack with a
+	// deterministic addressing plan (see internal/slirp). The guest IP and
+	// gateway are stamped into the kernel cmdline so the guest comes up with
+	// a static route — DHCP from the slirp engine works too but stamping it
+	// removes the boot-time dependency on a working DHCP client in the guest
+	// initramfs.
+	if opts.NetworkMode == NetworkModeSlirp {
+		if opts.TapName != "" {
+			return nil, fmt.Errorf("--tap and --net slirp are mutually exclusive")
+		}
+		opts.StaticIP = SlirpGuestCIDR
+		opts.Gateway = SlirpGatewayIP
 	}
 
 	// Warm-cache lookup for --jailer off path (mirrors runViaWorker logic).
@@ -606,6 +645,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		DiskImage:       bootDiskPath,
 		Drives:          runtimeDrives(bootDiskPath, opts),
 		TapName:         opts.TapName,
+		NetMode:         vmmNetMode(opts.NetworkMode),
 		Metadata:        cloneStringMap(opts.Metadata),
 		SharedFS:        sharedFS.Exports,
 		Vsock:           buildVsockConfig(opts),
@@ -750,7 +790,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 	}
 
 	var autoNet *hostnet.AutoNetwork
-	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto {
+	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto && opts.NetworkMode != NetworkModeSlirp {
 		return nil, fmt.Errorf("invalid network mode %q", opts.NetworkMode)
 	}
 	// See runLocal: auto-allocation only fires on cold boot; restore keeps
@@ -765,6 +805,17 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		opts.TapName = autoNet.TapName()
 		opts.StaticIP = autoNet.GuestCIDR()
 		opts.Gateway = autoNet.GatewayIP()
+	}
+	// Slirp mode (rootless): no TAP allocation, deterministic guest IP plan.
+	// See runLocal for the rationale; same logic applies here.
+	if opts.NetworkMode == NetworkModeSlirp {
+		if opts.TapName != "" {
+			return nil, fmt.Errorf("--tap and --net slirp are mutually exclusive")
+		}
+		if opts.SnapshotDir == "" {
+			opts.StaticIP = SlirpGuestCIDR
+			opts.Gateway = SlirpGatewayIP
+		}
 	}
 
 	// Opportunistic warm-cache lookup. Active when GOCRACKER_WARM_CACHE=1 or
@@ -984,6 +1035,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		DiskImage:       bootDiskPath,
 		Drives:          runtimeDrives(bootDiskPath, opts),
 		TapName:         opts.TapName,
+		NetMode:         vmmNetMode(opts.NetworkMode),
 		Metadata:        cloneStringMap(opts.Metadata),
 		SharedFS:        sharedFS.Exports,
 		Vsock:           buildVsockConfig(opts),

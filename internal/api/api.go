@@ -1832,17 +1832,27 @@ func validateNetworkMode(mode, staticIP, gateway string) error {
 			return fmt.Errorf("network_mode=auto is exclusive with explicit static_ip/gateway")
 		}
 		return nil
+	case container.NetworkModeSlirp:
+		// Slirp uses a fixed addressing plan baked into the engine; the
+		// container layer stamps StaticIP/Gateway from container.SlirpGuestCIDR
+		// etc. so callers must not also pass their own.
+		if strings.TrimSpace(staticIP) != "" || strings.TrimSpace(gateway) != "" {
+			return fmt.Errorf("network_mode=slirp is exclusive with explicit static_ip/gateway")
+		}
+		return nil
 	default:
-		return fmt.Errorf("invalid network_mode %q (want \"\"|\"none\"|\"auto\")", mode)
+		return fmt.Errorf("invalid network_mode %q (want \"\"|\"none\"|\"auto\"|\"slirp\")", mode)
 	}
 }
 
 // normalizeNetworkMode folds "none" back to "" so downstream code only has to
-// distinguish "" (explicit/none) from "auto".
+// distinguish "" (explicit/none) from the active modes.
 func normalizeNetworkMode(mode string) string {
 	switch strings.TrimSpace(strings.ToLower(mode)) {
 	case container.NetworkModeAuto:
 		return container.NetworkModeAuto
+	case container.NetworkModeSlirp:
+		return container.NetworkModeSlirp
 	default:
 		return ""
 	}

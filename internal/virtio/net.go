@@ -44,7 +44,11 @@ type netConfig struct {
 	Status uint16
 }
 
-// NetDevice is a virtio-net device backed by a Linux TAP interface.
+// NetDevice is a virtio-net device. It speaks to the host through either a
+// kernel TAP fd (the historical default, used when only tapName is supplied)
+// or a generic NetBackend (e.g. an in-process slirp stack). The two paths
+// share rxPump/transmit dispatch; when backend != nil it takes precedence
+// over the TAP fd fields.
 type NetDevice struct {
 	*Transport
 	cfg     netConfig
@@ -62,6 +66,12 @@ type NetDevice struct {
 	// construction; rxPump polls on this directly so calling *os.File.Fd()
 	// from the poll path cannot re-enable blocking mode on us.
 	tapRawFd int
+
+	// backend, if set, replaces the TAP fd as the host-side carrier. The
+	// rxPump and transmit paths route through it instead of touching
+	// tapFd / tapRawFd. This is how --net slirp wires a userspace network
+	// stack into virtio-net without a kernel TAP.
+	backend NetBackend
 
 	// closed is set by Close before it closes tapFd, so the rxPump
 	// goroutine can observe shutdown and stop touching guest memory
@@ -90,6 +100,26 @@ func NewNetDevice(mem []byte, basePA uint64, irq uint8, mac net.HardwareAddr, ta
 	d.Transport = NewTransport(d, mem, basePA, irq, dirty, irqFn)
 
 	// Start receive pump: TAP -> guest virtqueue
+	d.rxWG.Add(1)
+	go func() {
+		defer d.rxWG.Done()
+		d.rxPump()
+	}()
+	return d, nil
+}
+
+// NewNetDeviceWithBackend creates a virtio-net device backed by an arbitrary
+// NetBackend (e.g. an in-process slirp stack). No TAP fd is opened; the
+// backend owns the host-side carrier and is closed by NetDevice.Close.
+func NewNetDeviceWithBackend(mem []byte, basePA uint64, irq uint8, mac net.HardwareAddr, backend NetBackend, dirty *DirtyTracker, irqFn func(bool)) (*NetDevice, error) {
+	if backend == nil {
+		return nil, fmt.Errorf("virtio-net: nil backend")
+	}
+	d := &NetDevice{tapRawFd: -1, backend: backend}
+	copy(d.cfg.MAC[:], mac)
+	d.cfg.Status = 0
+	d.Transport = NewTransport(d, mem, basePA, irq, dirty, irqFn)
+
 	d.rxWG.Add(1)
 	go func() {
 		defer d.rxWG.Done()
@@ -138,6 +168,18 @@ func (d *NetDevice) Close() error {
 	// a frame in hand — observes shutdown on its next iteration and stops
 	// touching guest memory before kvmVM.Close unmaps it.
 	d.closed.Store(true)
+	if d.backend != nil {
+		// Close the backend first so any blocking ReadFrame inside
+		// rxPump returns a shutdown error; then wait for rxPump to exit.
+		if err := d.backend.Close(); err != nil {
+			errs = append(errs, err.Error())
+		}
+		d.rxWG.Wait()
+		if len(errs) > 0 {
+			return fmt.Errorf("close net device: %s", strings.Join(errs, "; "))
+		}
+		return nil
+	}
 	if d.tapFd != nil {
 		if err := d.tapFd.Close(); err != nil && !strings.Contains(err.Error(), "file already closed") {
 			errs = append(errs, err.Error())
@@ -196,20 +238,24 @@ func (d *NetDevice) transmit(q *Queue) {
 		if d.rlTx != nil {
 			d.rlTx.Wait(uint64(len(pkt)), 1)
 		}
-		// Use the cached raw fd — calling (*os.File).Fd() here would
-		// re-enable blocking mode on the TAP fd (see openTAP) and let
-		// rxPump get stuck in a bare unix.Read that Close() cannot
-		// wake, reintroducing the shutdown race this PR fixed.
-		_ = writeTapFrame(d.tapRawFd, pkt)
+		if d.backend != nil {
+			_ = d.backend.WriteFrame(pkt)
+		} else {
+			// Use the cached raw fd — calling (*os.File).Fd() here would
+			// re-enable blocking mode on the TAP fd (see openTAP) and let
+			// rxPump get stuck in a bare unix.Read that Close() cannot
+			// wake, reintroducing the shutdown race this PR fixed.
+			_ = writeTapFrame(d.tapRawFd, pkt)
+		}
 		_ = q.PushUsed(uint32(head), 0)
 	}); err != nil {
 		gclog.VMM.Warn("virtio-net TX queue iteration failed", "error", err)
 	}
 }
 
-// rxPump reads packets from TAP and places them into the RX virtqueue.
-// Uses manual avail ring access instead of IterAvail to avoid holding
-// the lock across the blocking TAP read.
+// rxPump reads packets from the host-side carrier (TAP fd or NetBackend) and
+// places them into the RX virtqueue. Uses manual avail ring access instead of
+// IterAvail to avoid holding the lock across the blocking read.
 func (d *NetDevice) rxPump() {
 	rxQ := d.Transport.queues[0]
 	buf := make([]byte, 65536)
@@ -221,20 +267,34 @@ func (d *NetDevice) rxPump() {
 		if d.closed.Load() {
 			return
 		}
-		// Read-first path: the TAP fd is non-blocking (see openTAP) so
-		// unix.Read returns EAGAIN immediately when idle. On EAGAIN we
-		// poll with a 50 ms timeout — that doubles as our shutdown
-		// observation granularity since Linux close(2) on the TAP fd
-		// does not wake a blocked reader. Tests replace tapReadFrameFn
-		// with a mock on a pipe fd, so this path still works there: we
-		// skip the poll-on-timeout behaviour for the negative/mock fd.
-		n, err := tapReadFrameFn(fd, buf)
+		var (
+			n   int
+			err error
+		)
+		if d.backend != nil {
+			// Backend ReadFrame should return EAGAIN/EINTR on idle so
+			// we periodically observe d.closed without busy-spinning.
+			n, err = d.backend.ReadFrame(buf)
+		} else {
+			// Read-first path: the TAP fd is non-blocking (see openTAP) so
+			// unix.Read returns EAGAIN immediately when idle. On EAGAIN we
+			// poll with a 50 ms timeout — that doubles as our shutdown
+			// observation granularity since Linux close(2) on the TAP fd
+			// does not wake a blocked reader. Tests replace tapReadFrameFn
+			// with a mock on a pipe fd, so this path still works there: we
+			// skip the poll-on-timeout behaviour for the negative/mock fd.
+			n, err = tapReadFrameFn(fd, buf)
+		}
 		if err != nil {
 			if isTapShutdownError(err) || d.closed.Load() {
 				return
 			}
 			if isTapTransientReadError(err) {
-				if fd >= 0 {
+				if d.backend != nil {
+					if tapTransientRetryDelay > 0 {
+						time.Sleep(tapTransientRetryDelay)
+					}
+				} else if fd >= 0 {
 					pfds[0].Revents = 0
 					_, perr := unix.Poll(pfds[:], 50)
 					if perr != nil && perr != syscall.EINTR {

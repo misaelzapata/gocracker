@@ -43,7 +43,7 @@ type KeyInput struct {
 	MemMB          uint64
 	VCPUs          int
 	Arch           string // "amd64" | "arm64"
-	NetworkMode    string // "" (none) | "auto" — affects virtio-net presence in snapshot
+	NetworkMode    string // "" (none) | "auto" | "slirp" — affects virtio-net presence/backend in snapshot
 	ToolboxVersion string // internal/toolbox/spec.Version baked into the disk
 }
 

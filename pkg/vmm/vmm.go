@@ -32,6 +32,7 @@ import (
 	"github.com/gocracker/gocracker/internal/mptable"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
 	"github.com/gocracker/gocracker/internal/seccomp"
+	"github.com/gocracker/gocracker/internal/slirp"
 	"github.com/gocracker/gocracker/internal/uart"
 	"github.com/gocracker/gocracker/internal/virtio"
 	"github.com/gocracker/gocracker/internal/vsock"
@@ -153,6 +154,12 @@ type Config struct {
 	DiskRO         bool
 	Drives         []DriveConfig `json:"drives,omitempty"`
 	TapName        string
+	// NetMode selects the host-side virtio-net carrier:
+	//   ""       — TAP if TapName set, otherwise no NIC (back-compat)
+	//   "tap"    — TAP backend; TapName must be set
+	//   "slirp"  — userspace slirp stack; no TapName, runs rootless
+	// See internal/slirp for the slirp engine.
+	NetMode        string `json:"net_mode,omitempty"`
 	MACAddr        net.HardwareAddr
 	Metadata       map[string]string  `json:"metadata,omitempty"`
 	NetRateLimiter *RateLimiterConfig `json:"net_rate_limiter,omitempty"`
@@ -1770,11 +1777,15 @@ func (m *VM) setupDevices() error {
 		slot++
 	}
 
-	// virtio-net
-	if m.cfg.TapName != "" {
+	// virtio-net — TAP (default) or slirp (rootless userspace stack).
+	if m.cfg.TapName != "" || m.cfg.NetMode == "slirp" {
+		seedName := m.cfg.TapName
+		if seedName == "" {
+			seedName = "slirp"
+		}
 		mac := m.cfg.MACAddr
 		if mac == nil {
-			mac = defaultGuestMAC(m.cfg.ID, m.cfg.TapName)
+			mac = defaultGuestMAC(m.cfg.ID, seedName)
 		}
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
@@ -1782,7 +1793,13 @@ func (m *VM) setupDevices() error {
 		if err != nil {
 			return fmt.Errorf("virtio-net irqfd: %w", err)
 		}
-		nd, err := virtio.NewNetDevice(mem, base, irq, mac, m.cfg.TapName, m.memDirty, irqFn)
+		var nd *virtio.NetDevice
+		if m.cfg.NetMode == "slirp" {
+			backend := slirp.New()
+			nd, err = virtio.NewNetDeviceWithBackend(mem, base, irq, mac, backend, m.memDirty, irqFn)
+		} else {
+			nd, err = virtio.NewNetDevice(mem, base, irq, mac, m.cfg.TapName, m.memDirty, irqFn)
+		}
 		if err != nil {
 			return fmt.Errorf("virtio-net: %w", err)
 		}

@@ -157,7 +157,7 @@ func cmdRun(args []string) {
 	hotplugSlotMiB := fs.Uint64("hotplug-slot-mib", 0, "Hotpluggable memory slot size in MiB")
 	hotplugBlockMiB := fs.Uint64("hotplug-block-mib", 0, "Hotpluggable memory block size in MiB")
 	x86Boot := fs.String("x86-boot", string(vmm.X86BootAuto), "x86 boot mode: auto, acpi, or legacy")
-	netMode := fs.String("net", "none", "network mode: none or auto")
+	netMode := fs.String("net", "none", "network mode: none, auto (TAP+NAT, needs CAP_NET_ADMIN), or slirp (rootless userspace stack, MVP: ARP+DHCP+ICMP echo only — TCP/UDP outbound deferred)")
 	tap := fs.String("tap", "", "TAP interface (e.g. tap0)")
 	disk := fs.Int("disk", 2048, "Disk size MiB")
 	snap := fs.String("snapshot", "", "Restore from snapshot dir")
@@ -285,7 +285,7 @@ func cmdRepo(args []string) {
 	hotplugSlotMiB := fs.Uint64("hotplug-slot-mib", 0, "Hotpluggable memory slot size in MiB")
 	hotplugBlockMiB := fs.Uint64("hotplug-block-mib", 0, "Hotpluggable memory block size in MiB")
 	x86Boot := fs.String("x86-boot", string(vmm.X86BootAuto), "x86 boot mode: auto, acpi, or legacy")
-	netMode := fs.String("net", "none", "network mode: none or auto")
+	netMode := fs.String("net", "none", "network mode: none, auto (TAP+NAT, needs CAP_NET_ADMIN), or slirp (rootless userspace stack, MVP: ARP+DHCP+ICMP echo only — TCP/UDP outbound deferred)")
 	tap := fs.String("tap", "", "TAP interface")
 	disk := fs.Int("disk", 2048, "Disk size MiB")
 	snap := fs.String("snapshot", "", "Restore from snapshot dir")
@@ -1376,8 +1376,10 @@ func normalizeNetworkMode(raw string) string {
 		return ""
 	case container.NetworkModeAuto:
 		return container.NetworkModeAuto
+	case container.NetworkModeSlirp:
+		return container.NetworkModeSlirp
 	default:
-		fatal("invalid --net: " + raw + " (want none or auto)")
+		fatal("invalid --net: " + raw + " (want none, auto, or slirp)")
 		return ""
 	}
 }

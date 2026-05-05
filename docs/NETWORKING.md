@@ -1,7 +1,8 @@
 # Networking
 
-gocracker provides three networking modes for guest VMs: no network, automatic
-NAT, and manual TAP. Compose stacks use a fourth mode with bridged namespaces.
+gocracker provides four networking modes for guest VMs: no network, automatic
+NAT, manual TAP, and rootless slirp. Compose stacks use a fifth mode with
+bridged namespaces.
 
 ## Overview
 
@@ -9,8 +10,38 @@ NAT, and manual TAP. Compose stacks use a fourth mode with bridged namespaces.
 |------|------|----------|
 | None (default) | `--net none` | Isolated workloads, no network needed |
 | Automatic NAT | `--net auto` | Single VMs that need internet access |
+| Slirp (rootless) | `--net slirp` | No `CAP_NET_ADMIN`, ARP+DHCP+ICMP today; TCP/UDP outbound coming |
 | Manual TAP | `--tap tap0` | Full control, custom topologies |
 | Compose bridge | (automatic) | Multi-VM stacks with service DNS |
+
+## Rootless Slirp (`--net slirp`)
+
+`--net slirp` routes guest traffic through an in-process userspace network
+stack — no `/dev/net/tun`, no `CAP_NET_ADMIN`, no iptables rules. The guest
+gets a deterministic addressing plan (same as QEMU's `-netdev user`):
+
+| | |
+| --- | --- |
+| Guest IP | `10.0.2.15/24` |
+| Gateway | `10.0.2.2` |
+| DNS | `10.0.2.3` |
+
+```bash
+./gocracker run \
+  --image alpine:3.20 \
+  --kernel ./kernel \
+  --net slirp \
+  --wait
+```
+
+**MVP scope (this release):** ARP, DHCPv4, ICMP echo to the gateway. The
+guest can boot, configure its NIC, and ping `10.0.2.2`. Outbound TCP/UDP
+NAT is the next chunk — see [`design/slirp-tcp-udp.md`](design/slirp-tcp-udp.md)
+for the plan. Until that lands, slirp guests do not have outbound internet.
+
+The slirp engine lives at [`internal/slirp/`](../internal/slirp/) and plugs
+into virtio-net through the `NetBackend` interface — the same surface a
+future Windows/WHP or macOS/HVF backend would use.
 
 ## Automatic Networking (`--net auto`)
 
