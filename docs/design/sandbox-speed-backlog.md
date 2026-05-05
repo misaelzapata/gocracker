@@ -17,6 +17,8 @@ listed for context; the rest are deferred work, ordered by ROI.
 | `ReconcileInterval` default 500 → 50 ms | [sandboxes/internal/pool/pool.go](../../sandboxes/internal/pool/pool.go) | Burst-empty refill convergence |
 | `socketWaitStep` 25 → 1 ms | [internal/worker/vmm.go](../../internal/worker/vmm.go) | Worker-startup polling fallback |
 | Async lease-timing log | [sandboxes/internal/pool/pool.go](../../sandboxes/internal/pool/pool.go) | Off the request goroutine; helps p99 jitter |
+| **C4 — devtmpfs retry inside post-restore mount** | [pkg/container/codedisk_mount.go](../../pkg/container/codedisk_mount.go) | 50 ms backoff up to 1 s for `/dev/vd[N]` to land — covers the kernel-publish race after Phase 2 restore-with-attach |
+| **C5 — warm code-disk cache by content hash** | [pkg/container/codedisk_cache.go](../../pkg/container/codedisk_cache.go) | Content-addressed ext4-image cache; key = SHA-256 of dir contents + fs + ro flag; tmp+rename atomic Store; zero-byte sentinel rejection |
 
 ## Deferred — high ROI, medium effort
 

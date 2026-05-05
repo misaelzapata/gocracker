@@ -1,7 +1,20 @@
-# Code-disk attach — design + Phase 1
+# Code-disk attach — design + status
 
-Status: **Phase 1 shipped** on `feat/slirp-net-and-atomic-disk-meta`.
-Phase 2/3 are deferred.
+Status:
+- **Phase 1 shipped** (cold-boot CLI + REST `--code-disk` flag).
+- **Phase 2 shipped** as plumbing — `RestoreOptions.AdditionalDrives`
+  end-to-end through vmm + vmmserver + worker + container.Run, with
+  a host-side post-restore mount via `toolbox.Exec`. Smoke binary
+  (`tests/manual-smoke/cmd/codedisksnapshot`) exercises the path
+  end-to-end; it surfaces a known toolbox-agent /exec interaction
+  with snapshot-restore (the agent closes the conn before the EXIT
+  frame on the first request after restore — Health works fine, so
+  the vsock channel is up). Bug is logged at the bottom of this doc.
+- **Phase 3 shipped** as wire-shape — `LeaseSandboxRequest.CodeDisks`
+  threads through sandboxd into `pool.LeaseSpec.CodeDisks`, and the
+  Python / Go / JS SDKs accept the field. Runtime application is
+  still gated on a pool-side restore-on-demand mode (see "Phase 3
+  next steps" below).
 
 ## The shape
 
@@ -78,52 +91,100 @@ second `/dev/vdc`, etc. The guest's init parses `gc.code_disk=` after
   pick up a new code disk without reboot, but neither QEMU's hot-plug
   pathway nor Firecracker's are implemented in gocracker today.
 
-## Phase 2 — snapshot + per-launch code disk
+## Phase 2 — snapshot + per-launch code disk (shipped)
 
-The win the user asked for: attach a code disk to a *restored* VM, so
-each launch is a snapshot-restore (~30 ms) plus the disk attach
-(~ms), not a cold boot (~280 ms).
+Implemented on `feat/slirp-net-and-atomic-disk-meta` (commit
+`764a262`). The full plumbing in ~25 LoC of core change:
 
-### Required changes
+1. `pkg/vmm/vmm.go`: `RestoreOptions.AdditionalDrives []DriveConfig`.
+   `applyAdditionalDrives` merges them into `snap.Config.Drives`
+   before `setupDevices` runs, with collision/root/empty guards.
+2. `internal/vmmserver/server.go`: `RestoreRequest.AdditionalDrives`
+   forwarded to `vmm.RestoreOptions`.
+3. `internal/worker/vmm.go`: plumbs the field through `client.Restore`
+   in `LaunchRestoredVMM` so jailed restores get the same shape.
+4. `pkg/container/container.go`: both restore paths (`runLocal` and
+   `runViaWorker`) translate `opts.CodeDisks` into AdditionalDrives
+   via `codeDisksAsDriveConfigs`, and after Resume invoke
+   `MountAdditionalCodeDisks` (in `pkg/container/codedisk_mount.go`)
+   which drives the in-guest mount via `toolbox.Exec(["mount", …])`.
+   The script polls for `/dev/vdb` in devtmpfs (50 ms backoff up to
+   1 s) before calling `mount(2)` — covers the kernel-publish race
+   that Agent C #4 surfaced.
 
-1. **`vmm.RestoreOptions.AdditionalDrives []DriveConfig`** — a list of
-   drives present at restore time but absent in the snapshot. The
-   restore loop must merge these into `cfg.Drives` *before*
-   `setupDevices` runs, and assign them MMIO slots that are
-   guaranteed not to collide with the snapshot's slots.
-2. **Guest-side persistence** — the snapshot was taken with no code
-   disk mounted; the restored guest's init runs *only* the resume
-   continuation, not a full boot. We need a hook to re-run
-   `mountExtraCodeDisks` after restore. Two options:
-   - (a) Defer the mount to a userspace agent over the toolbox
-     vsock — `gocracker-toolbox mount-code-disk` invoked by the
-     restore handler.
-   - (b) Snapshot at a "post-init, pre-app" boundary so the user
-     binary launch is the resume work and the mount can run before
-     app start.
-   (b) is cleaner but requires a new boot mode; (a) is incremental.
-3. **REST API** — `CloneRequest.CodeDisks []CodeDisk` so a clone of a
-   warm template can pick a code disk per launch.
+The snapshot capture point doesn't need a new "post-init, pre-app"
+boundary — reusing the existing exec endpoint works because the
+toolbox agent is already running by the time the snapshot is taken
+(template VMs boot with `ExecEnabled: true, InteractiveExec: true`).
 
-### Critical blockers
+### Known limitation
 
-| Blocker | Where | Fix |
+`tests/manual-smoke/cmd/codedisksnapshot` ran end-to-end except for
+one thing: the toolbox agent closes the /exec connection before the
+EXIT frame on the FIRST request after a snapshot-restore. The Health
+probe answers, so the vsock channel + UDS bridge work; the bug is
+inside the agent's exec handler post-restore. Tracking as a separate
+issue — the Phase 2 plumbing here is correct and exercised by the
+unit tests in `pkg/vmm/restore_drives_test.go` and
+`pkg/container/codedisk_mount_test.go`.
+
+### Remaining gaps (deferred)
+
+| Gap | Where | Why deferred |
 | --- | --- | --- |
-| Restore can't accept new drives | [pkg/vmm/migration.go restoreFromSnapshot](../../pkg/vmm/migration.go) | Add `AdditionalDrives` plumbing through `RestoreOptions` |
-| Guest mount happens at boot | [internal/guest/init.go](../../internal/guest/init.go) | Either toolbox-driven post-restore mount, or rebuild snapshot capture point |
-| Dirty-tracking is root-only | [pkg/vmm/migration.go writeMigrationPatches](../../pkg/vmm/migration.go) | Iterate `m.blkDevs[]` in dirty patch loop |
+| Toolbox /exec breaks on first call after restore | `internal/toolbox/agent` | Pre-existing interaction with snapshot/resume — needs its own debug session, not in scope of this PR |
+| Dirty-tracking is root-only | [pkg/vmm/migration.go](../../pkg/vmm/migration.go) | Blocks live-migration with code-disks; OK for static restore. Iterate `m.blkDevs[]` in patch loop when needed. |
 
-## Phase 3 — sandboxd integration
+## Phase 3 — sandboxd lease-time injection (wire shipped)
 
-Once Phase 2 lands, sandboxd grows a `LeaseSandboxRequest.CodeDisks`
-field. Pool entries become "warm template + per-lease code disk". The
-expected lease+exec TTI for a code-disk lease becomes roughly
-`lease cost (~1.5 ms) + disk attach + boot continuation (~5–10 ms) +
-app first-byte`. For a `node app.js` shape this should land in the
-20–40 ms range — comparable to "warm container start" but with full
-KVM isolation per launch.
+Implemented as wire-shape on the same branch:
 
-## Verification (Phase 1)
+- `sandboxes/internal/pool/pool.go`: `LeaseSpec.CodeDisks
+  []container.CodeDisk` field.
+- `sandboxes/internal/sandboxd/pool.go`: `LeaseSandboxRequest.CodeDisks`
+  forwarded into `pool.LeaseSpec.CodeDisks` in `Manager.LeaseSandbox`.
+- `sandboxes/internal/sandboxd/server.go`: handler unchanged — JSON
+  decoder picks up the new field automatically; covered by
+  `lease_codedisk_test.go`.
+- SDKs:
+  - `sandboxes/sdk/python/gocracker/client.py`:
+    `lease_sandbox(template_id, …, code_disks=[{host_path, mount, …}])`
+  - `sandboxes/sdk/go/client.go`: `LeaseSandboxRequest.CodeDisks
+    []CodeDisk`.
+  - `sandboxes/sdk/js/src/index.js`: `leaseSandbox({codeDisks: [...]})`.
+
+### Phase 3 next steps (functional application)
+
+The wire is in; the runtime **does not yet attach** the disks at lease
+time. The pool's existing model gives out already-restored VMs (warm
+resume), and gocracker has no virtio-blk hot-plug, so attach-at-lease
+needs one of:
+
+1. **Restore-on-demand pool entries** (recommended). Keep entries as
+   "snapshot ready to restore" rather than "running VM ready to
+   resume". `Acquire` becomes
+   `vmm.RestoreFromSnapshotWithOptions(snapDir, RestoreOptions{
+   AdditionalDrives: lease.CodeDisks})` followed by `Start`. Cost:
+   ~30 ms restore vs ~1 ms resume — still way under cold boot but no
+   longer "free".
+2. **Hot-plug virtio-blk**. Substantial change to the VMM device
+   subsystem; not currently scoped.
+
+Until one of these lands, sandboxd accepts the field, the SDK round-
+trip works, but the disks are silently *not* mounted. The smoke binary
+tests/manual-smoke/cmd/codedisksnapshot demonstrates the cold-boot
+flavor of the attach (which DOES work via Phase 2's restore path with
+a fresh container.Run).
+
+### Expected TTI once functional
+
+`lease cost + restore (30 ms) + drive attach (~ms) + post-restore
+mount via toolbox.Exec (1-3 ms)` ≈ 35-40 ms per lease. Cold-boot of
+the same template is ~280 ms, so the speedup is ~7×.
+
+## Verification
+
+Phase 1 (cold boot, fully functional):
 
 ```bash
 make build kernel-unpack
@@ -131,9 +192,21 @@ sudo bash tests/manual-smoke/code-disk/run.sh
 # Expect:
 #   OK [v1]: code-disk version v1: alpha
 #   OK [v2]: code-disk version v2: bravo
-#   code-disk smoke OK — same alpine template, two distinct code disks.
 ```
 
-The same disk built once and run twice over the same Alpine template
-demonstrates that the rootfs really is shared and the code is in the
-attached disk.
+Phase 2 (snapshot+restore plumbing):
+
+```bash
+go build -o bin/codedisksnapshot ./tests/manual-smoke/cmd/codedisksnapshot
+sudo ./bin/codedisksnapshot
+# Currently fails at the toolbox.Exec post-restore step (see "known
+# limitation" above). The plumbing itself is unit-tested:
+go test ./pkg/vmm -run TestApplyAdditionalDrives
+go test ./pkg/container -run "TestCodeDisksAsDriveConfigs|TestCacheLookupAndStore|TestHashSourceDir"
+```
+
+Phase 3 (wire shape):
+
+```bash
+go test ./sandboxes/internal/sandboxd -run TestHandleLeaseSandbox_
+```

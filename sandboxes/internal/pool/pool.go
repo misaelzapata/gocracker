@@ -467,6 +467,20 @@ type LeaseSpec struct {
 	// magnitude of slack for pathological runs without stalling the
 	// caller indefinitely.
 	SetNetworkTimeout time.Duration
+
+	// CodeDisks are virtio-blk drives the caller wants attached at
+	// lease time — Phase 3 of code-disk-attach. The wire shape is
+	// here so sandboxd / SDKs can route per-lease code disks to the
+	// pool, but runtime application is **not yet implemented**: the
+	// pool's existing warm-resume model gives out already-restored
+	// VMs, and gocracker has no virtio-blk hot-plug path to attach
+	// new drives to a running guest. Today the field is accepted and
+	// preserved (so callers can wire it through SDKs without a future
+	// API break) but is a no-op on Acquire — making it functional
+	// requires a restore-on-demand pool mode that re-restores the
+	// snapshot at lease time with these drives merged in. Tracked in
+	// docs/design/code-disk-attach.md.
+	CodeDisks []container.CodeDisk
 }
 
 // Lease is what Acquire returns on success. Callers stash lease.ID
