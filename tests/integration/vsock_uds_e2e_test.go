@@ -118,10 +118,28 @@ func TestE2EUDS_DialAndExchange(t *testing.T) {
 		t.Fatalf("stop vm: %v", err)
 	}
 
-	// Socket file should be removed by cleanup().
-	if _, err := os.Stat(udsPath); !os.IsNotExist(err) {
-		t.Fatalf("uds socket file not removed after stop: stat err=%v", err)
+	// StopVM is async on the server side: handleStopVM kicks off
+	// vm.Stop() then returns 204 immediately while a goroutine waits
+	// for WaitStopped and the cleanup that unlinks udsPath. Poll up
+	// to 5 s for the file to disappear instead of stat-ing once and
+	// failing on a 1 ms race.
+	if !waitForFileGone(udsPath, 5*time.Second) {
+		t.Fatalf("uds socket file not removed after stop within 5s: %s", udsPath)
 	}
+}
+
+// waitForFileGone polls until path is gone (os.IsNotExist) or the
+// timeout expires. Returns true if the file was removed in time.
+func waitForFileGone(path string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	_, err := os.Stat(path)
+	return os.IsNotExist(err)
 }
 
 // TestE2EUDS_MultipleClients boots one VM with a UDS and the in-guest

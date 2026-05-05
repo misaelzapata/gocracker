@@ -499,6 +499,17 @@ func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, re
 			VsockPort: info.ExecVsockPort,
 		}
 	}
+	// VMInfo doesn't echo the vsock UDS path back, but we know what we
+	// asked for via the override. Populate Vsock so vsockUDSPathForInfo
+	// in the API layer sees the same cfg shape as a cold-boot run.
+	// "-" is the sentinel for "clear the snapshot's path"; leave Vsock
+	// nil in that case.
+	if opts.OverrideVsockUDSPath != "" && opts.OverrideVsockUDSPath != "-" {
+		restoredCfg.Vsock = &vmm.VsockConfig{
+			Enabled: true,
+			UDSPath: opts.OverrideVsockUDSPath,
+		}
+	}
 	rvm := &remoteVM{
 		client:   client,
 		cfg:      restoredCfg,
