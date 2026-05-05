@@ -173,6 +173,8 @@ func cmdRun(args []string) {
 	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs read-write directly (writes survive VM stop; slower boot). Default: Docker-style tmpfs overlay.")
 	warm := fs.Bool("warm", false, "Auto snapshot-cache: restore from snapshot on cache hit (~3 ms); snapshot after cold boot on miss so next run is fast.")
 	vsockUDSPath := fs.String("vsock-uds-path", "", "Absolute path for the VM's Firecracker-style vsock UDS. Clients dial it and send \"CONNECT <port>\\n\" to reach a guest vsock port. Empty = no UDS (HTTP /vms/{id}/vsock/connect still works).")
+	codeDisks := multiStringFlag{}
+	fs.Var(&codeDisks, "code-disk", "Attach an ext4 disk image and mount it inside the guest. Format: HOST_PATH:GUEST_MOUNT[:FS[:ro]] (FS defaults to ext4). Repeatable; appended after --drive entries as /dev/vdb, /dev/vdc, … See docs/design/code-disk-attach.md.")
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
@@ -182,6 +184,7 @@ func cmdRun(args []string) {
 	if *image == "" && *df == "" {
 		fatal("--image or --dockerfile required")
 	}
+	parsedCodeDisks := mustParseCodeDisks(codeDisks.Values())
 
 	interactive := mustInteractiveMode(*ttyMode, *wait)
 	consoleIn := io.Reader(nil)
@@ -212,6 +215,7 @@ func cmdRun(args []string) {
 		RootfsPersistent: *rootfsPersistent,
 		WarmCapture:     *warm,
 		VsockUDSPath:    *vsockUDSPath,
+		CodeDisks:       parsedCodeDisks,
 	}
 	if *balloonTargetMiB > 0 || *balloonDeflateOnOOM || *balloonStatsIntervalS > 0 || strings.TrimSpace(*balloonAuto) != "" {
 		runOpts.Balloon = &vmm.BalloonConfig{
@@ -1382,6 +1386,55 @@ func normalizeNetworkMode(raw string) string {
 		fatal("invalid --net: " + raw + " (want none, auto, or slirp)")
 		return ""
 	}
+}
+
+// mustParseCodeDisks turns the --code-disk flag values
+// (HOST_PATH:GUEST_MOUNT[:FS[:ro]]) into container.CodeDisk entries.
+// Fatal on malformed input — callers expect either a usable slice or a
+// hard failure before VM setup begins.
+func mustParseCodeDisks(values []string) []container.CodeDisk {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]container.CodeDisk, 0, len(values))
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		parts := strings.Split(v, ":")
+		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+			fatal("invalid --code-disk " + v + " (want HOST_PATH:GUEST_MOUNT[:FS[:ro]])")
+		}
+		host := parts[0]
+		mount := parts[1]
+		if !filepath.IsAbs(mount) {
+			fatal("invalid --code-disk mount " + mount + " (must be absolute)")
+		}
+		fs := "ext4"
+		if len(parts) >= 3 && parts[2] != "" {
+			fs = parts[2]
+		}
+		ro := false
+		if len(parts) >= 4 {
+			switch strings.ToLower(parts[3]) {
+			case "ro":
+				ro = true
+			case "", "rw":
+				ro = false
+			default:
+				fatal("invalid --code-disk mode " + parts[3] + " (want ro or rw)")
+			}
+		}
+		host = resolveRequiredExistingPath("code-disk", host)
+		out = append(out, container.CodeDisk{
+			HostPath: host,
+			Mount:    mount,
+			FSType:   fs,
+			ReadOnly: ro,
+		})
+	}
+	return out
 }
 
 type multiStringFlag []string

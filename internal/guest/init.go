@@ -125,6 +125,10 @@ func main() {
 
 	materializeRunDirsFromTmpfiles()
 	klogf("process exec=%q args=%q workdir=%q user=%q", spec.Process.Exec, spec.Process.Args, spec.WorkDir, spec.User)
+	// gc.code_disk=DEVICE:MOUNT[:FS[:RO|RW]] mounts user-attached
+	// virtio-blk drives (the "template + per-launch code disk" shape).
+	// Runs after switch_root so target paths are inside the new rootfs.
+	mountExtraCodeDisks(cmdline)
 	mountSharedFilesystems(spec.SharedFS)
 	klogf("shared filesystem mounts completed count=%d", len(spec.SharedFS))
 
@@ -1762,6 +1766,58 @@ func switchRoot(newRoot string) error {
 	}
 	klogf("switch_root completed into %q", newRoot)
 	return nil
+}
+
+// mountExtraCodeDisks mounts non-root virtio-blk devices declared via the
+// kernel cmdline. The convention is:
+//
+//	gc.code_disk=DEVICE:MOUNTPOINT[:FSTYPE[:RO|RW]]
+//
+// Multiple disks are comma-separated:
+//
+//	gc.code_disk=/dev/vdb:/app:ext4,/dev/vdc:/data:ext4:ro
+//
+// The FSTYPE defaults to ext4; the access mode defaults to rw. This is the
+// host-side hook for the "template + per-launch code disk" shape: build the
+// image's rootfs once as the boot disk, attach a freshly minted ext4 image
+// containing just the user's code as a second drive, and let the guest pick
+// it up here. Failures are logged but non-fatal — the VM still boots even
+// if a code disk is mis-specified, so the operator can debug from a shell.
+func mountExtraCodeDisks(cmdline map[string]string) {
+	raw := strings.TrimSpace(cmdline["gc.code_disk"])
+	if raw == "" {
+		return
+	}
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.Split(entry, ":")
+		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+			klogf("gc.code_disk: malformed entry %q (want DEVICE:MOUNT[:FS[:RO|RW]])", entry)
+			continue
+		}
+		device, target := parts[0], parts[1]
+		fstype := "ext4"
+		if len(parts) >= 3 && parts[2] != "" {
+			fstype = parts[2]
+		}
+		flags := uintptr(0)
+		if len(parts) >= 4 && strings.EqualFold(parts[3], "ro") {
+			flags |= syscall.MS_RDONLY
+		}
+		if err := os.MkdirAll(target, 0755); err != nil {
+			klogf("gc.code_disk: mkdir target %q failed: %v", target, err)
+			continue
+		}
+		if err := syscall.Mount(device, target, fstype, flags, ""); err != nil {
+			klogf("gc.code_disk: mount %q on %q (%s) failed: %v", device, target, fstype, err)
+			fmt.Fprintf(os.Stderr, "[init] mount code-disk %s on %s: %v\n", device, target, err)
+			continue
+		}
+		klogf("gc.code_disk: mounted %q on %q (%s, ro=%t)", device, target, fstype, flags&syscall.MS_RDONLY != 0)
+	}
 }
 
 func mountSharedFilesystems(mounts []runtimecfg.SharedFSMount) {

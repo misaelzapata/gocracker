@@ -23,8 +23,14 @@ import (
 )
 
 const (
-	pollInterval   = 250 * time.Millisecond
-	socketWaitStep = 25 * time.Millisecond
+	pollInterval = 250 * time.Millisecond
+	// socketWaitStep is the polling cadence in waitForSocketPoll, which
+	// only fires when the inotify primary path falls through (e.g. on
+	// kernels without inotify or in tests). At 25 ms we paid up to a
+	// full tick of pure wait per cold-boot worker startup; 1 ms keeps
+	// the fallback responsive without spinning the CPU — the loop also
+	// blocks on a 100 ms net.DialTimeout so the actual rate is bounded.
+	socketWaitStep = 1 * time.Millisecond
 	socketWaitMax  = 10 * time.Second
 )
 

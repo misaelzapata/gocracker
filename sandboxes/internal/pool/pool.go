@@ -613,7 +613,14 @@ func (p *Pool) Acquire(ctx context.Context, spec LeaseSpec) (Lease, error) {
 		p.mu.Unlock()
 		lease.GuestIP = spec.IP
 	}
-	gclog.VMM.Info("lease timing", "id", lease.ID, "resume_ms", resumeMs, "setnet_ms", setnetMs, "guest_ip", lease.GuestIP)
+	// The lease-timing log is informational; emit it async so the
+	// underlying logger's syscall (write to stderr/file) cannot show up
+	// on the request goroutine's hot path. Affects p99 jitter under
+	// burst load. Goroutine spawn is ~µs and the snapshot of values
+	// captured below makes it safe to read after we return.
+	go func(id string, resumeMs, setnetMs int64, guestIP string) {
+		gclog.VMM.Info("lease timing", "id", id, "resume_ms", resumeMs, "setnet_ms", setnetMs, "guest_ip", guestIP)
+	}(lease.ID, resumeMs, setnetMs, lease.GuestIP)
 
 	return lease, nil
 }

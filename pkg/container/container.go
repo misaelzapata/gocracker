@@ -113,6 +113,16 @@ type RunOptions struct {
 	// Additional create-time block devices exposed after the root disk.
 	Drives []vmm.DriveConfig
 
+	// CodeDisks are ext4 disk images attached at boot and mounted inside
+	// the guest at the specified path. Each entry becomes one virtio-blk
+	// drive (assigned /dev/vdb, /dev/vdc, … in order — appended after any
+	// explicit Drives) and one segment of the gc.code_disk= kernel
+	// cmdline param so the guest's init mounts it. This is the host-side
+	// surface for the "template + per-launch code disk" shape: bake the
+	// rootfs once via OCI, attach a tiny ext4 image with the user's code
+	// per launch. See docs/design/code-disk-attach.md.
+	CodeDisks []CodeDisk
+
 	// Optional memory management devices.
 	Balloon       *vmm.BalloonConfig
 	MemoryHotplug *vmm.MemoryHotplugConfig
@@ -267,6 +277,21 @@ func resolvedCacheDir(cacheDir string) string {
 		return base
 	}
 	return defaultCacheDir()
+}
+
+// CodeDisk describes one extra ext4 (or other fs) disk image that should
+// be attached as a virtio-blk drive and mounted inside the guest. The
+// guest-side mount happens via the gc.code_disk= kernel cmdline param;
+// see internal/guest/init.go mountExtraCodeDisks.
+type CodeDisk struct {
+	// HostPath is the absolute path to the disk image on the host.
+	HostPath string `json:"host_path"`
+	// Mount is the absolute mountpoint inside the guest (e.g. "/app").
+	Mount string `json:"mount"`
+	// FSType defaults to "ext4" when empty.
+	FSType string `json:"fs_type,omitempty"`
+	// ReadOnly mounts the disk read-only inside the guest.
+	ReadOnly bool `json:"read_only,omitempty"`
 }
 
 type MountBackend string
@@ -1801,6 +1826,29 @@ func buildCmdlineWithPlan(opts RunOptions, sharedFS sharedFSPlan, allowKernelMod
 		parts = append(parts, "gc.rootfs_overlay=off")
 	}
 
+	// Code disks. Devices are assigned in runtimeDrives order: root is
+	// /dev/vda; explicit Drives take /dev/vd[b..b+len(opts.Drives)-1];
+	// CodeDisks take the slots after that. Predict each device name from
+	// its absolute index so the guest's mountExtraCodeDisks knows where
+	// to find the disk without negotiating with the VMM.
+	if len(opts.CodeDisks) > 0 {
+		extraStart := len(opts.Drives) // /dev/vdb is index 0 in this offset
+		segs := make([]string, 0, len(opts.CodeDisks))
+		for i, cd := range opts.CodeDisks {
+			fs := cd.FSType
+			if fs == "" {
+				fs = "ext4"
+			}
+			dev := fmt.Sprintf("/dev/vd%c", 'b'+byte(extraStart+i))
+			seg := fmt.Sprintf("%s:%s:%s", dev, cd.Mount, fs)
+			if cd.ReadOnly {
+				seg += ":ro"
+			}
+			segs = append(segs, seg)
+		}
+		parts = append(parts, "gc.code_disk="+strings.Join(segs, ","))
+	}
+
 	// Working dir
 	return strings.Join(parts, " ")
 }
@@ -1931,7 +1979,7 @@ func hotplugNeedsGuestAgent(cfg *vmm.MemoryHotplugConfig) bool {
 }
 
 func runtimeDrives(rootDisk string, opts RunOptions) []vmm.DriveConfig {
-	if len(opts.Drives) == 0 {
+	if len(opts.Drives) == 0 && len(opts.CodeDisks) == 0 {
 		return nil
 	}
 	drives := []vmm.DriveConfig{{
@@ -1947,6 +1995,14 @@ func runtimeDrives(rootDisk string, opts RunOptions) []vmm.DriveConfig {
 			Root:        false,
 			ReadOnly:    drive.ReadOnly,
 			RateLimiter: cloneVMLimiter(drive.RateLimiter),
+		})
+	}
+	for i, cd := range opts.CodeDisks {
+		drives = append(drives, vmm.DriveConfig{
+			ID:       fmt.Sprintf("code%d", i),
+			Path:     cd.HostPath,
+			Root:     false,
+			ReadOnly: cd.ReadOnly,
 		})
 	}
 	return drives
