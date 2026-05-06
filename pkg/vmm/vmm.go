@@ -1659,13 +1659,18 @@ func (m *VM) acpiMMIODevices() []acpi.MMIODevice {
 
 func (m *VM) loadKernel() (*loader.KernelInfo, error) {
 	mem := m.kvmVM.Memory()
-
 	info, err := loader.LoadKernel(mem, m.cfg.KernelPath, BootParamsAddr)
 	if err != nil {
 		return nil, err
 	}
+	return m.finishLoadKernel(mem, info)
+}
 
-	// Write kernel cmdline at CmdlineAddr
+// finishLoadKernel writes the cmdline, ACPI tables, initrd, boot params and
+// MP table on top of an already-loaded kernel image. Split out from
+// loadKernel so the cached fast path (LoadKernelCached + CopySegmentsInto)
+// and the cold path (LoadKernel) share the post-load wiring.
+func (m *VM) finishLoadKernel(mem []byte, info *loader.KernelInfo) (*loader.KernelInfo, error) {
 	cmdline := m.cfg.Cmdline
 	if cmdline == "" {
 		cmdline = runtimecfg.DefaultKernelCmdline(false)
@@ -1675,7 +1680,10 @@ func (m *VM) loadKernel() (*loader.KernelInfo, error) {
 		mode = X86BootAuto
 	}
 
-	var acpiRSDP uint64
+	var (
+		acpiRSDP uint64
+		err      error
+	)
 	if mode == X86BootAuto || mode == X86BootACPI {
 		// Match Firecracker's transitional x86 path: advertise virtio-mmio
 		// devices through ACPI. Auto keeps the legacy cmdline enumeration
