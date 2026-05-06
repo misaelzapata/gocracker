@@ -930,6 +930,18 @@ func (m *VM) FirstOutputAt() time.Time {
 	return m.uart0.FirstOutputAt()
 }
 
+// FirstOutputCh returns a channel that closes when the guest's first UART
+// byte arrives. Lets callers park on the event instead of polling — kills
+// the up-to-2 ms jitter the old waitFirstOutput poll loop introduced into
+// guest_first_output_ms. Returns nil if there is no UART (zero-value VMs
+// in tests), in which case callers should fall back to polling.
+func (m *VM) FirstOutputCh() <-chan struct{} {
+	if m.uart0 == nil {
+		return nil
+	}
+	return m.uart0.FirstOutputCh()
+}
+
 // ---- Snapshot / Restore ----
 
 type Snapshot struct {

@@ -209,22 +209,55 @@ const (
 	firstOutputWaitMax = 500 * time.Millisecond
 )
 
-// waitFirstOutput polls for the guest's first UART output, returning the
-// elapsed time from startedAt. Returns 0 if h is nil or nothing arrives.
+// waitFirstOutput blocks until the guest's first UART byte arrives, then
+// returns the elapsed time from startedAt. If the handle exposes a
+// FirstOutputCh() (every local *vmm.VM does, the worker-backed remoteVM
+// does not), we park on it and pay zero polling jitter — otherwise we
+// fall back to the legacy 2 ms poll loop. Returns 0 if h is nil or the
+// guest never writes within maxWait.
 func waitFirstOutput(h vmm.Handle, startedAt time.Time, maxWait time.Duration) time.Duration {
 	if h == nil {
 		return 0
 	}
+	type firstOutputWaiter interface {
+		FirstOutputCh() <-chan struct{}
+	}
+	measure := func() time.Duration {
+		at := h.FirstOutputAt()
+		if at.IsZero() {
+			return 0
+		}
+		d := at.Sub(startedAt)
+		if d < 0 {
+			// Guest wrote to the UART before vm.Start() returned — common on
+			// ARM64 where vCPU setup overlaps early kernel output. Report as
+			// ~instant instead of the sentinel zero.
+			return time.Microsecond
+		}
+		return d
+	}
+	if w, ok := h.(firstOutputWaiter); ok {
+		ch := w.FirstOutputCh()
+		if ch != nil {
+			// Fast path: guest already wrote before we got here (channel may
+			// already be closed). The select below handles that, but check
+			// the timestamp first so the < 0 fix-up branch in measure() can
+			// fire correctly.
+			if d := measure(); d != 0 {
+				return d
+			}
+			select {
+			case <-ch:
+				return measure()
+			case <-time.After(maxWait):
+				return 0
+			}
+		}
+	}
+	// Fallback (worker-backed handle, zero-value test VM): legacy poll.
 	deadline := startedAt.Add(maxWait)
 	for {
-		if at := h.FirstOutputAt(); !at.IsZero() {
-			d := at.Sub(startedAt)
-			if d < 0 {
-				// Guest wrote to the UART before vm.Start() returned — common on
-				// ARM64 where vCPU setup overlaps early kernel output. Report as
-				// ~instant instead of the sentinel zero.
-				return time.Microsecond
-			}
+		if d := measure(); d != 0 {
 			return d
 		}
 		if time.Now().After(deadline) {
@@ -1667,8 +1700,16 @@ func inspectCachedRunArtifacts(diskPath, configPath string) (oci.ImageConfig, bo
 
 func prepareBootDisk(workDir, templateDiskPath, id string, overlay bool) (string, func(), error) {
 	runtimeDir := filepath.Join(workDir, "runs", sanitizeRuntimePathComponent(id))
-	if err := os.RemoveAll(runtimeDir); err != nil {
-		return "", nil, err
+	// IDs are randomised per launch (gc-<5 random digits>), so the directory
+	// almost always doesn't exist yet. Stat-then-RemoveAll lets us skip the
+	// RemoveAll syscall on the common path; only pay it on the rare collision
+	// or when delayedRemoveAll hasn't yet reaped a previous run with this ID.
+	if _, err := os.Stat(runtimeDir); err == nil {
+		if err := os.RemoveAll(runtimeDir); err != nil {
+			return "", nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		return "", nil, fmt.Errorf("stat runtime dir: %w", err)
 	}
 	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		return "", nil, err

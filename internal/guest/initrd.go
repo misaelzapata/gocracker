@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	cpiolib "github.com/cavaliergopher/cpio"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
@@ -46,9 +47,22 @@ func BuildInitrd(outputPath string, extraFiles map[string]string) error {
 	return BuildInitrdWithOptions(outputPath, InitrdOptions{ExtraFiles: extraFiles})
 }
 
+// embeddedInitDigestOnce caches the sha256 of the embedded init binary.
+// The bytes are constant for the life of the process (compiled in via
+// go:embed), so paying ~5–10 ms hashing the 5.4 MB blob on every cold
+// create call was pure waste — cachedGuestSpecMatches calls this once
+// per gocracker run, and the bench loop hits it 10× per session.
+var (
+	embeddedInitDigestOnce  sync.Once
+	embeddedInitDigestValue string
+)
+
 func EmbeddedInitDigest() string {
-	sum := sha256.Sum256(embeddedInit)
-	return hex.EncodeToString(sum[:])
+	embeddedInitDigestOnce.Do(func() {
+		sum := sha256.Sum256(embeddedInit)
+		embeddedInitDigestValue = hex.EncodeToString(sum[:])
+	})
+	return embeddedInitDigestValue
 }
 
 // BuildInitrdWithOptions assembles a minimal rootfs with the embedded init

@@ -96,6 +96,10 @@ type UART struct {
 	// Used by the boot-time instrumentation to report a guest_first_output_ms
 	// phase that is honest about "when did the kernel actually start speaking".
 	firstOutputAt time.Time
+	// firstOutputCh is closed exactly once when firstOutputAt is recorded,
+	// so callers (waitFirstOutput in pkg/container) can park on it instead
+	// of polling every 2 ms — saves up to 2 ms of jitter on cold-create TTI.
+	firstOutputCh chan struct{}
 
 	// IRQ callback: called when interrupt state changes
 	irqFn func(asserted bool)
@@ -104,10 +108,11 @@ type UART struct {
 // New creates a UART with the given I/O streams and IRQ callback.
 func New(out io.Writer, in io.Reader, irqFn func(bool)) *UART {
 	u := &UART{
-		out:       out,
-		in:        in,
-		irqFn:     irqFn,
-		outBufMax: defaultOutputBufSize,
+		out:           out,
+		in:            in,
+		irqFn:         irqFn,
+		outBufMax:     defaultOutputBufSize,
+		firstOutputCh: make(chan struct{}),
 	}
 	// Initial LSR: transmitter empty and idle (ready to send)
 	u.lsr = LSRTHREmpty | LSRTransmitEmpty
@@ -200,9 +205,13 @@ func (u *UART) Write(offset, val uint8) {
 			u.injectLoopbackByteLocked(val)
 			return
 		}
-		// Record first-ever TX timestamp for guest_first_output_ms metric.
+		// Record first-ever TX timestamp for guest_first_output_ms metric,
+		// and signal any waiter parked on FirstOutputCh().
 		if u.firstOutputAt.IsZero() {
 			u.firstOutputAt = time.Now()
+			if u.firstOutputCh != nil {
+				close(u.firstOutputCh)
+			}
 		}
 		// Transmit character to output
 		if u.out != nil {
@@ -360,6 +369,15 @@ func (u *UART) FirstOutputAt() time.Time {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return u.firstOutputAt
+}
+
+// FirstOutputCh returns a channel that is closed when the guest's first
+// UART byte arrives. Callers should park on it with a deadline rather
+// than polling FirstOutputAt(). The channel is allocated in New(); a
+// zero-value UART (used in some tests) has nil here, so callers should
+// guard accordingly.
+func (u *UART) FirstOutputCh() <-chan struct{} {
+	return u.firstOutputCh
 }
 
 // Ports returns the I/O port range for this UART [base, base+8).
