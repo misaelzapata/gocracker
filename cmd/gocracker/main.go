@@ -33,6 +33,7 @@ import (
 	"github.com/gocracker/gocracker/internal/oci"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
 	"github.com/gocracker/gocracker/internal/tempprune"
+	"github.com/gocracker/gocracker/internal/trace"
 	"github.com/gocracker/gocracker/internal/vmmserver"
 	"github.com/gocracker/gocracker/internal/worker"
 	"github.com/gocracker/gocracker/pkg/container"
@@ -141,6 +142,7 @@ func main() {
 // ---- run ----
 
 func cmdRun(args []string) {
+	trace.Event("cmd_run_enter")
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	image := fs.String("image", "", "OCI image ref (e.g. ubuntu:22.04)")
 	df := fs.String("dockerfile", "", "Path to Dockerfile")
@@ -178,6 +180,7 @@ func cmdRun(args []string) {
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
+	trace.Event("flags_parsed", "warm", *warm, "image", *image != "", "dockerfile", *df != "")
 
 	requireKernel(*kernel)
 	*kernel = resolveRequiredExistingPath("kernel", *kernel)
@@ -232,7 +235,9 @@ func cmdRun(args []string) {
 			BlockSizeMiB: *hotplugBlockMiB,
 		}
 	}
+	trace.Event("container_run_begin")
 	result := mustRun(runOpts)
+	trace.Event("container_run_done", "total_ms", result.Timings.Total.Milliseconds())
 	defer result.Close()
 	if interactive.enabled {
 		// Drain warm-capture BEFORE printing result or opening the shell. The
@@ -255,10 +260,12 @@ func cmdRun(args []string) {
 		drainWarmDone(result)
 		cmd := effectiveCommandSlice(runOpts.Cmd, imageDefaultCmd(result.Config))
 		if len(cmd) > 0 {
+			trace.Event("warm_cmd_begin", "argv0", cmd[0])
 			if err := runWarmCmd(result.VM, cmd); err != nil {
 				stopVMAndWait(result.VM, 5*time.Second)
 				fatal(err.Error())
 			}
+			trace.Event("warm_cmd_done")
 		}
 		stopVMAndWait(result.VM, 5*time.Second)
 		return
