@@ -17,7 +17,15 @@ const VersionFilePath = "/opt/gocracker/toolbox/VERSION"
 // Version is bumped when the wire protocol or behavior changes
 // incompatibly. Snapshot metadata records the version that was baked
 // at capture time; restore validates parity.
-const Version = "0.1.0"
+//
+// 0.2.0 (this commit): the agent gained a /runtime/<name>/ready
+// endpoint and a long-lived `node` warm runner spawned at Serve start.
+// Existing snapshots don't have the runner running, so cmd[0] =
+// "node-warm" exec calls against a 0.1.0-baked snapshot will
+// correctly fail-closed with "runner not ready" rather than silently
+// fork+execing a fresh node. Bumping Version invalidates every
+// warmcache entry so users get the new agent on their next build.
+const Version = "0.2.0"
 
 // VsockPort is the agent's listening port. The host UDS listener (Fase 1)
 // proxies "CONNECT 10023\n" to this port. Distinct from the legacy

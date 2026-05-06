@@ -37,6 +37,12 @@ type CreateTemplateRequest struct {
 	Env        []string                  `json:"env,omitempty"`
 	WorkDir    string                    `json:"workdir,omitempty"`
 	Readiness  *templates.ReadinessProbe `json:"readiness,omitempty"`
+	// Runtime selects an in-guest warm-eval runtime ("node", and
+	// later "python"/"bun"). When set, the snapshot is captured
+	// after the toolbox agent's warm runner binds its UDS, so
+	// leases that exec `<name>-warm` skip language startup.
+	// Empty = standard cold-snapshot (every exec forks fresh).
+	Runtime string `json:"runtime,omitempty"`
 }
 
 // CreateTemplateResponse wraps the built template + the CacheHit
@@ -104,6 +110,9 @@ func (m *Manager) CreateTemplate(ctx context.Context, req CreateTemplateRequest)
 		Env:        req.Env,
 		WorkDir:    req.WorkDir,
 		Readiness:  req.Readiness,
+	}
+	if req.Runtime != "" {
+		spec.Runtime = &templates.RuntimeSpec{Name: req.Runtime}
 	}
 	if err := spec.Validate(); err != nil {
 		return CreateTemplateResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)

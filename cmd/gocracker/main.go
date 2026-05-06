@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -33,6 +35,8 @@ import (
 	"github.com/gocracker/gocracker/internal/oci"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
 	"github.com/gocracker/gocracker/internal/tempprune"
+	toolboxagent "github.com/gocracker/gocracker/internal/toolbox/agent"
+	toolboxspec "github.com/gocracker/gocracker/internal/toolbox/spec"
 	"github.com/gocracker/gocracker/internal/trace"
 	"github.com/gocracker/gocracker/internal/vmmserver"
 	"github.com/gocracker/gocracker/internal/worker"
@@ -174,6 +178,7 @@ func cmdRun(args []string) {
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
 	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs read-write directly (writes survive VM stop; slower boot). Default: Docker-style tmpfs overlay.")
 	warm := fs.Bool("warm", false, "Auto snapshot-cache: restore from snapshot on cache hit (~3 ms); snapshot after cold boot on miss so next run is fast.")
+	warmRuntime := fs.String("warm-runtime", "", "Bake a warm language runtime into the snapshot (e.g. \"node\"). The snapshot is taken AFTER the toolbox agent's GET /runtime/<name>/ready returns 200, so post-restore exec calls of the form `<name>-warm <code>` skip V8/Python startup. Requires --warm. Empty = standard CMD-agnostic snapshot.")
 	vsockUDSPath := fs.String("vsock-uds-path", "", "Absolute path for the VM's Firecracker-style vsock UDS. Clients dial it and send \"CONNECT <port>\\n\" to reach a guest vsock port. Empty = no UDS (HTTP /vms/{id}/vsock/connect still works).")
 	codeDisks := multiStringFlag{}
 	fs.Var(&codeDisks, "code-disk", "Attach an ext4 disk image and mount it inside the guest. Format: HOST_PATH:GUEST_MOUNT[:FS[:ro]] (FS defaults to ext4). Repeatable; appended after --drive entries as /dev/vdb, /dev/vdc, … See docs/design/code-disk-attach.md.")
@@ -217,6 +222,7 @@ func cmdRun(args []string) {
 		ConsoleIn:       consoleIn,
 		RootfsPersistent: *rootfsPersistent,
 		WarmCapture:     *warm,
+		WarmRuntime:     *warmRuntime,
 		VsockUDSPath:    *vsockUDSPath,
 		CodeDisks:       parsedCodeDisks,
 	}
@@ -1169,6 +1175,14 @@ func imageDefaultCmd(cfg oci.ImageConfig) []string {
 // runWarmCmd runs a one-shot exec command on a --warm VM (restored from
 // snapshot) via the vsock exec agent. Streams stdout/stderr to the terminal
 // and returns the guest exit code as an error when non-zero.
+//
+// Dispatch:
+//   - cmd[0] == "node-warm" / similar → toolbox /exec on port 10023, which
+//     routes to the in-guest warm runner (V8 already booted). ~5–10 ms in
+//     the steady state vs ~50 ms for fork+exec'ed `node`.
+//   - everything else → legacy guestexec on port 10022 (request/response,
+//     no framing). Cheaper to wire, simpler protocol; the warm runner
+//     speedup only matters for runtimes with heavy startup.
 func runWarmCmd(vm vmm.Handle, cmd []string) error {
 	if cfg := vm.VMConfig(); cfg.Exec == nil || !cfg.Exec.Enabled {
 		return fmt.Errorf("exec agent not available on this VM (exec not enabled)")
@@ -1176,6 +1190,9 @@ func runWarmCmd(vm vmm.Handle, cmd []string) error {
 	dialer, ok := vm.(vmm.VsockDialer)
 	if !ok {
 		return fmt.Errorf("exec agent not available on this VM (no vsock)")
+	}
+	if len(cmd) > 0 && isWarmRuntimeCmd(cmd[0]) {
+		return runWarmCmdViaToolbox(dialer, cmd)
 	}
 	conn, err := dialer.DialVsock(execVsockPort(vm.VMConfig()))
 	if err != nil {
@@ -1205,6 +1222,83 @@ func runWarmCmd(vm vmm.Handle, cmd []string) error {
 		return fmt.Errorf("exit code %d", resp.ExitCode)
 	}
 	return nil
+}
+
+func isWarmRuntimeCmd(name string) bool {
+	switch name {
+	case "node-warm":
+		return true
+	default:
+		return false
+	}
+}
+
+// runWarmCmdViaToolbox dials the toolbox agent on port 10023, sends a
+// POST /exec request with the warm-runtime cmd, and demuxes the framed
+// response back to host stdout/stderr. Stays in this file rather than
+// importing the toolbox client (which expects a UDS path) — the
+// in-process --warm path uses VsockDialer, not UDS.
+func runWarmCmdViaToolbox(dialer vmm.VsockDialer, cmd []string) error {
+	conn, err := dialer.DialVsock(toolboxspec.VsockPort)
+	if err != nil {
+		return fmt.Errorf("toolbox dial: %w", err)
+	}
+	defer conn.Close()
+
+	body, err := json.Marshal(toolboxagent.ExecRequest{Cmd: cmd})
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	httpReq := fmt.Sprintf(
+		"POST /exec HTTP/1.0\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+		len(body),
+	)
+	bufs := net.Buffers{[]byte(httpReq), body}
+	if _, err := bufs.WriteTo(conn); err != nil {
+		return fmt.Errorf("write request: %w", err)
+	}
+
+	br := bufio.NewReader(conn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read status: %w", err)
+	}
+	if !strings.HasPrefix(statusLine, "HTTP/1.0 200") && !strings.HasPrefix(statusLine, "HTTP/1.1 200") {
+		return fmt.Errorf("toolbox /exec rejected: %s", strings.TrimRight(statusLine, "\r\n"))
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("read headers: %w", err)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	// Read framed responses until EXIT.
+	var exitCode int32
+	for {
+		ch, payload, ferr := toolboxagent.ReadFrame(br)
+		if ferr != nil {
+			return fmt.Errorf("read frame: %w", ferr)
+		}
+		switch ch {
+		case toolboxagent.ChannelStdout:
+			_, _ = os.Stdout.Write(payload)
+		case toolboxagent.ChannelStderr:
+			_, _ = os.Stderr.Write(payload)
+		case toolboxagent.ChannelExit:
+			if len(payload) >= 4 {
+				exitCode = int32(payload[0])<<24 | int32(payload[1])<<16 |
+					int32(payload[2])<<8 | int32(payload[3])
+			}
+			if exitCode != 0 {
+				return fmt.Errorf("exit code %d", exitCode)
+			}
+			return nil
+		}
+	}
 }
 
 // drainWarmDone blocks until the background warmcache snapshot goroutine

@@ -149,6 +149,15 @@ type RunOptions struct {
 	// arch) so it is safe to enable permanently — any parameter change misses.
 	// Equivalent to setting GOCRACKER_WARM_CACHE=1 but applies per-call.
 	WarmCapture bool
+
+	// WarmRuntime, when non-empty, defers the warm-cache snapshot until
+	// the toolbox agent's GET /runtime/<name>/ready endpoint returns 200.
+	// Used to bake a long-lived language runtime (currently "node") into
+	// the snapshot so post-restore exec calls of the form
+	// `<name>-warm <code>` skip V8/Python startup and land at single-
+	// digit-ms latency. Empty = capture at toolbox-idle (the existing
+	// CMD-agnostic snapshot, ~50 ms guest exec via fork+exec node).
+	WarmRuntime string
 }
 
 // RunResult is returned after a VM is started.

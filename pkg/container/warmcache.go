@@ -2,6 +2,7 @@ package container
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,6 +105,18 @@ func captureWarmSnapshot(handle vmm.Handle, opts RunOptions, key string) {
 	if handle.State() != vmm.StateRunning {
 		return
 	}
+	// When the caller asked for a "warm runtime" snapshot (e.g. node REPL
+	// already booted into V8), wait for the toolbox agent to mark its
+	// /runtime/<name>/ready endpoint OK before snapshotting. Without this
+	// gate the snapshot freezes a half-up runner and post-restore exec
+	// dials race the runner's listen() callback.
+	if opts.WarmRuntime != "" {
+		if !waitWarmRuntimeReady(handle, opts.WarmRuntime, 30*time.Second) {
+			gclog.Container.Warn("warm-cache capture: runtime not ready, skipping snapshot",
+				"runtime", opts.WarmRuntime)
+			return
+		}
+	}
 	tmp, err := os.MkdirTemp("", "gocracker-warmsnap-*")
 	if err != nil {
 		gclog.Container.Warn("warm-cache capture: mktemp", "error", err)
@@ -141,6 +154,41 @@ func captureWarmSnapshot(handle vmm.Handle, opts RunOptions, key string) {
 		return
 	}
 	gclog.Container.Info("warm-cache stored", "key", key[:12])
+}
+
+// waitWarmRuntimeReady polls the toolbox agent's GET /runtime/<name>/ready
+// endpoint over vsock:10023 until it returns 200 or timeout elapses.
+// Mirrors waitExecReady's "dial-and-discard" probe shape but speaks
+// HTTP/1.0 — a 200 means the in-guest language runtime has bound its
+// own UDS and is ready to serve `<name>-warm` exec calls.
+func waitWarmRuntimeReady(handle vmm.Handle, name string, timeout time.Duration) bool {
+	dialer, ok := handle.(vmm.VsockDialer)
+	if !ok {
+		return false
+	}
+	deadline := time.Now().Add(timeout)
+	req := fmt.Sprintf("GET /runtime/%s/ready HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n", name)
+	for time.Now().Before(deadline) {
+		conn, err := dialer.DialVsock(10023)
+		if err != nil {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		_ = conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+		if _, werr := conn.Write([]byte(req)); werr != nil {
+			conn.Close()
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		buf := make([]byte, 64)
+		n, _ := conn.Read(buf)
+		conn.Close()
+		if n > 12 && (string(buf[:12]) == "HTTP/1.0 200" || string(buf[:12]) == "HTTP/1.1 200") {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
 }
 
 // waitExecReady polls the vsock exec port until the guest agent accepts a
