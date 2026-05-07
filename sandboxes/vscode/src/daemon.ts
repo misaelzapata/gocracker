@@ -1,12 +1,69 @@
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as path from 'path';
+import * as https from 'https';
+import * as zlib from 'zlib';
 import { GocrackrConfig } from './config';
 
 const fs = require('fs') as typeof import('fs');
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function downloadAndGunzip(url: string, dest: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const follow = (u: string) => {
+      https.get(u, res => {
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          follow(res.headers.location);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          reject(new Error(`HTTP ${res.statusCode}`));
+          return;
+        }
+        const out = fs.createWriteStream(dest);
+        const gunzip = zlib.createGunzip();
+        res.pipe(gunzip).pipe(out);
+        out.on('finish', () => out.close(() => resolve()));
+        out.on('error', reject);
+        gunzip.on('error', reject);
+      }).on('error', reject);
+    };
+    follow(url);
+  });
+}
+
+export async function downloadKernel(
+  context: vscode.ExtensionContext,
+  outputChannel: vscode.OutputChannel
+): Promise<string> {
+  const url =
+    process.arch === 'arm64'
+      ? 'https://github.com/misaelzapata/gocracker/releases/latest/download/gocracker-guest-standard-arm64-Image.gz'
+      : 'https://github.com/misaelzapata/gocracker/releases/latest/download/gocracker-guest-standard-vmlinux.gz';
+
+  const kernelsDir = path.join(context.globalStorageUri.fsPath, 'kernels');
+  const gzPath = path.join(kernelsDir, 'gocracker-guest-standard-vmlinux.gz');
+  const kernelPath = path.join(kernelsDir, 'gocracker-guest-standard-vmlinux');
+
+  fs.mkdirSync(kernelsDir, { recursive: true });
+
+  if (fs.existsSync(kernelPath)) {
+    return kernelPath;
+  }
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: 'gocracker: Downloading kernel', cancellable: false },
+    async progress => {
+      progress.report({ increment: 1, message: 'downloading...' });
+      await downloadAndGunzip(url, kernelPath);
+    }
+  );
+
+  outputChannel.appendLine('[kernel] downloaded to ' + kernelPath);
+  return kernelPath;
 }
 
 export class DaemonManager implements vscode.Disposable {
@@ -47,11 +104,17 @@ export class DaemonManager implements vscode.Disposable {
       return;
     }
 
-    const kernelPath = this.discoverKernel(config);
+    let kernelPath = this.discoverKernel(config);
     if (!kernelPath) {
-      throw new Error(
-        'gocracker kernel not found. Set gocracker.kernelPath or GOCRACKER_KERNEL.'
+      const choice = await vscode.window.showInformationMessage(
+        'gocracker: No kernel found. Download the pre-built kernel (~10 MB)?',
+        'Download', 'Cancel'
       );
+      if (choice !== 'Download') {
+        throw new Error('No kernel configured. Set gocracker.kernelPath or run "gocracker: Download Kernel".');
+      }
+      const downloaded = await downloadKernel(this.context, this.log);
+      kernelPath = downloaded;
     }
     this.log.appendLine(`[daemon] using kernel: ${kernelPath}`);
 

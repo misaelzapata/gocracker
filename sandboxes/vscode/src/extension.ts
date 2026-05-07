@@ -5,7 +5,9 @@ import { GocrackrClient } from './client';
 import { DaemonManager } from './daemon';
 import { templateForDocument, execCommandForTemplate } from './language';
 import { GocrackrOutputPanel } from './panel';
-import { SandboxExplorer } from './explorer';
+import { SandboxExplorer, SandboxItem } from './explorer';
+import { openSandboxShell } from './terminal';
+import { downloadKernel }  from './daemon';
 
 let daemonManager: DaemonManager | undefined;
 
@@ -173,6 +175,51 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     explorer.refresh();
   });
 
+  const cmdDeleteSandbox = vscode.commands.registerCommand('gocracker.deleteSandbox', async (item?: SandboxItem) => {
+    const id = item?.sandbox.id;
+    if (!id) return;
+    const confirm = await vscode.window.showWarningMessage(
+      `Delete sandbox ${id.slice(0, 12)}?`, { modal: true }, 'Delete'
+    );
+    if (confirm !== 'Delete') return;
+    try {
+      await client.deleteSandbox(id);
+      explorer.refresh();
+    } catch (err: any) {
+      vscode.window.showErrorMessage(`gocracker: ${err.message}`);
+    }
+  });
+
+  const cmdRecycleSandbox = vscode.commands.registerCommand('gocracker.recycleSandbox', async (item?: SandboxItem) => {
+    const id = item?.sandbox.id;
+    if (!id) return;
+    try {
+      await client.recycleSandbox(id);
+      explorer.refresh();
+      vscode.window.showInformationMessage('Sandbox recycled');
+    } catch (err: any) {
+      vscode.window.showErrorMessage(`gocracker: ${err.message}`);
+    }
+  });
+
+  const cmdExecShell = vscode.commands.registerCommand('gocracker.execShell', (item?: SandboxItem) => {
+    const id = item?.sandbox.id;
+    if (!id) {
+      vscode.window.showErrorMessage('gocracker: right-click a sandbox in the explorer to open a shell');
+      return;
+    }
+    openSandboxShell(id, client);
+  });
+
+  const cmdDownloadKernel = vscode.commands.registerCommand('gocracker.downloadKernel', async () => {
+    try {
+      const kernelPath = await downloadKernel(context, outputChannel);
+      vscode.window.showInformationMessage(`gocracker: kernel saved to ${kernelPath}`);
+    } catch (err: any) {
+      vscode.window.showErrorMessage(`gocracker: kernel download failed — ${err.message}`);
+    }
+  });
+
   // ─── Push disposables ───────────────────────────────────────────────────────
   context.subscriptions.push(
     outputChannel,
@@ -186,6 +233,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     cmdStopDaemon,
     cmdSetupMcp,
     cmdRefreshExplorer,
+    cmdDeleteSandbox,
+    cmdRecycleSandbox,
+    cmdExecShell,
+    cmdDownloadKernel,
   );
 }
 

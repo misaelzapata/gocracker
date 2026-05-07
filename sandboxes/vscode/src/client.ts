@@ -121,4 +121,12 @@ export class GocrackrClient {
     const data = (await res.json()) as { sandboxes: Sandbox[] };
     return data.sandboxes;
   }
+
+  async recycleSandbox(id: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/sandboxes/${id}/recycle`, { method: 'POST' });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`recycleSandbox: HTTP ${res.status}: ${text}`);
+    }
+  }
 }

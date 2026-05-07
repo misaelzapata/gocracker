@@ -16,7 +16,11 @@
       { "command": "gocracker.startDaemon",  "title": "Start Daemon",              "category": "gocracker" },
       { "command": "gocracker.stopDaemon",   "title": "Stop Daemon",               "category": "gocracker" },
       { "command": "gocracker.setupMcp",     "title": "Setup MCP (write tool configs)", "category": "gocracker" },
-      { "command": "gocracker.refreshExplorer", "title": "Refresh", "icon": "$(refresh)", "category": "gocracker" }
+      { "command": "gocracker.refreshExplorer", "title": "Refresh", "icon": "$(refresh)", "category": "gocracker" },
+      { "command": "gocracker.deleteSandbox",  "title": "Delete Sandbox",  "category": "gocracker" },
+      { "command": "gocracker.recycleSandbox", "title": "Recycle Sandbox", "category": "gocracker" },
+      { "command": "gocracker.execShell",      "title": "Open Shell",      "category": "gocracker" },
+      { "command": "gocracker.downloadKernel", "title": "Download Kernel", "category": "gocracker" }
     ],
     "keybindings": [
       { "command": "gocracker.runSelection", "key": "ctrl+shift+g", "when": "editorHasSelection" },
@@ -29,6 +33,11 @@
       ],
       "view/title": [
         { "command": "gocracker.refreshExplorer", "when": "view == gocrackrSandboxes", "group": "navigation" }
+      ],
+      "view/item/context": [
+        { "command": "gocracker.execShell",      "when": "view == gocrackrSandboxes && viewItem == sandbox", "group": "gocracker@1" },
+        { "command": "gocracker.deleteSandbox",  "when": "view == gocrackrSandboxes && viewItem == sandbox", "group": "gocracker@2" },
+        { "command": "gocracker.recycleSandbox", "when": "view == gocrackrSandboxes && viewItem == sandbox", "group": "gocracker@3" }
       ]
     },
     "views": {
