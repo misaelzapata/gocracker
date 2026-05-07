@@ -8,8 +8,29 @@ No Docker daemon required. Inspired by Firecracker.
 - **Linux** (x86_64 or aarch64). No macOS or Windows support.
 - **KVM** enabled in your kernel.
 - **Go 1.22+** only if building from source (pre-built binaries available).
-- **ip** (iproute2) and **iptables** (or iptables-nft) for networking.
-- Root privileges (or appropriate `/dev/kvm` permissions).
+- **`kvm` group membership** — the only privilege required for normal use (see below).
+- **ip** (iproute2) and **iptables** (or iptables-nft) — only for `--net auto` (optional).
+
+## Privilege model
+
+gocracker works **without sudo** once you are in the `kvm` group:
+
+```bash
+sudo usermod -aG kvm $USER   # one-time; log out and back in
+```
+
+| Mode | Needs root? | When used |
+|------|:-----------:|-----------|
+| Default (`--jailer off`, auto-detected) | **No** | Any non-root user in `kvm` group |
+| `--jailer on` (explicit) | Yes | Extra isolation layer: chroot + mount namespace + seccomp |
+| `--net none` (default) | **No** | No network inside the VM |
+| `--net slirp` | **No** | Full userspace network stack, no TAP/iptables |
+| `--net auto` | Yes | TAP interface + NAT — needs `CAP_NET_ADMIN` or root |
+
+When gocracker detects it is not running as root and `--jailer` was not
+explicitly passed, it automatically uses `--jailer off`. KVM hardware
+isolation is still in full effect; the jailer only adds an extra host-side
+chroot layer. All examples below run without `sudo`.
 
 ## 1. Check KVM Support
 
@@ -86,7 +107,7 @@ vmlinuz (must have virtio drivers and 9P/ext4 built in).
 Boot an Alpine container as a microVM:
 
 ```bash
-sudo ./gocracker run \
+./gocracker run \
   --image alpine:3.20 \
   --kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux \
   --wait \
@@ -102,7 +123,7 @@ VM ID and returns immediately.
 Open an interactive session inside an Ubuntu VM:
 
 ```bash
-sudo ./gocracker run \
+./gocracker run \
   --image ubuntu:22.04 \
   --kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux \
   --wait \
@@ -117,7 +138,7 @@ This allocates a PTY over virtio-vsock and drops you into a shell. Press
 Build and boot a Dockerfile directly:
 
 ```bash
-sudo ./gocracker run \
+./gocracker run \
   --dockerfile ./tests/examples/python-api/Dockerfile \
   --context ./tests/examples/python-api \
   --kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux \
@@ -136,7 +157,7 @@ result as a VM.
 Clone a repo and auto-detect its Dockerfile:
 
 ```bash
-sudo ./gocracker repo \
+./gocracker repo \
   --url https://github.com/user/myapp \
   --kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux \
   --wait
@@ -149,7 +170,7 @@ Use `--ref` and `--subdir` to pick a branch/tag and subdirectory.
 Boot a `docker-compose.yml` where each service becomes its own VM:
 
 ```bash
-sudo ./gocracker compose \
+./gocracker compose \
   --file ./tests/manual-smoke/fixtures/compose-todo-postgres/docker-compose.yml \
   --kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux \
   --wait
@@ -166,7 +187,7 @@ See [COMPOSE.md](COMPOSE.md) for full details.
 Start the Firecracker-compatible API server:
 
 ```bash
-sudo ./gocracker serve --addr :8080
+./gocracker serve --addr :8080
 ```
 
 Then create VMs via the HTTP API:
@@ -195,7 +216,7 @@ curl -s -X PUT http://localhost:8080/machine-config \
 | `--mem` | `256` | RAM in MiB |
 | `--cpus` | `1` | Number of vCPUs |
 | `--disk` | `2048` | Disk image size in MiB |
-| `--net` | `none` | Network mode: `none` or `auto` |
+| `--net` | `none` | Network mode: `none` (no root), `slirp` (no root), or `auto` (needs root) |
 | `--tap` | | Explicit TAP interface name |
 | `--tty` | `auto` | Console mode: `auto`, `off`, or `force` |
 | `--wait` | `false` | Block until the VM exits |
@@ -204,7 +225,7 @@ curl -s -X PUT http://localhost:8080/machine-config \
 | `--entrypoint` | | Override the image ENTRYPOINT |
 | `--workdir` | | Override the working directory |
 | `--cache-dir` | `/tmp/gocracker/cache` | Persistent artifact cache |
-| `--jailer` | `on` | Privilege model: `on` or `off` |
+| `--jailer` | auto | `off` when not root (default), `on` for extra chroot+namespace isolation (needs root) |
 | `--snapshot` | | Restore from a snapshot directory |
 
 ## Networking

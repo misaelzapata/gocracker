@@ -1,40 +1,22 @@
 // gocracker-mcp is a Model Context Protocol server that exposes
 // gocracker sandbox primitives to AI clients (Claude Desktop, Claude
-// Code, custom MCP-aware agents).
+// Code, VS Code, Cursor, Windsurf, and any other MCP-capable tool).
 //
 // It speaks JSON-RPC 2.0 per modelcontextprotocol.io spec rev
-// 2025-11-25 and is, in this MVP, a thin translator over
-// sandboxes/sdk/go — every tool invocation lands on one or two SDK
-// methods. There is no VMM state in this process; sandboxd owns it.
+// 2025-11-25 over stdio. sandboxd must be running separately.
 //
 // # Quick start
 //
-//	# Terminal 1: run sandboxd somewhere reachable
-//	sudo gocracker-sandboxd serve --addr 127.0.0.1:9091 \
-//	    --kernel-path /path/to/gocracker-guest-standard-vmlinux
+//	sudo gocracker-sandboxd serve --kernel-path /path/to/kernel
+//	gocracker-mcp setup   # writes config for every detected tool
 //
-//	# Terminal 2: spawn the MCP server pointing at sandboxd
-//	gocracker-mcp --sandboxd http://127.0.0.1:9091
+// After setup, restart your editor/assistant. It will spawn
+// gocracker-mcp automatically and surface the gocracker tools.
 //
-//	# Terminal 3 (or Claude Desktop config): pipe JSON-RPC frames
-//	echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | gocracker-mcp \
-//	    --sandboxd http://127.0.0.1:9091
+// # Subcommands
 //
-// # Claude Desktop integration
-//
-// Add to claude_desktop_config.json:
-//
-//	{
-//	  "mcpServers": {
-//	    "gocracker": {
-//	      "command": "/usr/local/bin/gocracker-mcp",
-//	      "args": ["--sandboxd", "http://127.0.0.1:9091"]
-//	    }
-//	  }
-//	}
-//
-// Claude Desktop spawns the binary as a subprocess, frames JSON-RPC
-// over stdin/stdout, reads diagnostic logs from stderr.
+//	(default)     Start the MCP stdio server (spawned by tools directly).
+//	setup         Auto-detect installed tools and write their MCP configs.
 package main
 
 import (
@@ -51,6 +33,14 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "setup" {
+		cmdSetup(os.Args[2:])
+		return
+	}
+	cmdServe()
+}
+
+func cmdServe() {
 	sandboxdURL := flag.String("sandboxd", envOr("GOCRACKER_SANDBOXD", "http://127.0.0.1:9091"),
 		"Base URL of the gocracker-sandboxd HTTP API")
 	// auth-token: reserved for the streamable-HTTP transport (multi-

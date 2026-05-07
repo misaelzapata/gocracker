@@ -110,7 +110,7 @@ func TestToolsListReturnsAllTools(t *testing.T) {
 	if err := json.Unmarshal(resp.Result, &got); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"process.eval_node", "process.exec", "sandbox.delete", "sandbox.lease", "sandbox.recycle"}
+	want := []string{"process.eval_node", "process.exec", "sandbox.delete", "sandbox.fan_out", "sandbox.lease", "sandbox.recycle"}
 	if len(got.Tools) != len(want) {
 		t.Fatalf("got %d tools, want %d", len(got.Tools), len(want))
 	}
@@ -164,6 +164,54 @@ func TestToolsCallMissingArgs(t *testing.T) {
 	}
 	if !strings.Contains(got.Content[0].Text, "template_id") {
 		t.Errorf("error text missing field name: %q", got.Content[0].Text)
+	}
+}
+
+func TestToolsCallSandboxFanOut(t *testing.T) {
+	s, _ := newServerWithFake(t)
+	resp := s.Handle(context.Background(), []byte(`{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"sandbox.fan_out","arguments":{"template_id":"base-node","n":3}}}`))
+	if resp.Error != nil {
+		t.Fatal(resp.Error)
+	}
+	var got CallToolResult
+	if err := json.Unmarshal(resp.Result, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.IsError {
+		t.Fatalf("tool reported error: %+v", got.Content)
+	}
+	var parsed sandboxFanOutResult
+	if err := json.Unmarshal([]byte(got.Content[0].Text), &parsed); err != nil {
+		t.Fatalf("inner JSON: %v", err)
+	}
+	if len(parsed.Sandboxes) != 3 {
+		t.Errorf("want 3 sandboxes, got %d (errors=%v)", len(parsed.Sandboxes), parsed.Errors)
+	}
+	for i, sb := range parsed.Sandboxes {
+		if sb.ID != "sb-test-1" {
+			t.Errorf("sandboxes[%d].id = %q, want sb-test-1", i, sb.ID)
+		}
+	}
+}
+
+func TestToolsCallSandboxFanOutInvalidN(t *testing.T) {
+	s, _ := newServerWithFake(t)
+	for _, n := range []int{0, 65} {
+		raw, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+			"params": map[string]any{"name": "sandbox.fan_out", "arguments": map[string]any{"template_id": "x", "n": n}},
+		})
+		resp := s.Handle(context.Background(), raw)
+		if resp.Error != nil {
+			t.Fatal(resp.Error)
+		}
+		var got CallToolResult
+		if err := json.Unmarshal(resp.Result, &got); err != nil {
+			t.Fatal(err)
+		}
+		if !got.IsError {
+			t.Errorf("n=%d: expected isError=true", n)
+		}
 	}
 }
 

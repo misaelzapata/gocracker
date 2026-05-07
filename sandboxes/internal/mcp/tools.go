@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	gosdk "github.com/gocracker/gocracker/sandboxes/sdk/go"
@@ -18,11 +19,106 @@ import (
 // reflection-driven schema generator yet — schemas are hand-written
 // to keep the dependency surface tiny.
 func registerDefaultTools(s *Server) {
+	registerSandboxFanOut(s)
 	registerSandboxLease(s)
 	registerSandboxDelete(s)
 	registerSandboxRecycle(s)
 	registerProcessExec(s)
 	registerProcessEvalNode(s)
+}
+
+// ---- sandbox.fan_out ----
+
+type sandboxFanOutArgs struct {
+	TemplateID string `json:"template_id"`
+	N          int    `json:"n"`
+	TimeoutMs  int    `json:"timeout_ms,omitempty"`
+}
+
+type sandboxFanOutResult struct {
+	Sandboxes []sandboxLeaseResult `json:"sandboxes"`
+	WallMs    int64                `json:"wall_ms"`
+	Errors    []string             `json:"errors,omitempty"`
+}
+
+func registerSandboxFanOut(s *Server) {
+	s.RegisterTool(Tool{
+		Name: "sandbox.fan_out",
+		Description: `Lease N sandboxes from the same warm-pool template in a single RPC. ` +
+			`All leases run in parallel — wall time equals one lease, not N. ` +
+			`Returns the array of sandbox handles (id, uds_path, guest_ip) plus any per-slot errors. ` +
+			`Backed by gocracker's dirty-page-delta CoW restore; typical p95 < 30 ms for N ≤ 8.`,
+		InputSchema: json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "template_id": {"type": "string", "description": "Pool template ID, e.g. base-node-warm"},
+    "n":           {"type": "integer", "description": "Number of sandboxes to lease (1–64)", "minimum": 1, "maximum": 64},
+    "timeout_ms":  {"type": "integer", "description": "Per-lease timeout in ms (default 5000)"}
+  },
+  "required": ["template_id", "n"]
+}`),
+	}, func(ctx context.Context, raw json.RawMessage) (CallToolResult, error) {
+		var args sandboxFanOutArgs
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return errResult("decode args: " + err.Error()), nil
+		}
+		if args.TemplateID == "" {
+			return errResult("template_id required"), nil
+		}
+		if args.N < 1 || args.N > 64 {
+			return errResult("n must be between 1 and 64"), nil
+		}
+
+		timeout := time.Duration(args.TimeoutMs) * time.Millisecond
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+
+		type slotResult struct {
+			idx int
+			sb  *sandboxLeaseResult
+			err string
+		}
+		results := make([]slotResult, args.N)
+		var wg sync.WaitGroup
+		wg.Add(args.N)
+
+		t0 := time.Now()
+		for i := range args.N {
+			go func(idx int) {
+				defer wg.Done()
+				leaseCtx, cancel := context.WithTimeout(ctx, timeout)
+				defer cancel()
+				req := gosdk.LeaseSandboxRequest{
+					TemplateID: args.TemplateID,
+					Timeout:    timeout,
+				}
+				sb, err := s.Sandboxd.LeaseSandbox(leaseCtx, req)
+				if err != nil {
+					results[idx] = slotResult{idx: idx, err: err.Error()}
+					return
+				}
+				results[idx] = slotResult{idx: idx, sb: &sandboxLeaseResult{
+					ID:       sb.ID,
+					UDSPath:  sb.UDSPath,
+					GuestIP:  sb.GuestIP,
+					State:    sb.State,
+					LeasedAt: sb.CreatedAt.UTC().Format(time.RFC3339Nano),
+				}}
+			}(i)
+		}
+		wg.Wait()
+
+		out := sandboxFanOutResult{WallMs: time.Since(t0).Milliseconds()}
+		for _, r := range results {
+			if r.err != "" {
+				out.Errors = append(out.Errors, fmt.Sprintf("slot %d: %s", r.idx, r.err))
+			} else {
+				out.Sandboxes = append(out.Sandboxes, *r.sb)
+			}
+		}
+		return jsonResult(out), nil
+	})
 }
 
 // ---- sandbox.lease ----

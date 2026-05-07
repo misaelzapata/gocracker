@@ -185,6 +185,7 @@ func cmdRun(args []string) {
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
+	*jailerMode = resolveJailerMode(fs, *jailerMode)
 	trace.Event("flags_parsed", "warm", *warm, "image", *image != "", "dockerfile", *df != "")
 
 	requireKernel(*kernel)
@@ -318,6 +319,7 @@ func cmdRepo(args []string) {
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
+	*jailerMode = resolveJailerMode(fs, *jailerMode)
 
 	if *url == "" {
 		fatal("--url required")
@@ -412,6 +414,7 @@ func cmdCompose(args []string) {
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
 	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs rw in each service VM (writes survive; slower boot).")
 	fs.Parse(args)
+	*jailerMode = resolveJailerMode(fs, *jailerMode)
 
 	requireKernel(*kernel)
 	*kernel = resolveRequiredExistingPath("kernel", *kernel)
@@ -624,6 +627,7 @@ func cmdBuild(args []string) {
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
+	*jailerMode = resolveJailerMode(fs, *jailerMode)
 
 	if *output == "" {
 		fatal("--output required")
@@ -662,6 +666,7 @@ func cmdRestore(args []string) {
 	x86Boot := fs.String("x86-boot", "", "Expected x86 boot mode from snapshot")
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
 	fs.Parse(args)
+	*jailerMode = resolveJailerMode(fs, *jailerMode)
 
 	if *snapDir == "" {
 		fatal("--snapshot required")
@@ -1455,6 +1460,23 @@ var fatalFunc = func(msg string) {
 
 func fatal(msg string) {
 	fatalFunc(msg)
+}
+
+// resolveJailerMode returns the effective jailer mode. If the --jailer flag
+// was not explicitly set and the process is not root, it falls back to "off"
+// so that commands work without sudo (kvm-group membership is enough).
+// Explicit --jailer on always wins regardless of uid.
+func resolveJailerMode(fs *flag.FlagSet, flagVal string) string {
+	explicitly := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "jailer" {
+			explicitly = true
+		}
+	})
+	if !explicitly && os.Getuid() != 0 {
+		return container.JailerModeOff
+	}
+	return flagVal
 }
 
 func splitComma(s string) []string {

@@ -220,12 +220,12 @@ func (m *Manager) RegisterPool(ctx context.Context, req CreatePoolRequest) (Pool
 			MemMB:        defaultUint64(req.MemMB, 256),
 			CPUs:         defaultInt(req.CPUs, 1),
 			JailerMode:   jailerMode,
-			// Lease path SetNetwork configures eth0 post-restore —
-			// the pool needs a TAP + eth0 available on every booted
-			// VM. network_mode=auto gives us exactly that (host-side
-			// TAP + guest-side eth0); anything else (none / manual)
-			// would fail SetNetwork with "Link not found".
-			NetworkMode:  "auto",
+			// Pool warm-lease path passes spec.IP="" so SetNetwork is
+			// skipped; the guest network state is preserved in the
+			// snapshot. "auto" (TAP+iptables) needs CAP_NET_ADMIN;
+			// "slirp" (in-process userspace) is rootless and equally
+			// compatible with snapshot/restore. Defaults to "auto".
+			NetworkMode:  defaultString(m.DefaultNetworkMode, "auto"),
 			ExecEnabled:  true, // pooled sandboxes always have toolbox running
 			VsockUDSPath: poolVsockUDSPath(req.TemplateID, jailerMode),
 			VMMBinary:    m.VMMBinary,
@@ -427,6 +427,7 @@ func (m *Manager) LeaseSandbox(ctx context.Context, req LeaseSandboxRequest) (Sa
 		s.poolTemplateID = req.TemplateID
 	})
 	updated, _ := m.Store.Get(lease.ID)
+	m.chownUDS(updated.UDSPath)
 	return updated, nil
 }
 
@@ -563,6 +564,7 @@ func (m *Manager) RecycleLeased(ctx context.Context, id string) (Sandbox, error)
 	}
 	m.Store.Update(lease.ID, func(s *Sandbox) { s.poolTemplateID = templateID })
 	final, _ := m.Store.Get(lease.ID)
+	m.chownUDS(final.UDSPath)
 	return final, nil
 }
 

@@ -28,15 +28,26 @@ KVM requires hardware virtualization support.
 
 ## "Permission denied"
 
-gocracker needs root or equivalent capabilities for KVM access and network
-setup (TAP interfaces, iptables rules).
+**Most operations do not need root.** Add yourself to the `kvm` group once:
 
-- Run with `sudo`, or
-- Grant `CAP_NET_ADMIN` and ensure `/dev/kvm` is accessible to your user.
+```bash
+sudo usermod -aG kvm $USER   # log out and back in after this
+```
 
-When using the jailer (`--jailer on`, the default), the process requires root
-to set up chroot, mount namespaces, and PID namespaces before dropping
-privileges.
+Then `gocracker run`, `repo`, `compose`, `build`, and `sandboxd serve
+--network-mode slirp` all work without `sudo`.
+
+Root is only needed for two specific modes:
+
+| What | Why |
+|------|-----|
+| `--jailer on` (explicit) | `unshare(CLONE_NEWNS)` for chroot + mount namespace needs `CAP_SYS_ADMIN` |
+| `--net auto` | Creating TAP interfaces and iptables MASQUERADE rules needs `CAP_NET_ADMIN` |
+
+If you do need `--net auto` without full root, `setcap` works:
+```bash
+sudo setcap cap_net_admin+ep ./gocracker
+```
 
 ---
 
