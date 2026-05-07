@@ -1,9 +1,9 @@
 package mcp
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -118,8 +118,22 @@ func (s *Server) Handle(ctx context.Context, raw []byte) *Response {
 // This is the loop Claude Desktop drives: it spawns gocracker-mcp as
 // a subprocess, pipes JSON-RPC frames in stdin, reads responses from
 // stdout. Stderr is the server's log surface.
+//
+// Resilience: malformed JSON on a single line emits a parse-error
+// response (id=null) and the loop keeps reading. A non-recoverable
+// stream error (read error, scanner buffer overflow on a >1 MiB
+// line, etc.) terminates the loop. We deliberately do NOT use
+// json.Decoder here — it's stateful, so once it sees malformed
+// input the rest of the stream is corrupt. Line-by-line Unmarshal
+// is the standard JSON-RPC stdio framing per the MCP spec.
 func (s *Server) ServeStdio(ctx context.Context, r io.Reader, w io.Writer) error {
-	dec := json.NewDecoder(r)
+	scanner := bufio.NewScanner(r)
+	// MCP messages can be larger than the default 64 KB Scanner
+	// buffer (e.g. a tools/call with a 200 KB JS source). Bump to
+	// 4 MiB; anything bigger is almost certainly a misuse.
+	const maxLine = 4 * 1024 * 1024
+	scanner.Buffer(make([]byte, 64*1024), maxLine)
+
 	enc := json.NewEncoder(w)
 	for {
 		select {
@@ -127,14 +141,17 @@ func (s *Server) ServeStdio(ctx context.Context, r io.Reader, w io.Writer) error
 			return ctx.Err()
 		default:
 		}
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				return fmt.Errorf("scan: %w", err)
 			}
-			return fmt.Errorf("decode: %w", err)
+			return nil // EOF
 		}
-		resp := s.Handle(ctx, raw)
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		resp := s.Handle(ctx, line)
 		if resp == nil {
 			continue
 		}

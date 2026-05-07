@@ -223,3 +223,33 @@ func TestParseError(t *testing.T) {
 		t.Fatalf("got %+v, want parse error", resp.Error)
 	}
 }
+
+// TestServeStdioRecoversFromBadJSON regression-tests that a malformed
+// JSON line emits a parse-error response and the loop keeps reading
+// subsequent lines instead of fatally exiting. Earlier versions used
+// a json.Decoder (stateful) which corrupted the stream after the
+// first decode error — the scanner-based loop fixes this.
+func TestServeStdioRecoversFromBadJSON(t *testing.T) {
+	s, _ := newServerWithFake(t)
+	// Three lines: a bad-JSON line, a ping, an EOF-equivalent.
+	in := strings.NewReader("garbage line\n" +
+		`{"jsonrpc":"2.0","id":99,"method":"ping"}` + "\n")
+	var out bytes.Buffer
+	if err := s.ServeStdio(context.Background(), in, &out); err != nil {
+		t.Fatalf("ServeStdio returned error: %v", err)
+	}
+	dec := json.NewDecoder(&out)
+	var r1, r2 Response
+	if err := dec.Decode(&r1); err != nil {
+		t.Fatalf("decode r1 (parse error): %v", err)
+	}
+	if r1.Error == nil || r1.Error.Code != ErrParseError {
+		t.Errorf("r1: got %+v, want parse error", r1.Error)
+	}
+	if err := dec.Decode(&r2); err != nil {
+		t.Fatalf("decode r2 (ping after bad json): %v", err)
+	}
+	if r2.Error != nil {
+		t.Errorf("r2 (ping): got error %+v, want success", r2.Error)
+	}
+}
