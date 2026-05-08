@@ -277,6 +277,19 @@ export class Client {
   async leaseSandbox(req) {
     const body = { template_id: req.templateId };
     if (req.timeoutNs) body.timeout = req.timeoutNs;
+    // codeDisks is the Phase 3 wire for per-lease code-disk attach.
+    // Each entry is { hostPath, mount, fsType?, readOnly? }. Plumbed
+    // through to sandboxd's LeaseSandboxRequest.code_disks; runtime
+    // application is not yet implemented (pool warm-resume + no
+    // virtio-blk hot-plug). See docs/design/code-disk-attach.md.
+    if (req.codeDisks && req.codeDisks.length > 0) {
+      body.code_disks = req.codeDisks.map((cd) => ({
+        host_path: cd.hostPath,
+        mount: cd.mount,
+        fs_type: cd.fsType || undefined,
+        read_only: cd.readOnly || undefined,
+      }));
+    }
     const resp = await this._post('/sandboxes/lease', body);
     return new Sandbox(resp.sandbox ?? {}, this);
   }

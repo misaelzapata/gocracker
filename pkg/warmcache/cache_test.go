@@ -259,6 +259,62 @@ func TestHashFile(t *testing.T) {
 	}
 }
 
+// TestHashFileDiskCache verifies the on-disk hash sidecar persists
+// across what would be separate process invocations (we simulate by
+// clearing the in-memory cache map). The CLI cold path saw ~16 ms
+// shaved from TTI by this; without the disk layer every invocation
+// re-hashes the 35 MB kernel ELF.
+func TestHashFileDiskCache(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	p := filepath.Join(t.TempDir(), "k")
+	writeFile(t, p, "kernel bytes for disk cache test")
+
+	// First call: cold miss → computes + populates both caches.
+	h1, err := HashFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Confirm the sidecar exists and is parseable.
+	sidecar, err := hashSidecarPath(p)
+	if err != nil {
+		t.Fatalf("hashSidecarPath: %v", err)
+	}
+	if _, statErr := os.Stat(sidecar); statErr != nil {
+		t.Fatalf("disk sidecar not written at %s: %v", sidecar, statErr)
+	}
+
+	// Wipe the in-memory layer to simulate a fresh process.
+	hashCacheMu.Lock()
+	hashCache = map[hashCacheKey]string{}
+	hashCacheMu.Unlock()
+
+	// Second call: in-memory miss → disk hit → no recompute.
+	h2, err := HashFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 != h2 {
+		t.Fatalf("disk-cache hit mismatch: %q != %q", h1, h2)
+	}
+
+	// Mutate file content; new size + mtime invalidates the sidecar.
+	// We need a real mtime delta, so sleep a touch before rewriting.
+	time.Sleep(10 * time.Millisecond)
+	writeFile(t, p, "different content longer payload")
+	hashCacheMu.Lock()
+	hashCache = map[hashCacheKey]string{}
+	hashCacheMu.Unlock()
+	h3, err := HashFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h3 == h1 {
+		t.Fatal("hash should change after content change (disk cache should NOT have served the stale value)")
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

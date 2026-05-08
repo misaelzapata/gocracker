@@ -23,8 +23,14 @@ import (
 )
 
 const (
-	pollInterval   = 250 * time.Millisecond
-	socketWaitStep = 25 * time.Millisecond
+	pollInterval = 250 * time.Millisecond
+	// socketWaitStep is the polling cadence in waitForSocketPoll, which
+	// only fires when the inotify primary path falls through (e.g. on
+	// kernels without inotify or in tests). At 25 ms we paid up to a
+	// full tick of pure wait per cold-boot worker startup; 1 ms keeps
+	// the fallback responsive without spinning the CPU — the loop also
+	// blocks on a 100 ms net.DialTimeout so the actual rate is bounded.
+	socketWaitStep = 1 * time.Millisecond
 	socketWaitMax  = 10 * time.Second
 )
 
@@ -486,6 +492,11 @@ func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, re
 		// to the caller's socket (sandboxd's per-sandbox UDS).
 		// Empty = keep the snapshot's original path.
 		VsockUDSPath: opts.OverrideVsockUDSPath,
+		// Phase 2 of code-disk-attach: drives that were not present
+		// when the snapshot was taken. The vmm appends them to the
+		// snapshot's drive list before setupDevices runs; the host
+		// is responsible for invoking the in-guest mount post-resume.
+		AdditionalDrives: opts.AdditionalDrives,
 	})
 	if err != nil {
 		_ = cmd.Process.Kill()
@@ -497,6 +508,17 @@ func LaunchRestoredVMMWithResume(snapshotDir string, opts vmm.RestoreOptions, re
 		restoredCfg.Exec = &vmm.ExecConfig{
 			Enabled:   true,
 			VsockPort: info.ExecVsockPort,
+		}
+	}
+	// VMInfo doesn't echo the vsock UDS path back, but we know what we
+	// asked for via the override. Populate Vsock so vsockUDSPathForInfo
+	// in the API layer sees the same cfg shape as a cold-boot run.
+	// "-" is the sentinel for "clear the snapshot's path"; leave Vsock
+	// nil in that case.
+	if opts.OverrideVsockUDSPath != "" && opts.OverrideVsockUDSPath != "-" {
+		restoredCfg.Vsock = &vmm.VsockConfig{
+			Enabled: true,
+			UDSPath: opts.OverrideVsockUDSPath,
 		}
 	}
 	rvm := &remoteVM{

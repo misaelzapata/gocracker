@@ -196,6 +196,14 @@ type RunRequest struct {
 	Mounts     []container.Mount `json:"mounts,omitempty"`
 	Drives     []Drive           `json:"drives,omitempty"`
 
+	// RootfsPersistent makes the guest mount /dev/vda directly read-write
+	// instead of through a tmpfs overlay. Writes hit the virtio-blk
+	// device — required for tests that exercise block-device behaviour
+	// (e.g. rate limiting) and for callers that need writes to outlive
+	// the VM. See pkg/container.RunOptions.RootfsPersistent for the
+	// trade-offs (slower boot, no copy-on-write isolation).
+	RootfsPersistent bool `json:"rootfs_persistent,omitempty"`
+
 	// Snapshot to restore from (optional)
 	SnapshotDir   string                   `json:"snapshot_dir,omitempty"`
 	StaticIP      string                   `json:"static_ip,omitempty"`
@@ -1127,10 +1135,11 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		StaticIP:      req.StaticIP,
 		Gateway:       req.Gateway,
 		CacheDir:      req.CacheDir,
-		Metadata:      cloneMetadata(req.Metadata),
-		ExecEnabled:   req.ExecEnabled,
-		MemoryHotplug: cloneMemoryHotplug(req.MemoryHotplug),
-		VsockUDSPath:  req.VsockUDSPath,
+		Metadata:         cloneMetadata(req.Metadata),
+		ExecEnabled:      req.ExecEnabled,
+		MemoryHotplug:    cloneMemoryHotplug(req.MemoryHotplug),
+		VsockUDSPath:     req.VsockUDSPath,
+		RootfsPersistent: req.RootfsPersistent,
 	}
 	if req.Balloon != nil {
 		opts.Balloon = &vmm.BalloonConfig{
@@ -1832,17 +1841,27 @@ func validateNetworkMode(mode, staticIP, gateway string) error {
 			return fmt.Errorf("network_mode=auto is exclusive with explicit static_ip/gateway")
 		}
 		return nil
+	case container.NetworkModeSlirp:
+		// Slirp uses a fixed addressing plan baked into the engine; the
+		// container layer stamps StaticIP/Gateway from container.SlirpGuestCIDR
+		// etc. so callers must not also pass their own.
+		if strings.TrimSpace(staticIP) != "" || strings.TrimSpace(gateway) != "" {
+			return fmt.Errorf("network_mode=slirp is exclusive with explicit static_ip/gateway")
+		}
+		return nil
 	default:
-		return fmt.Errorf("invalid network_mode %q (want \"\"|\"none\"|\"auto\")", mode)
+		return fmt.Errorf("invalid network_mode %q (want \"\"|\"none\"|\"auto\"|\"slirp\")", mode)
 	}
 }
 
 // normalizeNetworkMode folds "none" back to "" so downstream code only has to
-// distinguish "" (explicit/none) from "auto".
+// distinguish "" (explicit/none) from the active modes.
 func normalizeNetworkMode(mode string) string {
 	switch strings.TrimSpace(strings.ToLower(mode)) {
 	case container.NetworkModeAuto:
 		return container.NetworkModeAuto
+	case container.NetworkModeSlirp:
+		return container.NetworkModeSlirp
 	default:
 		return ""
 	}
@@ -2318,8 +2337,24 @@ func (s *Server) handleVMClone(w http.ResponseWriter, r *http.Request) {
 	// supply tap_name/network_mode, mint a per-clone name derived from the
 	// new VM ID so restore does not hit TUNSETIFF EBUSY against the source.
 	tapName := strings.TrimSpace(req.TapName)
-	if tapName == "" && normalizeNetworkMode(req.NetworkMode) == "" && strings.TrimSpace(srcCfg.TapName) != "" {
+	if tapName == "" && strings.TrimSpace(srcCfg.TapName) != "" {
+		// Source still holds its TUN/TAP fd, so the clone cannot inherit
+		// the snapshot's tap name verbatim — restore would hit
+		// TUNSETIFF EBUSY. Mint a fresh per-clone name regardless of
+		// NetworkMode; the restore path will create this tap when the
+		// VMM starts and (for NetworkMode=auto) hostnet activation will
+		// install NAT against it after the worker comes up.
 		tapName = cloneTapName(newID)
+	}
+	// If the source had a vsock UDS, the clone keeps the same logical
+	// path inside its own jailer chroot — different host-side path because
+	// the chroot bases differ, but identical from the guest's perspective.
+	// Without this the snapshot-restore preserves the source's UDSPath,
+	// but since the clone runs in a separate worker the host-resolved
+	// path needs to be re-stamped on the new VMConfig that GetVM reads.
+	var cloneVsockUDS string
+	if srcCfg.Vsock != nil {
+		cloneVsockUDS = srcCfg.Vsock.UDSPath
 	}
 	opts := container.RunOptions{
 		ID:           newID,
@@ -2331,6 +2366,7 @@ func (s *Server) handleVMClone(w http.ResponseWriter, r *http.Request) {
 		Gateway:      req.Gateway,
 		Mounts:       append([]container.Mount(nil), req.Mounts...),
 		ExecEnabled:  req.ExecEnabled,
+		VsockUDSPath: cloneVsockUDS,
 		Metadata:     cloneMetadata(req.Metadata),
 		JailerMode:   s.jailerMode,
 		JailerBinary: s.jailerBinary,

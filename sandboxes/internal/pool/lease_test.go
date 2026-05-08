@@ -247,3 +247,24 @@ func BenchmarkAcquire_Lease(b *testing.B) {
 }
 
 func benchID(i int) string { return "bench-" + itoa(int64(i)) }
+
+// BenchmarkPoolAcquire_Many is a regression guard for the O(1) bucket
+// selection. Before the bucket refactor, Acquire scanned the full
+// entries map on every call — under burst load that scaled linearly
+// in pool size. The bucket impl pops the head of a doubly-linked list
+// (O(1)) regardless of pool population. Pre-populate 1000 paused
+// entries; ns/op should be ~µs and stay flat with pool size.
+func BenchmarkPoolAcquire_Many(b *testing.B) {
+	p, _ := NewPool(baseCfg())
+	const seedSize = 1000
+	for i := 0; i < seedSize+b.N; i++ {
+		p.AddPaused(benchID(i), nil, "/tmp/b.sock", &fakeResumer{}, nil)
+	}
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := p.Acquire(ctx, LeaseSpec{}); err != nil {
+			b.Fatalf("Acquire #%d: %v", i, err)
+		}
+	}
+}

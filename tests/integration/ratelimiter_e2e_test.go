@@ -56,13 +56,18 @@ func TestE2ERateLimiterBlock(t *testing.T) {
 	client := internalapi.NewClient(serverURL)
 	runCtx, runCancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer runCancel()
+	// RootfsPersistent disables the tmpfs overlay so guest writes
+	// actually land on the virtio-blk device. Without this, dd's data
+	// is absorbed by the overlay's tmpfs upper and never reaches the
+	// rate-limited virtio queue.
 	runResp, err := client.Run(runCtx, internalapi.RunRequest{
-		Image:       "alpine:3.20",
-		KernelPath:  kernel,
-		MemMB:       256,
-		DiskSizeMB:  512,
-		Cmd:         []string{"/bin/sh", "-lc", "sleep infinity"},
-		ExecEnabled: true,
+		Image:            "alpine:3.20",
+		KernelPath:       kernel,
+		MemMB:            256,
+		DiskSizeMB:       512,
+		Cmd:              []string{"/bin/sh", "-lc", "sleep infinity"},
+		ExecEnabled:      true,
+		RootfsPersistent: true,
 	})
 	if err != nil {
 		t.Fatalf("/run: %v\nserve log:\n%s", err, serveLog.String())
@@ -95,10 +100,12 @@ func TestE2ERateLimiterBlock(t *testing.T) {
 
 	// dd 20 MiB with O_SYNC equivalent (conv=fsync) so the host disk really
 	// takes the hit instead of the write being absorbed by the guest page
-	// cache. We wrap in `time` to capture guest-side wall-clock as a sanity
-	// check but rely on host-side elapsed for the assertion.
+	// cache. /tmp is a tmpfs in gocracker's guest init so writes there
+	// never reach virtio-blk; /root sits on the persistent rootfs disk
+	// (rootfs_persistent=true above), so writes go through the rate-
+	// limited virtio queue.
 	const wantBytes = 20
-	ddCmd := fmt.Sprintf("time dd if=/dev/zero of=/tmp/big bs=1M count=%d conv=fsync 2>&1", wantBytes)
+	ddCmd := fmt.Sprintf("time dd if=/dev/zero of=/root/big bs=1M count=%d conv=fsync 2>&1", wantBytes)
 	start := time.Now()
 	ddResp := waitForExecResponse(t, client, runResp.ID, internalapi.ExecRequest{
 		Command: []string{"/bin/sh", "-lc", ddCmd},

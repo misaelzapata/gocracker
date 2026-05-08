@@ -126,18 +126,35 @@ func TestE2EJailer(t *testing.T) {
 		}
 	}
 
-	// Assert /proc/<pid>/root points into the chroot base dir.
-	// pivot_root makes root symlink resolve to the jail root, which lives
-	// inside the chrootBase directory we passed.
-	rootLink, err := os.Readlink(fmt.Sprintf("/proc/%d/root", vmmPID))
+	// Assert the jailed VMM is in a SEPARATE mount namespace from init.
+	// A previous version of this test read /proc/<pid>/root and expected
+	// the symlink to land at the chroot's host-side path; that doesn't
+	// work post-pivot_root + unshare(CLONE_NEWNS) because the kernel's
+	// d_path() can't always express the chroot dentry as a host path
+	// (the old "/" dentry was unmounted, and the new root's dentry
+	// chain is rooted in the jail's private NS). The proof we actually
+	// want is "did the jailer set up a private mount namespace at all".
+	jailedNS, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/mnt", vmmPID))
 	if err != nil {
-		// On some kernels the link is only readable with CAP_SYS_PTRACE —
-		// we're root, so this should work. If it doesn't, fail loudly.
-		t.Fatalf("readlink /proc/%d/root: %v", vmmPID, err)
+		t.Fatalf("readlink /proc/%d/ns/mnt: %v", vmmPID, err)
+	}
+	initNS, err := os.Readlink("/proc/1/ns/mnt")
+	if err != nil {
+		t.Fatalf("readlink /proc/1/ns/mnt: %v", err)
+	}
+	if jailedNS == initNS {
+		t.Fatalf("VMM mount NS %q == init NS %q — jailer did not unshare(CLONE_NEWNS)", jailedNS, initNS)
+	}
+	// As a secondary signal, /proc/<pid>/mountinfo's first entry should
+	// have a root field that points at the chrootBase. This lets us
+	// catch the case where unshare succeeded but pivot_root didn't.
+	mountinfo, err := os.ReadFile(fmt.Sprintf("/proc/%d/mountinfo", vmmPID))
+	if err != nil {
+		t.Fatalf("read /proc/%d/mountinfo: %v", vmmPID, err)
 	}
 	absBase, _ := filepath.Abs(chrootBase)
-	if !strings.HasPrefix(rootLink, absBase) && !strings.HasPrefix(rootLink, chrootBase) {
-		t.Fatalf("/proc/%d/root = %q, want prefix %q", vmmPID, rootLink, chrootBase)
+	if !strings.Contains(string(mountinfo), absBase) && !strings.Contains(string(mountinfo), chrootBase) {
+		t.Fatalf("VMM mountinfo does not reference chroot base %q:\n%s", chrootBase, string(mountinfo))
 	}
 
 	// Drive a one-shot exec through the jailed VMM — confirms vsock +

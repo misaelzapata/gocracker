@@ -14,16 +14,20 @@ func TestAcquire_PrefersHotOverPaused(t *testing.T) {
 	p, _ := NewPool(baseCfg())
 	// Inject one paused + one hot entry manually (hot first created).
 	p.mu.Lock()
-	p.entries["hot-a"] = &Entry{
+	hot := &Entry{
 		ID: "hot-a", State: StateHot,
 		CreatedAt: time.Now().Add(-time.Hour),
 		resumer:   &fakeResumer{},
 	}
-	p.entries["paused-b"] = &Entry{
+	paused := &Entry{
 		ID: "paused-b", State: StatePaused,
 		CreatedAt: time.Now().Add(-2 * time.Hour), // OLDER, would win FIFO
 		resumer:   &fakeResumer{},
 	}
+	p.entries["hot-a"] = hot
+	p.entries["paused-b"] = paused
+	p.enqueueAvailableLocked(hot)
+	p.enqueueAvailableLocked(paused)
 	p.mu.Unlock()
 
 	lease, err := p.Acquire(context.Background(), LeaseSpec{})
@@ -41,9 +45,11 @@ func TestAcquire_HotSkipsResume(t *testing.T) {
 	p, _ := NewPool(baseCfg())
 	r := &fakeResumer{}
 	p.mu.Lock()
-	p.entries["h"] = &Entry{
+	e := &Entry{
 		ID: "h", State: StateHot, CreatedAt: time.Now(), resumer: r,
 	}
+	p.entries["h"] = e
+	p.enqueueAvailableLocked(e)
 	p.mu.Unlock()
 
 	if _, err := p.Acquire(context.Background(), LeaseSpec{}); err != nil {

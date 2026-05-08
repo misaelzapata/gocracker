@@ -113,6 +113,16 @@ type RunOptions struct {
 	// Additional create-time block devices exposed after the root disk.
 	Drives []vmm.DriveConfig
 
+	// CodeDisks are ext4 disk images attached at boot and mounted inside
+	// the guest at the specified path. Each entry becomes one virtio-blk
+	// drive (assigned /dev/vdb, /dev/vdc, … in order — appended after any
+	// explicit Drives) and one segment of the gc.code_disk= kernel
+	// cmdline param so the guest's init mounts it. This is the host-side
+	// surface for the "template + per-launch code disk" shape: bake the
+	// rootfs once via OCI, attach a tiny ext4 image with the user's code
+	// per launch. See docs/design/code-disk-attach.md.
+	CodeDisks []CodeDisk
+
 	// Optional memory management devices.
 	Balloon       *vmm.BalloonConfig
 	MemoryHotplug *vmm.MemoryHotplugConfig
@@ -139,6 +149,15 @@ type RunOptions struct {
 	// arch) so it is safe to enable permanently — any parameter change misses.
 	// Equivalent to setting GOCRACKER_WARM_CACHE=1 but applies per-call.
 	WarmCapture bool
+
+	// WarmRuntime, when non-empty, defers the warm-cache snapshot until
+	// the toolbox agent's GET /runtime/<name>/ready endpoint returns 200.
+	// Used to bake a long-lived language runtime (currently "node") into
+	// the snapshot so post-restore exec calls of the form
+	// `<name>-warm <code>` skip V8/Python startup and land at single-
+	// digit-ms latency. Empty = capture at toolbox-idle (the existing
+	// CMD-agnostic snapshot, ~50 ms guest exec via fork+exec node).
+	WarmRuntime string
 }
 
 // RunResult is returned after a VM is started.
@@ -199,22 +218,55 @@ const (
 	firstOutputWaitMax = 500 * time.Millisecond
 )
 
-// waitFirstOutput polls for the guest's first UART output, returning the
-// elapsed time from startedAt. Returns 0 if h is nil or nothing arrives.
+// waitFirstOutput blocks until the guest's first UART byte arrives, then
+// returns the elapsed time from startedAt. If the handle exposes a
+// FirstOutputCh() (every local *vmm.VM does, the worker-backed remoteVM
+// does not), we park on it and pay zero polling jitter — otherwise we
+// fall back to the legacy 2 ms poll loop. Returns 0 if h is nil or the
+// guest never writes within maxWait.
 func waitFirstOutput(h vmm.Handle, startedAt time.Time, maxWait time.Duration) time.Duration {
 	if h == nil {
 		return 0
 	}
+	type firstOutputWaiter interface {
+		FirstOutputCh() <-chan struct{}
+	}
+	measure := func() time.Duration {
+		at := h.FirstOutputAt()
+		if at.IsZero() {
+			return 0
+		}
+		d := at.Sub(startedAt)
+		if d < 0 {
+			// Guest wrote to the UART before vm.Start() returned — common on
+			// ARM64 where vCPU setup overlaps early kernel output. Report as
+			// ~instant instead of the sentinel zero.
+			return time.Microsecond
+		}
+		return d
+	}
+	if w, ok := h.(firstOutputWaiter); ok {
+		ch := w.FirstOutputCh()
+		if ch != nil {
+			// Fast path: guest already wrote before we got here (channel may
+			// already be closed). The select below handles that, but check
+			// the timestamp first so the < 0 fix-up branch in measure() can
+			// fire correctly.
+			if d := measure(); d != 0 {
+				return d
+			}
+			select {
+			case <-ch:
+				return measure()
+			case <-time.After(maxWait):
+				return 0
+			}
+		}
+	}
+	// Fallback (worker-backed handle, zero-value test VM): legacy poll.
 	deadline := startedAt.Add(maxWait)
 	for {
-		if at := h.FirstOutputAt(); !at.IsZero() {
-			d := at.Sub(startedAt)
-			if d < 0 {
-				// Guest wrote to the UART before vm.Start() returned — common on
-				// ARM64 where vCPU setup overlaps early kernel output. Report as
-				// ~instant instead of the sentinel zero.
-				return time.Microsecond
-			}
+		if d := measure(); d != 0 {
 			return d
 		}
 		if time.Now().After(deadline) {
@@ -228,9 +280,34 @@ func waitFirstOutput(h vmm.Handle, startedAt time.Time, maxWait time.Duration) t
 const (
 	NetworkModeNone = ""
 	NetworkModeAuto = "auto"
-	JailerModeOn    = "on"
-	JailerModeOff   = "off"
+	// NetworkModeSlirp routes guest traffic through an in-process userspace
+	// network stack (see internal/slirp). It does not need CAP_NET_ADMIN,
+	// /dev/net/tun, or any iptables rules — at the cost of being slower than
+	// the kernel TAP path and currently shipping an MVP feature set
+	// (ARP + DHCPv4 + ICMP echo + DHCP server; TCP/UDP outbound NAT deferred,
+	// see docs/design/slirp-tcp-udp.md).
+	NetworkModeSlirp = "slirp"
+	JailerModeOn     = "on"
+	JailerModeOff    = "off"
 )
+
+// Slirp default addressing — kept here so callers (CLI, API) can stamp the
+// guest cmdline with deterministic IPs without importing internal/slirp.
+const (
+	SlirpGuestCIDR = "10.0.2.15/24"
+	SlirpGatewayIP = "10.0.2.2"
+	SlirpDNSIP     = "10.0.2.3"
+)
+
+// vmmNetMode maps the public NetworkMode constants to vmm.Config.NetMode.
+// NetworkModeAuto stays "" because it uses the TAP code path — TapName
+// already drives that branch in pkg/vmm.
+func vmmNetMode(mode string) string {
+	if mode == NetworkModeSlirp {
+		return "slirp"
+	}
+	return ""
+}
 
 func defaultCacheDir() string {
 	return filepath.Join(os.TempDir(), "gocracker", "cache")
@@ -242,6 +319,21 @@ func resolvedCacheDir(cacheDir string) string {
 		return base
 	}
 	return defaultCacheDir()
+}
+
+// CodeDisk describes one extra ext4 (or other fs) disk image that should
+// be attached as a virtio-blk drive and mounted inside the guest. The
+// guest-side mount happens via the gc.code_disk= kernel cmdline param;
+// see internal/guest/init.go mountExtraCodeDisks.
+type CodeDisk struct {
+	// HostPath is the absolute path to the disk image on the host.
+	HostPath string `json:"host_path"`
+	// Mount is the absolute mountpoint inside the guest (e.g. "/app").
+	Mount string `json:"mount"`
+	// FSType defaults to "ext4" when empty.
+	FSType string `json:"fs_type,omitempty"`
+	// ReadOnly mounts the disk read-only inside the guest.
+	ReadOnly bool `json:"read_only,omitempty"`
 }
 
 type MountBackend string
@@ -301,6 +393,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	}
 	if err := hostguard.CheckHostDevices(hostguard.DeviceRequirements{
 		NeedKVM: true,
+		// Slirp is rootless and does not touch /dev/net/tun.
 		NeedTun: opts.TapName != "" || opts.NetworkMode == NetworkModeAuto,
 	}); err != nil {
 		return nil, fmt.Errorf("host device preflight: %w", err)
@@ -314,7 +407,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 	}
 
 	var autoNet *hostnet.AutoNetwork
-	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto {
+	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto && opts.NetworkMode != NetworkModeSlirp {
 		return nil, fmt.Errorf("invalid network mode %q", opts.NetworkMode)
 	}
 	// network_mode=auto allocates a fresh tap + /30 + guest IP + gateway.
@@ -334,6 +427,19 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		opts.TapName = autoNet.TapName()
 		opts.StaticIP = autoNet.GuestCIDR()
 		opts.Gateway = autoNet.GatewayIP()
+	}
+	// network_mode=slirp routes through an in-process userspace stack with a
+	// deterministic addressing plan (see internal/slirp). The guest IP and
+	// gateway are stamped into the kernel cmdline so the guest comes up with
+	// a static route — DHCP from the slirp engine works too but stamping it
+	// removes the boot-time dependency on a working DHCP client in the guest
+	// initramfs.
+	if opts.NetworkMode == NetworkModeSlirp {
+		if opts.TapName != "" {
+			return nil, fmt.Errorf("--tap and --net slirp are mutually exclusive")
+		}
+		opts.StaticIP = SlirpGuestCIDR
+		opts.Gateway = SlirpGatewayIP
 	}
 
 	// Warm-cache lookup for --jailer off path (mirrors runViaWorker logic).
@@ -378,6 +484,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 				OverrideX86Boot:      opts.X86Boot,
 				OverrideVsockUDSPath: opts.VsockUDSPath,
 				SharedFSRebinds:      buildSharedFSRebinds(opts.Mounts),
+				AdditionalDrives:     codeDisksAsDriveConfigs(opts.CodeDisks),
 			})
 			if err == nil {
 				// Activate the freshly-allocated host-side tap (assigns the
@@ -403,6 +510,26 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 				if autoNet != nil && opts.ExecEnabled {
 					if ripErr := reIPGuest(vm, opts.StaticIP, opts.Gateway, 2*time.Second); ripErr != nil {
 						gclog.Container.Warn("restore re-IP failed", "error", ripErr)
+					}
+				}
+				// Phase 2 of code-disk-attach: the snapshot didn't have
+				// these drives, so the guest's init never mounted them.
+				// Drive the in-guest mount via toolbox.Exec now that
+				// the VM is resumed and its agent is reachable.
+				if len(opts.CodeDisks) > 0 {
+					udsPath := vsockUDSForCodeDiskMount(vm)
+					if udsPath != "" {
+						baseIdx := nonRootDriveCount(vm) - len(opts.CodeDisks)
+						if baseIdx < 0 {
+							baseIdx = 0
+						}
+						mountCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+						if mErr := MountAdditionalCodeDisks(mountCtx, udsPath, opts.CodeDisks, baseIdx, 5*time.Second); mErr != nil {
+							gclog.Container.Warn("post-restore code-disk mount failed", "error", mErr)
+						}
+						cancel()
+					} else {
+						gclog.Container.Warn("post-restore code-disk mount skipped: no vsock uds path on restored VM")
 					}
 				}
 				gclog.Container.Info("restored", "duration", time.Since(t0).Round(time.Millisecond))
@@ -606,6 +733,7 @@ func runLocal(opts RunOptions) (*RunResult, error) {
 		DiskImage:       bootDiskPath,
 		Drives:          runtimeDrives(bootDiskPath, opts),
 		TapName:         opts.TapName,
+		NetMode:         vmmNetMode(opts.NetworkMode),
 		Metadata:        cloneStringMap(opts.Metadata),
 		SharedFS:        sharedFS.Exports,
 		Vsock:           buildVsockConfig(opts),
@@ -750,7 +878,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 	}
 
 	var autoNet *hostnet.AutoNetwork
-	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto {
+	if opts.NetworkMode != "" && opts.NetworkMode != NetworkModeAuto && opts.NetworkMode != NetworkModeSlirp {
 		return nil, fmt.Errorf("invalid network mode %q", opts.NetworkMode)
 	}
 	// See runLocal: auto-allocation only fires on cold boot; restore keeps
@@ -765,6 +893,17 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		opts.TapName = autoNet.TapName()
 		opts.StaticIP = autoNet.GuestCIDR()
 		opts.Gateway = autoNet.GatewayIP()
+	}
+	// Slirp mode (rootless): no TAP allocation, deterministic guest IP plan.
+	// See runLocal for the rationale; same logic applies here.
+	if opts.NetworkMode == NetworkModeSlirp {
+		if opts.TapName != "" {
+			return nil, fmt.Errorf("--tap and --net slirp are mutually exclusive")
+		}
+		if opts.SnapshotDir == "" {
+			opts.StaticIP = SlirpGuestCIDR
+			opts.Gateway = SlirpGatewayIP
+		}
 	}
 
 	// Opportunistic warm-cache lookup. Active when GOCRACKER_WARM_CACHE=1 or
@@ -803,6 +942,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 				ConsoleIn:            opts.ConsoleIn,
 				ConsoleOut:           opts.ConsoleOut,
 				SharedFSRebinds:      buildSharedFSRebinds(opts.Mounts),
+				AdditionalDrives:     codeDisksAsDriveConfigs(opts.CodeDisks),
 			}, worker.VMMOptions{
 				JailerBinary: opts.JailerBinary,
 				VMMBinary:    opts.VMMBinary,
@@ -829,6 +969,26 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 				tap := opts.TapName
 				if tap == "" {
 					tap = handle.VMConfig().TapName
+				}
+				// Phase 2 of code-disk-attach (worker path): drive the
+				// in-guest mount via toolbox.Exec for each AdditionalDrive
+				// that the snapshot did not include. See runLocal for
+				// the same logic on the direct vmm path.
+				if len(opts.CodeDisks) > 0 {
+					udsPath := vsockUDSForCodeDiskMount(handle)
+					if udsPath != "" {
+						baseIdx := nonRootDriveCount(handle) - len(opts.CodeDisks)
+						if baseIdx < 0 {
+							baseIdx = 0
+						}
+						mountCtx, mCancel := context.WithTimeout(context.Background(), 10*time.Second)
+						if mErr := MountAdditionalCodeDisks(mountCtx, udsPath, opts.CodeDisks, baseIdx, 5*time.Second); mErr != nil {
+							gclog.Container.Warn("post-restore code-disk mount failed (worker path)", "error", mErr)
+						}
+						mCancel()
+					} else {
+						gclog.Container.Warn("post-restore code-disk mount skipped: no vsock uds path on restored VM")
+					}
 				}
 				return &RunResult{
 					VM:           handle,
@@ -984,6 +1144,7 @@ func runViaWorker(opts RunOptions) (*RunResult, error) {
 		DiskImage:       bootDiskPath,
 		Drives:          runtimeDrives(bootDiskPath, opts),
 		TapName:         opts.TapName,
+		NetMode:         vmmNetMode(opts.NetworkMode),
 		Metadata:        cloneStringMap(opts.Metadata),
 		SharedFS:        sharedFS.Exports,
 		Vsock:           buildVsockConfig(opts),
@@ -1548,8 +1709,16 @@ func inspectCachedRunArtifacts(diskPath, configPath string) (oci.ImageConfig, bo
 
 func prepareBootDisk(workDir, templateDiskPath, id string, overlay bool) (string, func(), error) {
 	runtimeDir := filepath.Join(workDir, "runs", sanitizeRuntimePathComponent(id))
-	if err := os.RemoveAll(runtimeDir); err != nil {
-		return "", nil, err
+	// IDs are randomised per launch (gc-<5 random digits>), so the directory
+	// almost always doesn't exist yet. Stat-then-RemoveAll lets us skip the
+	// RemoveAll syscall on the common path; only pay it on the rare collision
+	// or when delayedRemoveAll hasn't yet reaped a previous run with this ID.
+	if _, err := os.Stat(runtimeDir); err == nil {
+		if err := os.RemoveAll(runtimeDir); err != nil {
+			return "", nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		return "", nil, fmt.Errorf("stat runtime dir: %w", err)
 	}
 	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		return "", nil, err
@@ -1749,6 +1918,29 @@ func buildCmdlineWithPlan(opts RunOptions, sharedFS sharedFSPlan, allowKernelMod
 		parts = append(parts, "gc.rootfs_overlay=off")
 	}
 
+	// Code disks. Devices are assigned in runtimeDrives order: root is
+	// /dev/vda; explicit Drives take /dev/vd[b..b+len(opts.Drives)-1];
+	// CodeDisks take the slots after that. Predict each device name from
+	// its absolute index so the guest's mountExtraCodeDisks knows where
+	// to find the disk without negotiating with the VMM.
+	if len(opts.CodeDisks) > 0 {
+		extraStart := len(opts.Drives) // /dev/vdb is index 0 in this offset
+		segs := make([]string, 0, len(opts.CodeDisks))
+		for i, cd := range opts.CodeDisks {
+			fs := cd.FSType
+			if fs == "" {
+				fs = "ext4"
+			}
+			dev := fmt.Sprintf("/dev/vd%c", 'b'+byte(extraStart+i))
+			seg := fmt.Sprintf("%s:%s:%s", dev, cd.Mount, fs)
+			if cd.ReadOnly {
+				seg += ":ro"
+			}
+			segs = append(segs, seg)
+		}
+		parts = append(parts, "gc.code_disk="+strings.Join(segs, ","))
+	}
+
 	// Working dir
 	return strings.Join(parts, " ")
 }
@@ -1879,7 +2071,7 @@ func hotplugNeedsGuestAgent(cfg *vmm.MemoryHotplugConfig) bool {
 }
 
 func runtimeDrives(rootDisk string, opts RunOptions) []vmm.DriveConfig {
-	if len(opts.Drives) == 0 {
+	if len(opts.Drives) == 0 && len(opts.CodeDisks) == 0 {
 		return nil
 	}
 	drives := []vmm.DriveConfig{{
@@ -1895,6 +2087,14 @@ func runtimeDrives(rootDisk string, opts RunOptions) []vmm.DriveConfig {
 			Root:        false,
 			ReadOnly:    drive.ReadOnly,
 			RateLimiter: cloneVMLimiter(drive.RateLimiter),
+		})
+	}
+	for i, cd := range opts.CodeDisks {
+		drives = append(drives, vmm.DriveConfig{
+			ID:       fmt.Sprintf("code%d", i),
+			Path:     cd.HostPath,
+			Root:     false,
+			ReadOnly: cd.ReadOnly,
 		})
 	}
 	return drives

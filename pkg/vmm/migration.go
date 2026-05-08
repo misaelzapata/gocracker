@@ -149,12 +149,11 @@ func FinalizeMigrationBundle(vm *VM, dir string) (*Snapshot, *MigrationPatchSet,
 		return nil, nil, err
 	}
 
-	metaFile := filepath.Join(dir, "snapshot.json")
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := os.WriteFile(metaFile, data, 0644); err != nil {
+	if err := WriteSnapshotJSON(dir, data); err != nil {
 		return nil, nil, err
 	}
 
@@ -287,28 +286,49 @@ func rewriteSnapshotBundleOpts(dir string, snap Snapshot, cfg Config, skipDisk b
 	return &snap, nil
 }
 
-// WriteSnapshotJSON writes data to <dir>/snapshot.json with fsync on the file
-// and the parent directory. A crash between WriteFile and the next sync point
-// otherwise leaves a half-written snapshot.json that a later restore happily
-// picks up and feeds to the kernel. Crashing loudly here is strictly better
-// than booting a corrupt template later. Exposed so the worker proxy (which
-// patches snapshot.json after host-side hardlinking) can reuse the same
-// durability guarantees.
+// WriteSnapshotJSON atomically writes data to <dir>/snapshot.json using
+// tmp+rename with fsync on both the temp file and the parent directory. The
+// previous implementation opened snapshot.json with O_TRUNC, so a crash
+// mid-write left a truncated file that a later restore would happily feed to
+// the kernel. tmp+rename ensures readers always see either the old contents
+// or the full new payload, never a torn write.
 func WriteSnapshotJSON(dir string, data []byte) error {
-	metaFile := filepath.Join(dir, "snapshot.json")
-	f, err := os.OpenFile(metaFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	return writeFileAtomic(filepath.Join(dir, "snapshot.json"), data, 0644)
+}
+
+// writeFileAtomic writes data to path atomically: it creates a sibling temp
+// file, fsyncs it, renames it over path, then fsyncs the parent directory so
+// the rename itself is durable. On any error before the rename, the temp file
+// is removed.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
+	tmpPath := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpPath) }
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		cleanup()
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		cleanup()
 		return err
 	}
 	if dirF, err := os.Open(dir); err == nil {
@@ -428,10 +448,13 @@ func writeMigrationPatches(vm *VM, dir string) (*MigrationPatchSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(dir, migrationPatchMeta), data, 0644); err != nil {
+	if err := patchFile.Sync(); err != nil {
 		return nil, err
 	}
-	return patchSet, patchFile.Sync()
+	if err := writeFileAtomic(filepath.Join(dir, migrationPatchMeta), data, 0644); err != nil {
+		return nil, err
+	}
+	return patchSet, nil
 }
 
 func buildDirtyFilePatch(w io.Writer, src io.ReaderAt, srcSize uint64, relPath string, pageSize uint64, bitmap []uint64, nextDataOffset *uint64) (DirtyFilePatch, error) {

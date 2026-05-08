@@ -83,11 +83,12 @@ func (c *Client) SetNetwork(ctx context.Context, req agent.SetNetworkRequest) (a
 		"POST /internal/setnetwork HTTP/1.0\r\nHost: x\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
 		len(body),
 	)
-	if _, err := conn.Write([]byte(httpReq)); err != nil {
-		return agent.SetNetworkResponse{}, fmt.Errorf("write setnetwork headers: %w", err)
-	}
-	if _, err := conn.Write(body); err != nil {
-		return agent.SetNetworkResponse{}, fmt.Errorf("write setnetwork body: %w", err)
+	// Coalesce headers + body into a single writev(2) so we don't burn
+	// two host syscalls (and two vsock-bridge round-trips) on every
+	// SetNetwork call.
+	bufs := net.Buffers{[]byte(httpReq), body}
+	if _, err := bufs.WriteTo(conn); err != nil {
+		return agent.SetNetworkResponse{}, fmt.Errorf("write setnetwork: %w", err)
 	}
 	// We CANNOT use io.ReadAll on br: the agent's HTTP response
 	// ships a Content-Length but the conn doesn't always close
@@ -216,13 +217,11 @@ func (c *Client) Stream(ctx context.Context, req agent.ExecRequest) (*Session, e
 		"POST /exec HTTP/1.0\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
 		len(body),
 	)
-	if _, err := conn.Write([]byte(httpReq)); err != nil {
+	// Single writev(2) for headers + body — saves a syscall per Stream.
+	bufs := net.Buffers{[]byte(httpReq), body}
+	if _, err := bufs.WriteTo(conn); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("write exec request line+headers: %w", err)
-	}
-	if _, err := conn.Write(body); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("write exec request body: %w", err)
+		return nil, fmt.Errorf("write exec request: %w", err)
 	}
 	br := bufio.NewReader(conn)
 	if err := skipHTTPHeaders(br); err != nil {

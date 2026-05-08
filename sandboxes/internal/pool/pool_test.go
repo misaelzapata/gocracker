@@ -159,17 +159,22 @@ func TestAcquire_TransitionsPausedToLeased(t *testing.T) {
 
 func TestAcquire_PicksOldestPaused(t *testing.T) {
 	p, _ := NewPool(baseCfg())
-	p.AddPaused("new", nil, "", nil, nil)
-	time.Sleep(10 * time.Millisecond) // ensure distinct CreatedAt
-	p.AddPaused("newer", nil, "", nil, nil)
-	// Inject an even-older entry by hand to assert ordering.
+	// Inject the older entry first so insertion order matches its
+	// CreatedAt. The bucket FIFO is insertion-ordered (matches
+	// production: AddPaused / refiller enqueue immediately on creation),
+	// so "oldest by CreatedAt" == "first inserted" in any normal flow.
 	p.mu.Lock()
-	p.entries["oldest"] = &Entry{
+	oldest := &Entry{
 		ID:        "oldest",
 		State:     StatePaused,
 		CreatedAt: time.Now().Add(-time.Hour),
 	}
+	p.entries["oldest"] = oldest
+	p.enqueueAvailableLocked(oldest)
 	p.mu.Unlock()
+	p.AddPaused("new", nil, "", nil, nil)
+	time.Sleep(10 * time.Millisecond) // ensure distinct CreatedAt
+	p.AddPaused("newer", nil, "", nil, nil)
 	e, err := p.Acquire(context.Background(), LeaseSpec{})
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
@@ -182,9 +187,15 @@ func TestAcquire_PicksOldestPaused(t *testing.T) {
 func TestAcquire_SkipsLeasedAndStopped(t *testing.T) {
 	p, _ := NewPool(baseCfg())
 	p.mu.Lock()
-	p.entries["leased"] = &Entry{ID: "leased", State: StateLeased, CreatedAt: time.Now().Add(-time.Hour)}
-	p.entries["stopped"] = &Entry{ID: "stopped", State: StateStopped, CreatedAt: time.Now().Add(-time.Hour)}
-	p.entries["paused"] = &Entry{ID: "paused", State: StatePaused, CreatedAt: time.Now()}
+	leased := &Entry{ID: "leased", State: StateLeased, CreatedAt: time.Now().Add(-time.Hour)}
+	stopped := &Entry{ID: "stopped", State: StateStopped, CreatedAt: time.Now().Add(-time.Hour)}
+	paused := &Entry{ID: "paused", State: StatePaused, CreatedAt: time.Now()}
+	p.entries["leased"] = leased
+	p.entries["stopped"] = stopped
+	p.entries["paused"] = paused
+	// Only the paused entry is bucket-eligible; leased/stopped are
+	// excluded by the bucket maintenance contract.
+	p.enqueueAvailableLocked(paused)
 	p.mu.Unlock()
 	e, err := p.Acquire(context.Background(), LeaseSpec{})
 	if err != nil {

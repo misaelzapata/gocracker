@@ -32,6 +32,7 @@ import (
 	"github.com/gocracker/gocracker/internal/mptable"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
 	"github.com/gocracker/gocracker/internal/seccomp"
+	"github.com/gocracker/gocracker/internal/slirp"
 	"github.com/gocracker/gocracker/internal/uart"
 	"github.com/gocracker/gocracker/internal/virtio"
 	"github.com/gocracker/gocracker/internal/vsock"
@@ -153,6 +154,12 @@ type Config struct {
 	DiskRO         bool
 	Drives         []DriveConfig `json:"drives,omitempty"`
 	TapName        string
+	// NetMode selects the host-side virtio-net carrier:
+	//   ""       — TAP if TapName set, otherwise no NIC (back-compat)
+	//   "tap"    — TAP backend; TapName must be set
+	//   "slirp"  — userspace slirp stack; no TapName, runs rootless
+	// See internal/slirp for the slirp engine.
+	NetMode        string `json:"net_mode,omitempty"`
 	MACAddr        net.HardwareAddr
 	Metadata       map[string]string  `json:"metadata,omitempty"`
 	NetRateLimiter *RateLimiterConfig `json:"net_rate_limiter,omitempty"`
@@ -328,6 +335,14 @@ type VM struct {
 	pausedVCPUs map[int]struct{}
 	vcpuTIDs    map[int]int
 
+	// pauseCond signals state transitions to and from StatePaused. It
+	// rides on m.mu — vCPU goroutines waitIfPaused() on it, and Pause()
+	// / Resume() / Stop() / cleanup() call Broadcast under the lock.
+	// Broadcast-instead-of-poll is what makes resume sub-millisecond:
+	// the previous design used a 10 ms time.Sleep loop, which capped
+	// resume-to-running latency at ~5 ms p50 and ~10 ms p99.
+	pauseCond *sync.Cond
+
 	// restoring is set while setupDevices runs as part of snapshot restore.
 	// It lets per-device constructors take shortcuts that are only safe when
 	// the guest already negotiated virtio features (e.g. skipping the ~3ms
@@ -410,6 +425,7 @@ func New(cfg Config) (*VM, error) {
 		vcpuTIDs:    make(map[int]int),
 		memDirty:    virtio.NewDirtyTracker(uint64(len(kvmVM.Memory()))),
 	}
+	m.pauseCond = sync.NewCond(&m.mu)
 	m.events.Emit(EventCreated, fmt.Sprintf("VM %s created, %d MiB RAM", cfg.ID, cfg.MemMB))
 	if err := m.setupMemoryHotplug(); err != nil {
 		return nil, fmt.Errorf("setup memory hotplug: %w", err)
@@ -512,6 +528,11 @@ func (m *VM) Stop() {
 		for _, vcpu := range m.vcpus {
 			vcpu.RunData.ImmediateExit = 1
 		}
+		// Wake any vCPUs parked in waitIfPaused so they observe
+		// StateStopped and exit instead of waiting on the cond forever.
+		if m.pauseCond != nil {
+			m.pauseCond.Broadcast()
+		}
 		go m.kickVCPUs()
 		select {
 		case <-m.stopCh: // already closed
@@ -545,8 +566,22 @@ func (m *VM) WaitStopped(ctx context.Context) error {
 	}
 }
 
+// ensurePauseCondLocked lazy-initializes m.pauseCond. Construction-site
+// tests build &VM{} directly and never call New/RestoreFromSnapshot, so we
+// can't assume the cond is set. The caller must already hold m.mu.
+func (m *VM) ensurePauseCondLocked() *sync.Cond {
+	if m.pauseCond == nil {
+		m.pauseCond = sync.NewCond(&m.mu)
+	}
+	return m.pauseCond
+}
+
 // Pause stops vCPU execution at a consistent boundary so guest state can be captured.
 // Like Firecracker, snapshotting and migration build on top of this paused state.
+//
+// Pause and Resume are designed for sub-millisecond wake-up: vCPUs park on
+// m.pauseCond and Resume broadcasts. The previous polling implementation
+// added a flat 0–10 ms latency on each side from the time.Sleep tick.
 func (m *VM) Pause() error {
 	m.mu.Lock()
 	switch m.state {
@@ -561,6 +596,7 @@ func (m *VM) Pause() error {
 	}
 	m.state = StatePaused
 	clear(m.pausedVCPUs)
+	cond := m.ensurePauseCondLocked()
 	vcpuCount := len(m.vcpus)
 	for _, vcpu := range m.vcpus {
 		vcpu.RunData.ImmediateExit = 1
@@ -569,30 +605,44 @@ func (m *VM) Pause() error {
 
 	m.kickVCPUs()
 
-	deadline := time.Now().Add(defaultPauseTimeout)
-	for time.Now().Before(deadline) {
+	// Wait for every vCPU to land in waitIfPaused. Each vCPU broadcasts on
+	// the cond as it enters; this loop wakes whenever that happens. To
+	// enforce defaultPauseTimeout without a busy-poll, schedule a single
+	// timer that broadcasts the cond once when it fires — the wait below
+	// then re-evaluates the deadline and bails out cleanly.
+	timer := time.AfterFunc(defaultPauseTimeout, func() {
 		m.mu.Lock()
-		paused := len(m.pausedVCPUs)
-		stopped := m.state == StateStopped
+		cond.Broadcast()
 		m.mu.Unlock()
-		if stopped {
+	})
+	defer timer.Stop()
+	deadline := time.Now().Add(defaultPauseTimeout)
+
+	m.mu.Lock()
+	for {
+		if m.state == StateStopped {
+			m.mu.Unlock()
 			return fmt.Errorf("vm stopped while pausing")
 		}
-		if paused == vcpuCount {
+		if len(m.pausedVCPUs) >= vcpuCount {
+			listener := m.udsListener
+			m.mu.Unlock()
 			// Close any active UDS bridges so clients observe the pause as
 			// EOF and reconnect after Resume. The listener itself stays up,
 			// accepting new connections that will block on DialVsock until
 			// the guest resumes.
-			if m.udsListener != nil {
-				m.udsListener.closeAllBridges()
+			if listener != nil {
+				listener.closeAllBridges()
 			}
 			m.events.Emit(EventPaused, fmt.Sprintf("%d vCPU(s) paused", vcpuCount))
 			return nil
 		}
-		time.Sleep(10 * time.Millisecond)
+		if !time.Now().Before(deadline) {
+			break
+		}
+		cond.Wait()
 	}
-
-	m.mu.Lock()
+	// Timeout: roll back.
 	if m.state == StatePaused {
 		m.state = StateRunning
 	}
@@ -600,11 +650,15 @@ func (m *VM) Pause() error {
 	for _, vcpu := range m.vcpus {
 		vcpu.RunData.ImmediateExit = 0
 	}
+	cond.Broadcast()
 	m.mu.Unlock()
 	return fmt.Errorf("timeout waiting for %d vCPU(s) to pause", vcpuCount)
 }
 
-// Resume restarts a previously paused VM.
+// Resume restarts a previously paused VM. Wake-up is delivered through
+// m.pauseCond.Broadcast under the lock, so all parked vCPU goroutines
+// re-enter their KVM_RUN loop in goroutine-handoff time (≪1 ms) instead
+// of waiting up to 10 ms for a polling tick.
 func (m *VM) Resume() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -616,6 +670,7 @@ func (m *VM) Resume() error {
 	for _, vcpu := range m.vcpus {
 		vcpu.RunData.ImmediateExit = 0
 	}
+	m.ensurePauseCondLocked().Broadcast()
 	m.events.Emit(EventResumed, fmt.Sprintf("%d vCPU(s) resumed", len(m.vcpus)))
 	return nil
 }
@@ -875,6 +930,18 @@ func (m *VM) FirstOutputAt() time.Time {
 	return m.uart0.FirstOutputAt()
 }
 
+// FirstOutputCh returns a channel that closes when the guest's first UART
+// byte arrives. Lets callers park on the event instead of polling — kills
+// the up-to-2 ms jitter the old waitFirstOutput poll loop introduced into
+// guest_first_output_ms. Returns nil if there is no UART (zero-value VMs
+// in tests), in which case callers should fall back to polling.
+func (m *VM) FirstOutputCh() <-chan struct{} {
+	if m.uart0 == nil {
+		return nil
+	}
+	return m.uart0.FirstOutputCh()
+}
+
 // ---- Snapshot / Restore ----
 
 type Snapshot struct {
@@ -1057,6 +1124,16 @@ type RestoreOptions struct {
 	// SharedFS entry whose Target matches; empty list means "use the
 	// snapshot's own sources unchanged".
 	SharedFSRebinds []SharedFSRebind
+	// AdditionalDrives are virtio-blk drives that were NOT present when
+	// the snapshot was taken — they get appended to the restored
+	// Config.Drives before setupDevices runs. Use this to land a fresh
+	// per-launch code disk on top of a frozen template snapshot. The
+	// guest's init has already finished by the time the snapshot was
+	// taken, so the disks will appear as /dev/vd[N..] without an
+	// automatic mount; callers are expected to drive the mount via
+	// `toolbox.Exec(["mount", DEV, MOUNT, "-t", FS])` after Resume. See
+	// docs/design/code-disk-attach.md (Phase 2).
+	AdditionalDrives []DriveConfig
 }
 
 // SharedFSRebind rewrites the Source behind a virtio-fs export that was
@@ -1105,6 +1182,42 @@ func applySharedFSRebinds(snap *Snapshot, rebinds []SharedFSRebind) error {
 		// fresh virtiofsd against the new Source (direct path) or requires
 		// the worker to re-populate it (worker path).
 		snap.Config.SharedFS[i].SocketPath = ""
+	}
+	return nil
+}
+
+// applyAdditionalDrives appends per-launch drives onto the snapshot's
+// Config.Drives before setupDevices reads it. The drives in extras must
+// not be flagged Root, must have unique IDs not already present in the
+// snapshot, and must point at host paths the caller has already
+// validated (existence, permissions). MMIO slot allocation in
+// setupDevices runs sequentially from the existing slot count, so
+// these drives land just past whatever the snapshot already had.
+func applyAdditionalDrives(snap *Snapshot, extras []DriveConfig) error {
+	if snap == nil || len(extras) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	for _, d := range snap.Config.Drives {
+		if d.ID != "" {
+			seen[d.ID] = struct{}{}
+		}
+	}
+	for i, d := range extras {
+		if d.Root {
+			return fmt.Errorf("AdditionalDrives[%d]: cannot inject a root drive at restore", i)
+		}
+		if d.ID == "" {
+			return fmt.Errorf("AdditionalDrives[%d]: drive ID is required", i)
+		}
+		if d.Path == "" {
+			return fmt.Errorf("AdditionalDrives[%d]: drive path is required", i)
+		}
+		if _, dup := seen[d.ID]; dup {
+			return fmt.Errorf("AdditionalDrives[%d]: drive ID %q collides with snapshot", i, d.ID)
+		}
+		seen[d.ID] = struct{}{}
+		snap.Config.Drives = append(snap.Config.Drives, d)
 	}
 	return nil
 }
@@ -1194,6 +1307,9 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	if err := applySharedFSRebinds(&snap, opts.SharedFSRebinds); err != nil {
 		return nil, err
 	}
+	if err := applyAdditionalDrives(&snap, opts.AdditionalDrives); err != nil {
+		return nil, err
+	}
 	if opts.OverrideX86Boot != "" {
 		mode, err := normalizeX86BootMode(opts.OverrideX86Boot)
 		if err != nil {
@@ -1260,6 +1376,7 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		vcpuTIDs:    make(map[int]int),
 		memDirty:    virtio.NewDirtyTracker(uint64(len(kvmVM.Memory()))),
 	}
+	m.pauseCond = sync.NewCond(&m.mu)
 
 	// Seed the per-device restore shortcuts before setupDevices runs so
 	// NewBlockDeviceWithOptions can skip the FALLOC_FL_PUNCH_HOLE probe
@@ -1542,13 +1659,18 @@ func (m *VM) acpiMMIODevices() []acpi.MMIODevice {
 
 func (m *VM) loadKernel() (*loader.KernelInfo, error) {
 	mem := m.kvmVM.Memory()
-
 	info, err := loader.LoadKernel(mem, m.cfg.KernelPath, BootParamsAddr)
 	if err != nil {
 		return nil, err
 	}
+	return m.finishLoadKernel(mem, info)
+}
 
-	// Write kernel cmdline at CmdlineAddr
+// finishLoadKernel writes the cmdline, ACPI tables, initrd, boot params and
+// MP table on top of an already-loaded kernel image. Split out from
+// loadKernel so the cached fast path (LoadKernelCached + CopySegmentsInto)
+// and the cold path (LoadKernel) share the post-load wiring.
+func (m *VM) finishLoadKernel(mem []byte, info *loader.KernelInfo) (*loader.KernelInfo, error) {
 	cmdline := m.cfg.Cmdline
 	if cmdline == "" {
 		cmdline = runtimecfg.DefaultKernelCmdline(false)
@@ -1558,7 +1680,10 @@ func (m *VM) loadKernel() (*loader.KernelInfo, error) {
 		mode = X86BootAuto
 	}
 
-	var acpiRSDP uint64
+	var (
+		acpiRSDP uint64
+		err      error
+	)
 	if mode == X86BootAuto || mode == X86BootACPI {
 		// Match Firecracker's transitional x86 path: advertise virtio-mmio
 		// devices through ACPI. Auto keeps the legacy cmdline enumeration
@@ -1770,11 +1895,15 @@ func (m *VM) setupDevices() error {
 		slot++
 	}
 
-	// virtio-net
-	if m.cfg.TapName != "" {
+	// virtio-net — TAP (default) or slirp (rootless userspace stack).
+	if m.cfg.TapName != "" || m.cfg.NetMode == "slirp" {
+		seedName := m.cfg.TapName
+		if seedName == "" {
+			seedName = "slirp"
+		}
 		mac := m.cfg.MACAddr
 		if mac == nil {
-			mac = defaultGuestMAC(m.cfg.ID, m.cfg.TapName)
+			mac = defaultGuestMAC(m.cfg.ID, seedName)
 		}
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
@@ -1782,7 +1911,13 @@ func (m *VM) setupDevices() error {
 		if err != nil {
 			return fmt.Errorf("virtio-net irqfd: %w", err)
 		}
-		nd, err := virtio.NewNetDevice(mem, base, irq, mac, m.cfg.TapName, m.memDirty, irqFn)
+		var nd *virtio.NetDevice
+		if m.cfg.NetMode == "slirp" {
+			backend := slirp.New()
+			nd, err = virtio.NewNetDeviceWithBackend(mem, base, irq, mac, backend, m.memDirty, irqFn)
+		} else {
+			nd, err = virtio.NewNetDevice(mem, base, irq, mac, m.cfg.TapName, m.memDirty, irqFn)
+		}
 		if err != nil {
 			return fmt.Errorf("virtio-net: %w", err)
 		}
@@ -2009,26 +2144,31 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 	}
 }
 
+// waitIfPaused parks the calling vCPU goroutine until the VM exits the
+// Paused state. It rides on m.pauseCond so wake-up after Resume is
+// effectively immediate (microseconds for the goroutine handoff) instead
+// of bounded by a 10 ms polling tick. Returns true when the VM has been
+// stopped and the caller should exit its run loop.
 func (m *VM) waitIfPaused(vcpuID int) bool {
-	for {
-		m.mu.Lock()
-		paused := m.state == StatePaused
-		stopped := m.state == StateStopped
-		if paused {
-			m.pausedVCPUs[vcpuID] = struct{}{}
-		} else {
-			delete(m.pausedVCPUs, vcpuID)
-		}
-		m.mu.Unlock()
-
-		if stopped {
-			return true
-		}
-		if !paused {
-			return false
-		}
-		time.Sleep(10 * time.Millisecond)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state != StatePaused {
+		// Fast path: not paused, nothing to wait for. Clear stale
+		// pausedVCPUs membership in case the caller raced with a
+		// previous Pause/Resume cycle.
+		delete(m.pausedVCPUs, vcpuID)
+		return m.state == StateStopped
 	}
+	cond := m.ensurePauseCondLocked()
+	m.pausedVCPUs[vcpuID] = struct{}{}
+	// Wake any Pause() waiter that's counting how many vCPUs have
+	// observed the pause.
+	cond.Broadcast()
+	for m.state == StatePaused {
+		cond.Wait()
+	}
+	delete(m.pausedVCPUs, vcpuID)
+	return m.state == StateStopped
 }
 
 func (m *VM) cleanup() {

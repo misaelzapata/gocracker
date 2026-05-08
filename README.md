@@ -359,25 +359,27 @@ The Firecracker head-to-head above measures at the VMM level. **Time-to-Interact
 - **Warm artifact cache**: first iteration pulls/extracts once, subsequent timed runs boot from the cached ext4
 - **Rootfs mode**: default (read-only rootfs with tmpfs overlay) — matches Docker's ephemeral-writable-layer semantics and enables the hardlink fast-path in [pkg/container/container.go](pkg/container/container.go)
 
-### Results (10 timed runs after one warmup, CPU-pinned + FIFO scheduler)
+### Two paths the bench exposes
 
-```
-TTI 1: 209ms
-TTI 2: 211ms
-TTI 3: 219ms
-TTI 4: 227ms
-TTI 5: 245ms
-TTI 6: 262ms
-TTI 7: 287ms
-TTI 8: 285ms
-TTI 9: 274ms
-TTI 10: 292ms
-median = 253 ms, mean = 251 ms, p95 = 292 ms, min = 209 ms, max = 292 ms
+The same script runs in two modes — they answer different questions:
+
+```bash
+sudo ./tools/bench-node-tti.sh 10              # cold-CLI (--dockerfile)
+sudo WARM=1 ./tools/bench-node-tti.sh 10       # snapshot-pool (--image, --warm)
 ```
 
-The bench pins `gocracker` to CPU 0 with `taskset -c 0` and SCHED_FIFO priority 50 via `chrt`. Override with `TTI_PIN_CPUS="0-3"` or `TTI_PIN_CPUS=""` to disable pinning. The VMM process itself also calls `mlockall(MCL_CURRENT)` in [cmd/gocracker-vmm/main.go](cmd/gocracker-vmm/main.go) so its working set stays resident.
+| Mode | What it measures | median | p95 | min |
+|---|---|---:|---:|---:|
+| **cold-CLI** | true cold create: OCI artifact cache hit, fresh kernel boot, fresh init, exec `node -v` | **231 ms** | 239 ms | 227 ms |
+| **WARM=1 snapshot-pool** | what Daytona / Vercel / E2B actually publish: pre-warmed snapshot of the same image, MAP_PRIVATE COW restore, exec `node -v` against the restored guest | **92 ms** | 100 ms | 88 ms |
 
-The median is ~35 ms slower than the pre-toolbox 218 ms baseline because [internal/guest/init.go](internal/guest/init.go) now also spawns the baked toolbox agent (`/opt/gocracker/toolbox/toolboxguest serve --vsock-port 10023`) before the user's CMD runs. That's the honest cost of having a dial-able per-sandbox UDS on vsock 10023 at `t=0` instead of paying a bootstrap race on every lease (which is what feat/sandboxes-v2 tried and burned down on). For most sandbox workloads it's a rounding-error tradeoff; for latency-critical cold-boot-only callers [internal/toolbox/embed](internal/toolbox/embed/) can be omitted at build time with a short stub.
+The WARM mode auto-captures a snapshot on the first iteration of a fresh image (~9 s warmup) and restores from it on every subsequent invocation (~2 ms restore primitive + ~50 ms `node -v` startup in the guest + ~12 ms host process startup + ~28 ms in misc dial / framing / log / scheduler overhead).
+
+Both modes pin `gocracker` to CPU 0 with `taskset -c 0` and SCHED_FIFO priority 50 via `chrt` (override with `TTI_PIN_CPUS="0-3"` or `""`). The VMM process itself calls `mlockall(MCL_CURRENT)` in [cmd/gocracker-vmm/main.go](cmd/gocracker-vmm/main.go) so its working set stays resident.
+
+The 100 ms WARM p95 sits at or below Daytona's published 100 ms median on the same `node -v` methodology — see [www.computesdk.com/benchmarks](https://www.computesdk.com/benchmarks/). Hardware is not directly comparable (we measure on a Ryzen laptop, ComputeSDK's leaderboard runs on its own infra); ranking is meaningful, exact margin would shift on a level-playing-field rerun.
+
+The cold-CLI 231 ms is what users see on a first-of-its-kind image with no warm pool. That's the path that's hardware-floored: ~12 ms host process startup, ~3 ms KVM/memfd setup, ~41 ms guest kernel boot to first printk, ~50 ms guest init → exec → `node -v` first byte, plus ~125 ms of structural overhead the kernel boot path can't skip without dropping initramfs / using virtio-pci hotplug / similar architectural changes.
 
 ## Sandboxd (sandbox control plane)
 

@@ -76,6 +76,22 @@ type Spec struct {
 	// every lease. Nil = standard boot-only snapshot (fast to build,
 	// but the caller's CMD needs to run again on each lease).
 	Readiness *ReadinessProbe `json:"readiness,omitempty"`
+
+	// Runtime, when non-nil, tells the builder to wait for an in-guest
+	// language runtime (managed by the toolbox agent) to bind its
+	// warm-eval socket before snapshotting. Snapshots taken at this
+	// point have V8/CPython/etc. parked in idle on a UDS. On lease,
+	// callers exec `<lang>-warm` (e.g. cmd[0] = "node-warm") and the
+	// agent dispatches the JS/Python source to the running interpreter
+	// over the UDS — collapsing ~25–50 ms of cold V8 startup to the
+	// dial + JSON round-trip cost (~5–10 ms).
+	//
+	// Different from Readiness: Runtime targets the toolbox-managed
+	// interpreter on a known endpoint, Readiness targets a user app on
+	// a user-chosen TCP port. Both can be nil; setting both is allowed
+	// (the builder waits for runtime ready, then app ready, in that
+	// order).
+	Runtime *RuntimeSpec `json:"runtime,omitempty"`
 }
 
 // ReadinessProbe is an HTTP readiness check the template builder runs
@@ -94,12 +110,41 @@ type ReadinessProbe struct {
 	Interval time.Duration `json:"interval,omitempty"`
 }
 
+// RuntimeSpec selects which language runtime the toolbox agent should
+// keep parked on a warm-eval UDS inside the guest. The builder polls
+// /runtime/<name>/ready (vsock 10023) until 200, then snapshots — so
+// the captured memory has V8 / CPython / etc. already initialised.
+//
+// Currently supported names: "node". Adding "python" / "bun" is a
+// matter of a new runner script + StartXxxWarmRunner; the wire and
+// snapshot semantics generalise.
+type RuntimeSpec struct {
+	// Name is the runner alias. Must match what the toolbox agent
+	// exposes under /runtime/<name>/ready and what the agent's exec
+	// dispatcher recognises as cmd[0] = "<name>-warm". Required.
+	Name string `json:"name"`
+	// Timeout caps total wait for the runner to bind its socket.
+	// Default 60s — node startup on alpine warm cache is &lt; 1s, but
+	// cold OCI extract + boot can push the first build longer.
+	Timeout time.Duration `json:"timeout,omitempty"`
+	// Interval is the gap between readiness probes. Default 50 ms,
+	// since the cost is a single in-guest HTTP GET on vsock and the
+	// runner's listen() callback fires once.
+	Interval time.Duration `json:"interval,omitempty"`
+}
+
 // CacheFormatVersion bumps when the Spec/Build pipeline changes in
 // a way that invalidates existing snapshots (e.g. new Spec field
 // with default value, change to WarmCapture's snapshot.json schema).
 // Embedded into SpecHash so old cached snapshots no longer collide
 // with new specs.
-const CacheFormatVersion = 1
+//
+// v2 (this commit): added Spec.Runtime — every prior snapshot was
+// taken at "toolbox idle, no language runtime running", which is a
+// strict subset of the new Spec semantics. Old snapshots are now
+// orphaned in the cache dir; they'll get reaped by the existing
+// orphan-cleanup pass.
+const CacheFormatVersion = 2
 
 // SpecHash returns a deterministic SHA-256 hex over the spec's JSON
 // representation prefixed with the cache format version. Two Specs

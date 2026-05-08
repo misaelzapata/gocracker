@@ -411,14 +411,39 @@ class Client:
     def unregister_pool(self, template_id: str) -> None:
         self._request("DELETE", f"/pools/{template_id}", body=None, expect_status={204})
 
-    def lease_sandbox(self, template_id: str, timeout_ns: int = 0) -> Sandbox:
+    def lease_sandbox(
+        self,
+        template_id: str,
+        timeout_ns: int = 0,
+        code_disks: Optional[List[Dict[str, Any]]] = None,
+    ) -> Sandbox:
         """Pull a warm sandbox from the named pool. Blocks server-side
         until available or timeout elapses. `timeout_ns` is passed as
         Go `time.Duration` via JSON-number nanoseconds (the server's
-        decoder handles both nanoseconds and sub-unit suffixes)."""
+        decoder handles both nanoseconds and sub-unit suffixes).
+
+        ``code_disks`` is the Phase 3 wire for per-lease code-disk
+        attach. Each entry is a dict with the shape::
+
+            {
+              "host_path": "/abs/path/to/app.ext4",
+              "mount":     "/app",
+              "fs_type":   "ext4",        # optional, defaults to ext4
+              "read_only": True,          # optional
+            }
+
+        The field is plumbed through to sandboxd's LeaseSandboxRequest
+        and from there into pool.LeaseSpec.CodeDisks. The runtime
+        application of the disks is **not yet implemented** — see
+        docs/design/code-disk-attach.md for the missing pool
+        restore-on-demand mode that makes the field functional.
+        Today the request is accepted and stamped onto the lease but
+        the disks are not actually mounted by sandboxd."""
         req: Dict[str, Any] = {"template_id": template_id}
         if timeout_ns:
             req["timeout"] = timeout_ns
+        if code_disks:
+            req["code_disks"] = code_disks
         resp = self._post("/sandboxes/lease", req)
         return self._parse_sandbox(resp.get("sandbox", {}))
 

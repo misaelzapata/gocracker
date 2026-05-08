@@ -80,6 +80,15 @@ type CreatePoolRequest struct {
 type LeaseSandboxRequest struct {
 	TemplateID string        `json:"template_id"`
 	Timeout    time.Duration `json:"timeout,omitempty"` // default 5s
+
+	// CodeDisks attach extra virtio-blk drives at lease time — Phase 3
+	// of code-disk-attach. The field is plumbed through to the pool's
+	// LeaseSpec and SDKs so callers can wire it now; runtime
+	// application is gated on the pool's restore-on-demand mode (not
+	// yet implemented). Until that lands, sandboxd stamps the field
+	// onto the lease but does not actually mount the disks. See
+	// docs/design/code-disk-attach.md.
+	CodeDisks []container.CodeDisk `json:"code_disks,omitempty"`
 }
 
 // ErrPoolAlreadyRegistered is returned by RegisterPool when the
@@ -386,7 +395,16 @@ func (m *Manager) LeaseSandbox(ctx context.Context, req LeaseSandboxRequest) (Sa
 	// consulted when the caller explicitly wants a specific IP (not the
 	// default SDK flow today). Skipping Allocate + SetNetwork removes
 	// the 12–18 ms netlink round trip that used to dominate lease p95.
-	lease, err := reg.pool.AcquireWait(ctx, pool.LeaseSpec{Interface: "eth0"}, timeout)
+	//
+	// req.CodeDisks plumbs through into LeaseSpec.CodeDisks so the wire
+	// is in place for Phase 3; the pool currently records but does not
+	// apply them (warm-resume model + no virtio-blk hot-plug). When the
+	// restore-on-demand pool mode lands, this field becomes functional
+	// without further changes here.
+	lease, err := reg.pool.AcquireWait(ctx, pool.LeaseSpec{
+		Interface: "eth0",
+		CodeDisks: append([]container.CodeDisk(nil), req.CodeDisks...),
+	}, timeout)
 	if err != nil {
 		return Sandbox{}, fmt.Errorf("sandboxd: lease: %w", err)
 	}

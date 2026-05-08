@@ -73,7 +73,29 @@ func Handler() http.Handler {
 	// user-facing API surface; callers reach it via the same UDS
 	// CONNECT 10023 path as the other endpoints.
 	mux.HandleFunc("POST /internal/setnetwork", handleSetNetwork)
+	// /runtime/<lang>/ready is the host's "is the warm runner up" probe.
+	// The template builder polls this between guest boot and snapshot
+	// capture so the snapshot is taken with the runtime parked on its
+	// listener — that's what makes `cmd[0]=="<lang>-warm"` execs land
+	// in single-digit ms post-restore instead of paying full V8/Python
+	// startup. See sandboxes/internal/templates/builder.go for the
+	// caller side.
+	mux.HandleFunc("GET /runtime/node/ready", handleRuntimeNodeReady)
 	return mux
+}
+
+// handleRuntimeNodeReady returns 200 OK with body "ready\n" when the
+// node warm runner has bound its UDS, 503 otherwise. We keep the body
+// non-empty so a 1.0 client doing ReadAll doesn't hang on an empty
+// successful response.
+func handleRuntimeNodeReady(w http.ResponseWriter, _ *http.Request) {
+	if NodeWarmReady() {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready\n"))
+		return
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte("not ready\n"))
 }
 
 func Serve(ctx context.Context, port uint32) error {
@@ -82,6 +104,12 @@ func Serve(ctx context.Context, port uint32) error {
 		return err
 	}
 	defer listener.Close()
+
+	// Spawn the long-lived language runtimes BEFORE accepting any
+	// connections so the readiness probe can never serve true while
+	// a runner is half-up. StartNodeWarmRunner is idempotent and
+	// non-blocking; the actual readiness flip happens in a goroutine.
+	StartNodeWarmRunner()
 
 	server := &http.Server{Handler: Handler()}
 	go func() {

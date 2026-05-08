@@ -175,6 +175,17 @@ func (b *Builder) Build(ctx context.Context, id string, spec Spec) (BuildResult,
 		probeOpts.WarmCapture = false
 		probeOpts.InteractiveExec = false
 		snapshotDir, err = bootProbeCapture(ctx, probeOpts, *spec.Readiness)
+	} else if spec.Runtime != nil {
+		// Runtime-aware capture: keep the toolbox's idle-exec mode (we
+		// don't want the user CMD running, we want the language runtime
+		// parked on its UDS), but disable WarmCapture so we can poll
+		// /runtime/<name>/ready ourselves before snapshotting. Without
+		// this gate the toolbox might be up before its child node-warm
+		// process has bound, and the snapshot would freeze a half-up
+		// runner that lease-side dials would race.
+		runtimeOpts := opts
+		runtimeOpts.WarmCapture = false
+		snapshotDir, err = bootRuntimeReadyCapture(ctx, runtimeOpts, *spec.Runtime)
 	} else {
 		snapshotDir, err = booter.BootAndCapture(ctx, opts)
 	}
@@ -315,10 +326,17 @@ func bootProbeCapture(ctx context.Context, opts container.RunOptions, probe Read
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
 	}
+	// probe.Interval, if explicitly set, becomes a fixed cadence (back-compat
+	// for callers that need a deterministic poll rate). When unset (the
+	// default) we ramp from 1 ms to 100 ms exponentially: real apps come
+	// up in tens to hundreds of milliseconds, and the previous 500 ms
+	// fixed tick added up to a full poll-period of pure wait on every
+	// cold template build.
 	interval := probe.Interval
-	if interval <= 0 {
-		interval = 500 * time.Millisecond
-	}
+	const (
+		probeMinInterval = 1 * time.Millisecond
+		probeMaxInterval = 100 * time.Millisecond
+	)
 	path := probe.HTTPPath
 	if path == "" {
 		path = "/"
@@ -344,6 +362,10 @@ func bootProbeCapture(ctx context.Context, opts container.RunOptions, probe Read
 	defer cancel()
 	var lastErr error
 	var lastStatus int
+	currentInterval := interval
+	if currentInterval <= 0 {
+		currentInterval = probeMinInterval
+	}
 	for attempt := 0; ; attempt++ {
 		if err := probeCtx.Err(); err != nil {
 			return "", fmt.Errorf("templates: readiness timed out after %s (%d attempts, last_status=%d, last_err=%v): %w", timeout, attempt, lastStatus, lastErr, err)
@@ -355,9 +377,18 @@ func bootProbeCapture(ctx context.Context, opts container.RunOptions, probe Read
 			break
 		}
 		select {
-		case <-time.After(interval):
+		case <-time.After(currentInterval):
 		case <-probeCtx.Done():
 			return "", fmt.Errorf("templates: readiness timed out waiting for %d%s (last_status=%d, last_err=%v)", probe.HTTPPort, path, lastStatus, lastErr)
+		}
+		// When the caller didn't pin a fixed interval, double on each
+		// failure up to probeMaxInterval. Apps that come up in 5 ms
+		// pay 1+2+4 ms ≈ 7 ms of wait instead of the previous 500 ms.
+		if interval <= 0 && currentInterval < probeMaxInterval {
+			currentInterval *= 2
+			if currentInterval > probeMaxInterval {
+				currentInterval = probeMaxInterval
+			}
 		}
 	}
 
@@ -381,8 +412,15 @@ func bootProbeCapture(ctx context.Context, opts container.RunOptions, probe Read
 	if err := quiesceGuestNet(dialer, 2*time.Second); err != nil {
 		gclog.VMM.Warn("templates: eth0 quiesce failed; snapshot may panic on restore", "err", err.Error())
 	}
-	// Let the guest drain pending RX/TX descriptors.
-	time.Sleep(50 * time.Millisecond)
+	// quiesceGuestNet drains the agent's framed exec response to EOF, so
+	// `ip link set eth0 down` has already returned synchronously by the
+	// time we get here — the kernel finishes its admin-DOWN bookkeeping
+	// before the ip(8) syscall returns. A 1 ms scheduler yield is enough
+	// to let any deferred host-side virtio TX completion the kernel may
+	// have queued land. The previous 50 ms pad shaved 49 ms off every
+	// readiness-snapshot template build with no observed regression in
+	// the restore-panic rate that comment in quiesceGuestNet warns about.
+	time.Sleep(1 * time.Millisecond)
 
 	// Snapshot the live VM. TakeSnapshot pauses → writes → resumes.
 	tmp, err := os.MkdirTemp("", "gocracker-readysnap-*")
@@ -451,6 +489,182 @@ func bootProbeCapture(ctx context.Context, opts container.RunOptions, probe Read
 		return "", fmt.Errorf("templates: warmcache store: %w", err)
 	}
 	return warmcache.Dir(root, key), nil
+}
+
+// bootRuntimeReadyCapture cold-boots a template VM with WarmCapture=false,
+// polls the toolbox agent's GET /runtime/<name>/ready endpoint until it
+// returns 200, then takes a snapshot + stores it in the warm cache.
+// The captured memory image has the language runtime parked idle on
+// its UDS — leases that exec `<name>-warm` skip V8/CPython startup.
+//
+// Mirrors bootProbeCapture's structure but talks to the agent's
+// runtime-readiness surface instead of the user-app proxy. Both share
+// the quiesce-net + TakeSnapshot + warmcache.Store tail.
+//
+// Design choice: we keep InteractiveExec=true on opts (the toolbox
+// idle-supervisor stays in charge), unlike bootProbeCapture which
+// flips it off so the user CMD runs. The warm runner is spawned by
+// the toolbox agent itself, not by container init — that's why the
+// idle-exec mode still works here.
+func bootRuntimeReadyCapture(ctx context.Context, opts container.RunOptions, rt RuntimeSpec) (string, error) {
+	if rt.Name == "" {
+		return "", errors.New("templates: Runtime.Name required")
+	}
+	timeout := rt.Timeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	interval := rt.Interval
+	if interval <= 0 {
+		interval = 50 * time.Millisecond
+	}
+
+	result, err := container.Run(opts)
+	if err != nil {
+		return "", err
+	}
+	defer result.Close()
+	defer result.VM.Stop()
+
+	dialer, ok := result.VM.(vmm.VsockDialer)
+	if !ok {
+		return "", errors.New("templates: VM handle does not implement VsockDialer (cannot drive runtime probe)")
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var lastStatus int
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		if err := probeCtx.Err(); err != nil {
+			return "", fmt.Errorf("templates: runtime %q not ready after %s (%d attempts, last_status=%d, last_err=%v): %w",
+				rt.Name, timeout, attempt, lastStatus, lastErr, err)
+		}
+		status, perr := runtimeReadyOnce(dialer, rt.Name, 1*time.Second)
+		lastStatus = status
+		lastErr = perr
+		if perr == nil && status >= 200 && status < 300 {
+			break
+		}
+		select {
+		case <-time.After(interval):
+		case <-probeCtx.Done():
+			return "", fmt.Errorf("templates: runtime %q not ready (last_status=%d, last_err=%v)", rt.Name, lastStatus, lastErr)
+		}
+	}
+
+	// Same quiesce + 1ms yield + snapshot tail as bootProbeCapture.
+	if err := quiesceGuestNet(dialer, 2*time.Second); err != nil {
+		gclog.VMM.Warn("templates: eth0 quiesce failed; snapshot may panic on restore", "err", err.Error())
+	}
+	time.Sleep(1 * time.Millisecond)
+
+	tmp, err := os.MkdirTemp("", "gocracker-runtime-snap-*")
+	if err != nil {
+		return "", fmt.Errorf("templates: mktemp: %w", err)
+	}
+	defer func() {
+		if _, statErr := os.Stat(tmp); statErr == nil {
+			_ = os.RemoveAll(tmp)
+		}
+	}()
+	snap, err := result.VM.TakeSnapshot(tmp)
+	if err != nil {
+		return "", fmt.Errorf("templates: take snapshot: %w", err)
+	}
+	if snap != nil && snap.Config.DiskImage != "" && !strings.HasPrefix(snap.Config.DiskImage, "artifacts/") {
+		artifactsDir := filepath.Join(tmp, "artifacts")
+		if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
+			return "", fmt.Errorf("templates: mkdir artifacts: %w", err)
+		}
+		destDisk := filepath.Join(artifactsDir, "disk.ext4")
+		if err := os.Link(snap.Config.DiskImage, destDisk); err != nil {
+			if copyErr := copyFile(snap.Config.DiskImage, destDisk); copyErr != nil {
+				return "", fmt.Errorf("templates: link disk: %w (copy fallback: %v)", err, copyErr)
+			}
+		}
+		snap.Config.DiskImage = "artifacts/disk.ext4"
+		data, err := json.MarshalIndent(snap, "", "  ")
+		if err != nil {
+			return "", fmt.Errorf("templates: marshal snapshot.json: %w", err)
+		}
+		if err := os.WriteFile(filepath.Join(tmp, "snapshot.json"), data, 0o644); err != nil {
+			return "", fmt.Errorf("templates: rewrite snapshot.json: %w", err)
+		}
+	}
+
+	lookupOpts := opts
+	if lookupOpts.Arch == "" {
+		lookupOpts.Arch = runtime.GOARCH
+	}
+	if lookupOpts.MemMB == 0 {
+		lookupOpts.MemMB = 256
+	}
+	lookupOpts.WarmCapture = true
+	key, ok := container.ComputeWarmCacheKey(lookupOpts)
+	if !ok {
+		return "", errors.New("templates: warmcache key not derivable from spec")
+	}
+	root := warmcache.DefaultRoot()
+	if err := warmcache.Store(tmp, root, key); err != nil {
+		return "", fmt.Errorf("templates: warmcache store: %w", err)
+	}
+	return warmcache.Dir(root, key), nil
+}
+
+// runtimeReadyOnce issues GET /runtime/<name>/ready against the toolbox
+// agent and returns the HTTP status code. Mirrors probeOnce's shape
+// but targets the agent's runtime-readiness surface (no user app port
+// involved).
+func runtimeReadyOnce(dialer vmm.VsockDialer, name string, timeout time.Duration) (int, error) {
+	type dialResult struct {
+		conn interface {
+			io.ReadWriter
+			Close() error
+		}
+		err error
+	}
+	dialCh := make(chan dialResult, 1)
+	go func() {
+		c, err := dialer.DialVsock(10023)
+		dialCh <- dialResult{c, err}
+	}()
+	var conn interface {
+		io.ReadWriter
+		Close() error
+	}
+	select {
+	case r := <-dialCh:
+		if r.err != nil {
+			return 0, fmt.Errorf("dial agent vsock: %w", r.err)
+		}
+		conn = r.conn
+	case <-time.After(timeout):
+		return 0, fmt.Errorf("dial agent vsock: timeout after %s", timeout)
+	}
+	defer conn.Close()
+	if dc, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
+		_ = dc.SetDeadline(time.Now().Add(timeout))
+	}
+	req := fmt.Sprintf("GET /runtime/%s/ready HTTP/1.0\r\nHost: x\r\nConnection: close\r\n\r\n", name)
+	if _, err := io.WriteString(conn, req); err != nil {
+		return 0, fmt.Errorf("write probe: %w", err)
+	}
+	br := bufio.NewReader(conn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		return 0, fmt.Errorf("read probe status: %w", err)
+	}
+	go func() { _, _ = io.Copy(io.Discard, br) }()
+	parts := strings.SplitN(strings.TrimRight(statusLine, "\r\n"), " ", 3)
+	if len(parts) < 2 || !strings.HasPrefix(parts[0], "HTTP/") {
+		return 0, fmt.Errorf("bad status line: %q", statusLine)
+	}
+	var status int
+	if _, err := fmt.Sscanf(parts[1], "%d", &status); err != nil {
+		return 0, fmt.Errorf("parse status: %w", err)
+	}
+	return status, nil
 }
 
 // quiesceGuestNet asks the toolbox agent to run `ip link set eth0 down`
