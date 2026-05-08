@@ -210,3 +210,57 @@ Phase 3 (wire shape):
 ```bash
 go test ./sandboxes/internal/sandboxd -run TestHandleLeaseSandbox_
 ```
+
+## Real-app examples
+
+Three working examples live in [examples/code-disk/](../../examples/code-disk/).
+Each ships a real application, a bundled data file, and a `build.sh` that
+produces the ext4 disk image.
+
+| Example | Image | What it does |
+| --- | --- | --- |
+| [node-word-count](../../examples/code-disk/node-word-count/) | `node:20-alpine` | Node.js reads `/app/text.txt` from the code disk; emits a JSON word-frequency report (top-10, totals) |
+| [python-stats](../../examples/code-disk/python-stats/) | `python:3.12-alpine` | Python reads `/app/cities.csv`; emits JSON population statistics (mean, top-5, histogram buckets) |
+| [go-serve](../../examples/code-disk/go-serve/) | `alpine:3.20` | Statically-compiled Go binary reads `/app/config.json`; HTTP server with a `--print` mode for non-networked testing |
+
+### Quick start (individual examples)
+
+```bash
+make build kernel-unpack
+
+# node word-count
+bash examples/code-disk/node-word-count/build.sh
+sudo bin/gocracker run \
+  --image node:20-alpine \
+  --kernel artifacts/kernels/gocracker-guest-standard-vmlinux \
+  --code-disk examples/code-disk/node-word-count/node-word-count.ext4:/app:ext4:ro \
+  --net none --jailer off --wait \
+  --cmd 'node /app/word-count.js'
+
+# python population stats
+bash examples/code-disk/python-stats/build.sh
+sudo bin/gocracker run \
+  --image python:3.12-alpine \
+  --kernel artifacts/kernels/gocracker-guest-standard-vmlinux \
+  --code-disk examples/code-disk/python-stats/python-stats.ext4:/app:ext4:ro \
+  --net none --jailer off --wait \
+  --cmd 'python3 /app/stats.py'
+
+# go HTTP server (print mode)
+bash examples/code-disk/go-serve/build.sh
+sudo bin/gocracker run \
+  --image alpine:3.20 \
+  --kernel artifacts/kernels/gocracker-guest-standard-vmlinux \
+  --code-disk examples/code-disk/go-serve/go-serve.ext4:/app:ext4:ro \
+  --net none --jailer off --wait \
+  --cmd '/app/go-serve --print'
+```
+
+### Full automated smoke test (all three apps)
+
+```bash
+make build kernel-unpack
+sudo bash tests/manual-smoke/code-disk-apps/run.sh
+# Expected:
+#   Results: 10 passed, 0 failed
+```

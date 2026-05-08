@@ -1,0 +1,6 @@
+{
+  "app_name": "gocracker-demo",
+  "version": "1.0.0",
+  "port": 8080,
+  "greeting": "Hello from a code-disk mounted Go app!"
+}
