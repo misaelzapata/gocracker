@@ -8,6 +8,8 @@ import { GocrackrOutputPanel } from './panel';
 import { SandboxExplorer, SandboxItem } from './explorer';
 import { openSandboxShell } from './terminal';
 import { downloadKernel }  from './daemon';
+import { runFanOut } from './fanout';
+import { registerChatParticipant } from './chat';
 
 let daemonManager: DaemonManager | undefined;
 
@@ -42,7 +44,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const treeView = vscode.window.registerTreeDataProvider('gocrackrSandboxes', explorer);
   explorer.startPolling();
 
-  // 5. Status bar item
+  // 5. Chat participant
+  const chatParticipant = registerChatParticipant(context, client);
+  context.subscriptions.push(chatParticipant);
+
+  // 6. Status bar item
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.command = 'gocracker.startDaemon';
   statusBar.show();
@@ -175,6 +181,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     explorer.refresh();
   });
 
+  const cmdFanOut = vscode.commands.registerCommand('gocracker.fanOut', async () => {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.selection.isEmpty) {
+      vscode.window.showErrorMessage('gocracker: Select code to fan-out');
+      return;
+    }
+    const nStr = await vscode.window.showInputBox({
+      prompt: 'Number of parallel sandboxes',
+      value: '3',
+      validateInput: v => {
+        const n = parseInt(v, 10);
+        return (Number.isInteger(n) && n >= 2 && n <= 10) ? null : 'Enter a number between 2 and 10';
+      },
+    });
+    if (!nStr) return;
+    const n = parseInt(nStr, 10);
+
+    const config = getConfig();
+    if (config.autoStartDaemon) {
+      await daemon.ensure(config);
+      updateStatusBar();
+    }
+
+    const source = editor.document.getText(editor.selection);
+    await runFanOut(client, source, editor.document, context, n);
+  });
+
   const cmdDeleteSandbox = vscode.commands.registerCommand('gocracker.deleteSandbox', async (item?: SandboxItem) => {
     const id = item?.sandbox.id;
     if (!id) return;
@@ -233,6 +266,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     cmdStopDaemon,
     cmdSetupMcp,
     cmdRefreshExplorer,
+    cmdFanOut,
     cmdDeleteSandbox,
     cmdRecycleSandbox,
     cmdExecShell,

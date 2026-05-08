@@ -20,16 +20,19 @@
       { "command": "gocracker.deleteSandbox",  "title": "Delete Sandbox",  "category": "gocracker" },
       { "command": "gocracker.recycleSandbox", "title": "Recycle Sandbox", "category": "gocracker" },
       { "command": "gocracker.execShell",      "title": "Open Shell",      "category": "gocracker" },
-      { "command": "gocracker.downloadKernel", "title": "Download Kernel", "category": "gocracker" }
+      { "command": "gocracker.downloadKernel", "title": "Download Kernel", "category": "gocracker" },
+      { "command": "gocracker.fanOut", "title": "Fan Out (run N parallel sandboxes)", "category": "gocracker" }
     ],
     "keybindings": [
       { "command": "gocracker.runSelection", "key": "ctrl+shift+g", "when": "editorHasSelection" },
-      { "command": "gocracker.runFile",      "key": "ctrl+shift+alt+g" }
+      { "command": "gocracker.runFile",      "key": "ctrl+shift+alt+g" },
+      { "command": "gocracker.fanOut", "key": "ctrl+shift+alt+f", "when": "editorHasSelection" }
     ],
     "menus": {
       "editor/context": [
         { "command": "gocracker.runSelection", "when": "editorHasSelection", "group": "gocracker" },
-        { "command": "gocracker.runFile", "group": "gocracker" }
+        { "command": "gocracker.runFile", "group": "gocracker" },
+        { "command": "gocracker.fanOut", "when": "editorHasSelection", "group": "gocracker" }
       ],
       "view/title": [
         { "command": "gocracker.refreshExplorer", "when": "view == gocrackrSandboxes", "group": "navigation" }
@@ -40,6 +43,14 @@
         { "command": "gocracker.recycleSandbox", "when": "view == gocrackrSandboxes && viewItem == sandbox", "group": "gocracker@3" }
       ]
     },
+    "chatParticipants": [
+      {
+        "id": "gocracker.run",
+        "name": "gocracker",
+        "description": "Run code in isolated KVM micro-VM sandboxes",
+        "isSticky": false
+      }
+    ],
     "views": {
       "explorer": [
         { "id": "gocrackrSandboxes", "name": "gocracker Sandboxes", "when": "true" }
