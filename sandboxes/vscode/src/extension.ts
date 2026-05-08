@@ -29,7 +29,9 @@ function guestExtension(doc: vscode.TextDocument): string {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  if (process.platform !== 'linux') {
+  const isLinux = process.platform === 'linux';
+  vscode.commands.executeCommand('setContext', 'gocracker.isLinux', isLinux);
+  if (!isLinux) {
     vscode.window.showWarningMessage(
       'gocracker requires Linux with KVM. It will not function on this platform.'
     );
@@ -238,7 +240,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       explorer.refresh();
       vscode.window.showInformationMessage('Sandbox recycled');
     } catch (err: any) {
-      vscode.window.showErrorMessage(`gocracker: ${err.message}`);
+      if (err.message?.includes('HTTP 404') || err.message?.includes('405')) {
+        vscode.window.showWarningMessage(
+          'Recycle is only available for pool-leased sandboxes. Use Delete instead.'
+        );
+      } else {
+        vscode.window.showErrorMessage(`gocracker: ${err.message}`);
+      }
     }
   });
 

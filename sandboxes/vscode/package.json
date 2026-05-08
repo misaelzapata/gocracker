@@ -4,6 +4,7 @@
   "description": "Run code in isolated KVM micro-VMs directly from VS Code",
   "version": "0.1.0",
   "publisher": "gocracker",
+  "icon": "icon.png",
   "repository": { "type": "git", "url": "https://github.com/misaelzapata/gocracker" },
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],
@@ -54,7 +55,7 @@
     ],
     "views": {
       "explorer": [
-        { "id": "gocrackrSandboxes", "name": "gocracker Sandboxes", "when": "true" }
+        { "id": "gocrackrSandboxes", "name": "gocracker Sandboxes", "when": "gocracker.isLinux" }
       ]
     },
     "configuration": {
@@ -98,15 +99,26 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts"
+    "lint": "eslint src --ext ts",
+    "package": "vsce package",
+    "test": "jest"
   },
   "devDependencies": {
     "@types/vscode": "^1.90.0",
     "@types/node": "^20.0.0",
+    "@types/jest": "^29.0.0",
     "@vscode/vsce": "^3.0.0",
+    "jest": "^29.0.0",
+    "ts-jest": "^29.0.0",
     "typescript": "^5.3.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
     "eslint": "^8.56.0"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "testMatch": ["**/src/test/**/*.test.ts"],
+    "moduleNameMapper": { "^vscode$": "<rootDir>/src/test/__mocks__/vscode.ts" }
   }
 }

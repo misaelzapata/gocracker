@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
+import * as os from 'os';
 import * as path from 'path';
 import * as https from 'https';
 import * as zlib from 'zlib';
@@ -204,7 +205,14 @@ export class DaemonManager implements vscode.Disposable {
       return envKernel;
     }
 
-    // 3. globalStorageUri/kernels/gocracker-guest-standard-vmlinux
+    // 3. ~/.local/share/gocracker/kernels/ (installed via gocracker-sandboxd install)
+    const xdgData = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+    const xdgKernel = path.join(xdgData, 'gocracker', 'kernels', 'gocracker-guest-standard-vmlinux');
+    if (fs.existsSync(xdgKernel)) {
+      return xdgKernel;
+    }
+
+    // 4. globalStorageUri/kernels/ (downloaded by this extension)
     const storageKernel = path.join(
       this.context.globalStorageUri.fsPath,
       'kernels',
@@ -214,7 +222,7 @@ export class DaemonManager implements vscode.Disposable {
       return storageKernel;
     }
 
-    // 4. Relative to gocracker-sandboxd binary location
+    // 5. Relative to gocracker-sandboxd binary location
     try {
       const result = cp.spawnSync('which', ['gocracker-sandboxd'], { encoding: 'utf8' });
       if (result.status === 0 && result.stdout.trim()) {
