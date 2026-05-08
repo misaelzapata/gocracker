@@ -1,0 +1,124 @@
+{
+  "name": "gocracker",
+  "displayName": "gocracker",
+  "description": "Run code in isolated KVM micro-VMs directly from VS Code",
+  "version": "0.1.0",
+  "publisher": "gocracker",
+  "icon": "icon.png",
+  "repository": { "type": "git", "url": "https://github.com/misaelzapata/gocracker" },
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
+  "keywords": ["sandbox", "vm", "kvm", "execution"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "gocracker.runSelection", "title": "Run Selection in Sandbox", "category": "gocracker" },
+      { "command": "gocracker.runFile",      "title": "Run File in Sandbox",       "category": "gocracker" },
+      { "command": "gocracker.startDaemon",  "title": "Start Daemon",              "category": "gocracker" },
+      { "command": "gocracker.stopDaemon",   "title": "Stop Daemon",               "category": "gocracker" },
+      { "command": "gocracker.setupMcp",     "title": "Setup MCP (write tool configs)", "category": "gocracker" },
+      { "command": "gocracker.refreshExplorer", "title": "Refresh", "icon": "$(refresh)", "category": "gocracker" },
+      { "command": "gocracker.deleteSandbox",  "title": "Delete Sandbox",  "category": "gocracker" },
+      { "command": "gocracker.recycleSandbox", "title": "Recycle Sandbox", "category": "gocracker" },
+      { "command": "gocracker.execShell",      "title": "Open Shell",      "category": "gocracker" },
+      { "command": "gocracker.downloadKernel", "title": "Download Kernel", "category": "gocracker" },
+      { "command": "gocracker.fanOut", "title": "Fan Out (run N parallel sandboxes)", "category": "gocracker" }
+    ],
+    "keybindings": [
+      { "command": "gocracker.runSelection", "key": "ctrl+shift+g", "when": "editorHasSelection" },
+      { "command": "gocracker.runFile",      "key": "ctrl+shift+alt+g" },
+      { "command": "gocracker.fanOut", "key": "ctrl+shift+alt+f", "when": "editorHasSelection" }
+    ],
+    "menus": {
+      "editor/context": [
+        { "command": "gocracker.runSelection", "when": "editorHasSelection", "group": "gocracker" },
+        { "command": "gocracker.runFile", "group": "gocracker" },
+        { "command": "gocracker.fanOut", "when": "editorHasSelection", "group": "gocracker" }
+      ],
+      "view/title": [
+        { "command": "gocracker.refreshExplorer", "when": "view == gocrackrSandboxes", "group": "navigation" }
+      ],
+      "view/item/context": [
+        { "command": "gocracker.execShell",      "when": "view == gocrackrSandboxes && viewItem == sandbox", "group": "gocracker@1" },
+        { "command": "gocracker.deleteSandbox",  "when": "view == gocrackrSandboxes && viewItem == sandbox", "group": "gocracker@2" },
+        { "command": "gocracker.recycleSandbox", "when": "view == gocrackrSandboxes && viewItem == sandbox", "group": "gocracker@3" }
+      ]
+    },
+    "chatParticipants": [
+      {
+        "id": "gocracker.run",
+        "name": "gocracker",
+        "description": "Run code in isolated KVM micro-VM sandboxes",
+        "isSticky": false
+      }
+    ],
+    "views": {
+      "explorer": [
+        { "id": "gocrackrSandboxes", "name": "gocracker Sandboxes", "when": "gocracker.isLinux" }
+      ]
+    },
+    "configuration": {
+      "title": "gocracker",
+      "properties": {
+        "gocracker.kernelPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the guest kernel vmlinux. Leave empty to auto-discover."
+        },
+        "gocracker.sandboxdUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:9091",
+          "description": "gocracker-sandboxd HTTP API base URL"
+        },
+        "gocracker.networkMode": {
+          "type": "string",
+          "default": "slirp",
+          "enum": ["slirp", "auto", "none"],
+          "description": "Network mode for sandbox VMs. slirp = rootless userspace stack."
+        },
+        "gocracker.defaultMemMb": {
+          "type": "number",
+          "default": 256,
+          "description": "Default RAM in MiB for leased sandboxes"
+        },
+        "gocracker.autoStartDaemon": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start gocracker-sandboxd if it is not running"
+        },
+        "gocracker.keepSandboxOnError": {
+          "type": "boolean",
+          "default": false,
+          "description": "Keep the sandbox alive after a failed run (useful for debugging)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "@types/node": "^20.0.0",
+    "@types/jest": "^29.0.0",
+    "@vscode/vsce": "^3.0.0",
+    "jest": "^29.0.0",
+    "ts-jest": "^29.0.0",
+    "typescript": "^5.3.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.56.0"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "testMatch": ["**/src/test/**/*.test.ts"],
+    "moduleNameMapper": { "^vscode$": "<rootDir>/src/test/__mocks__/vscode.ts" }
+  }
+}

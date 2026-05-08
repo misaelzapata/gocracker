@@ -43,11 +43,14 @@ Firecracker-compatible REST API. All in a single static binary.
 ## Quick Start
 
 ```bash
+# One-time: join the kvm group so gocracker works without sudo
+sudo usermod -aG kvm $USER && newgrp kvm
+
 # Build gocracker + unpack the prebuilt guest kernel that ships with the repo
 make build kernel-unpack
 
-# Run your first microVM (uses the unpacked vmlinux from artifacts/kernels/)
-sudo ./gocracker run \
+# Run your first microVM — no sudo needed
+./gocracker run \
   --image alpine:latest \
   --kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux \
   --cmd "echo hello from a real VM" \
