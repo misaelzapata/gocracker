@@ -4,7 +4,8 @@
   "description": "Run code in isolated KVM micro-VMs directly from VS Code",
   "version": "0.1.0",
   "publisher": "gocracker",
-  "engines": { "vscode": "^1.85.0" },
+  "repository": { "type": "git", "url": "https://github.com/misaelzapata/gocracker" },
+  "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],
   "keywords": ["sandbox", "vm", "kvm", "execution"],
   "activationEvents": ["onStartupFinished"],
@@ -100,8 +101,9 @@
     "lint": "eslint src --ext ts"
   },
   "devDependencies": {
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "^1.90.0",
     "@types/node": "^20.0.0",
+    "@vscode/vsce": "^3.0.0",
     "typescript": "^5.3.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",

@@ -1,6 +1,6 @@
 # gocracker VS Code Extension — Design
 
-Status: **planning**
+Status: **shipped** (all 3 phases, `feat/mcp-server` branch)
 
 ## What it does
 
@@ -97,46 +97,52 @@ Kernel path discovery order:
 
 ## Phases
 
-### Phase 1 — MVP (~2 weeks)
+### Phase 1 — MVP ✅
 
-- [ ] Extension scaffold (`yo code`, TypeScript, no webpack)
-- [ ] `DaemonManager`: start/stop/health-check sandboxd
-- [ ] `GocrackrClient`: `leaseSandbox`, `exec`, `deleteSandbox` (plain `fetch`, no SDK)
-- [ ] `Run Selection` command with language detection + template mapping
-- [ ] `GocrackrOutputPanel`: WebviewPanel showing stdout/stderr with ANSI support
-- [ ] Status bar item (idle / running / error)
-- [ ] Settings: `kernelPath`, `sandboxdUrl`, `networkMode`
-- [ ] `gocracker: Start Daemon` and `gocracker: Stop Daemon` commands
-- [ ] README with install instructions (kvm group + kernel setup)
+- [x] Extension scaffold (TypeScript, no webpack)
+- [x] `DaemonManager`: start/stop/health-check sandboxd; auto-starts on first run
+- [x] `GocrackrClient`: `leaseSandbox`, `exec`, `uploadFile`, `deleteSandbox`, `listSandboxes`
+- [x] `Run Selection` command (`Ctrl+Shift+G`) with language detection + template mapping
+- [x] `GocrackrOutputPanel`: WebviewPanel showing stdout/stderr with ANSI→HTML support
+- [x] Status bar item (ready / stopped)
+- [x] Settings: `kernelPath`, `sandboxdUrl`, `networkMode`, `defaultMemMb`, `autoStartDaemon`, `keepSandboxOnError`
+- [x] `gocracker: Start Daemon` and `gocracker: Stop Daemon` commands
+- [x] README with install instructions (kvm group + kernel setup)
+- [x] sandboxd: `POST /sandboxes/{id}/exec` and `PUT /sandboxes/{id}/files` HTTP endpoints
 
-### Phase 2 — File run + explorer (~1 week)
+### Phase 2 — File run + explorer ✅
 
-- [ ] `Run File` command (uploads file, execs, cleans up)
-- [ ] Sandbox explorer TreeView (`GET /sandboxes` polled every 2 s)
-- [ ] Exec shell command (opens VS Code Terminal connected to sandbox exec)
-- [ ] Auto-kernel download if none configured (pulls pre-built from GitHub releases)
+- [x] `Run File` command (`Ctrl+Shift+Alt+G`) — uploads full file, execs, cleans up
+- [x] Sandbox explorer TreeView (`GET /sandboxes` polled every 3 s)
+- [x] Exec shell command — REPL-style PTY terminal via `vscode.Pseudoterminal`
+- [x] Auto-kernel download if none configured (pulls pre-built from GitHub releases, gunzips in-process)
+- [x] Right-click context menu: Open Shell, Delete (with confirmation), Recycle
 
-### Phase 3 — AI integration (~1 week)
+### Phase 3 — AI integration ✅
 
-- [ ] `gocracker: Setup MCP` command: calls `gocracker-mcp setup` in a terminal
-- [ ] Copilot / inline chat: show gocracker tool calls in the output panel
-- [ ] `sandbox.fan_out` UI: run N variants of selected code in parallel, show diff
+- [x] `gocracker: Setup MCP` command: calls `gocracker-mcp setup` in a terminal
+- [x] `@gocracker` Copilot chat participant — parses fenced code blocks, runs in sandbox, streams result
+- [x] `sandbox.fan_out` UI (`Ctrl+Shift+Alt+F`) — N parallel sandboxes, detects identical vs differing outputs
 
 ## File layout
 
 ```
-gocracker-vscode/          # separate repo or sandboxes/vscode/
+sandboxes/vscode/
   src/
-    extension.ts           # activate / deactivate
-    daemon.ts              # DaemonManager
-    client.ts              # GocrackrClient (HTTP)
-    panel.ts               # GocrackrOutputPanel (WebviewPanel)
-    explorer.ts            # SandboxExplorer (TreeView)
+    extension.ts           # activate / deactivate + all command registration
+    daemon.ts              # DaemonManager + downloadKernel()
+    client.ts              # GocrackrClient (HTTP fetch, no SDK)
+    panel.ts               # GocrackrOutputPanel (WebviewPanel, ANSI→HTML)
+    explorer.ts            # SandboxExplorer (TreeView, 3s poll)
+    terminal.ts            # openSandboxShell() — REPL PTY terminal
+    fanout.ts              # runFanOut() — N parallel sandbox runs
+    chat.ts                # @gocracker Copilot chat participant
     language.ts            # file extension → template ID
     config.ts              # settings wrapper
   package.json
   tsconfig.json
   .vscodeignore
+  .gitignore
 ```
 
 ## Language → template mapping

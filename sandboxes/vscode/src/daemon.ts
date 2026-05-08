@@ -119,6 +119,7 @@ export class DaemonManager implements vscode.Disposable {
     this.log.appendLine(`[daemon] using kernel: ${kernelPath}`);
 
     const stateDir = path.join(this.context.globalStorageUri.fsPath, 'sandboxd-state');
+    fs.mkdirSync(stateDir, { recursive: true });
     const udsGroup = process.env.USER || process.env.USERNAME || '';
 
     // Parse addr from URL (strip protocol)

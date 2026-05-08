@@ -29,6 +29,13 @@ function guestExtension(doc: vscode.TextDocument): string {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  if (process.platform !== 'linux') {
+    vscode.window.showWarningMessage(
+      'gocracker requires Linux with KVM. It will not function on this platform.'
+    );
+    return;
+  }
+
   // 1. Output channel for daemon logs
   const outputChannel = vscode.window.createOutputChannel('gocracker');
 
