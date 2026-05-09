@@ -16,6 +16,7 @@ import (
 	gclog "github.com/gocracker/gocracker/internal/log"
 	"github.com/gocracker/gocracker/internal/rtc"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
+	"github.com/gocracker/gocracker/internal/slirp"
 	"github.com/gocracker/gocracker/internal/uart"
 	"github.com/gocracker/gocracker/internal/virtio"
 	"github.com/gocracker/gocracker/internal/vsock"
@@ -187,11 +188,15 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 		slot++
 	}
 
-	// virtio-net
-	if vm.cfg.TapName != "" {
+	// virtio-net — TAP (default) or slirp (rootless userspace stack).
+	if vm.cfg.TapName != "" || vm.cfg.NetMode == "slirp" {
+		seedName := vm.cfg.TapName
+		if seedName == "" {
+			seedName = "slirp"
+		}
 		mac := vm.cfg.MACAddr
 		if mac == nil {
-			mac = defaultGuestMAC(vm.cfg.ID, vm.cfg.TapName)
+			mac = defaultGuestMAC(vm.cfg.ID, seedName)
 		}
 		base := uint64(arm64VirtioBase) + uint64(slot)*arm64VirtioStride
 		irq := uint8(arm64VirtioIRQBase + slot)
@@ -199,7 +204,13 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 		if err != nil {
 			return fmt.Errorf("virtio-net eventfd: %w", err)
 		}
-		nd, err := virtio.NewNetDevice(mem, base, irq, mac, vm.cfg.TapName, vm.memDirty, irqFn)
+		var nd *virtio.NetDevice
+		if vm.cfg.NetMode == "slirp" {
+			backend := slirp.New()
+			nd, err = virtio.NewNetDeviceWithBackend(mem, base, irq, mac, backend, vm.memDirty, irqFn)
+		} else {
+			nd, err = virtio.NewNetDevice(mem, base, irq, mac, vm.cfg.TapName, vm.memDirty, irqFn)
+		}
 		if err != nil {
 			return fmt.Errorf("virtio-net: %w", err)
 		}

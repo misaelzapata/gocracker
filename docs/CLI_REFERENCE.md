@@ -31,8 +31,13 @@ Internal commands (not typically invoked directly):
 Build and boot a microVM from an OCI image or Dockerfile.
 
 ```bash
-sudo gocracker run --image ubuntu:22.04 --kernel ./vmlinux --wait --jailer off
-sudo gocracker run --dockerfile ./Dockerfile --context . --kernel ./vmlinux --mem 512 --wait
+# No sudo needed — auto-detects non-root and uses jailer=off
+gocracker run --image ubuntu:22.04 --kernel ./vmlinux --wait
+gocracker run --dockerfile ./Dockerfile --context . --kernel ./vmlinux --mem 512 --wait
+# With network (slirp = no root; auto = needs root/CAP_NET_ADMIN)
+gocracker run --image alpine:3.20 --kernel ./vmlinux --net slirp --wait
+# Full isolation (root required for chroot+namespace layer)
+sudo gocracker run --image ubuntu:22.04 --kernel ./vmlinux --jailer on --net auto --wait
 ```
 
 | Flag | Type | Default | Description |
@@ -45,7 +50,7 @@ sudo gocracker run --dockerfile ./Dockerfile --context . --kernel ./vmlinux --me
 | `--arch` | string | host arch | Guest architecture: `amd64` or `arm64` |
 | `--cpus` | int | `1` | vCPU count |
 | `--x86-boot` | string | `auto` | x86 boot mode: `auto`, `acpi`, or `legacy` |
-| `--net` | string | `none` | Network mode: `none` or `auto` |
+| `--net` | string | `none` | Network: `none` (no root), `slirp` (userspace, no root), `auto` (TAP+NAT, needs root) |
 | `--tap` | string | | TAP interface (e.g. `tap0`) |
 | `--disk` | int | `2048` | Disk size in MiB |
 | `--snapshot` | string | | Restore from snapshot directory |
@@ -57,7 +62,7 @@ sudo gocracker run --dockerfile ./Dockerfile --context . --kernel ./vmlinux --me
 | `--id` | string | (auto) | VM identifier |
 | `--wait` | bool | `false` | Block until VM stops |
 | `--tty` | string | `auto` | Console mode: `auto`, `off`, or `force` |
-| `--jailer` | string | `on` | Privilege model: `on` or `off` |
+| `--jailer` | string | auto | `off` auto-detected when not root; `on` adds chroot+namespace layer (needs root); explicit `off` always rootless |
 | `--build-arg` | string | | Build arg `KEY=VALUE` (repeatable) |
 | `--balloon-target-mib` | uint64 | `0` | Balloon target in MiB |
 | `--balloon-deflate-on-oom` | bool | `false` | Allow balloon deflate on guest OOM |
@@ -75,8 +80,8 @@ sudo gocracker run --dockerfile ./Dockerfile --context . --kernel ./vmlinux --me
 Clone a git repo and boot the Dockerfile found inside.
 
 ```bash
-sudo gocracker repo --url https://github.com/user/myapp --kernel ./vmlinux --wait
-sudo gocracker repo --url ./myapp --kernel ./vmlinux --wait --jailer off
+gocracker repo --url https://github.com/user/myapp --kernel ./vmlinux --wait
+gocracker repo --url ./myapp --kernel ./vmlinux --wait
 ```
 
 | Flag | Type | Default | Description |
@@ -89,7 +94,7 @@ sudo gocracker repo --url ./myapp --kernel ./vmlinux --wait --jailer off
 | `--arch` | string | host arch | Guest architecture: `amd64` or `arm64` |
 | `--cpus` | int | `1` | vCPU count |
 | `--x86-boot` | string | `auto` | x86 boot mode |
-| `--net` | string | `none` | Network mode: `none` or `auto` |
+| `--net` | string | `none` | Network: `none` (no root), `slirp` (userspace, no root), `auto` (TAP+NAT, needs root) |
 | `--tap` | string | | TAP interface |
 | `--disk` | int | `2048` | Disk size in MiB |
 | `--snapshot` | string | | Restore from snapshot directory |
@@ -117,7 +122,7 @@ sudo gocracker repo --url ./myapp --kernel ./vmlinux --wait --jailer off
 Boot a `docker-compose.yml` stack as microVMs.
 
 ```bash
-sudo gocracker compose --file docker-compose.yml --kernel ./vmlinux --wait --jailer off
+gocracker compose --file docker-compose.yml --kernel ./vmlinux --wait
 ```
 
 Subcommands: `compose down`, `compose exec`.
@@ -158,8 +163,8 @@ gocracker compose exec --server http://localhost:8080 myservice   # interactive 
 Build a disk image without booting a VM.
 
 ```bash
-sudo gocracker build --image python:3.12-slim --output ./disk.ext4
-sudo gocracker build --dockerfile ./Dockerfile --context . --output ./disk.ext4
+gocracker build --image python:3.12-slim --output ./disk.ext4
+gocracker build --dockerfile ./Dockerfile --context . --output ./disk.ext4
 ```
 
 | Flag | Type | Default | Description |

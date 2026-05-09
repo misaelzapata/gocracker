@@ -37,6 +37,8 @@ func main() {
 		cmdServe(os.Args[2:])
 	case "template":
 		cmdTemplate(os.Args[2:])
+	case "install":
+		cmdInstall(os.Args[2:])
 	default:
 		usage()
 	}
@@ -47,6 +49,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "commands:")
 	fmt.Fprintln(os.Stderr, "  serve                                 Start the HTTP control plane")
 	fmt.Fprintln(os.Stderr, "  template create|list|delete|get       Manage warm templates (Fase 6)")
+	fmt.Fprintln(os.Stderr, "  install                               Install as a systemd service (run as root)")
 	os.Exit(2)
 }
 
@@ -61,6 +64,8 @@ func cmdServe(args []string) {
 	previewHost := fs.String("preview-host", "sbx.localhost", "DNS root for preview subdomains (<id>--<port>.<preview-host>)")
 	kernelPath := fs.String("kernel-path", "", "Path to the guest kernel. Used to auto-register base templates at startup. Defaults to $GOCRACKER_KERNEL.")
 	autoBaseTemplates := fs.Bool("auto-base-templates", true, "Build the canonical base-python / base-node / base-bun / base-go templates at startup (requires -kernel-path).")
+	udsGroup := fs.String("uds-group", "", "Unix group that may dial sandbox UDS sockets (e.g. 'gocracker'). Sets group ownership + 0660 on each socket so non-root MCP clients can connect.")
+	networkMode := fs.String("network-mode", "", `Network mode for pool VMs: "auto" (TAP+iptables, needs root/CAP_NET_ADMIN) or "slirp" (rootless, only needs kvm group). Default: auto.`)
 	fs.Parse(args)
 
 	if err := os.MkdirAll(*stateDir, 0o755); err != nil {
@@ -86,13 +91,15 @@ func cmdServe(args []string) {
 		}
 	}
 	mgr := &sandboxd.Manager{
-		Store:             store,
-		StateDir:          *stateDir,
-		VMMBinary:         resolvedVMM,
-		JailerBinary:      resolvedJailer,
-		PreviewSigningKey: previewKey,
-		PreviewTTL:        *previewTTL,
-		PreviewHost:       *previewHost,
+		Store:              store,
+		StateDir:           *stateDir,
+		VMMBinary:          resolvedVMM,
+		JailerBinary:       resolvedJailer,
+		PreviewSigningKey:  previewKey,
+		PreviewTTL:         *previewTTL,
+		PreviewHost:        *previewHost,
+		UDSGroup:           *udsGroup,
+		DefaultNetworkMode: *networkMode,
 	}
 	srv := &http.Server{
 		Addr:              *addr,

@@ -166,6 +166,24 @@ type Pool struct {
 type LeaseSandboxRequest struct {
 	TemplateID string        `json:"template_id"`
 	Timeout    time.Duration `json:"timeout,omitempty"`
+	// CodeDisks attach extra ext4 (or other fs) disks to the leased
+	// VM at lease time — Phase 3 of code-disk-attach. The wire is
+	// plumbed end-to-end (sandboxd → pool.LeaseSpec) but runtime
+	// application of the disks is not yet implemented because the
+	// pool gives out already-restored VMs and gocracker has no
+	// virtio-blk hot-plug. Today setting this field is accepted and
+	// preserved on the lease but the disks are not mounted. See
+	// docs/design/code-disk-attach.md.
+	CodeDisks []CodeDisk `json:"code_disks,omitempty"`
+}
+
+// CodeDisk mirrors pkg/container.CodeDisk for the SDK wire. Kept as
+// its own type so SDK consumers don't pull in pkg/container.
+type CodeDisk struct {
+	HostPath string `json:"host_path"`
+	Mount    string `json:"mount"`
+	FSType   string `json:"fs_type,omitempty"`
+	ReadOnly bool   `json:"read_only,omitempty"`
 }
 
 type CreateTemplateRequest struct {

@@ -32,3 +32,4 @@ gocracker-bottleneck.md
 
 # Local Claude / agent scratch
 .claude/
+.wrangler/

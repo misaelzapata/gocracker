@@ -23,6 +23,13 @@ type BaseTemplate struct {
 	// MemMB/CPUs: zero = container.Run defaults (256MB / 1 vCPU).
 	MemMB uint64
 	CPUs  int
+	// Runtime, when non-empty, marks this template as a "warm
+	// runtime" template: the snapshot is captured AFTER the named
+	// language runtime is parked on its UDS, so leases that exec
+	// `<name>-warm` skip ~25–50 ms of V8/Python startup. Only
+	// "node" is supported in this commit; "python" / "bun" land
+	// when their runner scripts are added to internal/toolbox/agent.
+	Runtime string
 }
 
 // DefaultBaseTemplates is the canonical list we register when sandboxd
@@ -30,10 +37,17 @@ type BaseTemplate struct {
 // nextjs, etc.) goes here — the list is intentionally short: anything
 // exotic belongs in user-defined templates so we don't bloat the
 // "default sandboxd" with opinions the user didn't ask for.
+//
+// base-node-warm sits next to base-node — same image, but the snapshot
+// is taken with the toolbox's node REPL server idle on its UDS. Leases
+// that need the cold semantics (each exec a fresh node process) keep
+// using base-node; leases that want sub-10 ms eval over a long-lived
+// V8 use base-node-warm.
 func DefaultBaseTemplates() []BaseTemplate {
 	return []BaseTemplate{
 		{ID: "base-python", Image: "python:3.12-alpine"},
 		{ID: "base-node", Image: "node:22-alpine"},
+		{ID: "base-node-warm", Image: "node:22-alpine", Runtime: "node"},
 		{ID: "base-bun", Image: "oven/bun:1"},
 		{ID: "base-go", Image: "golang:1.23-alpine"},
 	}
@@ -74,6 +88,7 @@ func (m *Manager) EnsureBaseTemplates(ctx context.Context, kernelPath string, se
 				KernelPath: kernelPath,
 				MemMB:      s.MemMB,
 				CPUs:       s.CPUs,
+				Runtime:    s.Runtime,
 			}
 			t0 := time.Now()
 			buildCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)

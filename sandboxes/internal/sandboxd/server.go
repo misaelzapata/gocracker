@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"time"
 
 	"github.com/gocracker/gocracker/sandboxes/internal/templates"
+	gosdk "github.com/gocracker/gocracker/sandboxes/sdk/go"
 )
 
 // Lifecycle is the small interface the HTTP server depends on for
@@ -88,6 +91,8 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("GET /templates/{id}", s.handleGetTemplate(tl))
 		mux.HandleFunc("DELETE /templates/{id}", s.handleDeleteTemplate(tl))
 	}
+	mux.HandleFunc("POST /sandboxes/{id}/exec", s.handleExecSandbox)
+	mux.HandleFunc("PUT /sandboxes/{id}/files/{path...}", s.handleUploadFile)
 	if pv, ok := s.Lifecycle.(PreviewLifecycle); ok {
 		mux.HandleFunc("POST /sandboxes/{id}/preview/{port}", s.handleMintPreview(pv))
 		// Go 1.22 ServeMux: {token...} path wildcard captures the
@@ -370,6 +375,114 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleExecSandbox(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sb, ok := s.Store.Get(id)
+	if !ok {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	if sb.UDSPath == "" {
+		http.Error(w, `{"error":"sandbox has no UDS path"}`, http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Cmd       []string `json:"cmd"`
+		Env       []string `json:"env,omitempty"`
+		WorkDir   string   `json:"workdir,omitempty"`
+		Stdin     string   `json:"stdin,omitempty"`
+		TimeoutMs int      `json:"timeout_ms,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+		return
+	}
+	if len(req.Cmd) == 0 {
+		http.Error(w, `{"error":"cmd required"}`, http.StatusBadRequest)
+		return
+	}
+
+	tb := gosdk.NewToolboxClient(sb.UDSPath)
+	opts := gosdk.ExecOptions{
+		Env:     req.Env,
+		WorkDir: req.WorkDir,
+		Stdin:   []byte(req.Stdin),
+	}
+	if req.TimeoutMs > 0 {
+		opts.Timeout = time.Duration(req.TimeoutMs) * time.Millisecond
+	}
+	ctx := r.Context()
+	start := time.Now()
+	res, err := tb.Exec(ctx, req.Cmd, opts)
+	wallMs := time.Since(start).Milliseconds()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"stdout":    string(res.Stdout),
+		"stderr":    string(res.Stderr),
+		"exit_code": res.ExitCode,
+		"wall_ms":   wallMs,
+	})
+}
+
+func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	path := r.PathValue("path")
+	if path == "" || path[0] != '/' {
+		path = "/" + path
+	}
+	sb, ok := s.Store.Get(id)
+	if !ok {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	if sb.UDSPath == "" {
+		http.Error(w, `{"error":"no UDS path"}`, http.StatusBadRequest)
+		return
+	}
+
+	const maxUploadBytes = 32 << 20 // 32 MiB
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	content, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
+		return
+	}
+
+	tb := gosdk.NewToolboxClient(sb.UDSPath)
+	// Pass path and dir as env vars to avoid shell command injection.
+	_, err = tb.Exec(r.Context(), []string{"sh", "-c", `mkdir -p "$GC_DIR" && cat > "$GC_PATH"`},
+		gosdk.ExecOptions{
+			Stdin: content,
+			Env:   []string{"GC_DIR=" + dirOf(path), "GC_PATH=" + path},
+		})
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func dirOf(path string) string {
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '/' {
+			if i == 0 {
+				return "/"
+			}
+			return path[:i]
+		}
+	}
+	return "/"
 }
 
 func writeJSON(w http.ResponseWriter, code int, value any) {

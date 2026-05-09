@@ -236,6 +236,7 @@ func (p *Pool) DrainPaused() int {
 		if e.State == StatePaused && e.result != nil {
 			toClose = append(toClose, e.result)
 			e.result = nil
+			p.dequeueAvailableLocked(e)
 			e.State = StateStopped
 			_ = id
 		}
@@ -428,6 +429,7 @@ func (p *Pool) reapOnce() int {
 		if e.stater == nil || !e.stater.Stopped() {
 			continue
 		}
+		p.dequeueAvailableLocked(e)
 		e.State = StateStopped
 		dead = append(dead, doomed{id: id, result: e.result})
 		e.result = nil
@@ -514,7 +516,7 @@ func (p *Pool) runCreate(ctx context.Context, booter Booter, isHot bool) {
 	if isHot {
 		state = StateHot
 	}
-	p.entries[id] = &Entry{
+	e := &Entry{
 		ID:        id,
 		State:     state,
 		CreatedAt: time.Now(),
@@ -524,6 +526,8 @@ func (p *Pool) runCreate(ctx context.Context, booter Booter, isHot bool) {
 		resumer:   bootResult.Resumer,
 		stater:    bootResult.Stater,
 	}
+	p.entries[id] = e
+	p.enqueueAvailableLocked(e)
 	p.consecutiveFailures = 0
 	p.cooldownUntil = time.Time{}
 	metricBootSuccesses.Add(1)

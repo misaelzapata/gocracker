@@ -80,6 +80,15 @@ type CreatePoolRequest struct {
 type LeaseSandboxRequest struct {
 	TemplateID string        `json:"template_id"`
 	Timeout    time.Duration `json:"timeout,omitempty"` // default 5s
+
+	// CodeDisks attach extra virtio-blk drives at lease time — Phase 3
+	// of code-disk-attach. The field is plumbed through to the pool's
+	// LeaseSpec and SDKs so callers can wire it now; runtime
+	// application is gated on the pool's restore-on-demand mode (not
+	// yet implemented). Until that lands, sandboxd stamps the field
+	// onto the lease but does not actually mount the disks. See
+	// docs/design/code-disk-attach.md.
+	CodeDisks []container.CodeDisk `json:"code_disks,omitempty"`
 }
 
 // ErrPoolAlreadyRegistered is returned by RegisterPool when the
@@ -211,12 +220,12 @@ func (m *Manager) RegisterPool(ctx context.Context, req CreatePoolRequest) (Pool
 			MemMB:        defaultUint64(req.MemMB, 256),
 			CPUs:         defaultInt(req.CPUs, 1),
 			JailerMode:   jailerMode,
-			// Lease path SetNetwork configures eth0 post-restore —
-			// the pool needs a TAP + eth0 available on every booted
-			// VM. network_mode=auto gives us exactly that (host-side
-			// TAP + guest-side eth0); anything else (none / manual)
-			// would fail SetNetwork with "Link not found".
-			NetworkMode:  "auto",
+			// Pool warm-lease path passes spec.IP="" so SetNetwork is
+			// skipped; the guest network state is preserved in the
+			// snapshot. "auto" (TAP+iptables) needs CAP_NET_ADMIN;
+			// "slirp" (in-process userspace) is rootless and equally
+			// compatible with snapshot/restore. Defaults to "auto".
+			NetworkMode:  defaultString(m.DefaultNetworkMode, "auto"),
 			ExecEnabled:  true, // pooled sandboxes always have toolbox running
 			VsockUDSPath: poolVsockUDSPath(req.TemplateID, jailerMode),
 			VMMBinary:    m.VMMBinary,
@@ -386,7 +395,16 @@ func (m *Manager) LeaseSandbox(ctx context.Context, req LeaseSandboxRequest) (Sa
 	// consulted when the caller explicitly wants a specific IP (not the
 	// default SDK flow today). Skipping Allocate + SetNetwork removes
 	// the 12–18 ms netlink round trip that used to dominate lease p95.
-	lease, err := reg.pool.AcquireWait(ctx, pool.LeaseSpec{Interface: "eth0"}, timeout)
+	//
+	// req.CodeDisks plumbs through into LeaseSpec.CodeDisks so the wire
+	// is in place for Phase 3; the pool currently records but does not
+	// apply them (warm-resume model + no virtio-blk hot-plug). When the
+	// restore-on-demand pool mode lands, this field becomes functional
+	// without further changes here.
+	lease, err := reg.pool.AcquireWait(ctx, pool.LeaseSpec{
+		Interface: "eth0",
+		CodeDisks: append([]container.CodeDisk(nil), req.CodeDisks...),
+	}, timeout)
 	if err != nil {
 		return Sandbox{}, fmt.Errorf("sandboxd: lease: %w", err)
 	}
@@ -409,6 +427,7 @@ func (m *Manager) LeaseSandbox(ctx context.Context, req LeaseSandboxRequest) (Sa
 		s.poolTemplateID = req.TemplateID
 	})
 	updated, _ := m.Store.Get(lease.ID)
+	m.chownUDS(updated.UDSPath)
 	return updated, nil
 }
 
@@ -545,6 +564,7 @@ func (m *Manager) RecycleLeased(ctx context.Context, id string) (Sandbox, error)
 	}
 	m.Store.Update(lease.ID, func(s *Sandbox) { s.poolTemplateID = templateID })
 	final, _ := m.Store.Get(lease.ID)
+	m.chownUDS(final.UDSPath)
 	return final, nil
 }
 

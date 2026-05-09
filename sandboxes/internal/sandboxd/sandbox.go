@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -46,6 +48,20 @@ type Manager struct {
 	tmplInit sync.Once
 	tmplMgr  *templateManager
 
+	// DefaultNetworkMode sets the network mode used when registering pool
+	// templates. Accepted values: "auto" (TAP + iptables, needs
+	// CAP_NET_ADMIN / root), "slirp" (in-process userspace stack, rootless,
+	// only needs kvm-group), "" (defaults to "auto").
+	// Set via --network-mode on the serve command.
+	DefaultNetworkMode string
+
+	// UDSGroup, when non-empty, names a Unix group whose members should
+	// be able to dial sandbox toolbox UDS sockets. After each socket
+	// appears on disk, sandboxd calls Lchown(-1, gid) + Chmod(0660) so
+	// non-root processes (e.g. gocracker-mcp spawned by Claude Desktop)
+	// can connect without sudo. Set via --uds-group on the serve command.
+	UDSGroup string
+
 	// Preview signer + proxy (Fase 7 slice 3). Lazily initialized
 	// on first MintPreview / ServePreview call. PreviewSigningKey
 	// (≥32 bytes) is set by main() from env / flag; empty means
@@ -57,6 +73,25 @@ type Manager struct {
 	PreviewHost       string
 	previewInit       sync.Once
 	previewMgr        *previewManager
+}
+
+// chownUDS applies group ownership + 0660 permissions to a UDS socket
+// so that members of UDSGroup can connect without running as root.
+// No-op when UDSGroup is empty or path is empty.
+func (m *Manager) chownUDS(path string) {
+	if m.UDSGroup == "" || path == "" {
+		return
+	}
+	g, err := user.LookupGroup(m.UDSGroup)
+	if err != nil {
+		return
+	}
+	gid, err := strconv.Atoi(g.Gid)
+	if err != nil {
+		return
+	}
+	_ = os.Lchown(path, -1, gid)
+	_ = os.Chmod(path, 0o660)
 }
 
 // Create cold-boots a fresh sandbox VM. Blocks until container.Run
@@ -113,6 +148,7 @@ func (m *Manager) Create(req CreateSandboxRequest) (Sandbox, error) {
 		VsockUDSPath: udsPath,
 		VMMBinary:    m.VMMBinary,
 		JailerBinary: m.JailerBinary,
+		CodeDisks:    normalized.CodeDisks,
 	}
 
 	result, runErr := container.Run(opts)
@@ -142,6 +178,7 @@ func (m *Manager) Create(req CreateSandboxRequest) (Sandbox, error) {
 		s.GuestIP = result.GuestIP
 		s.UDSPath = hostUDSPath
 	})
+	m.chownUDS(hostUDSPath)
 
 	updated, _ := m.Store.Get(id)
 	return updated, nil

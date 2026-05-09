@@ -118,10 +118,90 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Warm-eval fast path: if the caller's cmd[0] is a known warm-runner
+	// alias, route the request to the long-lived runtime parked on its
+	// UDS instead of fork+execing a fresh process. The cost difference is
+	// the runtime's startup tax (V8: ~25–50 ms on alpine) collapsed to a
+	// UDS dial + JSON round-trip (~5–10 ms total). Regular `node` execs
+	// keep their existing fork+exec semantics — this is opt-in via the
+	// argv0 alias only.
+	if len(req.Cmd) > 0 && req.Cmd[0] == "node-warm" {
+		if err := runWarmEvalNode(r.Context(), conn, req); err != nil {
+			_, _ = WriteFrame(conn, ChannelStderr, []byte("toolbox exec (node-warm): "+err.Error()+"\n"))
+			_ = WriteExitFrame(conn, -1)
+		}
+		return
+	}
+
 	if err := runExecSession(r.Context(), conn, brw, req); err != nil {
 		_, _ = WriteFrame(conn, ChannelStderr, []byte("toolbox exec: "+err.Error()+"\n"))
 		_ = WriteExitFrame(conn, -1)
 	}
+}
+
+// runWarmEvalNode dispatches a request to the in-guest node warm runner.
+// req.Cmd[0] == "node-warm"; req.Cmd[1] is the JS source to evaluate
+// (a single string, not argv-style — the caller is expected to compose
+// their snippet, e.g. ["node-warm", "console.log(process.version)"]).
+//
+// stdout/stderr from the eval are streamed back as ChannelStdout/Stderr
+// frames; a non-zero exit code from the runner (user code threw) maps
+// to a non-zero EXIT frame with the error message on ChannelStderr.
+//
+// We do NOT pump stdin from the caller — node-warm is one-shot per
+// /exec call by design (the runner is shared, so the only sane stdin
+// model is "none"). Callers that need stdin should use the regular
+// node fork+exec path.
+func runWarmEvalNode(ctx context.Context, conn net.Conn, req ExecRequest) error {
+	if len(req.Cmd) < 2 {
+		return errors.New("node-warm requires cmd[1] = JS source")
+	}
+	if !NodeWarmReady() {
+		return errors.New("node-warm runner not ready (template was built without GOCRACKER_NODE_WARM=1, or the runner crashed)")
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	rconn, err := dialNodeWarm(dialCtx)
+	if err != nil {
+		return fmt.Errorf("dial warm runner: %w", err)
+	}
+	defer rconn.Close()
+	timeoutMs := 30000
+	if deadline, ok := ctx.Deadline(); ok {
+		if rem := time.Until(deadline); rem > 0 && rem < 30*time.Second {
+			timeoutMs = int(rem.Milliseconds())
+		}
+	}
+	if err := EncodeWarmRequest(rconn, WarmEvalRequest{
+		ID:        1,
+		Code:      req.Cmd[1],
+		TimeoutMs: timeoutMs,
+	}); err != nil {
+		return fmt.Errorf("send: %w", err)
+	}
+	resp, err := DecodeWarmResponse(rconn)
+	if err != nil {
+		return fmt.Errorf("recv: %w", err)
+	}
+	if resp.Stdout != "" {
+		if _, werr := WriteFrame(conn, ChannelStdout, []byte(resp.Stdout)); werr != nil {
+			return werr
+		}
+	}
+	if resp.Stderr != "" {
+		if _, werr := WriteFrame(conn, ChannelStderr, []byte(resp.Stderr)); werr != nil {
+			return werr
+		}
+	}
+	if resp.Error != "" && resp.ExitCode == 0 {
+		// Defensive: a runner-side bad-request reports error+exit_code=2,
+		// but if a future runner reports error without flipping the code
+		// surface it via stderr so the caller sees something.
+		if _, werr := WriteFrame(conn, ChannelStderr, []byte(resp.Error+"\n")); werr != nil {
+			return werr
+		}
+	}
+	return WriteExitFrame(conn, int32(resp.ExitCode))
 }
 
 // runExecSession spawns the requested process, multiplexes I/O over

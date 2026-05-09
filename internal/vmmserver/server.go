@@ -212,6 +212,14 @@ type RestoreRequest struct {
 	// that restores a template snapshot but wants a fresh per-instance
 	// socket. Empty = keep the snapshot's original path.
 	VsockUDSPath string `json:"vsock_uds_path,omitempty"`
+	// AdditionalDrives are virtio-blk drives the caller wants attached
+	// at restore time but that were not present when the snapshot was
+	// taken — Phase 2 of the code-disk-attach feature. The vmm appends
+	// these to the snapshot's drive list before setupDevices runs;
+	// guests must mount them themselves (typical pattern: the host
+	// invokes `toolbox.Exec(["mount", DEV, MOUNT, "-t", FS])` after
+	// resume). See docs/design/code-disk-attach.md.
+	AdditionalDrives []vmm.DriveConfig `json:"additional_drives,omitempty"`
 }
 
 // restoreResponse is the minimal payload returned by POST /restore. It stays
@@ -1054,6 +1062,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		OverrideX86Boot:      mode,
 		OverrideVsockUDSPath: req.VsockUDSPath,
 		SharedFSRebinds:      req.SharedFSRebinds,
+		AdditionalDrives:     req.AdditionalDrives,
 	})
 	if err != nil {
 		apiErr(w, http.StatusBadRequest, err.Error())

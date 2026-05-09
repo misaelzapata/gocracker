@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -33,6 +35,9 @@ import (
 	"github.com/gocracker/gocracker/internal/oci"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
 	"github.com/gocracker/gocracker/internal/tempprune"
+	toolboxagent "github.com/gocracker/gocracker/internal/toolbox/agent"
+	toolboxspec "github.com/gocracker/gocracker/internal/toolbox/spec"
+	"github.com/gocracker/gocracker/internal/trace"
 	"github.com/gocracker/gocracker/internal/vmmserver"
 	"github.com/gocracker/gocracker/internal/worker"
 	"github.com/gocracker/gocracker/pkg/container"
@@ -141,6 +146,7 @@ func main() {
 // ---- run ----
 
 func cmdRun(args []string) {
+	trace.Event("cmd_run_enter")
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	image := fs.String("image", "", "OCI image ref (e.g. ubuntu:22.04)")
 	df := fs.String("dockerfile", "", "Path to Dockerfile")
@@ -157,7 +163,7 @@ func cmdRun(args []string) {
 	hotplugSlotMiB := fs.Uint64("hotplug-slot-mib", 0, "Hotpluggable memory slot size in MiB")
 	hotplugBlockMiB := fs.Uint64("hotplug-block-mib", 0, "Hotpluggable memory block size in MiB")
 	x86Boot := fs.String("x86-boot", string(vmm.X86BootAuto), "x86 boot mode: auto, acpi, or legacy")
-	netMode := fs.String("net", "none", "network mode: none or auto")
+	netMode := fs.String("net", "none", "network mode: none, auto (TAP+NAT, needs CAP_NET_ADMIN), or slirp (rootless userspace stack, MVP: ARP+DHCP+ICMP echo only — TCP/UDP outbound deferred)")
 	tap := fs.String("tap", "", "TAP interface (e.g. tap0)")
 	disk := fs.Int("disk", 2048, "Disk size MiB")
 	snap := fs.String("snapshot", "", "Restore from snapshot dir")
@@ -172,16 +178,22 @@ func cmdRun(args []string) {
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
 	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs read-write directly (writes survive VM stop; slower boot). Default: Docker-style tmpfs overlay.")
 	warm := fs.Bool("warm", false, "Auto snapshot-cache: restore from snapshot on cache hit (~3 ms); snapshot after cold boot on miss so next run is fast.")
+	warmRuntime := fs.String("warm-runtime", "", "Bake a warm language runtime into the snapshot (e.g. \"node\"). The snapshot is taken AFTER the toolbox agent's GET /runtime/<name>/ready returns 200, so post-restore exec calls of the form `<name>-warm <code>` skip V8/Python startup. Requires --warm. Empty = standard CMD-agnostic snapshot.")
 	vsockUDSPath := fs.String("vsock-uds-path", "", "Absolute path for the VM's Firecracker-style vsock UDS. Clients dial it and send \"CONNECT <port>\\n\" to reach a guest vsock port. Empty = no UDS (HTTP /vms/{id}/vsock/connect still works).")
+	codeDisks := multiStringFlag{}
+	fs.Var(&codeDisks, "code-disk", "Attach an ext4 disk image and mount it inside the guest. Format: HOST_PATH:GUEST_MOUNT[:FS[:ro]] (FS defaults to ext4). Repeatable; appended after --drive entries as /dev/vdb, /dev/vdc, … See docs/design/code-disk-attach.md.")
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
+	*jailerMode = resolveJailerMode(fs, *jailerMode)
+	trace.Event("flags_parsed", "warm", *warm, "image", *image != "", "dockerfile", *df != "")
 
 	requireKernel(*kernel)
 	*kernel = resolveRequiredExistingPath("kernel", *kernel)
 	if *image == "" && *df == "" {
 		fatal("--image or --dockerfile required")
 	}
+	parsedCodeDisks := mustParseCodeDisks(codeDisks.Values())
 
 	interactive := mustInteractiveMode(*ttyMode, *wait)
 	consoleIn := io.Reader(nil)
@@ -211,7 +223,9 @@ func cmdRun(args []string) {
 		ConsoleIn:       consoleIn,
 		RootfsPersistent: *rootfsPersistent,
 		WarmCapture:     *warm,
+		WarmRuntime:     *warmRuntime,
 		VsockUDSPath:    *vsockUDSPath,
+		CodeDisks:       parsedCodeDisks,
 	}
 	if *balloonTargetMiB > 0 || *balloonDeflateOnOOM || *balloonStatsIntervalS > 0 || strings.TrimSpace(*balloonAuto) != "" {
 		runOpts.Balloon = &vmm.BalloonConfig{
@@ -228,7 +242,9 @@ func cmdRun(args []string) {
 			BlockSizeMiB: *hotplugBlockMiB,
 		}
 	}
+	trace.Event("container_run_begin")
 	result := mustRun(runOpts)
+	trace.Event("container_run_done", "total_ms", result.Timings.Total.Milliseconds())
 	defer result.Close()
 	if interactive.enabled {
 		// Drain warm-capture BEFORE printing result or opening the shell. The
@@ -251,10 +267,12 @@ func cmdRun(args []string) {
 		drainWarmDone(result)
 		cmd := effectiveCommandSlice(runOpts.Cmd, imageDefaultCmd(result.Config))
 		if len(cmd) > 0 {
+			trace.Event("warm_cmd_begin", "argv0", cmd[0])
 			if err := runWarmCmd(result.VM, cmd); err != nil {
 				stopVMAndWait(result.VM, 5*time.Second)
 				fatal(err.Error())
 			}
+			trace.Event("warm_cmd_done")
 		}
 		stopVMAndWait(result.VM, 5*time.Second)
 		return
@@ -285,7 +303,7 @@ func cmdRepo(args []string) {
 	hotplugSlotMiB := fs.Uint64("hotplug-slot-mib", 0, "Hotpluggable memory slot size in MiB")
 	hotplugBlockMiB := fs.Uint64("hotplug-block-mib", 0, "Hotpluggable memory block size in MiB")
 	x86Boot := fs.String("x86-boot", string(vmm.X86BootAuto), "x86 boot mode: auto, acpi, or legacy")
-	netMode := fs.String("net", "none", "network mode: none or auto")
+	netMode := fs.String("net", "none", "network mode: none, auto (TAP+NAT, needs CAP_NET_ADMIN), or slirp (rootless userspace stack, MVP: ARP+DHCP+ICMP echo only — TCP/UDP outbound deferred)")
 	tap := fs.String("tap", "", "TAP interface")
 	disk := fs.Int("disk", 2048, "Disk size MiB")
 	snap := fs.String("snapshot", "", "Restore from snapshot dir")
@@ -301,6 +319,7 @@ func cmdRepo(args []string) {
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
+	*jailerMode = resolveJailerMode(fs, *jailerMode)
 
 	if *url == "" {
 		fatal("--url required")
@@ -395,6 +414,7 @@ func cmdCompose(args []string) {
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
 	rootfsPersistent := fs.Bool("rootfs-persistent", false, "Mount rootfs rw in each service VM (writes survive; slower boot).")
 	fs.Parse(args)
+	*jailerMode = resolveJailerMode(fs, *jailerMode)
 
 	requireKernel(*kernel)
 	*kernel = resolveRequiredExistingPath("kernel", *kernel)
@@ -607,6 +627,7 @@ func cmdBuild(args []string) {
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
 	fs.Parse(args)
+	*jailerMode = resolveJailerMode(fs, *jailerMode)
 
 	if *output == "" {
 		fatal("--output required")
@@ -645,6 +666,7 @@ func cmdRestore(args []string) {
 	x86Boot := fs.String("x86-boot", "", "Expected x86 boot mode from snapshot")
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
 	fs.Parse(args)
+	*jailerMode = resolveJailerMode(fs, *jailerMode)
 
 	if *snapDir == "" {
 		fatal("--snapshot required")
@@ -1158,6 +1180,14 @@ func imageDefaultCmd(cfg oci.ImageConfig) []string {
 // runWarmCmd runs a one-shot exec command on a --warm VM (restored from
 // snapshot) via the vsock exec agent. Streams stdout/stderr to the terminal
 // and returns the guest exit code as an error when non-zero.
+//
+// Dispatch:
+//   - cmd[0] == "node-warm" / similar → toolbox /exec on port 10023, which
+//     routes to the in-guest warm runner (V8 already booted). ~5–10 ms in
+//     the steady state vs ~50 ms for fork+exec'ed `node`.
+//   - everything else → legacy guestexec on port 10022 (request/response,
+//     no framing). Cheaper to wire, simpler protocol; the warm runner
+//     speedup only matters for runtimes with heavy startup.
 func runWarmCmd(vm vmm.Handle, cmd []string) error {
 	if cfg := vm.VMConfig(); cfg.Exec == nil || !cfg.Exec.Enabled {
 		return fmt.Errorf("exec agent not available on this VM (exec not enabled)")
@@ -1165,6 +1195,9 @@ func runWarmCmd(vm vmm.Handle, cmd []string) error {
 	dialer, ok := vm.(vmm.VsockDialer)
 	if !ok {
 		return fmt.Errorf("exec agent not available on this VM (no vsock)")
+	}
+	if len(cmd) > 0 && isWarmRuntimeCmd(cmd[0]) {
+		return runWarmCmdViaToolbox(dialer, cmd)
 	}
 	conn, err := dialer.DialVsock(execVsockPort(vm.VMConfig()))
 	if err != nil {
@@ -1194,6 +1227,83 @@ func runWarmCmd(vm vmm.Handle, cmd []string) error {
 		return fmt.Errorf("exit code %d", resp.ExitCode)
 	}
 	return nil
+}
+
+func isWarmRuntimeCmd(name string) bool {
+	switch name {
+	case "node-warm":
+		return true
+	default:
+		return false
+	}
+}
+
+// runWarmCmdViaToolbox dials the toolbox agent on port 10023, sends a
+// POST /exec request with the warm-runtime cmd, and demuxes the framed
+// response back to host stdout/stderr. Stays in this file rather than
+// importing the toolbox client (which expects a UDS path) — the
+// in-process --warm path uses VsockDialer, not UDS.
+func runWarmCmdViaToolbox(dialer vmm.VsockDialer, cmd []string) error {
+	conn, err := dialer.DialVsock(toolboxspec.VsockPort)
+	if err != nil {
+		return fmt.Errorf("toolbox dial: %w", err)
+	}
+	defer conn.Close()
+
+	body, err := json.Marshal(toolboxagent.ExecRequest{Cmd: cmd})
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	httpReq := fmt.Sprintf(
+		"POST /exec HTTP/1.0\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+		len(body),
+	)
+	bufs := net.Buffers{[]byte(httpReq), body}
+	if _, err := bufs.WriteTo(conn); err != nil {
+		return fmt.Errorf("write request: %w", err)
+	}
+
+	br := bufio.NewReader(conn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read status: %w", err)
+	}
+	if !strings.HasPrefix(statusLine, "HTTP/1.0 200") && !strings.HasPrefix(statusLine, "HTTP/1.1 200") {
+		return fmt.Errorf("toolbox /exec rejected: %s", strings.TrimRight(statusLine, "\r\n"))
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return fmt.Errorf("read headers: %w", err)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	// Read framed responses until EXIT.
+	var exitCode int32
+	for {
+		ch, payload, ferr := toolboxagent.ReadFrame(br)
+		if ferr != nil {
+			return fmt.Errorf("read frame: %w", ferr)
+		}
+		switch ch {
+		case toolboxagent.ChannelStdout:
+			_, _ = os.Stdout.Write(payload)
+		case toolboxagent.ChannelStderr:
+			_, _ = os.Stderr.Write(payload)
+		case toolboxagent.ChannelExit:
+			if len(payload) >= 4 {
+				exitCode = int32(payload[0])<<24 | int32(payload[1])<<16 |
+					int32(payload[2])<<8 | int32(payload[3])
+			}
+			if exitCode != 0 {
+				return fmt.Errorf("exit code %d", exitCode)
+			}
+			return nil
+		}
+	}
 }
 
 // drainWarmDone blocks until the background warmcache snapshot goroutine
@@ -1352,6 +1462,23 @@ func fatal(msg string) {
 	fatalFunc(msg)
 }
 
+// resolveJailerMode returns the effective jailer mode. If the --jailer flag
+// was not explicitly set and the process is not root, it falls back to "off"
+// so that commands work without sudo (kvm-group membership is enough).
+// Explicit --jailer on always wins regardless of uid.
+func resolveJailerMode(fs *flag.FlagSet, flagVal string) string {
+	explicitly := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "jailer" {
+			explicitly = true
+		}
+	})
+	if !explicitly && os.Getuid() != 0 {
+		return container.JailerModeOff
+	}
+	return flagVal
+}
+
 func splitComma(s string) []string {
 	if s == "" {
 		return nil
@@ -1376,10 +1503,61 @@ func normalizeNetworkMode(raw string) string {
 		return ""
 	case container.NetworkModeAuto:
 		return container.NetworkModeAuto
+	case container.NetworkModeSlirp:
+		return container.NetworkModeSlirp
 	default:
-		fatal("invalid --net: " + raw + " (want none or auto)")
+		fatal("invalid --net: " + raw + " (want none, auto, or slirp)")
 		return ""
 	}
+}
+
+// mustParseCodeDisks turns the --code-disk flag values
+// (HOST_PATH:GUEST_MOUNT[:FS[:ro]]) into container.CodeDisk entries.
+// Fatal on malformed input — callers expect either a usable slice or a
+// hard failure before VM setup begins.
+func mustParseCodeDisks(values []string) []container.CodeDisk {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]container.CodeDisk, 0, len(values))
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		parts := strings.Split(v, ":")
+		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+			fatal("invalid --code-disk " + v + " (want HOST_PATH:GUEST_MOUNT[:FS[:ro]])")
+		}
+		host := parts[0]
+		mount := parts[1]
+		if !filepath.IsAbs(mount) {
+			fatal("invalid --code-disk mount " + mount + " (must be absolute)")
+		}
+		fs := "ext4"
+		if len(parts) >= 3 && parts[2] != "" {
+			fs = parts[2]
+		}
+		ro := false
+		if len(parts) >= 4 {
+			switch strings.ToLower(parts[3]) {
+			case "ro":
+				ro = true
+			case "", "rw":
+				ro = false
+			default:
+				fatal("invalid --code-disk mode " + parts[3] + " (want ro or rw)")
+			}
+		}
+		host = resolveRequiredExistingPath("code-disk", host)
+		out = append(out, container.CodeDisk{
+			HostPath: host,
+			Mount:    mount,
+			FSType:   fs,
+			ReadOnly: ro,
+		})
+	}
+	return out
 }
 
 type multiStringFlag []string
