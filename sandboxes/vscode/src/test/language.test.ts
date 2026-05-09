@@ -8,7 +8,7 @@ describe('templateForDocument', () => {
   test.each([
     ['python',     'app.py',    'base-python'],
     ['javascript', 'index.js',  'base-node'],
-    ['typescript', 'index.ts',  'base-node'],
+    ['typescript', 'index.ts',  'base-bun'],
     ['go',         'main.go',   'base-go'],
     ['javascript', 'script.mjs','base-node'],
   ])('languageId=%s file=%s → %s', (lang, file, expected) => {
