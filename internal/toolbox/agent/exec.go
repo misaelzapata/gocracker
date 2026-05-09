@@ -166,10 +166,16 @@ func runWarmEvalNode(ctx context.Context, conn net.Conn, req ExecRequest) error 
 		return fmt.Errorf("dial warm runner: %w", err)
 	}
 	defer rconn.Close()
+	timeoutMs := 30000
+	if deadline, ok := ctx.Deadline(); ok {
+		if rem := time.Until(deadline); rem > 0 && rem < 30*time.Second {
+			timeoutMs = int(rem.Milliseconds())
+		}
+	}
 	if err := EncodeWarmRequest(rconn, WarmEvalRequest{
 		ID:        1,
 		Code:      req.Cmd[1],
-		TimeoutMs: 30000,
+		TimeoutMs: timeoutMs,
 	}); err != nil {
 		return fmt.Errorf("send: %w", err)
 	}

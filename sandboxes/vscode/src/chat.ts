@@ -27,8 +27,8 @@ const LANG_TO_CMD: Record<string, (p: string) => string[]> = {
   python:     p => ['python3', p],
   js:         p => ['node', p],
   javascript: p => ['node', p],
-  ts:         p => ['node', p],
-  typescript: p => ['node', '--input-type=module', p],
+  ts:         p => ['bun', 'run', p],
+  typescript: p => ['bun', 'run', p],
   go:         p => ['go', 'run', p],
 };
 

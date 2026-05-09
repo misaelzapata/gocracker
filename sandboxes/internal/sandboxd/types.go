@@ -105,7 +105,12 @@ type CreateSandboxRequest struct {
 	// resolves the template's spec fields client-side and lets the
 	// runtime's warmcache lookup find the snapshot by key. API
 	// consumers can still set it directly to pin a specific dir.
-	SnapshotDir string   `json:"snapshot_dir,omitempty"`
+	SnapshotDir string `json:"snapshot_dir,omitempty"`
+	// CodeDisks attaches one or more ext4 disk images to the VM and
+	// mounts them at the specified guest paths. Each entry maps a
+	// host-side image file to a guest mountpoint. See
+	// docs/design/code-disk-attach.md for the full shape.
+	CodeDisks []container.CodeDisk `json:"code_disks,omitempty"`
 }
 
 // CreateSandboxResponse is what POST /sandboxes returns — Sandbox is

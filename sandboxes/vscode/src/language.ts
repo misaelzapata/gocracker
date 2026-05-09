@@ -37,7 +37,7 @@ export function templateForDocument(doc: vscode.TextDocument): string | undefine
       return 'base-node';
 
     case '.ts':
-      return hasBunLockfile() ? 'base-bun' : 'base-node';
+      return 'base-bun'; // Bun natively runs TypeScript; node cannot
 
     case '.py':
       return 'base-python';

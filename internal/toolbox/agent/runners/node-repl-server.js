@@ -77,8 +77,8 @@ function handleRequest(conn, line) {
     let stderr = '';
     const origOut = process.stdout.write.bind(process.stdout);
     const origErr = process.stderr.write.bind(process.stderr);
-    process.stdout.write = (chunk) => { stdout += String(chunk); return true; };
-    process.stderr.write = (chunk) => { stderr += String(chunk); return true; };
+    process.stdout.write = (chunk, enc, cb) => { stdout += String(chunk); if (typeof cb === 'function') cb(); return true; };
+    process.stderr.write = (chunk, enc, cb) => { stderr += String(chunk); if (typeof cb === 'function') cb(); return true; };
 
     let result = null;
     let error = null;

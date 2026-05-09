@@ -61,6 +61,9 @@ var (
 // bound but BEFORE accepting connections, so the readiness probe at
 // /runtime/node/ready never serves true while the runner is half-up.
 func StartNodeWarmRunner() {
+	if os.Getenv("GOCRACKER_ENABLE_WARM_NODE") != "1" {
+		return
+	}
 	nodeWarmOnce.Do(func() {
 		if err := startNodeWarmRunner(); err != nil {
 			// Best-effort: log and continue. The exec path checks

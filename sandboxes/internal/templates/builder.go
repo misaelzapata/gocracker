@@ -510,6 +510,13 @@ func bootRuntimeReadyCapture(ctx context.Context, opts container.RunOptions, rt 
 	if rt.Name == "" {
 		return "", errors.New("templates: Runtime.Name required")
 	}
+	// Signal the toolbox agent to start the appropriate warm runner.
+	// Without this the StartNodeWarmRunner opt-in check fails and the
+	// runner never starts, so the /runtime/<name>/ready probe times out.
+	switch rt.Name {
+	case "node":
+		opts.Env = append(opts.Env, "GOCRACKER_ENABLE_WARM_NODE=1")
+	}
 	timeout := rt.Timeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second

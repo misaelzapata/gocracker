@@ -148,6 +148,7 @@ func (m *Manager) Create(req CreateSandboxRequest) (Sandbox, error) {
 		VsockUDSPath: udsPath,
 		VMMBinary:    m.VMMBinary,
 		JailerBinary: m.JailerBinary,
+		CodeDisks:    normalized.CodeDisks,
 	}
 
 	result, runErr := container.Run(opts)

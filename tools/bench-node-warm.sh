@@ -94,12 +94,17 @@ curl -sS -X POST "http://$ADDR/sandboxes/lease" \
 SB_ID=$(python3 -c 'import json;print(json.load(open("/tmp/warmup-lease.json"))["sandbox"]["id"])')
 curl -sS -X POST "http://$ADDR/sandboxes/$SB_ID/exec" \
     -H 'Content-Type: application/json' \
-    -d '{"command":["node-warm","console.log(process.version)"]}' > /tmp/warmup-exec.json
+    -d '{"cmd":["node-warm","console.log(process.version)"]}' > /tmp/warmup-exec.json
 cat /tmp/warmup-exec.json | python3 -c 'import json,sys; d=json.load(sys.stdin); print("warmup stdout:", d.get("stdout","").strip(), "stderr:", d.get("stderr","").strip(), "exit:", d.get("exit_code",-1))'
 curl -sS -X DELETE "http://$ADDR/sandboxes/$SB_ID" > /dev/null
 
 # Timed loop.
-samples=$(mktemp); trap 'rm -f $samples' EXIT
+samples=$(mktemp)
+# Extend the cleanup trap to also remove the temp samples file.
+# Re-declare so the existing cleanup() body + new rm both run on EXIT.
+_orig_cleanup() { pkill -f gocracker-sandboxd 2>/dev/null || true; sleep 1; }
+cleanup() { _orig_cleanup; rm -f "$samples"; }
+trap cleanup EXIT
 fails=0
 echo "=== $ITER timed runs (lease + node-warm eval) ==="
 for i in $(seq 1 "$ITER"); do
@@ -110,7 +115,7 @@ for i in $(seq 1 "$ITER"); do
     sb_id=$(echo "$LEASE" | python3 -c 'import json,sys;print(json.load(sys.stdin)["sandbox"]["id"])')
     EXEC=$(curl -sS -X POST "http://$ADDR/sandboxes/$sb_id/exec" \
         -H 'Content-Type: application/json' \
-        -d '{"command":["node-warm","process.stdout.write(process.version)"]}')
+        -d '{"cmd":["node-warm","process.stdout.write(process.version)"]}')
     t1="$(date +%s%3N)"
     out=$(echo "$EXEC" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("stdout",""))')
     if [[ "$out" =~ ^v[0-9] ]]; then

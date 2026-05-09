@@ -26,9 +26,15 @@ func run() error {
 	os.RemoveAll(work)
 	os.MkdirAll(work, 0755)
 	uds := filepath.Join(work, "vm.sock")
+	kernelPath := os.Getenv("GC_KERNEL")
+	if kernelPath == "" {
+		// Fallback: well-known repo-relative location.
+		repoRoot, _ := filepath.Abs(filepath.Join(filepath.Dir(os.Args[0]), "../../../.."))
+		kernelPath = filepath.Join(repoRoot, "artifacts/kernels/gocracker-guest-standard-vmlinux")
+	}
 	res, err := container.Run(container.RunOptions{
-		Image:        "alpine:3.20",
-		KernelPath:   "/home/misael/Desktop/projects/gocracker/artifacts/kernels/gocracker-guest-standard-vmlinux",
+		Image:      "alpine:3.20",
+		KernelPath: kernelPath,
 		MemMB:        256,
 		DiskSizeMB:   256,
 		ID:           "balloon-probe",

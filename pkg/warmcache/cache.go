@@ -255,15 +255,21 @@ func HashFile(path string) (string, error) {
 	}
 	out := hex.EncodeToString(h.Sum(nil))
 
+	// Update the in-memory map under the lock; do the disk write outside
+	// it so slow I/O (EACCES, NFS, full disk) doesn't serialize callers.
 	hashCacheMu.Lock()
+	shouldStore := false
 	if cur, statErr := os.Stat(path); statErr == nil &&
 		cur.ModTime().Equal(key.mtime) && cur.Size() == key.size {
 		hashCache[key] = out
-		// Best-effort disk write; failures (read-only home, EACCES,
-		// disk full) silently fall through — we already have the hash.
-		storeDiskHash(path, st, out)
+		shouldStore = true
 	}
 	hashCacheMu.Unlock()
+
+	if shouldStore {
+		// Best-effort disk write; failures silently fall through.
+		storeDiskHash(path, st, out)
+	}
 	return out, nil
 }
 

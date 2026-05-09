@@ -449,6 +449,8 @@ func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	const maxUploadBytes = 32 << 20 // 32 MiB
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	content, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
@@ -456,8 +458,12 @@ func (s *Server) handleUploadFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tb := gosdk.NewToolboxClient(sb.UDSPath)
-	_, err = tb.Exec(r.Context(), []string{"sh", "-c", "mkdir -p " + dirOf(path) + " && cat > " + path},
-		gosdk.ExecOptions{Stdin: content})
+	// Pass path and dir as env vars to avoid shell command injection.
+	_, err = tb.Exec(r.Context(), []string{"sh", "-c", `mkdir -p "$GC_DIR" && cat > "$GC_PATH"`},
+		gosdk.ExecOptions{
+			Stdin: content,
+			Env:   []string{"GC_DIR=" + dirOf(path), "GC_PATH=" + path},
+		})
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)

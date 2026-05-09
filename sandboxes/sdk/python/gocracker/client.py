@@ -302,6 +302,7 @@ class Client:
         dockerfile: str = "",
         context: str = "",
         template: str = "",
+        code_disks: Optional[List[Dict[str, Any]]] = None,
     ) -> Sandbox:
         # Template resolution: `create_sandbox(template="base-python")`
         # looks up the registered template, copies its image/kernel/mem
@@ -354,6 +355,8 @@ class Client:
             req["network_mode"] = network_mode
         if jailer_mode:
             req["jailer_mode"] = jailer_mode
+        if code_disks:
+            req["code_disks"] = code_disks
         resp = self._post("/sandboxes", req)
         return self._parse_sandbox(resp.get("sandbox", {}))
 

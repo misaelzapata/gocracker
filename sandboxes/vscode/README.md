@@ -37,8 +37,7 @@ Output appears in the **gocracker** panel. The sidebar **gocracker Sandboxes** v
 |---|---|---|
 | `.py` | `base-python` | Python 3 |
 | `.js`, `.mjs` | `base-node` | Node.js |
-| `.ts` (bun.lock present) | `base-bun` | Bun |
-| `.ts` (no bun.lock) | `base-node` | Node.js via ts-node |
+| `.ts` | `base-bun` | Bun (native TypeScript support) |
 | `.go` | `base-go` | Go |
 
 ## Settings
