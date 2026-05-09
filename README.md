@@ -672,6 +672,16 @@ Verify your host is ready:
 make hostcheck
 ```
 
+## Roadmap
+
+| # | Idea | Notes |
+|---|---|---|
+| 1 | **Shared-kernel mode** | One guest VM hosts multiple isolated user workloads via Linux namespaces + seccomp per process. Shared runtime pages (CoW), ~1 ms fork instead of ~40 ms restore, ~5–20 MB per tenant vs ~128 MB today. Tradeoff: namespace isolation instead of KVM hardware isolation — good fit for trusted tenants or high-density deployments. |
+| 2 | **Edge layer / public ingress** | Anycast-style routing so sandboxd is reachable from the internet without a manual reverse proxy. TLS termination, per-tenant auth tokens, rate limiting. |
+| 3 | **Hot disk swap** | virtio-blk hot-plug so a running VM can swap its code disk without rebooting. Currently requires attaching all disks at boot. |
+| 4 | **ARM64 warm snapshots** | Warm pool and snapshot/restore tested on x86-64; needs validation + tuning on Graviton / Apple Silicon (nested KVM). |
+| 5 | **macOS support** | Hypervisor.framework backend for local development without Linux. |
+
 ## License
 
 [Apache License 2.0](LICENSE)
