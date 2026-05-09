@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -11,6 +13,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/gocracker/gocracker/internal/paths"
 	"github.com/gocracker/gocracker/internal/vmmserver"
 	"github.com/gocracker/gocracker/pkg/vmm"
 )
@@ -68,7 +71,7 @@ func run(args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("gocracker-vmm", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
-	socketPath := fs.String("socket", "/tmp/gocracker-vmm.sock", "Unix socket path to listen on")
+	socketPath := fs.String("socket", paths.VMMSocket(), "Unix socket path to listen on")
 	defaultBoot := fs.String("default-x86-boot", string(vmm.X86BootAuto), "default x86 boot mode: auto, acpi, legacy")
 	vmID := fs.String("vm-id", "", "VM identifier used for worker-backed launches")
 	if err := fs.Parse(args); err != nil {

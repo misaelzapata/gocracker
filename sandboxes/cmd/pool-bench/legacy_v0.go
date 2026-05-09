@@ -11,6 +11,7 @@
 //	  -kernel artifacts/kernels/gocracker-guest-minimal-vmlinux \
 //	  -cmd 'bun --version' \
 //	  -pool 3 -iter 20
+
 package main
 
 import (

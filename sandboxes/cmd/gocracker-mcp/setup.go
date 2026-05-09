@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 // cmdSetup writes the gocracker-mcp entry into every MCP-capable tool

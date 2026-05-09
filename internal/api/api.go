@@ -25,6 +25,7 @@ import (
 	"github.com/gocracker/gocracker/internal/guestexec"
 	"github.com/gocracker/gocracker/internal/hostguard"
 	gclog "github.com/gocracker/gocracker/internal/log"
+	"github.com/gocracker/gocracker/internal/paths"
 	"github.com/gocracker/gocracker/internal/stacknet"
 	"github.com/gocracker/gocracker/pkg/container"
 	"github.com/gocracker/gocracker/pkg/vmm"
@@ -2599,7 +2600,7 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.DestDir == "" {
-		req.DestDir = fmt.Sprintf("/tmp/gocracker-snapshots/%s-%d", id, time.Now().Unix())
+		req.DestDir = filepath.Join(paths.SnapshotsDir(), fmt.Sprintf("%s-%d", id, time.Now().Unix()))
 	}
 	if err := s.validateSnapshotPathForServer(req.DestDir, false); err != nil {
 		apiErr(w, http.StatusBadRequest, err.Error())

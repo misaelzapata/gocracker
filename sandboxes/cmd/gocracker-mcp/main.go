@@ -17,6 +17,9 @@
 //
 //	(default)     Start the MCP stdio server (spawned by tools directly).
 //	setup         Auto-detect installed tools and write their MCP configs.
+
+//go:build linux
+
 package main
 
 import (

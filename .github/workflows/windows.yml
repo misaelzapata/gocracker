@@ -1,0 +1,75 @@
+name: windows-cross-compile
+
+# Windows port — Phase 0 onwards. This job catches build-tag/cross-compile
+# regressions early. It does NOT exercise the WHP backend (no nested-virt
+# in hosted runners); a separate self-hosted-windows-whp runner picks up
+# integration tests once the backend lands in Phase 2.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: windows-cross-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  cross-build:
+    name: Cross-compile linux→windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # vet-cross runs `go vet` for every (GOOS, GOARCH) pair we promise to
+      # support so a Windows-only typo (missing build tag, broken stub) fails
+      # PRs instead of bit-rotting until someone tries the Windows port.
+      # The non-Linux allow-list inside the Makefile grows phase-by-phase.
+      - name: go vet across all targets
+        run: make vet-cross
+      - name: Build all six Windows binaries
+        run: make build-windows-amd64
+      - name: Verify all six binaries exist
+        run: |
+          test -f gocracker.exe
+          test -f gocracker-vmm.exe
+          test -f gocracker-jailer.exe
+          test -f gocracker-hostcheck.exe
+          test -f gocracker-toolbox.exe
+          test -f toolbox-cli.exe
+          test -f debugvm.exe
+
+  hosted-windows-vet:
+    name: Native Windows go vet (no WHP)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # On a real Windows runner. WHP isn't available in hosted runners, but
+      # `go vet` and `go build` exercise the build-tag wiring with the actual
+      # Windows toolchain and standard-library shape. The package list grows
+      # phase by phase as more of the codebase becomes hypervisor-agnostic.
+      - name: go vet (non-Linux allow-list)
+        shell: pwsh
+        run: |
+          go vet `
+            ./internal/paths/... `
+            ./internal/slirp/... `
+            ./cmd/gocracker/... `
+            ./cmd/gocracker-vmm/... `
+            ./cmd/gocracker-jailer/... `
+            ./cmd/gocracker-hostcheck/... `
+            ./cmd/gocracker-toolbox/... `
+            ./cmd/toolbox-cli/... `
+            ./cmd/debugvm/... `
+            ./tools/bench-rtt/... `
+            ./sandboxes/cmd/...
+      - name: go test (non-Linux allow-list)
+        run: go test ./internal/paths/...
+      - name: go build gocracker.exe (stub on Windows)
+        run: go build -o gocracker.exe ./cmd/gocracker

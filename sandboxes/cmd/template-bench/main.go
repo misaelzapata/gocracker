@@ -12,6 +12,9 @@
 //	  -image alpine:3.20 \
 //	  -kernel /abs/path/to/kernel \
 //	  -p95-budget-ms 10
+
+//go:build linux
+
 package main
 
 import (

@@ -9,6 +9,9 @@
 //	  -image alpine:3.20 \
 //	  -kernel ./artifacts/kernels/gocracker-guest-standard-vmlinux \
 //	  -iter 50 -warmups 3 -output /tmp/bench-rtt.json
+//
+//go:build linux
+
 package main
 
 import (

@@ -11,6 +11,9 @@
 //
 // Future slices add /sandboxes/{id}/process/execute, /files,
 // /events SSE, warm pool primitives, templates, and preview.
+
+//go:build linux
+
 package main
 
 import (

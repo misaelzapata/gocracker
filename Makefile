@@ -4,6 +4,14 @@ CMD      := ./cmd/gocracker
 TARGET_GOOS ?= linux
 TARGET_GOARCH ?= $(shell go env GOARCH)
 
+# Windows binaries get a .exe suffix; everything else has no suffix. Lets a
+# single `$(BIN)$(BIN_EXT)` work across platforms in build commands.
+ifeq ($(TARGET_GOOS),windows)
+  BIN_EXT := .exe
+else
+  BIN_EXT :=
+endif
+
 # Version stamp injected via -ldflags. VERSION takes the git tag if
 # the working tree is clean at a tag, else "dev-<short-sha>-dirty?".
 # COMMIT is the short SHA; DATE is ISO-8601 UTC. Override from the
@@ -15,7 +23,7 @@ VERSION_LDFLAGS = -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
                   -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
                   -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build build-amd64 build-arm64 generate tidy test test-uds coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs kernel-guest-arm64 kernel-guest-arm64-minimal kernel-unpack hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed
+.PHONY: all build build-amd64 build-arm64 build-windows-amd64 build-darwin-amd64 build-darwin-arm64 generate tidy test test-uds coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs kernel-guest-arm64 kernel-guest-arm64-minimal kernel-unpack hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed vet-cross
 
 all: build
 
@@ -23,24 +31,68 @@ all: build
 generate:
 	go generate ./internal/guest/
 
-## Download dependencies, generate, and build all binaries.
-## gocracker-vmm and gocracker-jailer are linux-only (they use KVM, mount
-## namespaces, seccomp, etc.) so we skip them when TARGET_GOOS != linux.
+## Download dependencies, generate, and build all six user-facing binaries.
+##
+## All six are produced on every TARGET_GOOS so packaging is uniform.
+## gocracker-vmm/jailer/hostcheck/toolbox/debugvm have Linux-only main.go
+## files (KVM, namespaces, seccomp, /dev/kvm checks); on non-Linux targets
+## they fall through to main_other.go stubs that print a clear "Linux-only
+## / pending Phase N" message and exit 2. The Windows binaries are real
+## once Phases 1.2 + 2 (and later) land.
+GO_BUILD = CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
+  go build -trimpath -ldflags="-s -w $(VERSION_LDFLAGS)"
+
 build: tidy generate
-	CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
-	  go build -trimpath -ldflags="-s -w $(VERSION_LDFLAGS)" -o $(BIN) $(CMD)
-ifeq ($(TARGET_GOOS),linux)
-	CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
-	  go build -trimpath -ldflags="-s -w $(VERSION_LDFLAGS)" -o gocracker-vmm ./cmd/gocracker-vmm
-	CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
-	  go build -trimpath -ldflags="-s -w $(VERSION_LDFLAGS)" -o gocracker-jailer ./cmd/gocracker-jailer
-endif
+	$(GO_BUILD) -o $(BIN)$(BIN_EXT)               $(CMD)
+	$(GO_BUILD) -o gocracker-vmm$(BIN_EXT)        ./cmd/gocracker-vmm
+	$(GO_BUILD) -o gocracker-jailer$(BIN_EXT)     ./cmd/gocracker-jailer
+	$(GO_BUILD) -o gocracker-hostcheck$(BIN_EXT)  ./cmd/gocracker-hostcheck
+	$(GO_BUILD) -o gocracker-toolbox$(BIN_EXT)    ./cmd/gocracker-toolbox
+	$(GO_BUILD) -o toolbox-cli$(BIN_EXT)          ./cmd/toolbox-cli
+	$(GO_BUILD) -o debugvm$(BIN_EXT)              ./cmd/debugvm
 
 build-amd64:
 	$(MAKE) build TARGET_GOARCH=amd64
 
 build-arm64:
 	$(MAKE) build TARGET_GOARCH=arm64
+
+build-windows-amd64:
+	$(MAKE) build TARGET_GOOS=windows TARGET_GOARCH=amd64
+
+build-darwin-amd64:
+	$(MAKE) build TARGET_GOOS=darwin TARGET_GOARCH=amd64
+
+build-darwin-arm64:
+	$(MAKE) build TARGET_GOOS=darwin TARGET_GOARCH=arm64
+
+## Run go vet across every supported GOOS/GOARCH so the tree never goes red on
+## a cross-compile silently. Each invocation is independent so a regression on
+## one target doesn't mask others.
+##
+## On Linux we vet the whole tree. On non-Linux we vet only the packages that
+## should currently cross-compile clean. The non-Linux allow-list will grow
+## phase by phase: Phase 1.2 unblocks pkg/vmm; Phase 2 unblocks pkg/container,
+## internal/api, etc.; Phase 8 unblocks gocracker-vmm worker.
+NONLINUX_VET_PKGS = \
+  ./internal/paths/... \
+  ./internal/slirp/... \
+  ./cmd/gocracker/... \
+  ./cmd/gocracker-vmm/... \
+  ./cmd/gocracker-jailer/... \
+  ./cmd/gocracker-hostcheck/... \
+  ./cmd/gocracker-toolbox/... \
+  ./cmd/toolbox-cli/... \
+  ./cmd/debugvm/... \
+  ./tools/bench-rtt/... \
+  ./sandboxes/cmd/...
+
+vet-cross:
+	GOOS=linux   GOARCH=amd64 go vet ./...
+	GOOS=linux   GOARCH=arm64 go vet ./...
+	GOOS=windows GOARCH=amd64 go vet $(NONLINUX_VET_PKGS)
+	GOOS=darwin  GOARCH=amd64 go vet $(NONLINUX_VET_PKGS)
+	GOOS=darwin  GOARCH=arm64 go vet $(NONLINUX_VET_PKGS)
 
 tidy:
 	go mod tidy
@@ -133,4 +185,11 @@ start-vm:
 	  -d '{"action_type":"InstanceStart"}'
 
 clean:
-	rm -f $(BIN) internal/guest/init_amd64.bin internal/guest/init_arm64.bin
+	rm -f $(BIN) $(BIN).exe \
+	  gocracker-vmm gocracker-vmm.exe \
+	  gocracker-jailer gocracker-jailer.exe \
+	  gocracker-hostcheck gocracker-hostcheck.exe \
+	  gocracker-toolbox gocracker-toolbox.exe \
+	  toolbox-cli toolbox-cli.exe \
+	  debugvm debugvm.exe \
+	  internal/guest/init_amd64.bin internal/guest/init_arm64.bin

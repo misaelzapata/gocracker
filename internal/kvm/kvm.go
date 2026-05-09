@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package kvm provides low-level KVM hypervisor bindings for Linux.
 // It wraps /dev/kvm ioctls to create and manage virtual machines.
 package kvm

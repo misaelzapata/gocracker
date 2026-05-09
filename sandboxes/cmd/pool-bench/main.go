@@ -20,6 +20,9 @@
 //
 // Reports p50 / p95 / p99 lease ms, plus a budget check against the
 // plan target (--p95-budget-ms, default 20).
+
+//go:build linux
+
 package main
 
 import (

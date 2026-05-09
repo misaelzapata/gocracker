@@ -11,6 +11,9 @@
 //
 // All commands accept -addr to point at a non-default sandboxd
 // (default http://127.0.0.1:9091).
+
+//go:build linux
+
 package main
 
 import (

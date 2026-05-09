@@ -18,7 +18,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gocracker/gocracker/internal/buildserver"
@@ -1785,32 +1784,8 @@ func copyDiskImage(src, dst string, overlay bool) error {
 	return copyDiskImageFull(src, dst)
 }
 
-// ficlone is the Linux ioctl number for FICLONE (copy-on-write clone).
-const ficlone = 0x40049409
-
-func tryReflink(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	info, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode().Perm())
-	if err != nil {
-		return err
-	}
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, out.Fd(), ficlone, in.Fd())
-	if errno != 0 {
-		out.Close()
-		os.Remove(dst)
-		return errno
-	}
-	return out.Close()
-}
+// tryReflink lives in reflink_linux.go (real impl) and reflink_other.go
+// (stub that always errors so the full-copy fallback runs).
 
 func copyDiskImageFull(src, dst string) error {
 	info, err := os.Stat(src)

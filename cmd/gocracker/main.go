@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -21,8 +23,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/gocracker/gocracker/internal/api"
 	internalapi "github.com/gocracker/gocracker/internal/api"
 	"github.com/gocracker/gocracker/internal/buildinfo"
@@ -31,8 +31,8 @@ import (
 	"github.com/gocracker/gocracker/internal/console"
 	"github.com/gocracker/gocracker/internal/guestexec"
 	"github.com/gocracker/gocracker/internal/hostguard"
-	"github.com/gocracker/gocracker/internal/jailer"
 	"github.com/gocracker/gocracker/internal/oci"
+	"github.com/gocracker/gocracker/internal/paths"
 	"github.com/gocracker/gocracker/internal/runtimecfg"
 	"github.com/gocracker/gocracker/internal/tempprune"
 	toolboxagent "github.com/gocracker/gocracker/internal/toolbox/agent"
@@ -167,7 +167,7 @@ func cmdRun(args []string) {
 	tap := fs.String("tap", "", "TAP interface (e.g. tap0)")
 	disk := fs.Int("disk", 2048, "Disk size MiB")
 	snap := fs.String("snapshot", "", "Restore from snapshot dir")
-	cacheDir := fs.String("cache-dir", filepath.Join(os.TempDir(), "gocracker", "cache"), "Persistent cache directory")
+	cacheDir := fs.String("cache-dir", paths.CacheDir(), "Persistent cache directory")
 	envStr := fs.String("env", "", "Comma-separated KEY=VALUE env vars")
 	cmdStr := fs.String("cmd", "", "Override CMD")
 	entrypointStr := fs.String("entrypoint", "", "Override ENTRYPOINT")
@@ -307,7 +307,7 @@ func cmdRepo(args []string) {
 	tap := fs.String("tap", "", "TAP interface")
 	disk := fs.Int("disk", 2048, "Disk size MiB")
 	snap := fs.String("snapshot", "", "Restore from snapshot dir")
-	cacheDir := fs.String("cache-dir", filepath.Join(os.TempDir(), "gocracker", "cache"), "Persistent cache directory")
+	cacheDir := fs.String("cache-dir", paths.CacheDir(), "Persistent cache directory")
 	envStr := fs.String("env", "", "Comma-separated KEY=VALUE env vars")
 	cmdStr := fs.String("cmd", "", "Override CMD")
 	entrypointStr := fs.String("entrypoint", "", "Override ENTRYPOINT")
@@ -402,7 +402,7 @@ func cmdCompose(args []string) {
 	file := fs.String("file", "docker-compose.yml", "Path to docker-compose.yml")
 	serverURL := fs.String("server", "", "Optional gocracker API server URL for compose-managed VMs")
 	kernel := fs.String("kernel", "", "Kernel image path [required]")
-	cacheDir := fs.String("cache-dir", filepath.Join(os.TempDir(), "gocracker", "cache"), "Persistent cache directory")
+	cacheDir := fs.String("cache-dir", paths.CacheDir(), "Persistent cache directory")
 	mem := fs.Uint64("mem", 256, "Default RAM per service (MiB)")
 	arch := fs.String("arch", runtime.GOARCH, "Guest architecture for every service: amd64 or arm64 (same-arch only)")
 	disk := fs.Int("disk", 4096, "Default disk size per service (MiB)")
@@ -622,7 +622,7 @@ func cmdBuild(args []string) {
 	repoSubdir := fs.String("subdir", "", "Subdir inside repo")
 	output := fs.String("output", "", "Output ext4 image path [required]")
 	disk := fs.Int("disk", 2048, "Disk size MiB")
-	cacheDir := fs.String("cache-dir", filepath.Join(os.TempDir(), "gocracker", "cache"), "Persistent cache directory")
+	cacheDir := fs.String("cache-dir", paths.CacheDir(), "Persistent cache directory")
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model: on or off")
 	buildArgs := multiKVFlag{}
 	fs.Var(&buildArgs, "build-arg", "Build arg KEY=VALUE (repeatable)")
@@ -751,14 +751,14 @@ func cmdMigrate(args []string) {
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", "", "TCP address (e.g. :8080)")
-	sock := fs.String("sock", "/tmp/gocracker.sock", "Unix socket path")
+	sock := fs.String("sock", paths.APISocket(), "Unix socket path")
 	authToken := fs.String("auth-token", os.Getenv("GOCRACKER_API_TOKEN"), "Bearer token required for API requests when set")
 	x86Boot := fs.String("x86-boot", string(vmm.X86BootAuto), "Default x86 boot mode: auto, acpi, or legacy")
 	jailerMode := fs.String("jailer", container.JailerModeOn, "Privilege model for /run, root preboot, and restore/migration target: on or off")
 	jailerBinary := fs.String("jailer-binary", "gocracker-jailer", "Path to the standalone gocracker-jailer binary")
 	vmmBinary := fs.String("vmm-binary", "gocracker-vmm", "Path to the standalone gocracker-vmm binary")
-	stateDir := fs.String("state-dir", "/tmp/gocracker-serve-state", "Persistent supervisor state directory")
-	cacheDir := fs.String("cache-dir", filepath.Join(os.TempDir(), "gocracker", "cache"), "Persistent cache directory")
+	stateDir := fs.String("state-dir", paths.ServeStateDir(), "Persistent supervisor state directory")
+	cacheDir := fs.String("cache-dir", paths.CacheDir(), "Persistent cache directory")
 	chrootBaseDir := fs.String("chroot-base-dir", worker.DefaultChrootBaseDir(), "Base directory for jail roots")
 	uid := fs.Int("uid", os.Getuid(), "UID for jailed workers")
 	gid := fs.Int("gid", os.Getgid(), "GID for jailed workers")
@@ -768,7 +768,7 @@ func cmdServe(args []string) {
 	fs.Var(&trustedKernelDirs, "trusted-kernel-dir", "Trusted kernel directory for API-supplied kernel paths (repeatable)")
 	fs.Var(&trustedWorkDirs, "trusted-work-dir", "Trusted workspace directory for API-supplied dockerfile/context/initrd paths (repeatable)")
 	fs.Var(&trustedSnapshotDirs, "trusted-snapshot-dir", "Trusted snapshot directory for API snapshot/restore paths (repeatable)")
-	pruneMaxAge := fs.Duration("prune-stale-temp-age", 48*time.Hour, "Age threshold for pruning /tmp/gocracker-* orphans left by crashed builds; 0 disables")
+	pruneMaxAge := fs.Duration("prune-stale-temp-age", 48*time.Hour, "Age threshold for pruning gocracker-* temp orphans left by crashed builds; 0 disables")
 	fs.Parse(args)
 	if *addr != "" && !isLoopbackTCPAddr(*addr) && strings.TrimSpace(*authToken) == "" {
 		fatal("--auth-token is required when --addr is not an explicit loopback address; use 127.0.0.1:PORT for local unauthenticated access")
@@ -884,7 +884,7 @@ func resolveStandaloneBinary(value string) (string, error) {
 
 func cmdVMM(args []string) {
 	fs := flag.NewFlagSet("vmm", flag.ExitOnError)
-	socketPath := fs.String("socket", "/tmp/gocracker-vmm.sock", "Unix socket path to listen on")
+	socketPath := fs.String("socket", paths.VMMSocket(), "Unix socket path to listen on")
 	defaultBoot := fs.String("default-x86-boot", string(vmm.X86BootAuto), "default x86 boot mode: auto, acpi, legacy")
 	vmID := fs.String("vm-id", "", "VM identifier used for worker-backed launches")
 	fs.Parse(args)
@@ -911,7 +911,7 @@ func cmdVMM(args []string) {
 
 func cmdBuildWorker(args []string) {
 	fs := flag.NewFlagSet("build-worker", flag.ExitOnError)
-	socketPath := fs.String("socket", "/tmp/gocracker-build.sock", "Unix socket path to listen on")
+	socketPath := fs.String("socket", paths.BuildSocket(), "Unix socket path to listen on")
 	fs.Parse(args)
 
 	srv := buildserver.New()
@@ -928,13 +928,7 @@ func cmdBuildWorker(args []string) {
 	}
 }
 
-// ---- jailer ----
-
-func cmdJailer(args []string) {
-	if err := jailer.RunCLI(args); err != nil {
-		fatal(err.Error())
-	}
-}
+// ---- jailer ---- (impl in jailer_linux.go / jailer_other.go)
 
 // ---- helpers ----
 
@@ -1677,7 +1671,7 @@ func defaultTrustedSnapshotDirs(stateDir string) []string {
 	candidates := []string{
 		filepath.Join(stateDir, "snapshots"),
 		stateDir,
-		"/tmp/gocracker-snapshots",
+		paths.SnapshotsDir(),
 	}
 	out := make([]string, 0, len(candidates))
 	seen := map[string]struct{}{}
@@ -1698,33 +1692,8 @@ func defaultTrustedSnapshotDirs(stateDir string) []string {
 	return out
 }
 
-// raiseAmbientNetAdmin promotes CAP_NET_ADMIN to the ambient capability set so
-// that every child process exec'd by this server (ip, iptables, etc.) inherits
-// the capability automatically. This allows gocracker to run as a non-root user
-// with `setcap cap_net_admin+ep` while still delegating network setup to those
-// utilities.
-//
-// Steps:
-//  1. Add CAP_NET_ADMIN to the inheritable set (required by Linux before a cap
-//     can be raised to ambient).
-//  2. Call prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN).
-//
-// Errors are silently ignored: kernels < 4.3 don't have ambient caps, and any
-// failure means gocracker simply falls back to requiring root for sub-process
-// network operations.
-func raiseAmbientNetAdmin() {
-	hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
-	var data [2]unix.CapUserData
-	if err := unix.Capget(&hdr, &data[0]); err != nil {
-		return
-	}
-	// CAP_NET_ADMIN = 12; it fits in the low 32-bit word.
-	data[0].Inheritable |= 1 << unix.CAP_NET_ADMIN
-	if err := unix.Capset(&hdr, &data[0]); err != nil {
-		return
-	}
-	_ = unix.Prctl(unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_RAISE, unix.CAP_NET_ADMIN, 0, 0)
-}
+// raiseAmbientNetAdmin lives in caps_linux.go on Linux and is a no-op
+// elsewhere via caps_other.go. See caps_linux.go for the rationale.
 
 func isLoopbackTCPAddr(addr string) bool {
 	host := addr

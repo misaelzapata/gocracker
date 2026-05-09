@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 // cmdInstall sets up gocracker-sandboxd as a persistent system service.
