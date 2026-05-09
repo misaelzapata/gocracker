@@ -59,9 +59,9 @@ make build kernel-unpack
 
 That's it — alpine boots in ~80 ms (warm OCI cache), runs the command, and exits. No kernel build required: the repo ships gzipped guest kernels under [artifacts/kernels/](artifacts/kernels/) for both x86_64 and arm64. `make kernel-unpack` decompresses them in place. To build a custom kernel from source, run `make kernel-guest` (x86_64) or `make kernel-guest-arm64` (arm64) instead — that takes ~10 min the first time.
 
-## Code-Disk Attach — one VM, infinite versions
+## Cartridge Deploys — one VM, infinite versions
 
-> **The base VM never changes. Only the disk does.**
+> **The base VM never changes. Only the cartridge does.**
 
 Every platform that runs user code faces the same problem: how do you deploy a new version without rebooting every running instance? The standard answer is containers (rebuild the image, restart the process) or blue/green deploys (spin up a new fleet, cut traffic over). Both require teardown and cold boot.
 
@@ -132,7 +132,8 @@ What this unlocks that no other open-source platform does today:
 | Deploy time | Minutes (build + push + pull) | Seconds (code only, no runtime) |
 | Rollback | Pull previous image tag | Point to previous ext4 |
 | Preview environments | Full container per PR | One ext4 per PR, shared base VM |
-| A/B testing | Two container fleets | Two VMs, same snapshot, different disk |
+| A/B testing | Two container fleets | Two VMs, same snapshot, different cartridge |
+| AI code execution | Docker per session (heavy) | One cartridge per conversation, warm VM |
 | Isolation | Shared kernel (containers) | KVM hardware per tenant |
 
 The base snapshot is built **once** when you define your stack (e.g. `node:20-alpine` + Express + your deps). Every deploy after that only touches the code disk. Runtime cold-start is eliminated because the snapshot is already warm in the pool.
@@ -155,7 +156,7 @@ The base snapshot is built **once** when you define your stack (e.g. `node:20-al
 
 **Sandbox control plane** -- [gocracker-sandboxd](sandboxes/cmd/gocracker-sandboxd/) — HTTP daemon that wraps the runtime with warm pools (`~1.5 ms p95 lease`), content-addressed templates (`~80 µs cache hit`), HMAC-signed preview URLs, and Python / Go / JS SDKs with typed errors and context-manager sandbox lifecycle. Per-sandbox Firecracker-style UDS at `<state-dir>/sandboxes/<id>.sock` speaks directly to a baked-in toolbox agent on vsock 10023 (framed exec + files + git + secrets + `SetNetwork` re-IP). See the [Sandboxd overview](#sandboxd-sandbox-control-plane).
 
-**Code-disk attach** -- Separate ext4 disk carries application code, mounted inside the guest at boot via `gc.code_disk=` kernel cmdline. The base VM snapshot never changes; swap the disk to deploy a new version. Attach multiple disks to one running VM for side-by-side version comparison without rebooting. See [Code-Disk Attach](#code-disk-attach--one-vm-infinite-versions).
+**Cartridge deploys** -- Separate ext4 disk carries application code, mounted inside the guest at boot via `gc.code_disk=` kernel cmdline. The base VM snapshot never changes; swap the cartridge to deploy a new version. Attach multiple cartridges to one running VM for side-by-side version comparison without rebooting. See [Cartridge Deploys](#cartridge-deploys--one-vm-infinite-versions).
 
 ## Examples
 
