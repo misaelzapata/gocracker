@@ -59,6 +59,45 @@ make build kernel-unpack
 
 That's it — alpine boots in ~80 ms (warm OCI cache), runs the command, and exits. No kernel build required: the repo ships gzipped guest kernels under [artifacts/kernels/](artifacts/kernels/) for both x86_64 and arm64. `make kernel-unpack` decompresses them in place. To build a custom kernel from source, run `make kernel-guest` (x86_64) or `make kernel-guest-arm64` (arm64) instead — that takes ~10 min the first time.
 
+## Code-Disk Attach — one VM, infinite versions
+
+> **The base VM never changes. Only the disk does.**
+
+Every platform that runs user code faces the same problem: how do you deploy a new version without rebooting every running instance? The standard answer is containers (rebuild the image, restart the process) or blue/green deploys (spin up a new fleet, cut traffic over). Both require teardown and cold boot.
+
+gocracker solves this differently. Application code lives on a **separate ext4 disk** — not baked into the rootfs. The base VM (kernel + runtime + libraries) is a frozen snapshot. At boot, gocracker attaches the code disk and mounts it inside the guest. To run a different version, attach a different disk. The VM never reboots.
+
+```
+┌─────────────────────────────────┐
+│  base snapshot (frozen, shared) │  node:20-alpine · Python 3 · Go 1.22
+│  kernel + runtime + libraries   │  built once, restored in ~40 ms
+└────────────────┬────────────────┘
+                 │ attach at boot
+        ┌────────┴────────┐
+        │   code disk     │  your app — ext4, read-only, swappable
+        │  /app/v1  v2  … │  swap the disk, not the VM
+        └─────────────────┘
+```
+
+**Multiple disks, one running VM.** Attach several code disks simultaneously and exec into any of them without rebooting:
+
+```bash
+gocracker-sandboxd run \
+  --image node:20-alpine \
+  --code-disk ./app-v1.ext4:/data/v1 \
+  --code-disk ./app-v2.ext4:/data/v2
+
+# same running VM, no reboot
+toolbox exec node /data/v1/app.js   # v1 output
+toolbox exec node /data/v2/app.js   # v2 output
+```
+
+This is the same architecture Vercel uses for preview deployments — code is a separate artifact from the runtime — but with real KVM hardware isolation instead of shared-kernel containers. To our knowledge, **no other open-source microVM project exposes code-disk attach as a first-class API.**
+
+See real working examples: [`examples/code-disk/`](examples/code-disk/) and the smoke test: [`tests/manual-smoke/code-disk-apps/run.sh`](tests/manual-smoke/code-disk-apps/run.sh).
+
+---
+
 ## Features
 
 **Container Sources** -- OCI images from any registry, local Dockerfiles (BuildKit AST), git repos with auto-detected Dockerfiles, local directories.
@@ -74,6 +113,8 @@ That's it — alpine boots in ~80 ms (warm OCI cache), runs the command, and exi
 **Devices** -- virtio-net, virtio-blk, virtio-rng, virtio-vsock, virtio-balloon (manual + auto reclaim), virtio-fs, UART 16550A serial console, memory hotplug.
 
 **Sandbox control plane** -- [gocracker-sandboxd](sandboxes/cmd/gocracker-sandboxd/) — HTTP daemon that wraps the runtime with warm pools (`~1.5 ms p95 lease`), content-addressed templates (`~80 µs cache hit`), HMAC-signed preview URLs, and Python / Go / JS SDKs with typed errors and context-manager sandbox lifecycle. Per-sandbox Firecracker-style UDS at `<state-dir>/sandboxes/<id>.sock` speaks directly to a baked-in toolbox agent on vsock 10023 (framed exec + files + git + secrets + `SetNetwork` re-IP). See the [Sandboxd overview](#sandboxd-sandbox-control-plane).
+
+**Code-disk attach** -- Separate ext4 disk carries application code, mounted inside the guest at boot via `gc.code_disk=` kernel cmdline. The base VM snapshot never changes; swap the disk to deploy a new version. Attach multiple disks to one running VM for side-by-side version comparison without rebooting. See [Code-Disk Attach](#code-disk-attach--one-vm-infinite-versions).
 
 ## Examples
 
