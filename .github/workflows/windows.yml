@@ -60,6 +60,7 @@ jobs:
           go vet `
             ./internal/paths/... `
             ./internal/slirp/... `
+            ./internal/whp/... `
             ./cmd/gocracker/... `
             ./cmd/gocracker-vmm/... `
             ./cmd/gocracker-jailer/... `
@@ -69,7 +70,9 @@ jobs:
             ./cmd/debugvm/... `
             ./tools/bench-rtt/... `
             ./sandboxes/cmd/...
+      # internal/whp tests skip gracefully on hosted runners (WHP feature
+      # off) but still verify DLL load + symbol resolution on real Windows.
       - name: go test (non-Linux allow-list)
-        run: go test ./internal/paths/...
+        run: go test ./internal/paths/... ./internal/whp/...
       - name: go build gocracker.exe (stub on Windows)
         run: go build -o gocracker.exe ./cmd/gocracker
