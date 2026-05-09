@@ -96,6 +96,47 @@ This is the same architecture Vercel uses for preview deployments — code is a 
 
 See real working examples: [`examples/code-disk/`](examples/code-disk/) and the smoke test: [`tests/manual-smoke/code-disk-apps/run.sh`](tests/manual-smoke/code-disk-apps/run.sh).
 
+### Building a platform on top of gocracker
+
+Every existing platform (Fly.io, Railway, Render, AWS Lambda) bakes code and runtime into the same container image. Deploying a new version means rebuilding the entire image, pushing it to a registry, pulling it on every node, and cold-booting a new container — even if only one `.js` file changed.
+
+With gocracker's code-disk model the runtime and the code are permanently separate:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  DEPLOY PIPELINE                                                │
+│                                                                 │
+│  git push → CI packages only your code into an ext4 disk       │
+│             (no docker build, no image pull, takes seconds)     │
+│                                                                 │
+│  gocracker swaps the disk on the warm VM snapshot              │
+│  → new version live in < 100 ms                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────┐     ┌──────────────────────────┐
+│  base snapshot  (never       │     │  code disk  (changes     │
+│  changes across deploys)     │     │  on every deploy)        │
+│                              │     │                          │
+│  node:20-alpine              │ ←── │  app-v42.ext4            │
+│  + your framework            │     │  ├── index.js            │
+│  + all npm deps              │     │  ├── routes/             │
+│  + runtime config            │     │  └── package.json        │
+└──────────────────────────────┘     └──────────────────────────┘
+```
+
+What this unlocks that no other open-source platform does today:
+
+| | Traditional containers | gocracker code-disk |
+|---|---|---|
+| Deploy a new version | Rebuild image + pull + cold boot | Package code into ext4, swap disk |
+| Deploy time | Minutes (build + push + pull) | Seconds (code only, no runtime) |
+| Rollback | Pull previous image tag | Point to previous ext4 |
+| Preview environments | Full container per PR | One ext4 per PR, shared base VM |
+| A/B testing | Two container fleets | Two VMs, same snapshot, different disk |
+| Isolation | Shared kernel (containers) | KVM hardware per tenant |
+
+The base snapshot is built **once** when you define your stack (e.g. `node:20-alpine` + Express + your deps). Every deploy after that only touches the code disk. Runtime cold-start is eliminated because the snapshot is already warm in the pool.
+
 ---
 
 ## Features
@@ -717,11 +758,12 @@ make hostcheck
 
 | # | Idea | Notes |
 |---|---|---|
-| 1 | **Shared-kernel mode** | One guest VM hosts multiple isolated user workloads via Linux namespaces + seccomp per process. Shared runtime pages (CoW), ~1 ms fork instead of ~40 ms restore, ~5–20 MB per tenant vs ~128 MB today. Tradeoff: namespace isolation instead of KVM hardware isolation — good fit for trusted tenants or high-density deployments. |
-| 2 | **Edge layer / public ingress** | Anycast-style routing so sandboxd is reachable from the internet without a manual reverse proxy. TLS termination, per-tenant auth tokens, rate limiting. |
-| 3 | **Hot disk swap** | virtio-blk hot-plug so a running VM can swap its code disk without rebooting. Currently requires attaching all disks at boot. |
-| 4 | **ARM64 warm snapshots** | Warm pool and snapshot/restore tested on x86-64; needs validation + tuning on Graviton / Apple Silicon (nested KVM). |
-| 5 | **macOS support** | Hypervisor.framework backend for local development without Linux. |
+| 1 | **Code-disk from object storage (S3 / R2)** | Accept `s3://bucket/app-v42.ext4` or `r2://bucket/app-v42.ext4` as a `--code-disk` source. sandboxd downloads and caches the ext4 locally before attaching, keyed by ETag/checksum so the same version is never downloaded twice. Enables a deploy pipeline where CI uploads the code disk to object storage and gocracker pulls it on demand — no shared filesystem required. |
+| 2 | **Shared-kernel mode** | One guest VM hosts multiple isolated user workloads via Linux namespaces + seccomp per process. Shared runtime pages (CoW), ~1 ms fork instead of ~40 ms restore, ~5–20 MB per tenant vs ~128 MB today. Tradeoff: namespace isolation instead of KVM hardware isolation — good fit for trusted tenants or high-density deployments. |
+| 3 | **Edge layer / public ingress** | Anycast-style routing so sandboxd is reachable from the internet without a manual reverse proxy. TLS termination, per-tenant auth tokens, rate limiting. |
+| 4 | **Hot disk swap** | virtio-blk hot-plug so a running VM can swap its code disk without rebooting. Currently requires attaching all disks at boot. |
+| 5 | **ARM64 warm snapshots** | Warm pool and snapshot/restore tested on x86-64; needs validation + tuning on Graviton / Apple Silicon (nested KVM). |
+| 6 | **macOS support** | Hypervisor.framework backend for local development without Linux. |
 
 ## License
 
