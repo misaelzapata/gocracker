@@ -79,17 +79,51 @@ gocracker solves this differently. Application code lives on a **separate ext4 d
         └─────────────────┘
 ```
 
-**Multiple disks, one running VM.** Attach several code disks simultaneously and exec into any of them without rebooting:
+**Next.js API route — deploy without Lambda cold starts.** This is what a cassette-based deploy handler looks like compared to the Lambda model:
 
-```bash
-gocracker-sandboxd run \
-  --image node:20-alpine \
-  --code-disk ./app-v1.ext4:/data/v1 \
-  --code-disk ./app-v2.ext4:/data/v2
+```typescript
+// Lambda / Vercel serverless — cold boot on every deploy
+// AWS rebuilds your container image, distributes it, cold-starts on first request
+export async function POST(req: Request) {          // ~500 ms cold start after deploy
+  const { code } = await req.json();
+  // ... runs in shared-kernel container, no hardware isolation
+}
+```
 
-# same running VM, no reboot
-toolbox exec node /data/v1/app.js   # v1 output
-toolbox exec node /data/v2/app.js   # v2 output
+```typescript
+// app/api/run/route.ts — gocracker cassette model
+// The runtime VM (node:20-alpine + all deps) is a frozen snapshot, always warm.
+// Only the cassette (your code as ext4) changes on each deploy.
+import { Client } from '@gocracker/sdk';
+
+const gc = new Client('http://127.0.0.1:9091');
+
+export async function POST(req: Request) {
+  const { version } = await req.json();             // e.g. "v41" or "v42"
+
+  // VM boots from warm snapshot in ~40 ms — runtime was never torn down
+  const sb = await gc.createSandbox({
+    image: 'node:20-alpine',                        // frozen snapshot, shared
+    network_mode: 'none',
+    code_disks: [
+      { host_path: `/cassettes/app-${version}.ext4`, mount: '/app', read_only: true },
+    ],
+  });
+
+  try {
+    // exec runs inside a real KVM-isolated VM, not a shared container
+    const tb = sb.toolbox();
+    const result = await tb.exec(['node', '/app/server.js', '--once']);
+    return Response.json({ output: result.stdout });
+  } finally {
+    await sb.stop();   // VM destroyed — next request gets a fresh one from the pool
+  }
+}
+```
+
+```
+Lambda deploy:  rebuild image (2 min) → push to ECR → distribute → cold boot (~500 ms)
+Cassette deploy: pack code into ext4 (5 s) → drop file → next request warm (~40 ms)
 ```
 
 This is the same architecture Vercel uses for preview deployments — code is a separate artifact from the runtime — but with real KVM hardware isolation instead of shared-kernel containers. To our knowledge, **no other open-source microVM project exposes cassette-style deploys as a first-class API.**
