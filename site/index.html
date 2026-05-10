@@ -25,6 +25,7 @@
 <nav class="topnav">
   <a href="#install">install</a> ·
   <a href="#features">features</a> ·
+  <a href="#cassette">cassette</a> ·
   <a href="#numbers">numbers</a> ·
   <a href="#sdk">sdk</a> ·
   <a href="https://github.com/misaelzapata/gocracker">github</a> ·
@@ -96,8 +97,8 @@ sudo usermod -aG kvm $USER && newgrp kvm
   <dt>sandbox control plane</dt>
   <dd><code>gocracker-sandboxd</code> — warm pools, content-addressed templates, HMAC-signed preview URLs. Python · Go · JS SDKs.</dd>
 
-  <dt>code-disk attach</dt>
-  <dd>Separate ext4 disk carries application code, mounted inside the guest at boot. Swap versions by swapping the disk — base rootfs never changes. Hot-attach multiple disks to one running VM for side-by-side version comparison.</dd>
+  <dt>cassette deploys</dt>
+  <dd>Application code lives on a separate ext4 disk — not baked into the rootfs. The base VM (runtime + deps) is a frozen snapshot. Swap the cassette to deploy a new version. The VM never reboots. Multiple cassettes in one running VM for instant version comparison. <a href="#cassette">→ full explanation</a></dd>
 
   <dt>warm runtime</dt>
   <dd><code>base-node-warm</code> template pre-loads V8 inside the snapshot. Node.js code eval goes from ~50 ms cold to ~5–10 ms warm, no reboot.</dd>
@@ -108,6 +109,63 @@ sudo usermod -aG kvm $USER && newgrp kvm
   <dt>VS Code extension</dt>
   <dd>Run selected code or an entire file in a real KVM micro-VM with <code>Ctrl+Shift+G</code>. Sidebar lists live sandboxes. TypeScript runs via Bun natively — no transpile step.</dd>
 </dl>
+</section>
+
+<hr>
+
+<section id="cassette">
+<h2>── cassette deploys ─────────────────────────────────</h2>
+
+<p class="lede">Every platform today bakes code and runtime into the same container image. gocracker separates them — permanently.</p>
+
+<pre class="term"><span class="muted"># everyone else:</span>
+git push → docker build  <span class="muted">(rebuild runtime + code)</span>
+         → image push    <span class="muted">(upload gigabytes)</span>
+         → image pull    <span class="muted">(on every node)</span>
+         → container restart  <span class="muted">(cold boot)</span>
+
+<span class="muted"># gocracker cassette:</span>
+git push → pack code into ext4  <span class="muted">(seconds, code only)</span>
+         → attach cassette     <span class="muted">(warm VM, no reboot)</span>
+         → <span class="ok">live in &lt; 100 ms</span></pre>
+
+<p>The base VM — kernel, runtime, all dependencies — is a <strong>frozen snapshot built once</strong>. It never changes across deploys. Only the cassette (an ext4 disk carrying your application code) is swapped. This is the same separation Vercel achieves with bundles and V8 isolates, but with real KVM hardware isolation per tenant.</p>
+
+<pre class="term"><span class="muted">console (VM snapshot, frozen)    cassette (ext4, swappable)</span>
+┌──────────────────────────┐     ┌──────────────────────────┐
+│ node:20-alpine           │     │ app-v42.ext4             │
+│ + Express + all deps     │ ←── │ ├── index.js             │
+│ + runtime config         │     │ ├── routes/              │
+│ restored in ~40 ms       │     │ └── package.json         │
+└──────────────────────────┘     └──────────────────────────┘
+                                   ↑ swap this, not the console</pre>
+
+<dl class="feat">
+  <dt>instant rollback</dt>
+  <dd>Point to the previous cassette. No image rebuild, no container restart. The VM is already running.</dd>
+
+  <dt>preview environments for free</dt>
+  <dd>Each pull request gets its own ext4. They all share the same base VM snapshot — no extra memory for the runtime.</dd>
+
+  <dt>A/B deploys</dt>
+  <dd>Two VMs, same snapshot, two different cassettes. Route traffic split between them. Swap one cassette to promote the winner.</dd>
+
+  <dt>AI code execution</dt>
+  <dd>AI agents (Claude, Copilot, GPT) that execute code don't need to rebuild a container per session. One cassette per conversation — the runtime VM is always warm. Swap in the user's code, run it, tear down the cassette. No Docker, no heavy orchestration.</dd>
+
+  <dt>multiple versions, one VM</dt>
+  <dd>Attach several cassettes simultaneously. Exec into any version without rebooting — useful for migration testing and benchmarking across versions.</dd>
+</dl>
+
+<pre class="term"><span class="hash"># two versions, one running VM</span>
+sandboxd run --image node:20-alpine \
+  --code-disk ./app-v41.ext4:/data/v41 \
+  --code-disk ./app-v42.ext4:/data/v42
+
+toolbox exec node /data/v41/app.js   <span class="muted"># → v41 output</span>
+toolbox exec node /data/v42/app.js   <span class="muted"># → v42 output — same VM, no reboot</span></pre>
+
+<p class="note">To our knowledge, no other open-source microVM project exposes cassette-style code-disk attach as a first-class API. · <a href="https://github.com/misaelzapata/gocracker/tree/main/examples/code-disk">examples</a></p>
 </section>
 
 <hr>
@@ -137,7 +195,7 @@ arch parity     x86-64 + ARM64 (Graviton 1)        <span class="ok">full</span>
 
 client = Client(<span class="str">"http://127.0.0.1:9091"</span>)
 
-<span class="hash"># run a file from a code disk — swap the disk, not the VM</span>
+<span class="hash"># cassette deploy — swap the ext4, not the VM</span>
 sb = client.create_sandbox(
     image=<span class="str">"node:20-alpine"</span>,
     network_mode=<span class="str">"none"</span>,
