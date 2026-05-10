@@ -92,7 +92,7 @@ toolbox exec node /data/v1/app.js   # v1 output
 toolbox exec node /data/v2/app.js   # v2 output
 ```
 
-This is the same architecture Vercel uses for preview deployments — code is a separate artifact from the runtime — but with real KVM hardware isolation instead of shared-kernel containers. To our knowledge, **no other open-source microVM project exposes code-disk attach as a first-class API.**
+This is the same architecture Vercel uses for preview deployments — code is a separate artifact from the runtime — but with real KVM hardware isolation instead of shared-kernel containers. To our knowledge, **no other open-source microVM project exposes cassette-style deploys as a first-class API.**
 
 See real working examples: [`examples/code-disk/`](examples/code-disk/) and the smoke test: [`tests/manual-smoke/code-disk-apps/run.sh`](tests/manual-smoke/code-disk-apps/run.sh).
 
