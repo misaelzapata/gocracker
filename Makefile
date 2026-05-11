@@ -77,7 +77,9 @@ build-darwin-arm64:
 NONLINUX_VET_PKGS = \
   ./internal/paths/... \
   ./internal/slirp/... \
+  ./internal/loader/... \
   ./internal/whp/... \
+  ./pkg/vmm/... \
   ./cmd/gocracker/... \
   ./cmd/gocracker-vmm/... \
   ./cmd/gocracker-jailer/... \
