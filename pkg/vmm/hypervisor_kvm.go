@@ -87,6 +87,26 @@ type kvmVM struct {
 	irqfds map[uint32]int // irqNumber → eventfd
 }
 
+// AllocateGuestRAM returns the KVM-backed memfd memory as a Go slice.
+// kvm.VM already owns a single contiguous mmap region created at VM
+// construction time; we hand that slice out. Subsequent calls to
+// MapMemory accept any slice (the caller is responsible for pinning,
+// and slices returned from AllocateGuestRAM are pinned by definition).
+//
+// Note: today the kvm package allocates the entire guest RAM at
+// CreateVM time, so size is informational — we return the full backing
+// region. Phase 1.2 part 2 will support multiple disjoint allocations.
+func (v *kvmVM) AllocateGuestRAM(size uint64) ([]byte, error) {
+	if v.vm == nil {
+		return nil, fmt.Errorf("kvmVM.AllocateGuestRAM: VM closed")
+	}
+	mem := v.vm.Memory()
+	if uint64(len(mem)) < size {
+		return nil, fmt.Errorf("kvmVM.AllocateGuestRAM: requested %d bytes, only %d available", size, len(mem))
+	}
+	return mem[:size], nil
+}
+
 func (v *kvmVM) MapMemory(gpa uint64, hostMem []byte, flags MemFlags) error {
 	// AddMemoryRegion takes a slot number; pkg/vmm assigns slots in
 	// arch-specific code today. The adapter auto-numbers them in the

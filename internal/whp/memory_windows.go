@@ -61,6 +61,26 @@ func AllocateGuestMemory(size uint64) (*GuestMemory, error) {
 		size = (size + pageSize - 1) &^ (pageSize - 1)
 	}
 
+	hostBytes, base, err := allocateVirtualBytes(size)
+	if err != nil {
+		return nil, err
+	}
+	return &GuestMemory{
+		Base:      base,
+		Size:      size,
+		hostBytes: hostBytes,
+	}, nil
+}
+
+// allocateVirtualBytes is the unsafe boundary. Splitting it out lets
+// `go vet`'s unsafeptr analyzer reason about the conversion in a single
+// short function — VirtualAlloc returns a non-GC-managed address, so
+// the uintptr→unsafe.Pointer cast is safe; vet only flags it as
+// "possible misuse" because the general rule is unsafe when the uintptr
+// references Go-managed memory.
+//
+//go:nosplit
+func allocateVirtualBytes(size uint64) ([]byte, uintptr, error) {
 	base, err := windows.VirtualAlloc(
 		0, // let the kernel pick an address
 		uintptr(size),
@@ -68,18 +88,14 @@ func AllocateGuestMemory(size uint64) (*GuestMemory, error) {
 		windows.PAGE_READWRITE,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("VirtualAlloc(%d bytes): %w", size, err)
+		return nil, 0, fmt.Errorf("VirtualAlloc(%d bytes): %w", size, err)
 	}
-	// Build a Go slice header that references the VirtualAlloc'd region
-	// directly. unsafe.Slice (Go 1.17+) gives us a slice without a copy.
-	// The slice's backing array is the VirtualAlloc region; callers
-	// must not append/grow.
-	hostBytes := unsafe.Slice((*byte)(unsafe.Pointer(base)), size)
-	return &GuestMemory{
-		Base:      base,
-		Size:      size,
-		hostBytes: hostBytes,
-	}, nil
+	// VirtualAlloc'd memory is never moved by Go's GC — the address is
+	// stable for the entire allocation's lifetime. The slice header
+	// built here aliases that fixed region directly; callers must not
+	// append/grow it.
+	ptr := unsafe.Pointer(base) //nolint:govet // uintptr is from VirtualAlloc, not Go-managed
+	return unsafe.Slice((*byte)(ptr), size), base, nil
 }
 
 // Close releases the host memory. Safe to call multiple times.

@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package vmm is the core Virtual Machine Monitor.
 // It wires together KVM, virtio devices, UART, FDT, kernel loader,
 // and snapshot/restore.

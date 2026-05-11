@@ -88,10 +88,16 @@ NONLINUX_VET_PKGS = \
   ./tools/bench-rtt/... \
   ./sandboxes/cmd/...
 
+## internal/whp casts uintptr (windows.VirtualAlloc result) to
+## unsafe.Pointer to build a slice over the VirtualAlloc'd region. That
+## memory is NOT Go-managed (the GC never moves it), so the cast is
+## safe — but vet's unsafeptr analyzer can't tell. Disable just this
+## one analyzer for internal/whp, everywhere else keeps full vet.
 vet-cross:
 	GOOS=linux   GOARCH=amd64 go vet ./...
 	GOOS=linux   GOARCH=arm64 go vet ./...
-	GOOS=windows GOARCH=amd64 go vet $(NONLINUX_VET_PKGS)
+	GOOS=windows GOARCH=amd64 go vet -unsafeptr=false ./internal/whp/...
+	GOOS=windows GOARCH=amd64 go vet $(filter-out ./internal/whp/...,$(NONLINUX_VET_PKGS))
 	GOOS=darwin  GOARCH=amd64 go vet $(NONLINUX_VET_PKGS)
 	GOOS=darwin  GOARCH=arm64 go vet $(NONLINUX_VET_PKGS)
 

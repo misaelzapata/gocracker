@@ -57,10 +57,13 @@ jobs:
       - name: go vet (non-Linux allow-list)
         shell: pwsh
         run: |
+          # internal/whp wraps Windows DLL handles via uintptr→unsafe.Pointer
+          # casts that vet's unsafeptr analyzer flags. The memory comes from
+          # VirtualAlloc and is not Go-managed, so the cast is safe.
+          go vet -unsafeptr=false ./internal/whp/...
           go vet `
             ./internal/paths/... `
             ./internal/slirp/... `
-            ./internal/whp/... `
             ./cmd/gocracker/... `
             ./cmd/gocracker-vmm/... `
             ./cmd/gocracker-jailer/... `
@@ -69,7 +72,8 @@ jobs:
             ./cmd/toolbox-cli/... `
             ./cmd/debugvm/... `
             ./tools/bench-rtt/... `
-            ./sandboxes/cmd/...
+            ./sandboxes/cmd/... `
+            ./pkg/vmm/...
       # internal/whp tests skip gracefully on hosted runners (WHP feature
       # off) but still verify DLL load + symbol resolution on real Windows.
       - name: go test (non-Linux allow-list)

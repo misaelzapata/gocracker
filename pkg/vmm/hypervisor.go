@@ -67,10 +67,18 @@ type HVCapabilities struct {
 // concurrent reads (Capabilities, QueryDirtyBitmap on disjoint ranges)
 // are allowed.
 type HVVM interface {
+	// AllocateGuestRAM returns a pinned host-memory slice the caller can
+	// write into (e.g. to load a kernel image) and later MapMemory into
+	// the guest. On Linux this is mmap-backed; on Windows it's backed by
+	// windows.VirtualAlloc. The HVVM owns the underlying allocation —
+	// closing the HVVM releases it. Use this rather than passing a
+	// Go-managed slice to MapMemory, which can be moved by the GC.
+	AllocateGuestRAM(size uint64) ([]byte, error)
+
 	// MapMemory makes hostMem visible to the guest at gpa. The slice's
 	// underlying pages must remain pinned for the lifetime of the
-	// mapping (callers typically use windows.VirtualAlloc / mmap with
-	// MAP_POPULATE). Slot allocation is internal; backends pick one.
+	// mapping. Use AllocateGuestRAM to obtain a guaranteed-pinned slice.
+	// Slot allocation is internal; backends pick one.
 	MapMemory(gpa uint64, hostMem []byte, flags MemFlags) error
 
 	// UnmapMemory removes a previously-mapped range. gpa+size must match
