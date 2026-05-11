@@ -1784,6 +1784,33 @@ func (m *VM) makePulseIRQFn(irq uint32) func(bool) {
 	}
 }
 
+// makeIRQLine returns an interrupt-line callback (compatible with the
+// virtio device constructor signature `func(bool)`) plumbed through the
+// Hypervisor abstraction. The KVM backend translates each invocation
+// into KVM_IRQ_LINE (synchronous IOCTL); the WHP backend calls
+// WHvRequestInterrupt. Either way the call site is hypervisor-agnostic.
+//
+// This is the portable alternative to makeEventFDIRQFn. The legacy
+// eventfd + KVM_IRQFD pipeline still exists for KVM-optimised hot paths
+// (it saves a syscall per interrupt vs KVM_IRQ_LINE); makeIRQLine is
+// what Phase 2e's WHP boot path uses for its virtio device IRQ wiring,
+// and what new devices should use when they don't need the IRQFD
+// micro-optimisation. The two coexist until Phase 1.2 step 8 unifies them.
+func (m *VM) makeIRQLine(gsi uint32) func(bool) {
+	hv := m.hvVM
+	return func(assert bool) {
+		level := uint32(0)
+		if assert {
+			level = 1
+		}
+		_ = hv.InjectInterrupt(InterruptRequest{
+			VCPU:      -1, // any vCPU; the hypervisor's IRQ chip picks one
+			IRQNumber: gsi,
+			Level:     level,
+		})
+	}
+}
+
 // makeEventFDIRQFn creates an eventfd and returns an IRQ callback that writes
 // a single uint64(1) into it on each assert. Paired with a KVM_IRQFD
 // registration (see archBackend.postCreateVCPUs), this lets virtio devices
