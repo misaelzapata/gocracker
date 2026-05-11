@@ -390,7 +390,10 @@ func whpSegmentValueFromPortable(s Segment) whp.SegmentValue {
 // whpExitContextToPortable maps the WHP-decoded exit into the portable
 // ExitContext shape from pkg/vmm/hypervisor.go.
 func whpExitContextToPortable(c whp.ExitContext) ExitContext {
-	out := ExitContext{}
+	out := ExitContext{
+		RIP:               c.Rip,
+		InstructionLength: c.InstructionLength,
+	}
 	switch c.Reason {
 	case whp.ExitReasonMemoryAccess:
 		m := c.MMIO()

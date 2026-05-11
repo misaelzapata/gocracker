@@ -42,13 +42,9 @@ import (
 )
 
 // Fixed guest memory layout.
-// BootParamsAddr and PageTableBase live in boot_modes.go (portable so
-// the WHP backend can use the same layout without dragging in vmm.go's
-// linux-only build tag).
+// BootParamsAddr, PageTableBase, CmdlineAddr, InitrdAddr, KernelLoad
+// live in longmode.go (portable so the WHP backend can share them).
 const (
-	CmdlineAddr = 0x20000
-	InitrdAddr  = 0x1000000 // 16 MiB
-	KernelLoad  = 0x100000  // 1 MiB — standard bzImage load address
 
 	// MMIO layout for virtio devices
 	VirtioBase    = 0xD0000000

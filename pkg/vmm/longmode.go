@@ -4,18 +4,42 @@ import "encoding/binary"
 
 // Guest memory addresses for the boot GDT and IDT. Match Firecracker's
 // layout so kernels that snoop the GDT find what they expect.
+//
+// Layout summary (first MiB of guest RAM):
+//
+//	0x0000      reserved (real-mode IVT)
+//	0x0500      GDT (4 entries × 8 bytes = 32 bytes, .. 0x51F)
+//	0x0520      IDT (zero, 8 bytes)
+//	0x7000      boot_params / zero page (4 KiB)
+//	0x8FF0      initial RSP/RBP (just below page tables)
+//	0x9000      PML4 + PDPT + PD0..PD3 (5 × 4 KiB = 20 KiB)
+//	0x20000     kernel cmdline (up to 4 KiB)
+//	0x100000    bzImage / vmlinux load address (1 MiB)
+//	0x1000000   initrd default address (16 MiB)
 const (
 	BootGDTAddr = 0x500 // 4 entries × 8 bytes = 32 bytes (0x500..0x51F)
 	BootIDTAddr = 0x520 // zero IDT (8 bytes)
+
+	// BootParamsAddr is where the Linux 64-bit boot protocol expects
+	// the boot_params struct (zero-page) to live before kernel entry.
+	BootParamsAddr = 0x7000
 
 	// PageTableBase is the conventional location of the boot-time PML4
 	// inside the first MiB of guest RAM. Each consecutive 4 KiB slot
 	// holds PDPT, PD0, PD1, PD2, PD3 — 5 × 4 KiB = 20 KiB total.
 	PageTableBase = 0x9000
 
-	// BootParamsAddr is where the Linux 64-bit boot protocol expects
-	// the boot_params struct (zero-page) to live before kernel entry.
-	BootParamsAddr = 0x7000
+	// CmdlineAddr is where the kernel command line lives in guest RAM.
+	// boot_params.hdr.cmd_line_ptr points here.
+	CmdlineAddr = 0x20000
+
+	// KernelLoad is the standard bzImage / vmlinux load address per
+	// the Linux x86 boot protocol.
+	KernelLoad = 0x100000
+
+	// InitrdAddr is the default initrd load address (16 MiB). Callers
+	// may override if the kernel runs past this point.
+	InitrdAddr = 0x1000000
 )
 
 // BuildBootPageTables writes a 4-level identity-mapped page table at

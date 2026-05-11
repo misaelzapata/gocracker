@@ -259,6 +259,18 @@ type IRQLine func(level int) error
 type ExitContext struct {
 	Reason ExitReason
 
+	// RIP at the time of the exit. Useful for logging and for the WHP
+	// path that needs to advance past emulated instructions.
+	RIP uint64
+
+	// InstructionLength is the size in bytes of the trapped
+	// instruction. The WHP backend reports this; KVM does not (the
+	// kernel auto-advances RIP after most exits). Used by the WHP path
+	// to advance RIP after MMIO / IOPort / CPUID / MSR emulation. Zero
+	// means the backend didn't report it; the caller must decode the
+	// instruction or pick a sensible default.
+	InstructionLength uint8
+
 	// Populated when Reason == ExitReasonMMIO.
 	MMIO MMIOExit
 
