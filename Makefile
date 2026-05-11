@@ -78,6 +78,9 @@ NONLINUX_VET_PKGS = \
   ./internal/paths/... \
   ./internal/slirp/... \
   ./internal/loader/... \
+  ./internal/uart/... \
+  ./internal/i8042/... \
+  ./internal/acpi/... \
   ./internal/whp/... \
   ./pkg/vmm/... \
   ./cmd/gocracker/... \
