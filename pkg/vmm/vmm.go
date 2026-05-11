@@ -41,13 +41,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Fixed guest memory layout
+// Fixed guest memory layout.
+// BootParamsAddr and PageTableBase live in boot_modes.go (portable so
+// the WHP backend can use the same layout without dragging in vmm.go's
+// linux-only build tag).
 const (
-	BootParamsAddr = 0x7000
-	PageTableBase  = 0x9000 // ~20 KiB for 4-level page tables
-	CmdlineAddr    = 0x20000
-	InitrdAddr     = 0x1000000 // 16 MiB
-	KernelLoad     = 0x100000  // 1 MiB — standard bzImage load address
+	CmdlineAddr = 0x20000
+	InitrdAddr  = 0x1000000 // 16 MiB
+	KernelLoad  = 0x100000  // 1 MiB — standard bzImage load address
 
 	// MMIO layout for virtio devices
 	VirtioBase    = 0xD0000000
