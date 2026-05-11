@@ -78,46 +78,9 @@ type linuxSigaction struct {
 	mask     uint64
 }
 
-type X86BootMode string
-
-type MachineArch string
-
-const (
-	X86BootAuto   X86BootMode = "auto"
-	X86BootACPI   X86BootMode = "acpi"
-	X86BootLegacy X86BootMode = "legacy"
-
-	ArchAMD64 MachineArch = "amd64"
-	ArchARM64 MachineArch = "arm64"
-)
-
-func normalizeX86BootMode(mode X86BootMode) (X86BootMode, error) {
-	switch mode {
-	case "":
-		return X86BootAuto, nil
-	case X86BootAuto, X86BootACPI, X86BootLegacy:
-		return mode, nil
-	default:
-		return "", fmt.Errorf("invalid x86 boot mode %q", mode)
-	}
-}
-
-func HostArch() MachineArch {
-	return MachineArch(runtime.GOARCH)
-}
-
-func normalizeMachineArch(raw string) (MachineArch, error) {
-	arch := strings.TrimSpace(raw)
-	if arch == "" {
-		return HostArch(), nil
-	}
-	switch MachineArch(arch) {
-	case ArchAMD64, ArchARM64:
-		return MachineArch(arch), nil
-	default:
-		return "", fmt.Errorf("invalid arch %q", raw)
-	}
-}
+// X86BootMode, MachineArch, normalizeX86BootMode, HostArch, ArchAMD64/ARM64,
+// and normalizeMachineArch are defined in boot_modes.go so they're
+// available cross-platform.
 
 func normalizeSnapshotMachineArch(raw string) (MachineArch, error) {
 	if strings.TrimSpace(raw) == "" {

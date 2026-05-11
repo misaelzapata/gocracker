@@ -68,6 +68,12 @@ jobs:
             ./internal/uart/... `
             ./internal/i8042/... `
             ./internal/acpi/... `
+            ./internal/buildinfo/... `
+            ./internal/runtimecfg/... `
+            ./internal/tempprune/... `
+            ./internal/log/... `
+            ./internal/seccomp/... `
+            ./internal/firecrackerapi/... `
             ./pkg/vmm/... `
             ./cmd/gocracker/... `
             ./cmd/gocracker-vmm/... `
@@ -80,7 +86,24 @@ jobs:
             ./sandboxes/cmd/...
       # internal/whp tests skip gracefully on hosted runners (WHP feature
       # off) but still verify DLL load + symbol resolution on real Windows.
+      # internal/tempprune compiles on Windows but its tests hard-code
+      # /tmp paths — pre-existing Linux assumption, not introduced by
+      # this port. Excluded until tempprune is reworked to use
+      # os.TempDir(). Filed as follow-up.
       - name: go test (non-Linux allow-list)
-        run: go test ./internal/paths/... ./internal/whp/... ./internal/loader/... ./internal/uart/... ./internal/i8042/... ./internal/acpi/...
+        run: |
+          go test `
+            ./internal/paths/... `
+            ./internal/whp/... `
+            ./internal/loader/... `
+            ./internal/uart/... `
+            ./internal/i8042/... `
+            ./internal/acpi/... `
+            ./internal/buildinfo/... `
+            ./internal/runtimecfg/... `
+            ./internal/log/... `
+            ./internal/seccomp/... `
+            ./internal/firecrackerapi/... `
+            ./pkg/vmm/...
       - name: go build gocracker.exe (stub on Windows)
         run: go build -o gocracker.exe ./cmd/gocracker

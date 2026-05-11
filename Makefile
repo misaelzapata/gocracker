@@ -81,6 +81,12 @@ NONLINUX_VET_PKGS = \
   ./internal/uart/... \
   ./internal/i8042/... \
   ./internal/acpi/... \
+  ./internal/buildinfo/... \
+  ./internal/runtimecfg/... \
+  ./internal/tempprune/... \
+  ./internal/log/... \
+  ./internal/seccomp/... \
+  ./internal/firecrackerapi/... \
   ./internal/whp/... \
   ./pkg/vmm/... \
   ./cmd/gocracker/... \
