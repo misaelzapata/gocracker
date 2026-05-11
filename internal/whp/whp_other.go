@@ -48,3 +48,80 @@ func UnmapGpaRange(PartitionHandle, uint64, uint64) error                       
 func CreateVirtualProcessor(PartitionHandle, uint32) error                                    { return errNotWindows }
 func DeleteVirtualProcessor(PartitionHandle, uint32) error                                    { return errNotWindows }
 func CancelRunVirtualProcessor(PartitionHandle, uint32) error                                 { return errNotWindows }
+
+// Register helpers — stubs so the public surface matches Windows. None
+// of these can do anything useful without WinHvPlatform.dll.
+
+type RegisterName uint32
+type RegisterValue [16]byte
+type SegmentValue struct {
+	Base       uint64
+	Limit      uint32
+	Selector   uint16
+	Attributes uint16
+}
+type TableValue struct {
+	Base  uint64
+	Limit uint16
+}
+type SegmentAttrs struct {
+	Type, S, DPL, Present, AVL, L, DB, G uint8
+}
+
+const (
+	RegRax    RegisterName = 0x00000000
+	RegRcx    RegisterName = 0x00000001
+	RegRdx    RegisterName = 0x00000002
+	RegRbx    RegisterName = 0x00000003
+	RegRsp    RegisterName = 0x00000004
+	RegRbp    RegisterName = 0x00000005
+	RegRsi    RegisterName = 0x00000006
+	RegRdi    RegisterName = 0x00000007
+	RegR8     RegisterName = 0x00000008
+	RegR9     RegisterName = 0x00000009
+	RegR10    RegisterName = 0x0000000A
+	RegR11    RegisterName = 0x0000000B
+	RegR12    RegisterName = 0x0000000C
+	RegR13    RegisterName = 0x0000000D
+	RegR14    RegisterName = 0x0000000E
+	RegR15    RegisterName = 0x0000000F
+	RegRip    RegisterName = 0x00000010
+	RegRflags RegisterName = 0x00000011
+	RegEs     RegisterName = 0x00000012
+	RegCs     RegisterName = 0x00000013
+	RegSs     RegisterName = 0x00000014
+	RegDs     RegisterName = 0x00000015
+	RegFs     RegisterName = 0x00000016
+	RegGs     RegisterName = 0x00000017
+	RegLdtr   RegisterName = 0x00000018
+	RegTr     RegisterName = 0x00000019
+	RegIdtr   RegisterName = 0x0000001A
+	RegGdtr   RegisterName = 0x0000001B
+	RegCr0    RegisterName = 0x0000001C
+	RegCr2    RegisterName = 0x0000001D
+	RegCr3    RegisterName = 0x0000001E
+	RegCr4    RegisterName = 0x0000001F
+	RegCr8    RegisterName = 0x00000020
+	RegTsc          RegisterName = 0x00002000
+	RegEfer         RegisterName = 0x00002001
+	RegKernelGsBase RegisterName = 0x00002002
+	RegApicBase     RegisterName = 0x00002003
+
+	RegPendingInterruption RegisterName = 0x80000000
+	RegInterruptState      RegisterName = 0x80000001
+)
+
+func (v *RegisterValue) SetUint64(x uint64)            {}
+func (v *RegisterValue) Uint64() uint64                { return 0 }
+func (v *RegisterValue) SetSegment(s SegmentValue)     {}
+func (v *RegisterValue) Segment() SegmentValue         { return SegmentValue{} }
+func (v *RegisterValue) SetTable(t TableValue)         {}
+func (v *RegisterValue) Table() TableValue             { return TableValue{} }
+func (a SegmentAttrs) Pack() uint16                    { return 0 }
+func UnpackSegmentAttrs(uint16) SegmentAttrs           { return SegmentAttrs{} }
+func GetVCPURegisters(PartitionHandle, uint32, []RegisterName, []RegisterValue) error {
+	return errNotWindows
+}
+func SetVCPURegisters(PartitionHandle, uint32, []RegisterName, []RegisterValue) error {
+	return errNotWindows
+}
