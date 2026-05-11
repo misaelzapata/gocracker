@@ -2329,81 +2329,146 @@ func clearSignalRestart(sig syscall.Signal) error {
 	return nil
 }
 
-func (m *VM) handleIO(vcpu *kvm.VCPU) {
-	io := vcpu.GetIOData()
-	port := io.Port
+// dispatchIOPort is the portable port-I/O device dispatcher. Given the
+// port number, direction (0=IN, 1=OUT), and (for OUT) the byte the guest
+// is writing, it returns the byte the device wants the guest to read
+// back on IN. Used by both the KVM handleIO (writes the result into
+// kvm.RunData) and the future WHP backend (writes the result into the
+// vCPU's RAX register via WHvSetVirtualProcessorRegisters).
+//
+// Returns handled=true if the port matched a device. For unhandled
+// IN ports, the convention is to return 0xFF (no device) — callers
+// signal that themselves rather than baking it in here.
+func (m *VM) dispatchIOPort(port uint16, direction uint8, dataIn byte) (dataOut byte, handled bool) {
 	if m.uart0 != nil && port >= COM1Base && port < COM1Base+8 {
 		offset := uint8(port - COM1Base)
-		if io.Direction == 1 { // out
-			b := *vcpu.RunDataByte(io.DataOffset)
-			m.uart0.Write(offset, b)
-		} else { // in
-			*vcpu.RunDataByte(io.DataOffset) = m.uart0.Read(offset)
+		if direction == 1 { // OUT
+			m.uart0.Write(offset, dataIn)
+			return 0, true
 		}
-	} else if m.i8042 != nil && (port == I8042Base || port == I8042Base+4) {
+		return m.uart0.Read(offset), true
+	}
+	if m.i8042 != nil && (port == I8042Base || port == I8042Base+4) {
 		offset := uint8(port - I8042Base)
-		if io.Direction == 1 { // out
-			m.i8042.Write(offset, *vcpu.RunDataByte(io.DataOffset))
-		} else { // in
-			*vcpu.RunDataByte(io.DataOffset) = m.i8042.Read(offset)
+		if direction == 1 { // OUT
+			m.i8042.Write(offset, dataIn)
+			return 0, true
 		}
-	} else if io.Direction == 0 { // unhandled IN: return 0xFF (no device)
-		*vcpu.RunDataByte(io.DataOffset) = 0xFF
+		return m.i8042.Read(offset), true
+	}
+	return 0, false
+}
+
+// handleIO is the KVM-coupled wrapper around dispatchIOPort. Reads the
+// port-I/O exit context out of kvm.RunData and writes the device's
+// response back into the same shared buffer so KVM_RUN picks it up on
+// the next entry.
+func (m *VM) handleIO(vcpu *kvm.VCPU) {
+	io := vcpu.GetIOData()
+	dataPtr := vcpu.RunDataByte(io.DataOffset)
+	var dataIn byte
+	if io.Direction == 1 {
+		dataIn = *dataPtr
+	}
+	dataOut, handled := m.dispatchIOPort(io.Port, io.Direction, dataIn)
+	if !handled {
+		// Unhandled IN: return 0xFF (no device). Unhandled OUT: drop.
+		if io.Direction == 0 {
+			*dataPtr = 0xFF
+		}
+		return
+	}
+	if io.Direction == 0 {
+		*dataPtr = dataOut
 	}
 }
 
-func (m *VM) handleMMIO(vcpu *kvm.VCPU) {
-	mmio := vcpu.GetMMIOData()
-	// ARM64 UART dispatch via MMIO (Firecracker uses ns16550a at 0x40002000).
-	// On x86, uart0 is accessed via I/O ports in handleIO; on ARM64 it's MMIO.
-	// PL031 RTC at 0x40001000 (Firecracker: RTC_MEM_START).
+// dispatchMMIO is the portable MMIO device dispatcher. Given the guest
+// physical address, isWrite flag, length, and (for writes) the data the
+// guest is sending, it writes the response into dataOut for reads.
+// Returns handled=true if the address matched a device.
+//
+// dataIn is the byte slice the guest is writing (only consulted when
+// isWrite=true). dataOut is the byte slice to fill with the device's
+// response (only consulted when isWrite=false); it's zeroed before the
+// device fills it so unmapped bits read as zero. Both slices have the
+// same length, which is the access width (typically 1, 2, 4, or 8).
+//
+// Used by both KVM handleMMIO (reads/writes kvm.MMIOData.Data) and the
+// future WHP backend (uses the WHV emulator helpers).
+func (m *VM) dispatchMMIO(gpa uint64, isWrite bool, dataIn []byte, dataOut []byte) bool {
+	// PL031 RTC at 0x40001000 (Firecracker convention, ARM64 only on x86
+	// hosts but we don't gate by arch since the address is unused there).
 	if m.rtcDev != nil {
 		const rtcBase = 0x40001000
 		const rtcSize = 0x1000
-		if mmio.PhysAddr >= rtcBase && mmio.PhysAddr < rtcBase+rtcSize {
-			offset := uint16(mmio.PhysAddr - rtcBase)
-			if mmio.IsWrite == 1 {
-				m.rtcDev.WriteBytes(offset, mmio.Data[:mmio.Len])
+		if gpa >= rtcBase && gpa < rtcBase+rtcSize {
+			offset := uint16(gpa - rtcBase)
+			if isWrite {
+				m.rtcDev.WriteBytes(offset, dataIn)
 			} else {
-				for i := range mmio.Data {
-					mmio.Data[i] = 0
+				for i := range dataOut {
+					dataOut[i] = 0
 				}
-				m.rtcDev.ReadBytes(offset, mmio.Data[:mmio.Len])
+				m.rtcDev.ReadBytes(offset, dataOut)
 			}
-			return
+			return true
 		}
 	}
+	// ARM64 ns16550a serial UART at 0x40002000. (On x86 the UART is on
+	// port I/O; handleIO handles that path.)
 	if m.uart0 != nil {
 		const serialBase = 0x40002000
 		const serialSize = 0x1000
-		if mmio.PhysAddr >= serialBase && mmio.PhysAddr < serialBase+serialSize {
-			offset := uint8(mmio.PhysAddr - serialBase)
-			if mmio.IsWrite == 1 {
-				m.uart0.Write(offset, mmio.Data[0])
-			} else {
-				for i := range mmio.Data {
-					mmio.Data[i] = 0
+		if gpa >= serialBase && gpa < serialBase+serialSize {
+			offset := uint8(gpa - serialBase)
+			if isWrite {
+				if len(dataIn) > 0 {
+					m.uart0.Write(offset, dataIn[0])
 				}
-				mmio.Data[0] = m.uart0.Read(offset)
+			} else {
+				for i := range dataOut {
+					dataOut[i] = 0
+				}
+				if len(dataOut) > 0 {
+					dataOut[0] = m.uart0.Read(offset)
+				}
 			}
-			return
+			return true
 		}
 	}
 	for _, t := range m.transports {
 		base := t.BasePA()
-		if mmio.PhysAddr >= base && mmio.PhysAddr < base+VirtioStride {
-			offset := uint32(mmio.PhysAddr - base)
-			if mmio.IsWrite == 1 {
-				t.WriteBytes(offset, mmio.Data[:mmio.Len])
+		if gpa >= base && gpa < base+VirtioStride {
+			offset := uint32(gpa - base)
+			if isWrite {
+				t.WriteBytes(offset, dataIn)
 			} else {
-				for i := range mmio.Data {
-					mmio.Data[i] = 0
+				for i := range dataOut {
+					dataOut[i] = 0
 				}
-				t.ReadBytes(offset, mmio.Data[:mmio.Len])
+				t.ReadBytes(offset, dataOut)
 			}
-			return
+			return true
 		}
 	}
+	return false
+}
+
+// handleMMIO is the KVM-coupled wrapper around dispatchMMIO. Reads the
+// MMIO exit context out of kvm.RunData and writes device responses back
+// into the same shared buffer.
+func (m *VM) handleMMIO(vcpu *kvm.VCPU) {
+	mmio := vcpu.GetMMIOData()
+	isWrite := mmio.IsWrite == 1
+	if isWrite {
+		m.dispatchMMIO(mmio.PhysAddr, true, mmio.Data[:mmio.Len], nil)
+		return
+	}
+	// Read path: dispatchMMIO writes into mmio.Data via the slice that
+	// aliases the underlying RunData buffer. Pass a slice view of the
+	// fixed-size Data array so the device sees the right length.
+	m.dispatchMMIO(mmio.PhysAddr, false, nil, mmio.Data[:mmio.Len])
 }
 
 func countDirtyBits(bitmap []uint64) int {
