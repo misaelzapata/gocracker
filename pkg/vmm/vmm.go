@@ -554,8 +554,10 @@ func (m *VM) Stop() {
 	defer m.mu.Unlock()
 	if m.state == StateRunning || m.state == StatePaused {
 		m.state = StateStopped
-		for _, vcpu := range m.vcpus {
-			vcpu.RunData.ImmediateExit = 1
+		// Phase 1.2 step 4: cancel via the abstraction. KVM impl sets
+		// RunData.ImmediateExit; WHP impl calls WHvCancelRunVirtualProcessor.
+		for _, hv := range m.hvVCPUs {
+			_ = hv.Cancel()
 		}
 		// Wake any vCPUs parked in waitIfPaused so they observe
 		// StateStopped and exit instead of waiting on the cond forever.
@@ -627,8 +629,9 @@ func (m *VM) Pause() error {
 	clear(m.pausedVCPUs)
 	cond := m.ensurePauseCondLocked()
 	vcpuCount := len(m.vcpus)
-	for _, vcpu := range m.vcpus {
-		vcpu.RunData.ImmediateExit = 1
+	// Phase 1.2 step 4: cancel via the abstraction.
+	for _, hv := range m.hvVCPUs {
+		_ = hv.Cancel()
 	}
 	m.mu.Unlock()
 

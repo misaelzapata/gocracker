@@ -194,6 +194,15 @@ type kvmVCPU struct {
 func (c *kvmVCPU) ID() int { return c.id }
 
 func (c *kvmVCPU) Run() (ExitContext, error) {
+	// Clear any pending ImmediateExit from a prior Cancel() so the next
+	// KVM_RUN runs to completion. Mirrors WHP semantics where Cancel
+	// affects only the in-flight Run; subsequent calls start fresh.
+	// This makes the caller's lifecycle (Cancel → Run) symmetric across
+	// backends without the kvm-specific `RunData.ImmediateExit = 0`
+	// cleanup that Linux paths used to do manually.
+	if c.vcpu != nil && c.vcpu.RunData != nil {
+		c.vcpu.RunData.ImmediateExit = 0
+	}
 	if err := c.vcpu.Run(); err != nil {
 		return ExitContext{Reason: ExitReasonInternal, FailureMsg: err.Error()}, err
 	}
