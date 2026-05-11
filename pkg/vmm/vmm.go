@@ -300,6 +300,21 @@ type VM struct {
 	vcpus  []*kvm.VCPU
 	runWG  sync.WaitGroup
 
+	// hv / hvVM mirror kvmSys / kvmVM behind the Hypervisor abstraction.
+	// Phase 1.2 step 1: present alongside the kvm handles (not breaking).
+	// Subsequent steps migrate call sites from the concrete kvm pointers
+	// to these interface handles. Once every call goes through the
+	// abstraction, the kvm fields disappear and `pkg/vmm` builds for any
+	// hypervisor backend (WHP on Windows, HVF on macOS in a follow-up).
+	//
+	// Lifetime: the legacy cleanup() owns kvmSys/kvmVM. The HV wrappers
+	// share their handles; their Close() methods are NOT called from
+	// cleanup() to avoid double-free. When the migration completes, the
+	// HV fields will own the handles and the kvm fields will be deleted.
+	hv      Hypervisor
+	hvVM    HVVM
+	hvVCPUs []HVVCPU // parallel to vcpus until the migration finishes
+
 	archBackend machineArchBackend
 
 	uart0          *uart.UART
@@ -427,6 +442,13 @@ func New(cfg Config) (*VM, error) {
 		vcpuTIDs:    make(map[int]int),
 		memDirty:    virtio.NewDirtyTracker(uint64(len(kvmVM.Memory()))),
 	}
+	// Phase 1.2 step 1: also expose the hypervisor handles via the
+	// abstraction. The wrappers share kvmSys / kvmVM — they do NOT own
+	// them; legacy cleanup() still calls kvmSys.Close() / kvmVM.Close()
+	// directly. Migration in subsequent steps moves call sites onto
+	// m.hv / m.hvVM and eventually flips ownership.
+	m.hv = &kvmHypervisor{sys: sys}
+	m.hvVM = &hvvmKVM{sys: sys, vm: kvmVM}
 	m.pauseCond = sync.NewCond(&m.mu)
 	m.events.Emit(EventCreated, fmt.Sprintf("VM %s created, %d MiB RAM", cfg.ID, cfg.MemMB))
 	if err := m.setupMemoryHotplug(); err != nil {
@@ -456,6 +478,11 @@ func New(cfg Config) (*VM, error) {
 			return nil, fmt.Errorf("create vcpu %d: %w", i, err)
 		}
 		m.vcpus = append(m.vcpus, vcpu)
+		// Phase 1.2 step 2: also build the HVVCPU adapter, sharing the
+		// underlying *kvm.VCPU handle. Once the migration moves the run
+		// loop / register access through m.hvVCPUs, the m.vcpus slice
+		// (and the kvm.VCPU type leak) goes away.
+		m.hvVCPUs = append(m.hvVCPUs, &kvmVCPU{vm: m.hvVM.(*hvvmKVM), vcpu: vcpu, id: i})
 	}
 	if err := m.archBackend.postCreateVCPUs(m); err != nil {
 		return nil, err
@@ -1378,6 +1405,9 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		vcpuTIDs:    make(map[int]int),
 		memDirty:    virtio.NewDirtyTracker(uint64(len(kvmVM.Memory()))),
 	}
+	// Phase 1.2 step 1: HV abstraction handles, shared with kvmSys/kvmVM.
+	m.hv = &kvmHypervisor{sys: sys}
+	m.hvVM = &hvvmKVM{sys: sys, vm: kvmVM}
 	m.pauseCond = sync.NewCond(&m.mu)
 
 	// Seed the per-device restore shortcuts before setupDevices runs so
@@ -1416,6 +1446,8 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 			return nil, fmt.Errorf("create vcpu %d: %w", i, err)
 		}
 		m.vcpus = append(m.vcpus, vcpu)
+		// Phase 1.2 step 2: parallel HVVCPU wrapper.
+		m.hvVCPUs = append(m.hvVCPUs, &kvmVCPU{vm: m.hvVM.(*hvvmKVM), vcpu: vcpu, id: i})
 	}
 	// Mirror the cold-boot sequence: archBackend.postCreateVCPUs runs after
 	// the vCPU fds exist and before per-vCPU state is restored. On x86 it

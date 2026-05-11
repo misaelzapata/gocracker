@@ -60,7 +60,7 @@ func (h *kvmHypervisor) CreateVM(cfg HVVMConfig) (HVVM, error) {
 			return nil, fmt.Errorf("kvm.EnableDirtyLogging: %w", err)
 		}
 	}
-	return &kvmVM{sys: h.sys, vm: vm}, nil
+	return &hvvmKVM{sys: h.sys, vm: vm}, nil
 }
 
 func (h *kvmHypervisor) Close() error {
@@ -72,10 +72,10 @@ func (h *kvmHypervisor) Close() error {
 	return err
 }
 
-// kvmVM wraps kvm.VM. The current pkg/vmm code base creates VMs through
+// hvvmKVM wraps kvm.VM. The current pkg/vmm code base creates VMs through
 // kvm.System.CreateVM directly; once Phase 1 part 2 lands, callers will
 // route through HVVM and the wrapper centralises the kvm.* surface.
-type kvmVM struct {
+type hvvmKVM struct {
 	sys      *kvm.System
 	vm       *kvm.VM
 	nextSlot uint32
@@ -96,18 +96,18 @@ type kvmVM struct {
 // Note: today the kvm package allocates the entire guest RAM at
 // CreateVM time, so size is informational — we return the full backing
 // region. Phase 1.2 part 2 will support multiple disjoint allocations.
-func (v *kvmVM) AllocateGuestRAM(size uint64) ([]byte, error) {
+func (v *hvvmKVM) AllocateGuestRAM(size uint64) ([]byte, error) {
 	if v.vm == nil {
-		return nil, fmt.Errorf("kvmVM.AllocateGuestRAM: VM closed")
+		return nil, fmt.Errorf("hvvmKVM.AllocateGuestRAM: VM closed")
 	}
 	mem := v.vm.Memory()
 	if uint64(len(mem)) < size {
-		return nil, fmt.Errorf("kvmVM.AllocateGuestRAM: requested %d bytes, only %d available", size, len(mem))
+		return nil, fmt.Errorf("hvvmKVM.AllocateGuestRAM: requested %d bytes, only %d available", size, len(mem))
 	}
 	return mem[:size], nil
 }
 
-func (v *kvmVM) MapMemory(gpa uint64, hostMem []byte, flags MemFlags) error {
+func (v *hvvmKVM) MapMemory(gpa uint64, hostMem []byte, flags MemFlags) error {
 	// AddMemoryRegion takes a slot number; pkg/vmm assigns slots in
 	// arch-specific code today. The adapter auto-numbers them in the
 	// order MapMemory is called — the real allocator from arch.go
@@ -127,15 +127,15 @@ func (v *kvmVM) MapMemory(gpa uint64, hostMem []byte, flags MemFlags) error {
 	return nil
 }
 
-func (v *kvmVM) UnmapMemory(gpa uint64, size uint64) error {
+func (v *hvvmKVM) UnmapMemory(gpa uint64, size uint64) error {
 	// UnmapMemory by gpa requires looking up the slot. The kvm package
 	// does not yet expose a slot-by-gpa lookup; that helper lands with
 	// the arch.go refactor. For now this method is unimplemented but
 	// satisfies the interface so adapter consumers compile.
-	return fmt.Errorf("kvmVM.UnmapMemory: not yet implemented (Phase 1 part 2)")
+	return fmt.Errorf("hvvmKVM.UnmapMemory: not yet implemented (Phase 1 part 2)")
 }
 
-func (v *kvmVM) QueryDirtyBitmap(gpa uint64, size uint64, bitmap []byte) error {
+func (v *hvvmKVM) QueryDirtyBitmap(gpa uint64, size uint64, bitmap []byte) error {
 	// kvm.VM exposes GetDirtyLog(slot uint32). Callers using HVVM today
 	// must first translate gpa → slot; the adapter assumes slot 0 covers
 	// the whole RAM (true for current single-region layouts).
@@ -153,7 +153,7 @@ func (v *kvmVM) QueryDirtyBitmap(gpa uint64, size uint64, bitmap []byte) error {
 	return nil
 }
 
-func (v *kvmVM) CreateVCPU(idx int) (HVVCPU, error) {
+func (v *hvvmKVM) CreateVCPU(idx int) (HVVCPU, error) {
 	vcpu, err := v.vm.CreateVCPU(idx)
 	if err != nil {
 		return nil, fmt.Errorf("kvm.CreateVCPU(%d): %w", idx, err)
@@ -161,19 +161,19 @@ func (v *kvmVM) CreateVCPU(idx int) (HVVCPU, error) {
 	return &kvmVCPU{vm: v, vcpu: vcpu, id: idx}, nil
 }
 
-func (v *kvmVM) InjectInterrupt(req InterruptRequest) error {
+func (v *hvvmKVM) InjectInterrupt(req InterruptRequest) error {
 	// KVM has IRQLine for legacy IOAPIC delivery. The synchronous level
 	// is uint32 (1=assert, 0=deassert). Edge-triggered MSI-style would
 	// use KVM_SIGNAL_MSI which the kvm package does not yet wrap.
 	if req.Edge {
 		// Deferred — Phase 2 lands KVM_SIGNAL_MSI when MSI/MSI-X
 		// devices land.
-		return fmt.Errorf("kvmVM.InjectInterrupt: edge-triggered/MSI not yet supported")
+		return fmt.Errorf("hvvmKVM.InjectInterrupt: edge-triggered/MSI not yet supported")
 	}
 	return v.vm.IRQLine(req.IRQNumber, int(req.Level))
 }
 
-func (v *kvmVM) Close() error {
+func (v *hvvmKVM) Close() error {
 	if v.vm == nil {
 		return nil
 	}
@@ -186,7 +186,7 @@ func (v *kvmVM) Close() error {
 // into the unified ExitContext shape so device emulation code can stay
 // hypervisor-agnostic.
 type kvmVCPU struct {
-	vm   *kvmVM
+	vm   *hvvmKVM
 	vcpu *kvm.VCPU
 	id   int
 }
