@@ -125,3 +125,84 @@ func GetVCPURegisters(PartitionHandle, uint32, []RegisterName, []RegisterValue) 
 func SetVCPURegisters(PartitionHandle, uint32, []RegisterName, []RegisterValue) error {
 	return errNotWindows
 }
+
+// Run-loop stubs.
+
+type ExitReason uint32
+
+const (
+	ExitReasonNone                     ExitReason = 0
+	ExitReasonMemoryAccess             ExitReason = 0x00000001
+	ExitReasonX64IoPortAccess          ExitReason = 0x00000002
+	ExitReasonUnrecoverableException   ExitReason = 0x00000004
+	ExitReasonInvalidVpRegisterValue   ExitReason = 0x00000005
+	ExitReasonUnsupportedFeature       ExitReason = 0x00000006
+	ExitReasonX64InterruptWindow       ExitReason = 0x00000007
+	ExitReasonX64Halt                  ExitReason = 0x00000008
+	ExitReasonX64ApicEoi               ExitReason = 0x00000009
+	ExitReasonSynicSintDeliverable     ExitReason = 0x0000000A
+	ExitReasonX64MsrAccess             ExitReason = 0x00001000
+	ExitReasonX64Cpuid                 ExitReason = 0x00001001
+	ExitReasonException                ExitReason = 0x00001002
+	ExitReasonX64Rdtsc                 ExitReason = 0x00001003
+	ExitReasonX64ApicSmiTrap           ExitReason = 0x00001004
+	ExitReasonHypercall                ExitReason = 0x00001005
+	ExitReasonX64ApicInitSipiTrap      ExitReason = 0x00001006
+	ExitReasonX64ApicWriteTrap         ExitReason = 0x00001007
+	ExitReasonCanceled                 ExitReason = 0x00002001
+)
+
+type ExitContext struct {
+	Reason            ExitReason
+	InstructionLength uint8
+	Cr8               uint8
+	Cs                SegmentValue
+	Rip               uint64
+	Rflags            uint64
+}
+
+type MMIO struct {
+	InstructionByteCount uint8
+	InstructionBytes     [16]byte
+	AccessInfo           uint32
+	Gpa                  uint64
+	Gva                  uint64
+}
+
+func (m MMIO) AccessType() uint8 { return 0 }
+func (m MMIO) IsWrite() bool     { return false }
+
+type IOPort struct {
+	InstructionByteCount uint8
+	InstructionBytes     [16]byte
+	AccessInfo           uint32
+	Port                 uint16
+	Rax, Rcx, Rsi, Rdi   uint64
+	Ds, Es               SegmentValue
+}
+
+func (io IOPort) IsWrite() bool    { return false }
+func (io IOPort) AccessSize() uint8 { return 1 }
+
+type CPUID struct {
+	Rax, Rcx, Rdx, Rbx                                                   uint64
+	DefaultResultRax, DefaultResultRcx, DefaultResultRdx, DefaultResultRbx uint64
+}
+
+type MSR struct {
+	AccessInfo uint32
+	MsrNumber  uint32
+	Rax, Rdx   uint64
+}
+
+func (m MSR) IsWrite() bool { return false }
+
+func (e *ExitContext) MMIO() MMIO         { return MMIO{} }
+func (e *ExitContext) IOPort() IOPort     { return IOPort{} }
+func (e *ExitContext) CPUID() CPUID       { return CPUID{} }
+func (e *ExitContext) MSR() MSR           { return MSR{} }
+func (e *ExitContext) CancelReason() uint32 { return 0 }
+
+func RunVirtualProcessor(PartitionHandle, uint32) (ExitContext, error) {
+	return ExitContext{}, errNotWindows
+}
