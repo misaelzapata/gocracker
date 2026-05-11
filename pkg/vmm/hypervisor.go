@@ -286,12 +286,14 @@ const (
 	ExitReasonMMIO
 	ExitReasonIOPort
 	ExitReasonHalt
-	ExitReasonShutdown      // INIT/SIPI sequence handled by the hypervisor
+	ExitReasonShutdown      // immediate guest shutdown (KVM_EXIT_SHUTDOWN, triple-fault on WHP)
+	ExitReasonSystemEvent   // arch-specific (KVM_EXIT_SYSTEM_EVENT — reset/poweroff/s4); arch backend decides
 	ExitReasonIRQWindowOpen // ready for queued interrupt injection
 	ExitReasonCPUID         // WHP only; KVM hits this only for unhandled leaves
 	ExitReasonTriple        // triple-fault, fatal
 	ExitReasonInternal      // backend-internal failure; FailureMsg set
 	ExitReasonCancelled     // returned from Cancel()
+	ExitReasonFailEntry     // KVM_EXIT_FAIL_ENTRY: invalid guest state on entry
 )
 
 // MMIOExit describes a memory-mapped I/O access the device tree must

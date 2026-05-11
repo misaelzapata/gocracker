@@ -535,8 +535,8 @@ func (m *VM) Start() error {
 	m.startTime = time.Now()
 	if startFresh && len(m.vcpus) > 0 {
 		m.runWG.Add(len(m.vcpus))
-		for _, vcpu := range m.vcpus {
-			go m.runLoop(vcpu)
+		for i, vcpu := range m.vcpus {
+			go m.runLoop(vcpu, m.hvVCPUs[i])
 		}
 		go m.awaitStop()
 		if m.cfg.Balloon != nil && m.cfg.Balloon.Auto == BalloonAutoConservative {
@@ -2048,7 +2048,13 @@ func defaultGuestMAC(id, tapName string) net.HardwareAddr {
 
 // ---- vCPU run loop ----
 
-func (m *VM) runLoop(vcpu *kvm.VCPU) {
+// runLoop drives one vCPU's execution. Phase 1.2 step 3: control flow
+// goes through the Hypervisor abstraction (hvvcpu.Run() returning the
+// portable ExitContext), while device emulation (handleIO/handleMMIO,
+// arch-specific exit handlers, kvm.RunData fields like
+// RequestInterruptWindow) still consumes the legacy *kvm.VCPU. The
+// migration of those device-emulation paths is step 4+.
+func (m *VM) runLoop(vcpu *kvm.VCPU, hvvcpu HVVCPU) {
 	runtime.LockOSThread()
 	if err := seccomp.InstallThreadProfile(seccomp.ProfileVCPU); err != nil {
 		gclog.VMM.Error("install vcpu seccomp profile failed", "id", m.cfg.ID, "vcpu", vcpu.ID, "error", err)
@@ -2079,10 +2085,14 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 		}
 
 		interrupted := false
-		if err := vcpu.Run(); err != nil {
+		exitCtx, err := hvvcpu.Run()
+		if err != nil {
 			// Firecracker treats both EINTR and EAGAIN as transient KVM_RUN
 			// conditions, but they still mean "leave KVM_RUN and process
-			// pending control flow" before re-entering.
+			// pending control flow" before re-entering. The KVM HV adapter
+			// surfaces those errors unwrapped; the WHP adapter (Phase 2)
+			// uses a different cancellation path so this branch is
+			// KVM-specific.
 			if errors.Is(err, unix.EINTR) || errors.Is(err, unix.EAGAIN) {
 				interrupted = true
 			} else {
@@ -2094,8 +2104,8 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 		}
 
 		if !interrupted {
-			switch vcpu.RunData.ExitReason {
-			case kvm.ExitHLT:
+			switch exitCtx.Reason {
+			case ExitReasonHalt:
 				// A 1-vCPU guest executing `hlt` normally means
 				// "done" (no sibling thread can wake it) — this is
 				// Firecracker's behavior too (VcpuExit::Hlt →
@@ -2117,13 +2127,13 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 				// interrupt (PIT, LAPIC timer, IPI). No userspace sleep
 				// needed — the kernel's kvm_vcpu_block handles it.
 
-			case kvm.ExitIO:
+			case ExitReasonIOPort:
 				m.handleIO(vcpu)
 
-			case kvm.ExitMMIO:
+			case ExitReasonMMIO:
 				m.handleMMIO(vcpu)
 
-			case kvm.ExitSystemEvent:
+			case ExitReasonSystemEvent:
 				if handled, stop, err := m.archBackend.handleExit(m, vcpu); err != nil {
 					gclog.VMM.Error("arch exit handling failed", "id", m.cfg.ID, "vcpu", vcpu.ID, "error", err)
 					m.events.Emit(EventError, fmt.Sprintf("arch-specific exit handling on vcpu %d: %v", vcpu.ID, err))
@@ -2141,36 +2151,43 @@ func (m *VM) runLoop(vcpu *kvm.VCPU) {
 				m.Stop()
 				return
 
-			case kvm.ExitShutdown:
+			case ExitReasonShutdown:
 				gclog.VMM.Info("guest shutdown", "id", m.cfg.ID, "vcpu", vcpu.ID)
 				m.events.Emit(EventShutdown, "guest shutdown")
 				m.Stop()
 				return
 
-			case kvm.ExitIRQWindowOpen:
+			case ExitReasonIRQWindowOpen:
+				// KVM-specific control: clear the request-interrupt-window
+				// flag so the kernel doesn't immediately re-exit. WHP
+				// doesn't need this (different injection model).
 				vcpu.RunData.RequestInterruptWindow = 0
 
-			case kvm.ExitInternalError:
-				gclog.VMM.Error("KVM internal error", "id", m.cfg.ID, "vcpu", vcpu.ID)
-				m.events.Emit(EventError, fmt.Sprintf("KVM internal error on vcpu %d", vcpu.ID))
+			case ExitReasonInternal:
+				gclog.VMM.Error("hypervisor internal error", "id", m.cfg.ID, "vcpu", vcpu.ID, "msg", exitCtx.FailureMsg)
+				m.events.Emit(EventError, fmt.Sprintf("hypervisor internal error on vcpu %d: %s", vcpu.ID, exitCtx.FailureMsg))
 				m.Stop()
 				return
 
-			case kvm.ExitFailEntry:
-				gclog.VMM.Error("KVM fail entry", "id", m.cfg.ID, "vcpu", vcpu.ID)
-				m.events.Emit(EventError, fmt.Sprintf("KVM fail entry on vcpu %d (bad guest state)", vcpu.ID))
+			case ExitReasonFailEntry:
+				gclog.VMM.Error("hypervisor fail entry", "id", m.cfg.ID, "vcpu", vcpu.ID, "msg", exitCtx.FailureMsg)
+				m.events.Emit(EventError, fmt.Sprintf("hypervisor fail entry on vcpu %d (bad guest state): %s", vcpu.ID, exitCtx.FailureMsg))
 				m.Stop()
 				return
 
-			case kvm.ExitUnknown:
-				gclog.VMM.Warn("KVM exit unknown", "id", m.cfg.ID, "vcpu", vcpu.ID)
-				m.events.Emit(EventError, fmt.Sprintf("KVM exit unknown on vcpu %d", vcpu.ID))
+			case ExitReasonCancelled:
+				// Cooperative cancellation (HVVCPU.Cancel) — return cleanly.
+				return
+
+			case ExitReasonUnknown:
+				gclog.VMM.Warn("hypervisor exit unknown", "id", m.cfg.ID, "vcpu", vcpu.ID)
+				m.events.Emit(EventError, fmt.Sprintf("hypervisor exit unknown on vcpu %d", vcpu.ID))
 				m.Stop()
 				return
 
 			default:
-				gclog.VMM.Warn("unhandled exit reason", "id", m.cfg.ID, "vcpu", vcpu.ID, "reason", vcpu.RunData.ExitReason)
-				m.events.Emit(EventError, fmt.Sprintf("unhandled exit reason on vcpu %d: %d", vcpu.ID, vcpu.RunData.ExitReason))
+				gclog.VMM.Warn("unhandled exit reason", "id", m.cfg.ID, "vcpu", vcpu.ID, "reason", exitCtx.Reason)
+				m.events.Emit(EventError, fmt.Sprintf("unhandled exit reason on vcpu %d: %d", vcpu.ID, exitCtx.Reason))
 				m.Stop()
 				return
 			}

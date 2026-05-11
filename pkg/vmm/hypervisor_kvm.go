@@ -239,12 +239,24 @@ func (c *kvmVCPU) Run() (ExitContext, error) {
 		return ExitContext{Reason: ExitReasonHalt}, nil
 	case kvm.ExitShutdown:
 		return ExitContext{Reason: ExitReasonShutdown}, nil
+	case kvm.ExitSystemEvent:
+		// Arch-specific (reset/poweroff/s4). The vmm runLoop hands this
+		// to machineArchBackend.handleExit which decodes the system
+		// event subtype from kvm.RunData. Once Phase 1.2 step 6 lifts
+		// system-event decoding into ExitContext, this can mirror onto
+		// portable fields.
+		return ExitContext{Reason: ExitReasonSystemEvent}, nil
 	case kvm.ExitIRQWindowOpen:
 		return ExitContext{Reason: ExitReasonIRQWindowOpen}, nil
-	case kvm.ExitFailEntry, kvm.ExitInternalError:
+	case kvm.ExitFailEntry:
+		return ExitContext{
+			Reason:     ExitReasonFailEntry,
+			FailureMsg: fmt.Sprintf("kvm fail entry (bad guest state) exit_reason=%d", rd.ExitReason),
+		}, nil
+	case kvm.ExitInternalError:
 		return ExitContext{
 			Reason:     ExitReasonInternal,
-			FailureMsg: fmt.Sprintf("kvm exit_reason=%d", rd.ExitReason),
+			FailureMsg: fmt.Sprintf("kvm internal error exit_reason=%d", rd.ExitReason),
 		}, nil
 	default:
 		return ExitContext{Reason: ExitReasonUnknown}, nil
