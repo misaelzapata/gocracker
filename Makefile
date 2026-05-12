@@ -50,6 +50,7 @@ build: tidy generate
 	$(GO_BUILD) -o gocracker-toolbox$(BIN_EXT)    ./cmd/gocracker-toolbox
 	$(GO_BUILD) -o toolbox-cli$(BIN_EXT)          ./cmd/toolbox-cli
 	$(GO_BUILD) -o debugvm$(BIN_EXT)              ./cmd/debugvm
+	$(GO_BUILD) -o gocracker-whp$(BIN_EXT)        ./cmd/gocracker-whp
 
 build-amd64:
 	$(MAKE) build TARGET_GOARCH=amd64
@@ -96,6 +97,7 @@ NONLINUX_VET_PKGS = \
   ./cmd/gocracker-toolbox/... \
   ./cmd/toolbox-cli/... \
   ./cmd/debugvm/... \
+  ./cmd/gocracker-whp/... \
   ./tools/bench-rtt/... \
   ./sandboxes/cmd/...
 
@@ -210,4 +212,5 @@ clean:
 	  gocracker-toolbox gocracker-toolbox.exe \
 	  toolbox-cli toolbox-cli.exe \
 	  debugvm debugvm.exe \
+	  gocracker-whp gocracker-whp.exe \
 	  internal/guest/init_amd64.bin internal/guest/init_arm64.bin

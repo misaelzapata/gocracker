@@ -31,7 +31,7 @@ jobs:
         run: make vet-cross
       - name: Build all six Windows binaries
         run: make build-windows-amd64
-      - name: Verify all six binaries exist
+      - name: Verify all Windows binaries exist
         run: |
           test -f gocracker.exe
           test -f gocracker-vmm.exe
@@ -40,6 +40,7 @@ jobs:
           test -f gocracker-toolbox.exe
           test -f toolbox-cli.exe
           test -f debugvm.exe
+          test -f gocracker-whp.exe
 
   hosted-windows-vet:
     name: Native Windows go vet (no WHP)
@@ -82,6 +83,7 @@ jobs:
             ./cmd/gocracker-toolbox/... `
             ./cmd/toolbox-cli/... `
             ./cmd/debugvm/... `
+            ./cmd/gocracker-whp/... `
             ./tools/bench-rtt/... `
             ./sandboxes/cmd/...
       # internal/whp tests skip gracefully on hosted runners (WHP feature

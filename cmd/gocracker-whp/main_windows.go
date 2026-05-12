@@ -1,0 +1,106 @@
+//go:build windows
+
+// gocracker-whp boots a Linux kernel on the Windows Hypervisor Platform
+// (WHP) and prints the kernel's serial-console output to stdout. This is
+// the user-facing entry point for the Phase 2e+ WHP backend before the
+// full gocracker.exe is wired up.
+//
+// Usage:
+//
+//	gocracker-whp [-mem 128] [-cmdline "console=ttyS0 …"] [-timeout 30s] <kernel-path>
+//
+// The kernel binary may be a bzImage (gzipped or uncompressed) or an
+// ELF vmlinux. Boot output streams to stdout as the kernel produces it.
+//
+// Until Phase 2i lands a virtio-blk root disk, the kernel will reach
+// the userspace transition and panic on "Cannot open root device" —
+// expected behaviour; the full subsystem-init log up to that point is
+// the proof that WHP, long-mode setup, page tables, GDT/IDT, port I/O
+// dispatch, PIT, PIC, and UART all work end-to-end.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gocracker/gocracker/internal/whp"
+	"github.com/gocracker/gocracker/pkg/vmm"
+)
+
+func main() {
+	memMB := flag.Int("mem", 128, "guest RAM in MiB")
+	cmdline := flag.String("cmdline", "console=ttyS0 earlyprintk=ttyS0 reboot=k panic=1 nomodule no_timer_check lpj=10000000 tsc=reliable",
+		"kernel command line. The default works around the missing TSC calibration; remove no_timer_check/lpj/tsc=reliable once Phase 2h-cont. lands real PIT-driven calibration.")
+	initrdPath := flag.String("initrd", "", "optional initramfs / initrd path")
+	timeout := flag.Duration("timeout", 30*time.Second, "max wall time before killing the guest")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <kernel-path>\n\nFlags:\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+	if flag.NArg() != 1 {
+		flag.Usage()
+		os.Exit(2)
+	}
+	kernelPath := flag.Arg(0)
+
+	// Fail fast with a clear message if WHP isn't available, instead of
+	// the partition lifecycle failing later with a confusing HRESULT.
+	if !whp.Available() {
+		fmt.Fprintln(os.Stderr, "ERROR: WinHvPlatform.dll not loadable. This host does not expose the Windows Hypervisor Platform.")
+		os.Exit(3)
+	}
+	present, err := whp.HypervisorPresent()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: WHvGetCapability(HypervisorPresent) failed: %v\n", err)
+		os.Exit(3)
+	}
+	if !present {
+		fmt.Fprintln(os.Stderr, "ERROR: Hypervisor Platform feature is not enabled on this host.")
+		fmt.Fprintln(os.Stderr, "Enable it with (admin PowerShell, then reboot):")
+		fmt.Fprintln(os.Stderr, "  Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All")
+		os.Exit(3)
+	}
+
+	cfg := vmm.WHPBootConfig{
+		KernelPath:   kernelPath,
+		Cmdline:      *cmdline,
+		MemoryBytes:  uint64(*memMB) * 1024 * 1024,
+		VCPUs:        1,
+		InitrdPath:   *initrdPath,
+		OnUARTOutput: func(b byte) { os.Stdout.Write([]byte{b}) },
+	}
+
+	session, err := vmm.BootLinuxOnWHP(context.Background(), cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "BootLinuxOnWHP: %v\n", err)
+		os.Exit(1)
+	}
+	defer session.Close()
+
+	// Ctrl-C cleanly cancels the vCPU instead of leaving WHP state
+	// stranded.
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	fmt.Fprintf(os.Stderr, "gocracker-whp: booting %s (%d MiB RAM, %s)\n", kernelPath, *memMB, *timeout)
+	if err := session.Run(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "\ngocracker-whp: vCPU exit error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Fprintln(os.Stderr, "\ngocracker-whp: guest halted cleanly")
+}
