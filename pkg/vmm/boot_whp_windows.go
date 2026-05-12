@@ -56,6 +56,7 @@ type WHPBootSession struct {
 	vcpu     HVVCPU
 	memBytes []byte
 	stop     chan struct{}
+	pit      *pit8254 // 8254 PIT — satisfies Linux's TSC calibration loop
 }
 
 // BootLinuxOnWHP prepares a Linux kernel boot via WHP — allocates the
@@ -185,6 +186,7 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 		vcpu:     vcpu,
 		memBytes: ram,
 		stop:     make(chan struct{}),
+		pit:      newPIT8254(),
 	}, nil
 }
 
@@ -247,28 +249,48 @@ func (s *WHPBootSession) Run(ctx context.Context) error {
 	}
 }
 
-// handleIOPortExit dispatches a port I/O exit to the UART or drops it,
-// then advances RIP past the trapped instruction.
+// handleIOPortExit dispatches a port I/O exit to the right emulator
+// (UART or 8254 PIT) or drops it, then advances RIP past the trapped
+// instruction.
 func (s *WHPBootSession) handleIOPortExit(exit ExitContext) {
-	if exit.IOPort.Port >= 0x3F8 && exit.IOPort.Port < 0x400 {
+	port := exit.IOPort.Port
+	isWrite := exit.IOPort.Direction == IOPortOut
+	switch {
+	case port >= 0x3F8 && port < 0x400:
 		// COM1 (Firecracker uses 0x3F8 base, 8 ports).
-		if exit.IOPort.Direction == IOPortOut {
-			// On OUT, the byte is in RAX (low 8 bits).
+		if isWrite {
 			r, _ := s.vcpu.GetRegisters()
-			if exit.IOPort.Port == 0x3F8 {
+			if port == 0x3F8 {
 				s.cfg.OnUARTOutput(byte(r.RAX & 0xFF))
 			}
-			// Other COM1 registers (LCR, MCR, …) are ignored in v1;
-			// the kernel uses them but doesn't depend on responses.
 		} else {
-			// IN — return a "ready to send, nothing to receive" state.
-			// LSR (port+5) bit 5 = TX empty so the kernel keeps writing.
+			// IN — return TX-empty (LSR bit 5) on port+5 so the kernel
+			// keeps writing without blocking. Other registers read 0.
 			var ret byte
-			if exit.IOPort.Port == 0x3F8+5 {
+			if port == 0x3F8+5 {
 				ret = 0x20
 			}
 			r, _ := s.vcpu.GetRegisters()
 			r.RAX = (r.RAX &^ 0xFF) | uint64(ret)
+			_ = s.vcpu.SetRegisters(r)
+		}
+	case s.pit.handles(port):
+		// 8254 PIT (0x40-0x43) + NMI/speaker (0x61). The kernel uses
+		// these for TSC calibration.
+		if isWrite {
+			r, _ := s.vcpu.GetRegisters()
+			s.pit.writePort(port, byte(r.RAX&0xFF))
+		} else {
+			val := s.pit.readPort(port)
+			r, _ := s.vcpu.GetRegisters()
+			r.RAX = (r.RAX &^ 0xFF) | uint64(val)
+			_ = s.vcpu.SetRegisters(r)
+		}
+	default:
+		// Unhandled IN: return 0xFF (no device). Unhandled OUT: drop.
+		if !isWrite {
+			r, _ := s.vcpu.GetRegisters()
+			r.RAX = (r.RAX &^ 0xFF) | 0xFF
 			_ = s.vcpu.SetRegisters(r)
 		}
 	}
