@@ -57,6 +57,16 @@ const (
 	PropProcessorFeatures PartitionPropertyCode = 0x00001001
 	PropCpuidExitList     PartitionPropertyCode = 0x00000002
 
+	// PropLocalApicEmulationMode controls whether WHP emulates the
+	// local APIC internally (so guest reads/writes at GPA 0xFEE00000
+	// don't escape as MMIO exits) or leaves it to the VMM. Values:
+	//   0 = None    — every APIC access is an MMIO exit
+	//   1 = XApic   — WHP emulates a legacy MMIO-mapped xAPIC
+	//   2 = X2Apic  — WHP emulates an MSR-based x2APIC
+	// Phase 2f sets this to XApic so the kernel's early init runs to
+	// completion without us writing a full APIC emulator.
+	PropLocalApicEmulationMode PartitionPropertyCode = 0x00001005
+
 	// PropProcessorCount: the value in WinHvPlatformDefs.h on Windows 11
 	// 24H2 SDK (10.0.26100) is 0x00001fff, NOT 0x00001e00 as widely
 	// repeated in older docs and pre-24H2 references. Hardcoding 0x1e00
@@ -66,6 +76,13 @@ const (
 	// Windows revision moves this again, the lifecycle smoke test will
 	// catch it.
 	PropProcessorCount PartitionPropertyCode = 0x00001fff
+)
+
+// Local APIC emulation modes for PropLocalApicEmulationMode.
+const (
+	ApicEmuNone   uint32 = 0
+	ApicEmuXApic  uint32 = 1
+	ApicEmuX2Apic uint32 = 2
 )
 
 // MapGpaRangeFlags mirrors WHV_MAP_GPA_RANGE_FLAGS. Bitmask.

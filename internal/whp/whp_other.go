@@ -21,10 +21,15 @@ const (
 	CapProcessorVendor   CapabilityCode = 0x1000
 	CapProcessorFeatures CapabilityCode = 0x1001
 
-	PropExtendedVMExits   PartitionPropertyCode = 0x1
-	PropProcessorFeatures PartitionPropertyCode = 0x1001
-	PropCpuidExitList     PartitionPropertyCode = 0x2
-	PropProcessorCount    PartitionPropertyCode = 0x1fff
+	PropExtendedVMExits        PartitionPropertyCode = 0x1
+	PropProcessorFeatures      PartitionPropertyCode = 0x1001
+	PropCpuidExitList          PartitionPropertyCode = 0x2
+	PropLocalApicEmulationMode PartitionPropertyCode = 0x1005
+	PropProcessorCount         PartitionPropertyCode = 0x1fff
+
+	ApicEmuNone   uint32 = 0
+	ApicEmuXApic  uint32 = 1
+	ApicEmuX2Apic uint32 = 2
 
 	MapGpaNone    MapGpaRangeFlags = 0
 	MapGpaRead    MapGpaRangeFlags = 1

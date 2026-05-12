@@ -64,6 +64,18 @@ func (h *whpHypervisor) CreateVM(cfg HVVMConfig) (HVVM, error) {
 		cleanup()
 		return nil, fmt.Errorf("WHvSetPartitionProperty(ProcessorCount=%d): %w", cfg.NumVCPUs, err)
 	}
+	// Enable WHP's built-in xAPIC emulation so the kernel's APIC reads /
+	// writes at 0xFEE00000 are handled by the hypervisor rather than
+	// trapping out as MMIO exits. Without this the kernel panics in
+	// native_apic_mem_read during init_apic_mappings. Failure here is
+	// non-fatal — older Windows builds may not support the property and
+	// we still want the partition to come up (it just won't get past
+	// LAPIC init).
+	if err := whp.SetPartitionPropertyU32(handle, whp.PropLocalApicEmulationMode, whp.ApicEmuXApic); err != nil {
+		// Best-effort. Caller's run loop will hit MMIO exits at
+		// 0xFEE00000 if this didn't take.
+		_ = err
+	}
 	if err := whp.SetupPartition(handle); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("WHvSetupPartition: %w", err)
