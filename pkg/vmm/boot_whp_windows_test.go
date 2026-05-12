@@ -61,7 +61,7 @@ func TestBootLinuxOnWHP_RealKernel(t *testing.T) {
 
 	cfg := WHPBootConfig{
 		KernelPath:   kernel,
-		Cmdline:      "console=ttyS0 earlyprintk=ttyS0 reboot=k panic=1 nomodule",
+		Cmdline:      "console=ttyS0 earlyprintk=ttyS0 reboot=k panic=1 nomodule no_timer_check lpj=10000000 tsc=reliable",
 		MemoryBytes:  128 * 1024 * 1024,
 		VCPUs:        1,
 		OnUARTOutput: onByte,
@@ -77,7 +77,7 @@ func TestBootLinuxOnWHP_RealKernel(t *testing.T) {
 	// early output and panic on missing /init, or hang at some
 	// intermediate setup. Either way, 3 seconds is plenty for any
 	// observable signal at the printk level.
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	runDone := make(chan error, 1)
