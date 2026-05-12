@@ -301,6 +301,61 @@ func CancelRunVirtualProcessor(h PartitionHandle, idx uint32) error {
 	return nil
 }
 
+// whvInterruptControl mirrors WHV_INTERRUPT_CONTROL (32 bytes).
+//
+//	bits  0–3 : Type (0=Fixed, 1=LowestPriority, 2=Nmi, 3=Init, 4=Sipi, 5=LocalInt1)
+//	bits  4–7 : DestinationMode (0=Physical, 1=Logical)
+//	bits  8–11: TriggerMode (0=Edge, 1=Level)
+//	bits 12–63: reserved
+//	[8..11]   : reserved
+//	[12..15]  : Destination (vp index or APIC ID)
+//	[16..19]  : Vector
+//	[20..31]  : reserved
+type whvInterruptControl struct {
+	TypeDestModeTrigger uint64 // packed bitfield (Type/DestMode/Trigger)
+	_                   uint32 // reserved
+	Destination         uint32 // vp index (Physical) or APIC ID set (Logical)
+	Vector              uint32 // interrupt vector 0..0xFF
+	_                   uint32 // reserved
+	_                   uint64 // reserved tail to keep 32-byte size
+}
+
+// Interrupt type constants for whvInterruptControl.Type field.
+const (
+	IntTypeFixed           uint64 = 0
+	IntTypeLowestPriority  uint64 = 1
+	IntTypeNmi             uint64 = 2
+	IntTypeInit            uint64 = 3
+	IntTypeSipi            uint64 = 4
+	IntDestModePhysical    uint64 = 0
+	IntDestModeLogical     uint64 = 1 << 4
+	IntTriggerModeEdge     uint64 = 0
+	IntTriggerModeLevel    uint64 = 1 << 8
+)
+
+// RequestFixedInterrupt fires a Fixed/Physical/Edge interrupt with the
+// given vector at vCPU 0. Used by the PIC to deliver IRQs to the guest.
+// Mirrors node-vmm's `RequestFixedInterrupt` helper.
+func RequestFixedInterrupt(h PartitionHandle, vector uint32) error {
+	if err := loadDLL(); err != nil {
+		return err
+	}
+	ctl := whvInterruptControl{
+		TypeDestModeTrigger: IntTypeFixed | IntDestModePhysical | IntTriggerModeEdge,
+		Destination:         0,
+		Vector:              vector,
+	}
+	hr, _, _ := procRequestInterrupt.Call(
+		uintptr(h),
+		uintptr(unsafe.Pointer(&ctl)),
+		uintptr(unsafe.Sizeof(ctl)),
+	)
+	if HResult(hr) != sOK {
+		return HResult(hr)
+	}
+	return nil
+}
+
 // loadDLL caches DLL load + symbol resolution. The symbol resolutions
 // happen up-front so callers fail fast at process startup rather than
 // mid-run with a confusing "proc not found" error.

@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/gocracker/gocracker/internal/loader"
+	"github.com/gocracker/gocracker/internal/whp"
 )
 
 // WHPBootConfig is the minimum configuration to boot a Linux kernel on
@@ -57,6 +59,8 @@ type WHPBootSession struct {
 	memBytes []byte
 	stop     chan struct{}
 	pit      *pit8254 // 8254 PIT — satisfies Linux's TSC calibration loop
+	pic      *pic8259 // 8259 master/slave PICs — legacy IRQ delivery
+	hndl     whp.PartitionHandle // raw partition handle for IRQ injection
 }
 
 // BootLinuxOnWHP prepares a Linux kernel boot via WHP — allocates the
@@ -179,6 +183,16 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 		return nil, fmt.Errorf("SetRegisters: %w", err)
 	}
 
+	// Stash the underlying WHP partition handle so the IRQ goroutine
+	// can call whp.RequestFixedInterrupt directly. Type-asserting on
+	// *whpVM is safe because we only get here via NewWHPHypervisor.
+	whpvm, ok := vm.(*whpVM)
+	if !ok {
+		_ = vcpu.Close()
+		cleanupVM()
+		return nil, fmt.Errorf("internal: HVVM is %T, want *whpVM", vm)
+	}
+
 	return &WHPBootSession{
 		cfg:      cfg,
 		hv:       hv,
@@ -187,6 +201,8 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 		memBytes: ram,
 		stop:     make(chan struct{}),
 		pit:      newPIT8254(),
+		pic:      newPIC8259(),
+		hndl:     whpvm.handle,
 	}, nil
 }
 
@@ -212,6 +228,32 @@ func (s *WHPBootSession) Run(ctx context.Context) error {
 			_ = s.vcpu.Cancel()
 		case <-s.stop:
 			_ = s.vcpu.Cancel()
+		}
+	}()
+
+	// Timer-IRQ ticker: 100 Hz IRQ 0 deliveries via the 8259 PIC. The
+	// Linux kernel needs these to advance jiffies and finish its TSC
+	// calibration loop. We fire only once the kernel has finished the
+	// 8259 init sequence (PIC.initialized()) and unmasked IRQ 0.
+	go func() {
+		t := time.NewTicker(10 * time.Millisecond) // 100 Hz
+		defer t.Stop()
+		for {
+			select {
+			case <-s.stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if !s.pic.initialized() {
+					continue
+				}
+				if !s.pic.irqUnmasked(0) {
+					continue
+				}
+				vector := s.pic.vectorForIRQ(0)
+				_ = whp.RequestFixedInterrupt(s.hndl, vector)
+			}
 		}
 	}()
 
@@ -282,6 +324,19 @@ func (s *WHPBootSession) handleIOPortExit(exit ExitContext) {
 			s.pit.writePort(port, byte(r.RAX&0xFF))
 		} else {
 			val := s.pit.readPort(port)
+			r, _ := s.vcpu.GetRegisters()
+			r.RAX = (r.RAX &^ 0xFF) | uint64(val)
+			_ = s.vcpu.SetRegisters(r)
+		}
+	case s.pic.handles(port):
+		// 8259 master/slave PIC (0x20/0x21/0xA0/0xA1). Once the kernel
+		// runs the ICW1-ICW4 init sequence and unmasks IRQ 0, the
+		// IRQ-injection goroutine starts firing 100 Hz timer ticks.
+		if isWrite {
+			r, _ := s.vcpu.GetRegisters()
+			s.pic.writePort(port, byte(r.RAX&0xFF))
+		} else {
+			val := s.pic.readPort(port)
 			r, _ := s.vcpu.GetRegisters()
 			r.RAX = (r.RAX &^ 0xFF) | uint64(val)
 			_ = s.vcpu.SetRegisters(r)

@@ -53,6 +53,7 @@ func UnmapGpaRange(PartitionHandle, uint64, uint64) error                       
 func CreateVirtualProcessor(PartitionHandle, uint32) error                                    { return errNotWindows }
 func DeleteVirtualProcessor(PartitionHandle, uint32) error                                    { return errNotWindows }
 func CancelRunVirtualProcessor(PartitionHandle, uint32) error                                 { return errNotWindows }
+func RequestFixedInterrupt(PartitionHandle, uint32) error                                     { return errNotWindows }
 
 // Register helpers — stubs so the public surface matches Windows. None
 // of these can do anything useful without WinHvPlatform.dll.
