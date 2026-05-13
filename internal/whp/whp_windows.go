@@ -101,7 +101,10 @@ const (
 // platform-defined error codes (see WinError.h).
 type HResult uint32
 
-const sOK HResult = 0
+const (
+	sOK   HResult = 0
+	eFail HResult = 0x80004005 // generic E_FAIL — returned from callbacks on internal error
+)
 
 func (h HResult) Error() string {
 	return fmt.Sprintf("WHP HRESULT 0x%08x", uint32(h))
@@ -356,6 +359,37 @@ func RequestFixedInterrupt(h PartitionHandle, vector uint32) error {
 	return nil
 }
 
+// TranslateGva translates a guest-virtual address to a guest-physical
+// address by walking the guest's page tables. flags is a
+// WHV_TRANSLATE_GVA_FLAGS bitmask (e.g. PrivilegeExempt=1,
+// SetPageTableBits=2, EnforceUserMode=4). Returns the GPA + the
+// translation result code (WHV_TRANSLATE_GVA_RESULT_CODE: 0=Success).
+//
+// The WHP MMIO emulator invokes this through our TranslateGvaPage
+// callback when the trapped instruction referenced a memory operand
+// via a non-trivial segment / RIP-relative addressing mode.
+func TranslateGva(h PartitionHandle, vcpu uint32, gva uint64, flags uint32) (gpa uint64, result uint32, err error) {
+	if err := loadDLL(); err != nil {
+		return 0, 0, err
+	}
+	// WHV_TRANSLATE_GVA_RESULT is a 64-bit struct: { uint32 ResultCode;
+	// uint32 Reserved; }. We pass its address; only the low 32 bits
+	// (ResultCode) are meaningful.
+	var resultBuf [2]uint32
+	hr, _, _ := procTranslateGva.Call(
+		uintptr(h),
+		uintptr(vcpu),
+		uintptr(gva),
+		uintptr(flags),
+		uintptr(unsafe.Pointer(&resultBuf[0])),
+		uintptr(unsafe.Pointer(&gpa)),
+	)
+	if HResult(hr) != sOK {
+		return 0, 0, HResult(hr)
+	}
+	return gpa, resultBuf[0], nil
+}
+
 // loadDLL caches DLL load + symbol resolution. The symbol resolutions
 // happen up-front so callers fail fast at process startup rather than
 // mid-run with a confusing "proc not found" error.
@@ -393,6 +427,7 @@ var (
 	procGetVCPURegisters     = dll.NewProc("WHvGetVirtualProcessorRegisters")
 	procSetVCPURegisters     = dll.NewProc("WHvSetVirtualProcessorRegisters")
 	procRequestInterrupt     = dll.NewProc("WHvRequestInterrupt")
+	procTranslateGva         = dll.NewProc("WHvTranslateGva")
 
 	allProcs = []*windows.LazyProc{
 		procGetCapability,
@@ -410,6 +445,7 @@ var (
 		procGetVCPURegisters,
 		procSetVCPURegisters,
 		procRequestInterrupt,
+		procTranslateGva,
 	}
 
 	loadOnce sync.Once

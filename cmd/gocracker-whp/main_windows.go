@@ -7,16 +7,23 @@
 //
 // Usage:
 //
-//	gocracker-whp [-mem 128] [-cmdline "console=ttyS0 …"] [-timeout 30s] <kernel-path>
+//	gocracker-whp [flags] <kernel-path>
 //
 // The kernel binary may be a bzImage (gzipped or uncompressed) or an
 // ELF vmlinux. Boot output streams to stdout as the kernel produces it.
 //
-// Until Phase 2i lands a virtio-blk root disk, the kernel will reach
-// the userspace transition and panic on "Cannot open root device" —
-// expected behaviour; the full subsystem-init log up to that point is
-// the proof that WHP, long-mode setup, page tables, GDT/IDT, port I/O
-// dispatch, PIT, PIC, and UART all work end-to-end.
+// First-boot recipes:
+//
+//	# Boot a kernel with an initramfs straight to a busybox shell:
+//	gocracker-whp -initrd initramfs.cpio.gz vmlinux
+//
+//	# Boot a kernel with a virtio-blk rootfs (ext4) — /dev/vda is the
+//	# block device, kernel mounts root=/dev/vda automatically:
+//	gocracker-whp -rootfs rootfs.ext4 vmlinux
+//
+// The full subsystem-init log up to userspace handover is the proof
+// that WHP, long-mode setup, page tables, GDT/IDT, port I/O dispatch,
+// PIT, PIC, UART, the MMIO emulator, and virtio-blk all work end-to-end.
 package main
 
 import (
@@ -36,7 +43,9 @@ func main() {
 	memMB := flag.Int("mem", 128, "guest RAM in MiB")
 	cmdline := flag.String("cmdline", "console=ttyS0 earlyprintk=ttyS0 reboot=k panic=1 nomodule no_timer_check lpj=10000000 tsc=reliable",
 		"kernel command line. The default works around the missing TSC calibration; remove no_timer_check/lpj/tsc=reliable once Phase 2h-cont. lands real PIT-driven calibration.")
-	initrdPath := flag.String("initrd", "", "optional initramfs / initrd path")
+	initrdPath := flag.String("initrd", "", "optional initramfs / initrd path (CPIO archive)")
+	rootfsPath := flag.String("rootfs", "", "optional ext4 rootfs to attach as /dev/vda via virtio-blk-mmio")
+	rootfsReadOnly := flag.Bool("rootfs-ro", false, "open the rootfs read-only (sets VIRTIO_BLK_F_RO)")
 	timeout := flag.Duration("timeout", 30*time.Second, "max wall time before killing the guest")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <kernel-path>\n\nFlags:\n", os.Args[0])
@@ -68,12 +77,14 @@ func main() {
 	}
 
 	cfg := vmm.WHPBootConfig{
-		KernelPath:   kernelPath,
-		Cmdline:      *cmdline,
-		MemoryBytes:  uint64(*memMB) * 1024 * 1024,
-		VCPUs:        1,
-		InitrdPath:   *initrdPath,
-		OnUARTOutput: func(b byte) { os.Stdout.Write([]byte{b}) },
+		KernelPath:     kernelPath,
+		Cmdline:        *cmdline,
+		MemoryBytes:    uint64(*memMB) * 1024 * 1024,
+		VCPUs:          1,
+		InitrdPath:     *initrdPath,
+		RootfsPath:     *rootfsPath,
+		RootfsReadOnly: *rootfsReadOnly,
+		OnUARTOutput:   func(b byte) { os.Stdout.Write([]byte{b}) },
 	}
 
 	session, err := vmm.BootLinuxOnWHP(context.Background(), cfg)

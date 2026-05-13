@@ -5,6 +5,52 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+### Added — Windows / WHP port (2026-05-13)
+- 16550A UART (`pkg/vmm/uart_windows.go`) — full COM1 with DLAB-gated
+  divisor latches, IER, MCR loopback, RX FIFO, IRQ4 on RBR/THRE transitions.
+- PCI config-space dummy (`pkg/vmm/pci_windows.go`) — ports 0xCF8/0xCFC
+  return the no-device sentinel so Linux's bus enumeration exits cleanly.
+- 8254 PIT real mode-3 (`pkg/vmm/pit_windows.go` rewrite) — internal IRQ0
+  via `SetIRQ0Callback`; lets us drop the `tsc=reliable / lpj=10000000
+  / no_timer_check` cmdline workarounds.
+- MC146818 CMOS / RTC (`pkg/vmm/cmos_windows.go`) — BCD time fields backed
+  by `time.Now().UTC()`.
+- ACPI tables (`internal/acpi/tables_x86.go`) — RSDP + RSDT + MADT
+  enumerating LAPIC at 0xFEE00000, IOAPIC at 0xFEC00000, IRQ0 + IRQ4
+  source overrides.
+- virtio-rng-mmio (`pkg/vmm/virtio_rng_windows.go`) — always-on entropy
+  from `crypto/rand` so userspace doesn't block on initial seeding.
+- virtio-blk-mmio (`pkg/vmm/virtio_blk_windows.go`) — rootfs.ext4 attach
+  with T_IN / T_OUT / T_FLUSH / T_GET_ID. Port of node-vmm/virtio/blk.cc.
+- WHP MMIO emulator binding (`internal/whp/emulator_windows.go`) — wraps
+  `WHvEmulatorTryMmioEmulation` with 5 Go callbacks routed via a per-vCPU
+  registry. Plus `WHvTranslateGva` binding and `eFail` HRESULT.
+- Pure-Go ext4 image builder (`internal/ext4/builder.go`) — wraps
+  `github.com/diskfs/go-diskfs`.
+- `WHPBootConfig.RootfsPath` + `-rootfs` / `-rootfs-ro` flags on
+  `gocracker-whp.exe`.
+- `HVVMConfig.EnableXAPIC` opt-in (`BootLinuxOnWHP` sets true, bare-metal
+  smoke tests leave false). Default `false` keeps `WHvCancelRunVirtualProcessor`
+  semantics clean for HLT-only test partitions.
+- `make test-smoke` Makefile target (≤60 s sub-suite).
+
+### Changed — Windows / WHP port
+- virtio IRQ delivery unified: the per-device eventfd + `KVM_IRQFD` hot
+  path is gone. All 13 sites (UART + virtio devices in `vmm.go` and
+  `arch_arm64.go`) now use `makeIRQLine` → `HVVM.InjectInterrupt`. The
+  KVM adapter forwards to `kvm.VM.IRQLine` (one extra ioctl per IRQ);
+  the WHP adapter calls `WHvRequestInterrupt`. No per-arch divergence,
+  `irqEventFds` field gone, net −88 LoC.
+- `cmd/gocracker` Windows stub now points users at `gocracker-whp.exe`
+  instead of just suggesting WSL2.
+
+### Fixed — Windows / WHP port
+- `TestWHPHypervisorEndToEnd` no longer times out: enabling
+  `PropLocalApicEmulationMode` unconditionally on every partition caused
+  the bare-metal HLT-at-GPA-0 smoke test to never see its halt exit
+  (background timer IRQs kept the vCPU live). Gated behind
+  `HVVMConfig.EnableXAPIC`.
+
 ### Added
 - **Warm cache** (`--warm` / `GOCRACKER_WARM_CACHE=1`): captures a dirty-page
   snapshot on the first cold boot and restores from it on subsequent runs.

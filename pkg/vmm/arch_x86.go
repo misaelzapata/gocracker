@@ -28,25 +28,10 @@ func (x86MachineBackend) loadKernel(vm *VM) (*loader.KernelInfo, error) {
 }
 
 func (x86MachineBackend) postCreateVCPUs(vm *VM) error {
-	// Register the per-device eventfds collected in setupDevices against the
-	// GSIs set up by setupIRQs. From this point on, writing a uint64(1) into
-	// the eventfd injects the interrupt via KVM_IRQFD with no
-	// ioctl(KVM_IRQ_LINE) on our side — the same model Firecracker and our
-	// arm64 backend use. Order must match setupIRQs: COM1 first, then each
-	// transport in append order.
-	gsis := make([]uint32, 0, 1+len(vm.transports))
-	gsis = append(gsis, COM1IRQ)
-	for _, t := range vm.transports {
-		gsis = append(gsis, uint32(t.IRQLine()))
-	}
-	if len(vm.irqEventFds) != len(gsis) {
-		return fmt.Errorf("x86 irqfd count mismatch: %d eventfds vs %d GSIs", len(vm.irqEventFds), len(gsis))
-	}
-	for i, efd := range vm.irqEventFds {
-		if err := vm.kvmVM.RegisterIRQFD(efd, gsis[i]); err != nil {
-			return fmt.Errorf("register irqfd gsi=%d: %w", gsis[i], err)
-		}
-	}
+	// Phase 1.2 step 6 (Sprint A — A5) removed the eventfd + KVM_IRQFD
+	// hot path; all IRQ delivery now flows through makeIRQLine →
+	// hv.InjectInterrupt → kvmVM.IRQLine. No per-device wiring needed
+	// here; setupIRQs already published the GSI routing table.
 	return nil
 }
 

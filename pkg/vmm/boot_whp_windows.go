@@ -14,6 +14,13 @@ import (
 	"github.com/gocracker/gocracker/internal/whp"
 )
 
+// whpRunner is the Windows-only interface that *whpVCPU satisfies — it
+// gives us the raw whp.ExitContext alongside the portable one. We type-
+// assert on this to keep the public HVVCPU surface unchanged.
+type whpRunner interface {
+	RunRaw() (whp.ExitContext, ExitContext, error)
+}
+
 // WHPBootConfig is the minimum configuration to boot a Linux kernel on
 // Windows via the WHP backend. Phase 2e — the first end-to-end path
 // from `gocracker.exe` to a Linux kernel running on Hyper-V.
@@ -47,6 +54,19 @@ type WHPBootConfig struct {
 	// COM1 data port (0x3F8). Typically wired to os.Stdout for a
 	// serial console.
 	OnUARTOutput func(byte)
+
+	// RootfsPath optionally points to an ext4 image to attach as the
+	// guest's root block device (virtio-blk-mmio). Empty disables;
+	// useful for early kernel-only smoke tests. When set, the kernel
+	// command line is appended with
+	//   virtio_mmio.device=4K@0xD0000000:5 root=/dev/vda rw rootfstype=ext4
+	// so Linux's virtio_mmio driver probes the device at boot.
+	RootfsPath string
+
+	// RootfsReadOnly mounts the rootfs read-only (sets VIRTIO_BLK_F_RO).
+	// Combine with `ro` in the cmdline if you also want the kernel to
+	// avoid issuing writes.
+	RootfsReadOnly bool
 }
 
 // WHPBootSession is the handle returned by BootLinuxOnWHP. Run() drives
@@ -60,7 +80,20 @@ type WHPBootSession struct {
 	stop     chan struct{}
 	pit      *pit8254 // 8254 PIT — satisfies Linux's TSC calibration loop
 	pic      *pic8259 // 8259 master/slave PICs — legacy IRQ delivery
+	cmos     *cmosRTC // MC146818 RTC — seeds the kernel's wall clock
 	hndl     whp.PartitionHandle // raw partition handle for IRQ injection
+
+	// MMIO emulator + dispatch table for virtio-mmio devices. Each
+	// device entry handles a small GPA window; the emulator decodes
+	// the trapped instruction and routes the read/write through us.
+	emulator *whp.Emulator
+	blkDev   *VirtioBlk // virtio-blk-mmio (rootfs) — nil if no rootfs configured
+	rngDev   *VirtioRng // virtio-rng-mmio (entropy)
+
+	// IRQ lines wired through the 8259 PIC. Each must match the value
+	// in the `virtio_mmio.device=…:N` cmdline parameter.
+	blkIRQ uint8
+	rngIRQ uint8
 }
 
 // BootLinuxOnWHP prepares a Linux kernel boot via WHP — allocates the
@@ -91,6 +124,19 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 	if cfg.OnUARTOutput == nil {
 		cfg.OnUARTOutput = func(b byte) {} // /dev/null
 	}
+	// If the caller supplied a rootfs, extend the cmdline so Linux probes
+	// the virtio-mmio device and mounts /dev/vda. IRQ 5/6 are legacy ISA
+	// lines free from common PIC reservations; the PIC binds them once
+	// the kernel runs the ICW sequence. Always expose virtio-rng — most
+	// initramfs and userspace blocks on /dev/urandom seeding otherwise.
+	const blkMMIOBase uint64 = 0xD0000000
+	const rngMMIOBase uint64 = 0xD0001000
+	const blkIRQ uint8 = 5
+	const rngIRQ uint8 = 6
+	cfg.Cmdline += fmt.Sprintf(" virtio_mmio.device=4K@0x%X:%d", rngMMIOBase, rngIRQ)
+	if cfg.RootfsPath != "" {
+		cfg.Cmdline += fmt.Sprintf(" virtio_mmio.device=4K@0x%X:%d root=/dev/vda rw rootfstype=ext4", blkMMIOBase, blkIRQ)
+	}
 
 	hv, err := NewWHPHypervisor()
 	if err != nil {
@@ -98,7 +144,11 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 	}
 	cleanupHV := func() { _ = hv.Close() }
 
-	vm, err := hv.CreateVM(HVVMConfig{NumVCPUs: cfg.VCPUs, MemoryBytes: cfg.MemoryBytes})
+	vm, err := hv.CreateVM(HVVMConfig{
+		NumVCPUs:    cfg.VCPUs,
+		MemoryBytes: cfg.MemoryBytes,
+		EnableXAPIC: true,
+	})
 	if err != nil {
 		cleanupHV()
 		return nil, fmt.Errorf("CreateVM: %w", err)
@@ -158,6 +208,9 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 	// Long-mode page tables + GDT/IDT in guest RAM.
 	BuildBootPageTables(ram, PageTableBase)
 	WriteBootGDT(ram)
+	// REGION:ACPI-WIRE — Batch 2 integrator replaces with acpi.WriteTables(ram).
+	// (ACPI tables expose the LAPIC/IOAPIC topology and PIT/COM interrupt
+	// overrides so the kernel doesn't fall back to ad-hoc defaults.)
 
 	// Map RAM into the partition with full RWX.
 	if err := vm.MapMemory(0, ram, MemRWX); err != nil {
@@ -193,7 +246,7 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 		return nil, fmt.Errorf("internal: HVVM is %T, want *whpVM", vm)
 	}
 
-	return &WHPBootSession{
+	session := &WHPBootSession{
 		cfg:      cfg,
 		hv:       hv,
 		vm:       vm,
@@ -202,8 +255,54 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 		stop:     make(chan struct{}),
 		pit:      newPIT8254(),
 		pic:      newPIC8259(),
+		cmos:     newCMOS(),
 		hndl:     whpvm.handle,
-	}, nil
+		blkIRQ:   blkIRQ,
+		rngIRQ:   rngIRQ,
+	}
+
+	// Spin up the WHP MMIO emulator and the virtio devices. Done after
+	// the partition is fully set up because WHvEmulatorCreateEmulator
+	// validates against the loaded DLL.
+	em, err := whp.CreateEmulator()
+	if err != nil {
+		_ = vcpu.Close()
+		cleanupVM()
+		return nil, fmt.Errorf("whp.CreateEmulator: %w", err)
+	}
+	session.emulator = em
+	session.rngDev = NewVirtioRng(rngMMIOBase, ram, func() { session.raiseIRQ(rngIRQ) })
+
+	if cfg.RootfsPath != "" {
+		blk, err := NewVirtioBlk(blkMMIOBase, ram, cfg.RootfsPath, cfg.RootfsReadOnly,
+			func() { session.raiseIRQ(blkIRQ) })
+		if err != nil {
+			_ = em.Destroy()
+			_ = vcpu.Close()
+			cleanupVM()
+			return nil, fmt.Errorf("NewVirtioBlk: %w", err)
+		}
+		session.blkDev = blk
+	}
+
+	// REGION:UART-WIRE — Batch 2 integrator constructs the 16550A UART
+	// from pkg/vmm/uart_windows.go and assigns it to session.uart, then
+	// wires session.uart.RaiseIRQ to s.raiseIRQ(4) (IRQ4 = COM1).
+	// REGION:PCI-WIRE — Batch 2 integrator constructs the 0xCF8/0xCFC
+	// PCI-config dummy from pkg/vmm/pci_windows.go and assigns it to
+	// session.pci so handleIOPortExit can dispatch to it.
+
+	return session, nil
+}
+
+// raiseIRQ delivers a virtio device IRQ to the guest via the 8259
+// PIC. No-op until the kernel has finished the ICW sequence and
+// unmasked the line.
+func (s *WHPBootSession) raiseIRQ(irq uint8) {
+	if !s.pic.initialized() || !s.pic.irqUnmasked(irq) {
+		return
+	}
+	_ = whp.RequestFixedInterrupt(s.hndl, s.pic.vectorForIRQ(irq))
 }
 
 // Run drives the vCPU until the guest halts, the context is cancelled,
@@ -257,18 +356,33 @@ func (s *WHPBootSession) Run(ctx context.Context) error {
 		}
 	}()
 
+	// We need the raw exit context for MMIO emulation. *whpVCPU exposes
+	// it via RunRaw — fall back to plain Run() for backends that don't.
+	raw, ok := s.vcpu.(whpRunner)
+	if !ok {
+		return fmt.Errorf("internal: vcpu %T does not implement whpRunner", s.vcpu)
+	}
+
 	for {
-		exitCtx, err := s.vcpu.Run()
+		rawCtx, exitCtx, err := raw.RunRaw()
 		if err != nil {
-			return fmt.Errorf("vcpu.Run: %w", err)
+			return fmt.Errorf("vcpu.RunRaw: %w", err)
 		}
 		switch exitCtx.Reason {
 		case ExitReasonIOPort:
 			s.handleIOPortExit(exitCtx)
 		case ExitReasonMMIO:
-			// Best-effort: log and skip past the instruction. Phase 6
-			// (virtio-fs / sharedfs) and Phase 9 (compose networking)
-			// add real device emulation here.
+			// MMIO: route through the WHP emulator, which decodes the
+			// trapped instruction and calls back into our device tree.
+			// If the emulator isn't set up (no rootfs configured) or the
+			// access isn't claimed by any device, fall back to advancing
+			// RIP past the instruction so the kernel doesn't loop.
+			if s.emulator != nil && s.mmioAddrHandled(exitCtx.MMIO.Address) {
+				if err := s.dispatchMMIOExit(&rawCtx); err != nil {
+					return fmt.Errorf("MMIO emulation at gpa=%#x: %w", exitCtx.MMIO.Address, err)
+				}
+				continue // emulator updated RIP via SetRegistersCallback
+			}
 			if err := s.advanceRIP(exitCtx.InstructionLength); err != nil {
 				return err
 			}
@@ -289,6 +403,63 @@ func (s *WHPBootSession) Run(ctx context.Context) error {
 			return fmt.Errorf("unhandled exit reason %v", exitCtx.Reason)
 		}
 	}
+}
+
+// mmioAddrHandled reports whether the given guest-physical address
+// falls inside one of the registered virtio-mmio devices' windows.
+func (s *WHPBootSession) mmioAddrHandled(addr uint64) bool {
+	if s.blkDev != nil && s.blkDev.HandlesAddr(addr) {
+		return true
+	}
+	if s.rngDev != nil && s.rngDev.HandlesAddr(addr) {
+		return true
+	}
+	return false
+}
+
+// dispatchMMIOExit hands the trapped MMIO instruction to the WHP
+// emulator. The emulator decodes the instruction, invokes our memory
+// callback for the side effects, updates RIP and the destination
+// register, and returns. The raw exit context must remain alive for
+// the duration of the call (the emulator dereferences pointers into
+// its embedded sub-structs).
+func (s *WHPBootSession) dispatchMMIOExit(rawCtx *whp.ExitContext) error {
+	ev := &whp.EmulatorVCPU{
+		Partition: s.hndl,
+		VCPUIndex: 0,
+		Mem:       s.memBytes,
+		MMIORead: func(addr uint64, length uint8) []byte {
+			var v uint32
+			handled := false
+			if s.blkDev != nil && s.blkDev.HandlesAddr(addr) {
+				v = s.blkDev.ReadMMIO(addr, uint32(length))
+				handled = true
+			} else if s.rngDev != nil && s.rngDev.HandlesAddr(addr) {
+				v = s.rngDev.ReadMMIO(addr, uint32(length))
+				handled = true
+			}
+			if !handled {
+				return nil
+			}
+			out := make([]byte, length)
+			for i := uint8(0); i < length; i++ {
+				out[i] = byte((v >> (8 * i)) & 0xFF)
+			}
+			return out
+		},
+		MMIOWrite: func(addr uint64, length uint8, data []byte) {
+			var v uint32
+			for i := 0; i < int(length) && i < len(data); i++ {
+				v |= uint32(data[i]) << (8 * i)
+			}
+			if s.blkDev != nil && s.blkDev.HandlesAddr(addr) {
+				s.blkDev.WriteMMIO(addr, uint32(length), v)
+			} else if s.rngDev != nil && s.rngDev.HandlesAddr(addr) {
+				s.rngDev.WriteMMIO(addr, uint32(length), v)
+			}
+		},
+	}
+	return s.emulator.TryMmioEmulation(ev, rawCtx.VpContextPtr(), rawCtx.MemoryAccessPtr())
 }
 
 // handleIOPortExit dispatches a port I/O exit to the right emulator
@@ -341,6 +512,18 @@ func (s *WHPBootSession) handleIOPortExit(exit ExitContext) {
 			r.RAX = (r.RAX &^ 0xFF) | uint64(val)
 			_ = s.vcpu.SetRegisters(r)
 		}
+	case s.cmos != nil && s.cmos.handles(port):
+		// MC146818 RTC (0x70/0x71). Reads return host wall clock as
+		// BCD; writes to control regs only.
+		if isWrite {
+			r, _ := s.vcpu.GetRegisters()
+			s.cmos.writePort(port, byte(r.RAX&0xFF))
+		} else {
+			val := s.cmos.readPort(port)
+			r, _ := s.vcpu.GetRegisters()
+			r.RAX = (r.RAX &^ 0xFF) | uint64(val)
+			_ = s.vcpu.SetRegisters(r)
+		}
 	default:
 		// Unhandled IN: return 0xFF (no device). Unhandled OUT: drop.
 		if !isWrite {
@@ -380,6 +563,16 @@ func (s *WHPBootSession) Close() error {
 		close(s.stop)
 	}
 	var firstErr error
+	if s.blkDev != nil {
+		if err := s.blkDev.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if s.emulator != nil {
+		if err := s.emulator.Destroy(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	if s.vcpu != nil {
 		if err := s.vcpu.Close(); err != nil && firstErr == nil {
 			firstErr = err

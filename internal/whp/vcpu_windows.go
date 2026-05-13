@@ -257,6 +257,22 @@ func (e *ExitContext) CancelReason() uint32 {
 	return binary.LittleEndian.Uint32(e.raw[48:52])
 }
 
+// VpContextPtr returns a raw pointer to the embedded WHV_VP_EXIT_CONTEXT
+// (40 bytes at parent offset 8). Required when handing the exit
+// context to WHvEmulatorTryMmioEmulation / WHvEmulatorTryIoEmulation.
+// The pointer is valid for the lifetime of the *ExitContext value.
+func (e *ExitContext) VpContextPtr() unsafe.Pointer { return unsafe.Pointer(&e.raw[8]) }
+
+// MemoryAccessPtr returns a raw pointer to the WHV_MEMORY_ACCESS_CONTEXT
+// (40 bytes at parent offset 48). Only meaningful when Reason ==
+// ExitReasonMemoryAccess.
+func (e *ExitContext) MemoryAccessPtr() unsafe.Pointer { return unsafe.Pointer(&e.raw[48]) }
+
+// IoPortAccessPtr returns a raw pointer to the WHV_X64_IO_PORT_ACCESS_CONTEXT
+// (96 bytes at parent offset 48). Only meaningful when Reason ==
+// ExitReasonX64IoPortAccess.
+func (e *ExitContext) IoPortAccessPtr() unsafe.Pointer { return unsafe.Pointer(&e.raw[48]) }
+
 // RunVirtualProcessor executes the vCPU until it exits. The exit shape
 // is decoded into a Go struct; callers switch on ExitContext.Reason and
 // pull per-exit data via the typed accessors (MMIO, IOPort, CPUID, MSR).

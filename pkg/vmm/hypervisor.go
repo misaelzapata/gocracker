@@ -48,6 +48,14 @@ type HVVMConfig struct {
 	// EnableDirtyTracking turns on per-page dirty-bitmap collection. Used
 	// by snapshot/migrate. Adds non-trivial cost; off by default.
 	EnableDirtyTracking bool
+
+	// EnableXAPIC requests an in-hypervisor xAPIC for the partition (WHP:
+	// PropLocalApicEmulationMode=XApic). Linux kernels need this to get
+	// past native_apic_mem_read during init_apic_mappings; bare-metal vCPU
+	// smoke tests (HLT-at-GPA-0) want it OFF so the partition doesn't
+	// inject background timer interrupts that defeat halt detection.
+	// KVM ignores this flag.
+	EnableXAPIC bool
 }
 
 // HVCapabilities exposes whether optional features are available. Each is a

@@ -23,7 +23,7 @@ VERSION_LDFLAGS = -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
                   -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
                   -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build build-amd64 build-arm64 build-windows-amd64 build-darwin-amd64 build-darwin-arm64 generate tidy test test-uds coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs kernel-guest-arm64 kernel-guest-arm64-minimal kernel-unpack hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed vet-cross
+.PHONY: all build build-amd64 build-arm64 build-windows-amd64 build-darwin-amd64 build-darwin-arm64 generate tidy test test-smoke test-uds coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs kernel-guest-arm64 kernel-guest-arm64-minimal kernel-unpack hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed vet-cross
 
 all: build
 
@@ -119,6 +119,15 @@ tidy:
 
 test:
 	go test ./...
+
+## Smoke test for the parallel-sprint gate. Runs the representative tests
+## that prove KVM, virtio, boot, and memory paths still work; meant to be
+## under 60 s so it can be the inner-loop check between parallel commits.
+## Excludes the sandboxes/integration suites (slow + pre-existing flakes).
+test-smoke:
+	go test -short -timeout 60s \
+	  -run 'TestKVM|TestBoot|TestMemory|TestVirtio|TestHypervisor|TestLongMode|TestPort' \
+	  ./pkg/vmm/... ./internal/kvm/... ./internal/loader/... ./internal/paths/...
 
 ## Unit tests for the Firecracker-style UDS (vsock) feature, under the
 ## race detector, repeated 10x to surface ordering bugs and goroutine

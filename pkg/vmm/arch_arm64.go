@@ -139,16 +139,14 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 
 	// Serial console — gocracker currently exposes an ns16550a-compatible UART
 	// in Firecracker's serial MMIO slot at 0x40002000 instead of using PL011.
-	// IRQ delivery still goes through irqfd (eventfd -> KVM -> GIC).
+	// IRQ delivery flows through makeIRQLine → hv.InjectInterrupt → GIC
+	// (Sprint A — A5 removed the per-device eventfd + IRQFD path).
 	consoleOut := vm.cfg.ConsoleOut
 	if consoleOut == nil {
 		consoleOut = os.Stdout
 	}
 	consoleIn := vm.cfg.ConsoleIn
-	_, serialIRQFn, err := vm.makeEventFDIRQFn()
-	if err != nil {
-		return fmt.Errorf("serial eventfd: %w", err)
-	}
+	serialIRQFn := vm.makeIRQLine(uint32(fdt.DefaultARM64PL011IRQ))
 	vm.uart0 = uart.New(consoleOut, consoleIn, serialIRQFn)
 
 	// PL031 RTC — provides wall clock to the guest kernel at boot.
@@ -158,10 +156,7 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 	{
 		base := uint64(arm64VirtioBase) + uint64(slot)*arm64VirtioStride
 		irq := uint8(arm64VirtioIRQBase + slot)
-		_, irqFn, err := vm.makeEventFDIRQFn()
-		if err != nil {
-			return fmt.Errorf("virtio-rng eventfd: %w", err)
-		}
+		irqFn := vm.makeIRQLine(uint32(irq))
 		rng := virtio.NewRNGDevice(mem, base, irq, vm.memDirty, irqFn)
 		rng.SetRateLimiter(buildRateLimiter(vm.cfg.RNGRateLimiter))
 		vm.rngDev = rng
@@ -173,10 +168,7 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 	if vm.cfg.Balloon != nil {
 		base := uint64(arm64VirtioBase) + uint64(slot)*arm64VirtioStride
 		irq := uint8(arm64VirtioIRQBase + slot)
-		_, irqFn, err := vm.makeEventFDIRQFn()
-		if err != nil {
-			return fmt.Errorf("virtio-balloon eventfd: %w", err)
-		}
+		irqFn := vm.makeIRQLine(uint32(irq))
 		balloon := virtio.NewBalloonDevice(mem, base, irq, virtio.BalloonDeviceConfig{
 			AmountMiB:            vm.cfg.Balloon.AmountMiB,
 			DeflateOnOOM:         vm.cfg.Balloon.DeflateOnOOM,
@@ -200,11 +192,9 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 		}
 		base := uint64(arm64VirtioBase) + uint64(slot)*arm64VirtioStride
 		irq := uint8(arm64VirtioIRQBase + slot)
-		_, irqFn, err := vm.makeEventFDIRQFn()
-		if err != nil {
-			return fmt.Errorf("virtio-net eventfd: %w", err)
-		}
+		irqFn := vm.makeIRQLine(uint32(irq))
 		var nd *virtio.NetDevice
+		var err error
 		if vm.cfg.NetMode == "slirp" {
 			backend := slirp.New()
 			nd, err = virtio.NewNetDeviceWithBackend(mem, base, irq, mac, backend, vm.memDirty, irqFn)
@@ -224,10 +214,7 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 	if vm.cfg.Vsock != nil && vm.cfg.Vsock.Enabled {
 		base := uint64(arm64VirtioBase) + uint64(slot)*arm64VirtioStride
 		irq := uint8(arm64VirtioIRQBase + slot)
-		_, irqFn, err := vm.makeEventFDIRQFn()
-		if err != nil {
-			return fmt.Errorf("virtio-vsock eventfd: %w", err)
-		}
+		irqFn := vm.makeIRQLine(uint32(irq))
 		vsockDev := vsock.NewDevice(mem, base, irq, nil, vm.memDirty, irqFn)
 		vsockDev.Label = vm.cfg.ID
 		vm.vsockDev = vsockDev
@@ -243,10 +230,7 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 	for _, drive := range vm.cfg.DriveList() {
 		base := uint64(arm64VirtioBase) + uint64(slot)*arm64VirtioStride
 		irq := uint8(arm64VirtioIRQBase + slot)
-		_, irqFn, err := vm.makeEventFDIRQFn()
-		if err != nil {
-			return fmt.Errorf("virtio-blk eventfd: %w", err)
-		}
+		irqFn := vm.makeIRQLine(uint32(irq))
 		bd, err := virtio.NewBlockDevice(mem, base, irq, drive.Path, drive.ReadOnly, vm.memDirty, irqFn)
 		if err != nil {
 			return fmt.Errorf("virtio-blk %s: %w", drive.ID, err)
@@ -264,10 +248,7 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 	for _, fsCfg := range vm.cfg.SharedFS {
 		base := uint64(arm64VirtioBase) + uint64(slot)*arm64VirtioStride
 		irq := uint8(arm64VirtioIRQBase + slot)
-		_, irqFn, err := vm.makeEventFDIRQFn()
-		if err != nil {
-			return fmt.Errorf("virtio-fs eventfd: %w", err)
-		}
+		irqFn := vm.makeIRQLine(uint32(irq))
 		fsDev, err := virtio.NewFSDevice(mem, vm.kvmVM.MemoryFD(), base, irq, fsCfg.Source, fsCfg.Tag, fsCfg.SocketPath, vm.memDirty, irqFn)
 		if err != nil {
 			return fmt.Errorf("virtio-fs %s: %w", fsCfg.Tag, err)
@@ -321,16 +302,12 @@ func (arm64MachineBackend) postCreateVCPUs(vm *VM) error {
 		return fmt.Errorf("arm64 GSI routing: %w", err)
 	}
 
-	// Wire all device eventfds into KVM after the routing table exists.
-	if len(vm.irqEventFds) != len(gsis) {
-		return fmt.Errorf("irqfd count mismatch: %d eventfds vs %d GSIs", len(vm.irqEventFds), len(gsis))
-	}
-	for i, efd := range vm.irqEventFds {
-		if err := vm.kvmVM.RegisterIRQFD(efd, gsis[i]); err != nil {
-			return fmt.Errorf("register irqfd gsi=%d: %w", gsis[i], err)
-		}
-	}
-	gclog.VMM.Info("arm64 irqfd registered", "id", vm.cfg.ID, "count", len(gsis))
+	// Phase 1.2 step 6 (Sprint A — A5) removed the eventfd + KVM_IRQFD
+	// hot path; IRQ delivery now flows through makeIRQLine →
+	// hv.InjectInterrupt → kvmVM.IRQLine (which routes to the GIC).
+	// The GSI routing table set by SetGSIRoutingGIC above is what
+	// makes those calls land on the right pin.
+	gclog.VMM.Info("arm64 GIC IRQ routing established", "id", vm.cfg.ID, "count", len(gsis))
 	return nil
 }
 

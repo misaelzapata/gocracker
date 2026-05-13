@@ -64,17 +64,13 @@ func (h *whpHypervisor) CreateVM(cfg HVVMConfig) (HVVM, error) {
 		cleanup()
 		return nil, fmt.Errorf("WHvSetPartitionProperty(ProcessorCount=%d): %w", cfg.NumVCPUs, err)
 	}
-	// Enable WHP's built-in xAPIC emulation so the kernel's APIC reads /
-	// writes at 0xFEE00000 are handled by the hypervisor rather than
-	// trapping out as MMIO exits. Without this the kernel panics in
-	// native_apic_mem_read during init_apic_mappings. Failure here is
-	// non-fatal — older Windows builds may not support the property and
-	// we still want the partition to come up (it just won't get past
-	// LAPIC init).
-	if err := whp.SetPartitionPropertyU32(handle, whp.PropLocalApicEmulationMode, whp.ApicEmuXApic); err != nil {
-		// Best-effort. Caller's run loop will hit MMIO exits at
-		// 0xFEE00000 if this didn't take.
-		_ = err
+	// xAPIC emulation is opt-in (cfg.EnableXAPIC). BootLinuxOnWHP sets it
+	// because Linux's APIC init needs it; bare-metal unit tests leave it
+	// off so background timer IRQs don't keep the vCPU running past a HLT.
+	// Failure is non-fatal — older Windows builds may not support the
+	// property and we still want the partition to come up.
+	if cfg.EnableXAPIC {
+		_ = whp.SetPartitionPropertyU32(handle, whp.PropLocalApicEmulationMode, whp.ApicEmuXApic)
 	}
 	if err := whp.SetupPartition(handle); err != nil {
 		cleanup()
@@ -212,6 +208,20 @@ func (c *whpVCPU) Run() (ExitContext, error) {
 		return ExitContext{Reason: ExitReasonInternal, FailureMsg: err.Error()}, err
 	}
 	return whpExitContextToPortable(rawCtx), nil
+}
+
+// RunRaw is a Windows-only escape hatch: it returns both the portable
+// ExitContext and the raw whp.ExitContext so the WHP boot session can
+// hand the embedded WHV_MEMORY_ACCESS_CONTEXT pointer to
+// WHvEmulatorTryMmioEmulation without copying. The raw context is
+// owned by the caller — keep it alive for the duration of any
+// emulator call that takes its embedded pointers.
+func (c *whpVCPU) RunRaw() (whp.ExitContext, ExitContext, error) {
+	rawCtx, err := whp.RunVirtualProcessor(c.vm.handle, uint32(c.idx))
+	if err != nil {
+		return whp.ExitContext{}, ExitContext{Reason: ExitReasonInternal, FailureMsg: err.Error()}, err
+	}
+	return rawCtx, whpExitContextToPortable(rawCtx), nil
 }
 
 func (c *whpVCPU) Cancel() error {

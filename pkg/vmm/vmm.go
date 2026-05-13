@@ -282,7 +282,6 @@ type VM struct {
 	pl011dev       any // reserved for future PL011 device, currently unused
 	gicDev         any // *kvm.GICDevice on ARM64, nil on x86
 	arm64GICLayout arm64layout.GICLayout
-	irqEventFds    []int // eventfds for irqfd-based interrupt delivery (ARM64)
 	transports     []*virtio.Transport
 	rngDev         *virtio.RNGDevice
 	balloonDev     *virtio.BalloonDevice
@@ -1807,31 +1806,6 @@ func (m *VM) makeIRQLine(gsi uint32) func(bool) {
 	}
 }
 
-// makeEventFDIRQFn creates an eventfd and returns an IRQ callback that writes
-// a single uint64(1) into it on each assert. Paired with a KVM_IRQFD
-// registration (see archBackend.postCreateVCPUs), this lets virtio devices
-// inject interrupts with zero ioctl(KVM_IRQ_LINE) traffic and zero vCPU
-// context switches during the injection itself — Firecracker's model, which
-// arm64 already followed. The caller is expected to append the returned fd
-// to vm.irqEventFds in the same order as the GSIs it later registers, so
-// cleanup (vmm.cleanup) can close them on shutdown.
-func (m *VM) makeEventFDIRQFn() (int, func(bool), error) {
-	efd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
-	if err != nil {
-		return -1, nil, fmt.Errorf("eventfd: %w", err)
-	}
-	m.irqEventFds = append(m.irqEventFds, efd)
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], 1)
-	fn := func(assert bool) {
-		if !assert {
-			return
-		}
-		_, _ = unix.Write(efd, buf[:])
-	}
-	return efd, fn, nil
-}
-
 func (m *VM) setupIRQs() error {
 	routes := []uint32{COM1IRQ}
 	for _, t := range m.transports {
@@ -1868,16 +1842,13 @@ func (m *VM) setupDevices() error {
 	if consoleIn == nil {
 		consoleIn = os.Stdin
 	}
-	// IRQ delivery on x86 uses KVM_IRQFD: each device owns an eventfd and
-	// writing to it injects the GSI without a ioctl(KVM_IRQ_LINE). The
-	// eventfds are registered with KVM in postCreateVCPUs once GSI routing
-	// exists; the order of makeEventFDIRQFn calls here must mirror the GSI
-	// order produced by setupIRQs (COM1, then each transport in append order)
-	// so registerIRQFDs below can pair them.
-	_, serialIRQFn, err := m.makeEventFDIRQFn()
-	if err != nil {
-		return fmt.Errorf("serial irqfd: %w", err)
-	}
+	// IRQ delivery is routed through Hypervisor.InjectInterrupt via
+	// makeIRQLine — one mechanism for KVM and WHP. KVM's adapter
+	// forwards through ioctl(KVM_IRQ_LINE); WHP's calls
+	// WHvRequestInterrupt. The earlier eventfd + KVM_IRQFD hot path is
+	// gone (Sprint A — A5): the syscall savings weren't worth the
+	// per-arch divergence and the Windows-port complexity.
+	serialIRQFn := m.makeIRQLine(COM1IRQ)
 	m.uart0 = uart.New(consoleOut, consoleIn, serialIRQFn)
 	m.i8042 = i8042.New(func() {
 		gclog.VMM.Info("guest reboot requested via i8042", "id", m.cfg.ID)
@@ -1889,10 +1860,7 @@ func (m *VM) setupDevices() error {
 	{
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		_, irqFn, err := m.makeEventFDIRQFn()
-		if err != nil {
-			return fmt.Errorf("virtio-rng irqfd: %w", err)
-		}
+		irqFn := m.makeIRQLine(uint32(irq))
 		rng := virtio.NewRNGDevice(mem, base, irq, m.memDirty, irqFn)
 		rng.SetRateLimiter(buildRateLimiter(m.cfg.RNGRateLimiter))
 		m.rngDev = rng
@@ -1904,10 +1872,7 @@ func (m *VM) setupDevices() error {
 	if m.cfg.Balloon != nil {
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		_, irqFn, err := m.makeEventFDIRQFn()
-		if err != nil {
-			return fmt.Errorf("virtio-balloon irqfd: %w", err)
-		}
+		irqFn := m.makeIRQLine(uint32(irq))
 		balloon := virtio.NewBalloonDevice(mem, base, irq, virtio.BalloonDeviceConfig{
 			AmountMiB:            m.cfg.Balloon.AmountMiB,
 			DeflateOnOOM:         m.cfg.Balloon.DeflateOnOOM,
@@ -1931,11 +1896,9 @@ func (m *VM) setupDevices() error {
 		}
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		_, irqFn, err := m.makeEventFDIRQFn()
-		if err != nil {
-			return fmt.Errorf("virtio-net irqfd: %w", err)
-		}
+		irqFn := m.makeIRQLine(uint32(irq))
 		var nd *virtio.NetDevice
+		var err error
 		if m.cfg.NetMode == "slirp" {
 			backend := slirp.New()
 			nd, err = virtio.NewNetDeviceWithBackend(mem, base, irq, mac, backend, m.memDirty, irqFn)
@@ -1966,10 +1929,7 @@ func (m *VM) setupDevices() error {
 	if m.cfg.Vsock != nil && m.cfg.Vsock.Enabled {
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		_, irqFn, err := m.makeEventFDIRQFn()
-		if err != nil {
-			return fmt.Errorf("virtio-vsock irqfd: %w", err)
-		}
+		irqFn := m.makeIRQLine(uint32(irq))
 		vsockDev := vsock.NewDevice(mem, base, irq, nil, m.memDirty, irqFn)
 		vsockDev.Label = m.cfg.ID
 		m.vsockDev = vsockDev
@@ -1985,10 +1945,7 @@ func (m *VM) setupDevices() error {
 	for _, drive := range m.cfg.DriveList() {
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		_, irqFn, err := m.makeEventFDIRQFn()
-		if err != nil {
-			return fmt.Errorf("virtio-blk %s irqfd: %w", drive.ID, err)
-		}
+		irqFn := m.makeIRQLine(uint32(irq))
 		bd, err := virtio.NewBlockDeviceWithOptions(mem, base, irq, drive.Path, drive.ReadOnly, m.memDirty, irqFn, virtio.BlockDeviceOptions{
 			SkipDiscardProbe: m.restoring,
 			Discard:          m.restoredDiscard[drive.ID],
@@ -2008,10 +1965,7 @@ func (m *VM) setupDevices() error {
 	for _, fsCfg := range m.cfg.SharedFS {
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
-		_, irqFn, err := m.makeEventFDIRQFn()
-		if err != nil {
-			return fmt.Errorf("virtio-fs %s irqfd: %w", fsCfg.Tag, err)
-		}
+		irqFn := m.makeIRQLine(uint32(irq))
 		fsDev, err := virtio.NewFSDevice(mem, m.kvmVM.MemoryFD(), base, irq, fsCfg.Source, fsCfg.Tag, fsCfg.SocketPath, m.memDirty, irqFn)
 		if err != nil {
 			return fmt.Errorf("virtio-fs %s: %w", fsCfg.Tag, err)
@@ -2249,10 +2203,6 @@ func (m *VM) cleanup() {
 				gclog.VMM.Warn("net device cleanup failed", "id", m.cfg.ID, "error", err)
 			}
 		}
-		for _, efd := range m.irqEventFds {
-			unix.Close(efd)
-		}
-		m.irqEventFds = nil
 		for _, vcpu := range m.vcpus {
 			if vcpu != nil {
 				if err := vcpu.Close(); err != nil {
