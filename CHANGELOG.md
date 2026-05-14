@@ -63,6 +63,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   falls back to PIC for legacy IRQs, which is what
   `WHvRequestInterrupt` delivers.
 
+### Verified end-to-end (Win11 24H2 + WHP)
+`gocracker-whp.exe -mem 256 -initrd <initrd.cpio.gz> vmlinux` runs the
+Linux kernel through every subsystem-init phase (memory, ACPI,
+filesystems, PCI probe, 8250/16550 driver, virtio, networking,
+crypto) and hands off to `/init` in userspace. Tested kernels: the
+shipped `gocracker-guest-standard-vmlinux` (Linux 6.1.102).
+
+Remaining gap to an interactive shell: the embedded gocracker init
+binary exits when it can't reach the host over vsock. A subsequent
+change can replace it with a static `/bin/sh` (busybox) or wire the
+WHP path through host vsock so the existing init's handshake works.
+
 ### Added
 - **Warm cache** (`--warm` / `GOCRACKER_WARM_CACHE=1`): captures a dirty-page
   snapshot on the first cold boot and restores from it on subsequent runs.
