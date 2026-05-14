@@ -177,15 +177,25 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 	copy(ram[CmdlineAddr:], cmdlineBytes)
 	ram[CmdlineAddr+len(cmdlineBytes)] = 0 // NUL-terminated
 
-	// Optional initrd.
+	// Optional initrd. The default InitrdAddr (16 MiB) collides with a
+	// 40+ MiB vmlinux that gets loaded at 1 MiB, so we place the initrd
+	// near the top of RAM instead — leaves plenty of room for kernel
+	// + early page tables + boot params.
 	var initrdAddr, initrdSize uint64
 	if cfg.InitrdPath != "" {
-		size, err := loadFileIntoRAM(ram, cfg.InitrdPath, InitrdAddr, uint64(len(ram)))
+		fi, statErr := os.Stat(cfg.InitrdPath)
+		if statErr != nil {
+			cleanupVM()
+			return nil, fmt.Errorf("stat initrd: %w", statErr)
+		}
+		// Align down to 4 KiB so the kernel maps cleanly.
+		addr := (cfg.MemoryBytes - uint64(fi.Size())) &^ 0xFFF
+		size, err := loadFileIntoRAM(ram, cfg.InitrdPath, addr, uint64(len(ram)))
 		if err != nil {
 			cleanupVM()
 			return nil, fmt.Errorf("load initrd: %w", err)
 		}
-		initrdAddr = InitrdAddr
+		initrdAddr = addr
 		initrdSize = size
 	}
 

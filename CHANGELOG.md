@@ -50,6 +50,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   the bare-metal HLT-at-GPA-0 smoke test to never see its halt exit
   (background timer IRQs kept the vCPU live). Gated behind
   `HVVMConfig.EnableXAPIC`.
+- Initrd no longer corrupts the kernel image: placed near the top of
+  RAM (`MemoryBytes - initrdSize` aligned down) instead of at a fixed
+  16 MiB that collided with a 40 MiB vmlinux loaded at 1 MiB.
+- Initramfs `/init` execve no longer fails with EACCES on Windows host
+  builds: cpio writer stamps 0755 on regular files and directories
+  when `runtime.GOOS == "windows"` since the staged-temp files don't
+  carry POSIX mode bits there.
+- ACPI MADT no longer advertises an I/O APIC: previously the kernel
+  trusted the (unemulated) IOAPIC and masked the 8259 PIC, so timer
+  and COM1 IRQs never reached the guest. With LAPIC-only, the kernel
+  falls back to PIC for legacy IRQs, which is what
+  `WHvRequestInterrupt` delivers.
 
 ### Added
 - **Warm cache** (`--warm` / `GOCRACKER_WARM_CACHE=1`): captures a dirty-page

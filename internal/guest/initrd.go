@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -252,9 +253,18 @@ func packCpioGz(dir, output string) error {
 			return err
 		}
 
+		// Windows hosts don't carry POSIX mode bits on the staged temp
+		// files, so fi.Mode() comes back with no exec bit. The kernel
+		// then refuses to execve /init with EACCES (-13). We're building
+		// our own initramfs from a known good skeleton, so it's safe to
+		// stamp 0755 on regular files and dirs uniformly.
+		mode := fi.Mode()
+		if runtime.GOOS == "windows" && (fi.IsDir() || fi.Mode().IsRegular()) {
+			mode = (mode &^ os.ModePerm) | 0o755
+		}
 		hdr := &cpiolib.Header{
 			Name: rel,
-			Mode: cpiolib.FileMode(fi.Mode()),
+			Mode: cpiolib.FileMode(mode),
 			Size: 0,
 		}
 

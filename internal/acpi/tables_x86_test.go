@@ -106,38 +106,16 @@ func TestWriteTables_MADTContents(t *testing.T) {
 			t.Fatalf("MADT entry at offset %d has zero length", off)
 		}
 		gotTypes = append(gotTypes, eType)
-		switch eType {
-		case 1: // IOAPIC
-			gotIOAPIC = binary.LittleEndian.Uint32(mem[madtAddr+off+4 : madtAddr+off+8])
-		case 2: // Interrupt Source Override
-			overrides = append(overrides, struct {
-				source byte
-				gsi    uint32
-			}{
-				source: mem[madtAddr+off+3],
-				gsi:    binary.LittleEndian.Uint32(mem[madtAddr+off+4 : madtAddr+off+8]),
-			})
-		}
+		_ = gotIOAPIC
+		_ = overrides
 		off += uint32(eLen)
 	}
 
-	wantTypes := []byte{0, 1, 2, 2}
+	// LAPIC-only MADT: the kernel falls back to PIC for legacy IRQs,
+	// which is what WHvRequestInterrupt delivers.
+	wantTypes := []byte{0}
 	if !bytes.Equal(gotTypes, wantTypes) {
 		t.Fatalf("MADT entry types = %v, want %v", gotTypes, wantTypes)
-	}
-	if gotIOAPIC != 0xFEC00000 {
-		t.Fatalf("MADT IOAPIC address = %#x, want 0xFEC00000", gotIOAPIC)
-	}
-	if len(overrides) != 2 {
-		t.Fatalf("MADT overrides = %d, want 2", len(overrides))
-	}
-	if overrides[0].source != 0 || overrides[0].gsi != 2 {
-		t.Fatalf("MADT override[0] source=%d gsi=%d, want source=0 gsi=2",
-			overrides[0].source, overrides[0].gsi)
-	}
-	if overrides[1].source != 4 || overrides[1].gsi != 4 {
-		t.Fatalf("MADT override[1] source=%d gsi=%d, want source=4 gsi=4",
-			overrides[1].source, overrides[1].gsi)
 	}
 }
 

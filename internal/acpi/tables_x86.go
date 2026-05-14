@@ -48,15 +48,15 @@ var (
 // and never touches any host resource. Callers should hand it a slice
 // whose index 0 corresponds to guest physical address 0.
 //
-// The MADT carries one Type 0 (LAPIC) entry, one Type 1 (IOAPIC) entry,
-// and two Type 2 (interrupt source override) entries for the PIT (ISA
-// IRQ0 -> GSI 2) and COM1 (ISA IRQ4 -> GSI 4) legacy lines.
+// The MADT carries one Type 0 (LAPIC) entry only. We deliberately do
+// NOT advertise an I/O APIC or any interrupt-source overrides: we
+// emulate the legacy 8259 PIC and inject IRQs via
+// WHvRequestInterrupt — advertising an IOAPIC would make Linux mask
+// the PIC and route legacy IRQs (timer, COM1) through an IOAPIC we
+// don't emulate, killing every external IRQ delivery.
 func WriteTables(mem []byte) error {
 	madtLen := sdtHeaderLen + 8 /* LAPIC addr + flags */ +
-		8 /* LAPIC entry */ +
-		12 /* IOAPIC entry */ +
-		10 /* PIT override */ +
-		10 /* COM1 override */
+		8 /* LAPIC entry */
 	rsdtLen := sdtHeaderLen + 4 /* one u32 pointer to MADT */
 
 	required := int(wrMADTAddr) + madtLen
@@ -138,33 +138,6 @@ func writeMADT(buf []byte) {
 	buf[off+3] = 0 // APIC ID
 	binary.LittleEndian.PutUint32(buf[off+4:off+8], lapicFlagEnabled)
 	off += 8
-
-	// Type 1: I/O APIC (12 bytes).
-	buf[off+0] = madtEntryIOAPIC
-	buf[off+1] = 12
-	buf[off+2] = 0 // IOAPIC ID
-	buf[off+3] = 0 // reserved
-	binary.LittleEndian.PutUint32(buf[off+4:off+8], wrIOAPICAddr)
-	binary.LittleEndian.PutUint32(buf[off+8:off+12], 0) // GSI base
-	off += 12
-
-	// Type 2: Interrupt Source Override for PIT (ISA IRQ0 -> GSI 2).
-	buf[off+0] = madtEntryIntOverride
-	buf[off+1] = 10
-	buf[off+2] = 0 // bus (ISA)
-	buf[off+3] = 0 // source IRQ
-	binary.LittleEndian.PutUint32(buf[off+4:off+8], 2) // global system interrupt
-	binary.LittleEndian.PutUint16(buf[off+8:off+10], 0)
-	off += 10
-
-	// Type 2: Interrupt Source Override for COM1 (ISA IRQ4 -> GSI 4).
-	buf[off+0] = madtEntryIntOverride
-	buf[off+1] = 10
-	buf[off+2] = 0 // bus (ISA)
-	buf[off+3] = 4 // source IRQ
-	binary.LittleEndian.PutUint32(buf[off+4:off+8], 4) // global system interrupt
-	binary.LittleEndian.PutUint16(buf[off+8:off+10], 0)
-	off += 10
 
 	if off != len(buf) {
 		panic(fmt.Sprintf("acpi: MADT layout mismatch: wrote %d bytes, buffer is %d", off, len(buf)))
