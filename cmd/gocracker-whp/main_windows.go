@@ -108,6 +108,27 @@ func main() {
 		}
 	}()
 
+	// Bridge host stdin to the guest's COM1 RX. Runs until ctx is
+	// cancelled or stdin closes; bytes the user types appear at the
+	// guest's serial console.
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			n, err := os.Stdin.Read(buf)
+			if err != nil {
+				return
+			}
+			if n > 0 {
+				session.PushUARTInput(buf[0])
+			}
+		}
+	}()
+
 	fmt.Fprintf(os.Stderr, "gocracker-whp: booting %s (%d MiB RAM, %s)\n", kernelPath, *memMB, *timeout)
 	if err := session.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "\ngocracker-whp: vCPU exit error: %v\n", err)

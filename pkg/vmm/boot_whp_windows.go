@@ -78,9 +78,11 @@ type WHPBootSession struct {
 	vcpu     HVVCPU
 	memBytes []byte
 	stop     chan struct{}
-	pit      *pit8254 // 8254 PIT — satisfies Linux's TSC calibration loop
-	pic      *pic8259 // 8259 master/slave PICs — legacy IRQ delivery
-	cmos     *cmosRTC // MC146818 RTC — seeds the kernel's wall clock
+	pit      *pit8254        // 8254 PIT — real mode-3, drives IRQ 0
+	pic      *pic8259        // 8259 master/slave PICs — legacy IRQ delivery
+	cmos     *cmosRTC        // MC146818 RTC — seeds the kernel's wall clock
+	uart     *UART16550      // 16550A COM1 (output + RX FIFO + IRQ4)
+	pci      *pciConfigDummy // 0xCF8/0xCFC PCI config sentinel
 	hndl     whp.PartitionHandle // raw partition handle for IRQ injection
 
 	// MMIO emulator + dispatch table for virtio-mmio devices. Each
@@ -295,14 +297,24 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 		session.blkDev = blk
 	}
 
-	// REGION:UART-WIRE — Batch 2 integrator constructs the 16550A UART
-	// from pkg/vmm/uart_windows.go and assigns it to session.uart, then
-	// wires session.uart.RaiseIRQ to s.raiseIRQ(4) (IRQ4 = COM1).
-	// REGION:PCI-WIRE — Batch 2 integrator constructs the 0xCF8/0xCFC
-	// PCI-config dummy from pkg/vmm/pci_windows.go and assigns it to
-	// session.pci so handleIOPortExit can dispatch to it.
+	session.uart = NewUART16550(
+		func() { session.raiseIRQ(4) },
+		cfg.OnUARTOutput,
+	)
+	session.pci = newPCIConfigDummy()
+	session.pit.SetIRQ0Callback(func() { session.raiseIRQ(0) })
 
 	return session, nil
+}
+
+// PushUARTInput feeds a byte into the guest's COM1 RX path. The
+// caller (typically a stdin reader goroutine) writes one keystroke at
+// a time; the UART raises IRQ4 if the kernel's 8250 driver has
+// unmasked it.
+func (s *WHPBootSession) PushUARTInput(b byte) {
+	if s.uart != nil {
+		s.uart.PushRX(b)
+	}
 }
 
 // raiseIRQ delivers a virtio device IRQ to the guest via the 8259
@@ -479,22 +491,28 @@ func (s *WHPBootSession) handleIOPortExit(exit ExitContext) {
 	port := exit.IOPort.Port
 	isWrite := exit.IOPort.Direction == IOPortOut
 	switch {
-	case port >= 0x3F8 && port < 0x400:
-		// COM1 (Firecracker uses 0x3F8 base, 8 ports).
+	case s.uart != nil && s.uart.Handles(port):
+		// 16550A COM1 — full device. DLAB-gated divisor latches, IER,
+		// MCR loopback, RX FIFO, IRQ4 on RBR/THRE transitions.
 		if isWrite {
 			r, _ := s.vcpu.GetRegisters()
-			if port == 0x3F8 {
-				s.cfg.OnUARTOutput(byte(r.RAX & 0xFF))
-			}
+			s.uart.WritePort(port, byte(r.RAX&0xFF))
 		} else {
-			// IN — return TX-empty (LSR bit 5) on port+5 so the kernel
-			// keeps writing without blocking. Other registers read 0.
-			var ret byte
-			if port == 0x3F8+5 {
-				ret = 0x20
-			}
+			val := s.uart.ReadPort(port)
 			r, _ := s.vcpu.GetRegisters()
-			r.RAX = (r.RAX &^ 0xFF) | uint64(ret)
+			r.RAX = (r.RAX &^ 0xFF) | uint64(val)
+			_ = s.vcpu.SetRegisters(r)
+		}
+	case s.pci != nil && s.pci.handles(port):
+		// PCI config-space sentinel — every probe returns 0xFFFFFFFF
+		// (no device) so Linux's bus enumeration exits cleanly.
+		if isWrite {
+			r, _ := s.vcpu.GetRegisters()
+			s.pci.writePort(port, byte(r.RAX&0xFF))
+		} else {
+			val := s.pci.readPort(port)
+			r, _ := s.vcpu.GetRegisters()
+			r.RAX = (r.RAX &^ 0xFF) | uint64(val)
 			_ = s.vcpu.SetRegisters(r)
 		}
 	case s.pit.handles(port):
