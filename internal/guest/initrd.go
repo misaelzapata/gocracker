@@ -242,6 +242,11 @@ func packCpioGz(dir, output string) error {
 		if err != nil {
 			return err
 		}
+		// Linux cpio paths MUST use forward slashes — Windows hosts return
+		// backslash-separated paths from filepath.Rel which the Linux
+		// kernel then treats as literal filename characters, breaking
+		// every directory hierarchy in the archive.
+		rel = filepath.ToSlash(rel)
 		if rel == "." {
 			rel = "."
 		} else {

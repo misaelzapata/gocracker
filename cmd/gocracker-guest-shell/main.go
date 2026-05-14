@@ -1,10 +1,8 @@
 //go:build linux
 
-// gocracker-guest-shell is a minimal pid 1 for the WHP boot-to-shell
-// smoke path. It writes one byte at a time to /dev/console (raw
-// syscall, no Go stdio buffering), echoes anything it reads, and never
-// exits. No mounts, no Go runtime features beyond syscall — kept small
-// so the only thing that can go wrong is the host UART path itself.
+// gocracker-guest-shell is a minimal pid 1 that boots into an
+// interactive shell on the serial console. Built statically and
+// embedded as /init in a tiny initramfs for the WHP boot smoke path.
 package main
 
 import (
@@ -13,35 +11,59 @@ import (
 )
 
 func main() {
-	// First sign of life: write to fd 1, which the kernel wires to
-	// /dev/console (= ttyS0) before exec'ing /init. No /proc or /dev
-	// mount needed.
-	write1("\r\n=== gocracker-guest-shell alive ===\r\n# ")
+	// Mount devtmpfs so /dev/ttyS0, /dev/kmsg, /dev/console etc.
+	// appear automatically. Without this, hand-crafted mknod nodes
+	// don't actually function as device files on most kernels.
+	_ = syscall.Mkdir("/dev", 0o755)
+	_ = syscall.Mount("devtmpfs", "/dev", "devtmpfs", syscall.MS_NOSUID, "mode=0755")
+	_ = syscall.Mkdir("/proc", 0o755)
+	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
+	_ = syscall.Mkdir("/sys", 0o755)
+	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
 
-	// Try to also open /dev/ttyS0 directly as a belt-and-braces in case
-	// fd 1 isn't routed through the console driver for some reason.
-	if fd, err := syscall.Open("/dev/ttyS0", syscall.O_RDWR, 0); err == nil {
-		rawWrite(fd, "(also reachable via /dev/ttyS0)\r\n")
-		_ = syscall.Close(fd)
+	// Banner via the kernel printk channel — guaranteed to reach the
+	// host's console=ttyS0 via the printk forwarding path.
+	klog("=== gocracker-guest-shell — Linux on WHP — alive as PID 1 ===")
+	klog("Type characters on the serial console; they'll echo back.")
+	klog("Press Enter to get a fresh prompt. Ctrl-C halts the guest.")
+
+	// Open /dev/ttyS0 read-write with O_NOCTTY so it doesn't become
+	// our controlling terminal (which would block reads in weird
+	// ways). Use the same fd for input/output: serial drivers are
+	// full-duplex.
+	tty, err := syscall.Open("/dev/ttyS0", syscall.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		klog("open /dev/ttyS0 failed; sleeping forever")
+		for {
+			time.Sleep(time.Hour)
+		}
 	}
+	defer syscall.Close(tty)
 
-	// Read from fd 0 (/dev/console) byte at a time and echo back.
-	buf := make([]byte, 1)
+	_, _ = syscall.Write(tty, []byte("\r\n# "))
+
+	buf := make([]byte, 64)
 	for {
-		n, err := syscall.Read(0, buf)
+		n, err := syscall.Read(tty, buf)
 		if err != nil || n == 0 {
-			// stdin not wired — just pause and try again later.
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 			continue
 		}
-		// Echo char back so the user sees what they type.
-		write1(string(buf[:n]))
-		if buf[0] == '\r' || buf[0] == '\n' {
-			write1("\r\n# ")
+		_, _ = syscall.Write(tty, buf[:n])
+		for _, b := range buf[:n] {
+			if b == '\r' || b == '\n' {
+				_, _ = syscall.Write(tty, []byte("\r\n# "))
+				break
+			}
 		}
 	}
 }
 
-func write1(s string) { _, _ = syscall.Write(1, []byte(s)) }
-
-func rawWrite(fd int, s string) { _, _ = syscall.Write(fd, []byte(s)) }
+func klog(s string) {
+	fd, err := syscall.Open("/dev/kmsg", syscall.O_WRONLY, 0)
+	if err != nil {
+		return
+	}
+	_, _ = syscall.Write(fd, []byte("<6>"+s+"\n"))
+	_ = syscall.Close(fd)
+}

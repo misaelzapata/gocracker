@@ -89,6 +89,34 @@ KV-clock/HV-clock paravirtual TSC are the long-term fix).
 - `Run` loop treats `ExitReasonHalt` as idle (just continues) instead
   of returning — HLT is the vCPU's wait-for-interrupt state, not a
   shutdown signal.
+- Linux kernel cmdline now includes `tsc_early_khz=2400000` —
+  Linux's PIT-based TSC calibration loop doesn't converge against our
+  software-only PIT, but `tsc_early_khz` lets the kernel skip it and
+  trust the host's TSC rate directly. Once HPET emulation lands, this
+  workaround can come off.
+- cpio packer (internal/guest/initrd.go) converts Windows backslash
+  separators to forward slashes via `filepath.ToSlash`. The Linux
+  kernel cpio reader treats `dev\pts` as a literal filename, not as
+  `dev/pts`; every directory hierarchy in a Windows-built initramfs
+  was broken until this commit.
+
+### Verified end-to-end (Win11 24H2 + WHP)
+
+`gocracker-whp.exe -initrd <shell-initrd.cpio.gz> vmlinux` boots Linux
+to **userspace `/init` running**, with the embedded
+`gocracker-guest-shell` printing its banner to the host console:
+
+```
+[    0.221587] === gocracker-guest-shell — Linux on WHP — alive as PID 1 ===
+```
+
+The init binary mounts `devtmpfs / proc / sysfs`, opens `/dev/ttyS0`
+read-write, and loops echoing host stdin into the guest's COM1 RX
+path via `WHPBootSession.PushUARTInput`. End-to-end keystroke echo
+needs more polish (subsequent kmsg lines after the first don't
+always make it through within the 6 s timeout — likely a printk
+rate-limiting / TSC-tick-source artefact), but the boot-to-shell
+plumbing is in place.
 
 ### Added
 - **Warm cache** (`--warm` / `GOCRACKER_WARM_CACHE=1`): captures a dirty-page

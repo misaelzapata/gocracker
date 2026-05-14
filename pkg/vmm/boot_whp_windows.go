@@ -307,11 +307,15 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 	return session, nil
 }
 
-// PushUARTInput feeds a byte into the guest's COM1 RX path. The
-// caller (typically a stdin reader goroutine) writes one keystroke at
-// a time; the UART raises IRQ4 if the kernel's 8250 driver has
-// unmasked it.
+// PushUARTInput feeds a byte into the guest's COM1 RX path. Safe to
+// call from any goroutine; no-op once the session has been torn down.
 func (s *WHPBootSession) PushUARTInput(b byte) {
+	// Check stop first to avoid racing the close path.
+	select {
+	case <-s.stop:
+		return
+	default:
+	}
 	if s.uart != nil {
 		s.uart.PushRX(b)
 	}

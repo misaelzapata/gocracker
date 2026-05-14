@@ -41,8 +41,8 @@ import (
 
 func main() {
 	memMB := flag.Int("mem", 128, "guest RAM in MiB")
-	cmdline := flag.String("cmdline", "console=ttyS0 earlyprintk=ttyS0 reboot=k panic=1 nomodule no_timer_check lpj=10000000 tsc=reliable",
-		"kernel command line. tsc=reliable / lpj / no_timer_check stay because Linux's PIT-based TSC calibration still doesn't converge against our software PIT — HPET emulation or KVM-clock/HV-clock paravirtual TSC are the long-term fix.")
+	cmdline := flag.String("cmdline", "console=ttyS0 earlyprintk=ttyS0 reboot=k panic=1 nomodule tsc_early_khz=2400000 tsc=reliable lpj=10000000 no_timer_check",
+		"kernel command line. tsc_early_khz=N tells the kernel the TSC frequency in kHz up front — skips the PIT-based calibration loop that fails against our software PIT. Adjust to your host CPU's actual TSC rate if precise time matters in the guest.")
 	initrdPath := flag.String("initrd", "", "optional initramfs / initrd path (CPIO archive)")
 	rootfsPath := flag.String("rootfs", "", "optional ext4 rootfs to attach as /dev/vda via virtio-blk-mmio")
 	rootfsReadOnly := flag.Bool("rootfs-ro", false, "open the rootfs read-only (sets VIRTIO_BLK_F_RO)")
@@ -110,21 +110,26 @@ func main() {
 
 	// Bridge host stdin to the guest's COM1 RX. Runs until ctx is
 	// cancelled or stdin closes; bytes the user types appear at the
-	// guest's serial console.
+	// guest's serial console. `defer session.Close()` may run while
+	// the goroutine still has a read pending — PushUARTInput is
+	// stop-channel guarded so it's safe to keep firing on a closed
+	// session.
+	stdinDone := make(chan struct{})
 	go func() {
+		defer close(stdinDone)
 		buf := make([]byte, 1)
 		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
 			n, err := os.Stdin.Read(buf)
 			if err != nil {
 				return
 			}
 			if n > 0 {
 				session.PushUARTInput(buf[0])
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
 			}
 		}
 	}()
