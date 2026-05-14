@@ -304,36 +304,31 @@ func CancelRunVirtualProcessor(h PartitionHandle, idx uint32) error {
 	return nil
 }
 
-// whvInterruptControl mirrors WHV_INTERRUPT_CONTROL (32 bytes).
-//
-//	bits  0–3 : Type (0=Fixed, 1=LowestPriority, 2=Nmi, 3=Init, 4=Sipi, 5=LocalInt1)
-//	bits  4–7 : DestinationMode (0=Physical, 1=Logical)
-//	bits  8–11: TriggerMode (0=Edge, 1=Level)
-//	bits 12–63: reserved
-//	[8..11]   : reserved
-//	[12..15]  : Destination (vp index or APIC ID)
-//	[16..19]  : Vector
-//	[20..31]  : reserved
+// whvInterruptControl mirrors WHV_INTERRUPT_CONTROL from
+// WinHvPlatformDefs.h — 16 bytes total. The first u64 packs the
+// bitfield union (Type:8, DestinationMode:4, TriggerMode:4, the rest
+// reserved). The next two u32s are Destination + Vector. There is NO
+// trailing reserved word; passing 32 bytes here is rejected by
+// WHvRequestInterrupt with WHV_E_INVALID_PARAMETER (0xc0350005).
 type whvInterruptControl struct {
-	TypeDestModeTrigger uint64 // packed bitfield (Type/DestMode/Trigger)
-	_                   uint32 // reserved
+	TypeDestModeTrigger uint64 // packed bitfield
 	Destination         uint32 // vp index (Physical) or APIC ID set (Logical)
 	Vector              uint32 // interrupt vector 0..0xFF
-	_                   uint32 // reserved
-	_                   uint64 // reserved tail to keep 32-byte size
 }
 
-// Interrupt type constants for whvInterruptControl.Type field.
+// Interrupt type constants for whvInterruptControl.Type field. Each
+// occupies its own bitfield slot in the packed u64: Type is bits 0–7,
+// DestinationMode is bits 8–11, TriggerMode is bits 12–15.
 const (
-	IntTypeFixed           uint64 = 0
-	IntTypeLowestPriority  uint64 = 1
-	IntTypeNmi             uint64 = 2
-	IntTypeInit            uint64 = 3
-	IntTypeSipi            uint64 = 4
-	IntDestModePhysical    uint64 = 0
-	IntDestModeLogical     uint64 = 1 << 4
-	IntTriggerModeEdge     uint64 = 0
-	IntTriggerModeLevel    uint64 = 1 << 8
+	IntTypeFixed          uint64 = 0
+	IntTypeLowestPriority uint64 = 1
+	IntTypeNmi            uint64 = 2
+	IntTypeInit           uint64 = 3
+	IntTypeSipi           uint64 = 4
+	IntDestModePhysical   uint64 = 0
+	IntDestModeLogical    uint64 = 1 << 8  // DestinationMode bit 0
+	IntTriggerModeEdge    uint64 = 0
+	IntTriggerModeLevel   uint64 = 1 << 12 // TriggerMode bit 0
 )
 
 // RequestFixedInterrupt fires a Fixed/Physical/Edge interrupt with the

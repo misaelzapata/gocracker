@@ -409,7 +409,13 @@ func (s *WHPBootSession) Run(ctx context.Context) error {
 				return err
 			}
 		case ExitReasonHalt:
-			return nil
+			// HLT is the vCPU's idle state — it waits for the next
+			// external interrupt (timer, UART, virtio). WHP's Run
+			// blocks until that interrupt arrives, so we just loop;
+			// returning here would freeze the guest after the first
+			// idle. Real shutdown comes via ExitReasonCancelled (ctx
+			// done, Stop()) or the guest writing the reboot port.
+			continue
 		case ExitReasonCancelled:
 			return nil
 		case ExitReasonInternal:

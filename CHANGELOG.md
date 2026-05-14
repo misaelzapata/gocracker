@@ -68,12 +68,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 Linux kernel through every subsystem-init phase (memory, ACPI,
 filesystems, PCI probe, 8250/16550 driver, virtio, networking,
 crypto) and hands off to `/init` in userspace. Tested kernels: the
-shipped `gocracker-guest-standard-vmlinux` (Linux 6.1.102).
+shipped `gocracker-guest-standard-vmlinux` (Linux 6.1.102). The
+default cmdline still ships with `tsc=reliable / lpj=10000000 /
+no_timer_check` because our software PIT counter readbacks don't
+converge against Linux's TSC calibration probe (HPET emulation or
+KV-clock/HV-clock paravirtual TSC are the long-term fix).
 
-Remaining gap to an interactive shell: the embedded gocracker init
-binary exits when it can't reach the host over vsock. A subsequent
-change can replace it with a static `/bin/sh` (busybox) or wire the
-WHP path through host vsock so the existing init's handshake works.
+### Added — boot-to-shell scaffolding
+- `WHV_INTERRUPT_CONTROL` struct size fixed: 32 → 16 bytes. The wrong
+  size caused `WHvRequestInterrupt` to fail with `WHV_E_INVALID_PARAMETER`
+  (0xc0350005) on every PIT / UART IRQ injection — the kernel never
+  saw a timer tick, so jiffies never advanced and userspace never got
+  scheduled.
+- `WHPBootSession.PushUARTInput` exposes the 16550A RX path so a host
+  stdin reader can feed keystrokes into the guest's COM1.
+- `cmd/gocracker-guest-shell` — minimal Linux pid 1 that wires fd 0/1/2
+  to `/dev/ttyS0`, prints a banner, and echoes stdin. Used by
+  `tools/mkshellinitrd` to produce a `shell-initrd.cpio.gz` for the
+  WHP smoke path before the full vsock exec-agent lands on Windows.
+- `Run` loop treats `ExitReasonHalt` as idle (just continues) instead
+  of returning — HLT is the vCPU's wait-for-interrupt state, not a
+  shutdown signal.
 
 ### Added
 - **Warm cache** (`--warm` / `GOCRACKER_WARM_CACHE=1`): captures a dirty-page

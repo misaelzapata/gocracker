@@ -42,7 +42,7 @@ import (
 func main() {
 	memMB := flag.Int("mem", 128, "guest RAM in MiB")
 	cmdline := flag.String("cmdline", "console=ttyS0 earlyprintk=ttyS0 reboot=k panic=1 nomodule no_timer_check lpj=10000000 tsc=reliable",
-		"kernel command line. The default works around the missing TSC calibration; remove no_timer_check/lpj/tsc=reliable once Phase 2h-cont. lands real PIT-driven calibration.")
+		"kernel command line. tsc=reliable / lpj / no_timer_check stay because Linux's PIT-based TSC calibration still doesn't converge against our software PIT — HPET emulation or KVM-clock/HV-clock paravirtual TSC are the long-term fix.")
 	initrdPath := flag.String("initrd", "", "optional initramfs / initrd path (CPIO archive)")
 	rootfsPath := flag.String("rootfs", "", "optional ext4 rootfs to attach as /dev/vda via virtio-blk-mmio")
 	rootfsReadOnly := flag.Bool("rootfs-ro", false, "open the rootfs read-only (sets VIRTIO_BLK_F_RO)")
