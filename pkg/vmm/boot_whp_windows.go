@@ -303,6 +303,8 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 	)
 	session.pci = newPCIConfigDummy()
 	session.pit.SetIRQ0Callback(func() { session.raiseIRQ(0) })
+	// REGION:HPET-WIRE — Agent A2 replaces this with the HPET MMIO
+	// registration + IRQ wiring (high-resolution timer at 0xFED00000).
 
 	return session, nil
 }
