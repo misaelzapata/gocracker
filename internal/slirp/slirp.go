@@ -30,6 +30,11 @@ type Slirp struct {
 	// per-flow conns here when those land.
 	onClose []func()
 
+	// portfwd holds the host→guest port-forwarding registry. It's owned
+	// by the Slirp instance so the TCP dispatcher can consult it without
+	// needing extra plumbing, and so Close() can tear down host listeners.
+	portfwd *PortFwdRegistry
+
 	// stats — exposed for testing & operator debugging.
 	stats Stats
 }
@@ -52,8 +57,14 @@ func New() *Slirp {
 	return &Slirp{
 		rxQueue: make(chan []byte, 256),
 		done:    make(chan struct{}),
+		portfwd: NewPortFwdRegistry(),
 	}
 }
+
+// PortFwd exposes the port-forwarding registry so operators can register
+// host→guest rules before VM boot. Returns the live registry; the
+// returned value is owned by the Slirp instance and torn down on Close.
+func (s *Slirp) PortFwd() *PortFwdRegistry { return s.portfwd }
 
 // Snapshot returns a point-in-time copy of the counters. Useful for tests.
 func (s *Slirp) Snapshot() map[string]uint64 {
@@ -79,6 +90,9 @@ func (s *Slirp) Close() error {
 		return nil
 	}
 	close(s.done)
+	if s.portfwd != nil {
+		s.portfwd.closeAll()
+	}
 	s.mu.Lock()
 	for _, fn := range s.onClose {
 		fn()
