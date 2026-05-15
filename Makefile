@@ -39,8 +39,13 @@ generate:
 ## they fall through to main_other.go stubs that print a clear "Linux-only
 ## / pending Phase N" message and exit 2. The Windows binaries are real
 ## once Phases 1.2 + 2 (and later) land.
+##
+## TAGS is empty for default builds. Windows builds set TAGS=slirp_gvisor
+## so the gVisor netstack is compiled in — Windows has no /dev/net/tun, so
+## the userspace stack is the only viable network backend there.
+TAGS ?=
 GO_BUILD = CGO_ENABLED=0 GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) \
-  go build -trimpath -ldflags="-s -w $(VERSION_LDFLAGS)"
+  go build -trimpath -tags="$(TAGS)" -ldflags="-s -w $(VERSION_LDFLAGS)"
 
 build: tidy generate
 	$(GO_BUILD) -o $(BIN)$(BIN_EXT)               $(CMD)
@@ -59,7 +64,7 @@ build-arm64:
 	$(MAKE) build TARGET_GOARCH=arm64
 
 build-windows-amd64:
-	$(MAKE) build TARGET_GOOS=windows TARGET_GOARCH=amd64
+	$(MAKE) build TARGET_GOOS=windows TARGET_GOARCH=amd64 TAGS=slirp_gvisor
 
 build-darwin-amd64:
 	$(MAKE) build TARGET_GOOS=darwin TARGET_GOARCH=amd64
