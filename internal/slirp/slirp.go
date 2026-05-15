@@ -35,6 +35,10 @@ type Slirp struct {
 	// needing extra plumbing, and so Close() can tear down host listeners.
 	portfwd *PortFwdRegistry
 
+	// udpFlows tracks active outbound UDP NAT entries so the idle janitor
+	// can prune dead sessions.
+	udpFlows *udpFlowTable
+
 	// stats — exposed for testing & operator debugging.
 	stats Stats
 }
@@ -55,9 +59,10 @@ type Stats struct {
 // across goroutines.
 func New() *Slirp {
 	return &Slirp{
-		rxQueue: make(chan []byte, 256),
-		done:    make(chan struct{}),
-		portfwd: NewPortFwdRegistry(),
+		rxQueue:  make(chan []byte, 256),
+		done:     make(chan struct{}),
+		portfwd:  NewPortFwdRegistry(),
+		udpFlows: newUDPFlowTable(),
 	}
 }
 
@@ -90,6 +95,9 @@ func (s *Slirp) Close() error {
 		return nil
 	}
 	close(s.done)
+	if s.udpFlows != nil {
+		s.udpFlows.closeAll()
+	}
 	if s.portfwd != nil {
 		s.portfwd.closeAll()
 	}
