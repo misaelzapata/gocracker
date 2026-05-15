@@ -5,6 +5,70 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+### Added — Windows / WHP port (2026-05-16 — Sprint C+D+E)
+- **`gocracker.exe run` works on Windows** (`cmd/gocracker/main_windows.go`)
+  — un-stubbed via `BootLinuxOnWHP`. Flags mirror the Linux CLI;
+  jailer/seccomp/hostnet are stubbed for Windows. Subcommands not yet
+  ported (`build`, `compose`, `snapshot`, `migrate`, `serve`) print
+  a clear "not yet supported on Windows" message and exit 2.
+- **Snapshot v2 portable envelope** (`pkg/vmm/snapshot_v2.go`) —
+  versioned `{ Version, Hypervisor, Arch, VCPUs[], Devices[], Memory,
+  Meta }` envelope with opaque `ExtendedState` blobs. v1 round-trip
+  unchanged on Linux/KVM. v2 emission auto-detected when source is
+  WHP (`marshalSnapshotForSource` dispatcher in migration.go).
+  Same-hypervisor save/restore guaranteed; cross-hypervisor migration
+  (KVM↔WHP MSR layouts differ) remains out of scope.
+- **virtio-fs in-process FUSE server** (`internal/sharedfs/fs_inproc.go`)
+  — handwritten FUSE protocol decoder with 18 ops (INIT/LOOKUP/GETATTR/
+  READ/WRITE/OPEN/RELEASE/OPENDIR/READDIR/CREATE/UNLINK/RMDIR/MKDIR/
+  RENAME/SETATTR/SYMLINK/READLINK/LINK/STATFS). No external
+  `virtiofsd` process needed on Windows.
+- **winsandbox** (`internal/winsandbox/winsandbox_windows.go` +
+  `internal/sandbox/`) — Windows Job Object + restricted token + low-
+  integrity SID + ASLR/DEP/CFG mitigations. Cross-platform
+  `internal/sandbox.Config{MemoryLimitBytes, CPUShares, WorkingDir,
+  NoNetwork, KillOnParentExit}.Apply()` interface; Linux wraps
+  jailer, Windows wraps winsandbox.
+- **`gocracker-vmm.exe` on Windows** (`cmd/gocracker-vmm/main_windows.go`
+  + `mlockall_windows.go`) — minimal-shim REST API server bound to
+  AF_UNIX (Win10 1803+) or TCP. Firecracker subset:
+  `GET /`, `PUT /machine-config`, `PUT /boot-source`,
+  `PUT /drives/rootfs`, `PUT /actions`. Best-effort
+  `SetProcessWorkingSetSizeEx` mlockall, opt-out via
+  `GOCRACKER_NO_MLOCK=1`.
+- **Dockerfile RUN controlled-stub on Windows**
+  (`internal/dockerfile/rootless_windows.go`) — prints clear warning
+  + returns success so the rest of the build proceeds. Strict mode
+  via `GOCRACKER_WINDOWS_RUN_STRICT=1`. Real throwaway-microVM
+  executor is a follow-up.
+- **Pure-Go L2 switch + per-project DNS**
+  (`internal/stacknet/process_switch.go`, `dns_inproc.go`) — MAC-
+  learning Ethernet switch for in-process VM↔VM Compose networking;
+  minimal RFC-correct DNS server resolving
+  `<svc>.<project>.compose.local`. Cross-platform (Linux + Windows
+  + darwin).
+- **WHP dirty-bitmap binding** (`internal/whp/dirtybitmap_windows.go`)
+  — `WHvQueryGpaRangeDirtyBitmap` wired through
+  `whpVM.QueryDirtyBitmap`. Live migration on Windows now has a
+  functional dirty-page query path.
+- **Windows release pipeline**
+  (`.github/workflows/release.yml` + `Makefile`) —
+  `make release-windows-amd64` packages all 8 .exe binaries into
+  `gocracker-windows-amd64.zip`. Release workflow now has a
+  `windows-amd64` matrix leg with `slirp_gvisor` tag enabled.
+- **`gocracker-sandboxd.exe` builds on Windows**
+  (`sandboxes/cmd/gocracker-sandboxd`) — the cmd binary cross-
+  compiles; internal `pool`/`sandboxd`/`templates` packages gated
+  Linux-only with documented `ErrUnsupported` stubs for Windows
+  callers. Full runtime parity follows.
+
+### Changed — Windows / WHP port (2026-05-16)
+- `Makefile` `NONLINUX_VET_PKGS` allowlist broadened to cover
+  `internal/sharedfs`, `internal/winsandbox`, `internal/sandbox`,
+  `internal/stacknet`. `.github/workflows/windows.yml` mirrors.
+- `pkg/warmcache/cache_test.go` uses `filepath.Join` for OS-native
+  separators (fix for Windows test runner).
+
 ### Added — Windows / WHP port (2026-05-15)
 - **HPET emulation** (`pkg/vmm/hpet_windows.go`) — 10 MHz 64-bit
   counter at 0xFED00000 with 3 timers and a monotonic counter read
