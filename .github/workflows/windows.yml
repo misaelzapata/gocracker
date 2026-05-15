@@ -62,6 +62,11 @@ jobs:
           # casts that vet's unsafeptr analyzer flags. The memory comes from
           # VirtualAlloc and is not Go-managed, so the cast is safe.
           go vet -unsafeptr=false ./internal/whp/...
+          # Allow-list mirrors $(NONLINUX_VET_PKGS) in the Makefile so the
+          # native-Windows runner and the linux→windows cross-compile stay
+          # in lockstep. Sprint B/C/D added internal/sharedfs,
+          # internal/winsandbox, internal/sandbox, and internal/stacknet —
+          # all four cross-compile clean and ship in the Windows binaries.
           go vet `
             ./internal/paths/... `
             ./internal/slirp/... `
@@ -75,6 +80,10 @@ jobs:
             ./internal/log/... `
             ./internal/seccomp/... `
             ./internal/firecrackerapi/... `
+            ./internal/sharedfs/... `
+            ./internal/winsandbox/... `
+            ./internal/sandbox/... `
+            ./internal/stacknet/... `
             ./pkg/vmm/... `
             ./cmd/gocracker/... `
             ./cmd/gocracker-vmm/... `
@@ -106,6 +115,10 @@ jobs:
             ./internal/log/... `
             ./internal/seccomp/... `
             ./internal/firecrackerapi/... `
+            ./internal/sharedfs/... `
+            ./internal/winsandbox/... `
+            ./internal/sandbox/... `
+            ./internal/stacknet/... `
             ./pkg/vmm/...
       - name: go build gocracker.exe (stub on Windows)
         run: go build -o gocracker.exe ./cmd/gocracker

@@ -23,7 +23,7 @@ VERSION_LDFLAGS = -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
                   -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
                   -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: all build build-amd64 build-arm64 build-windows-amd64 build-darwin-amd64 build-darwin-arm64 generate tidy test test-smoke test-uds coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs kernel-guest-arm64 kernel-guest-arm64-minimal kernel-unpack hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed vet-cross
+.PHONY: all build build-amd64 build-arm64 build-windows-amd64 build-darwin-amd64 build-darwin-arm64 release-windows-amd64 generate tidy test test-smoke test-uds coverage clean kernel-host kernel-host-virtiofs kernel-guest kernel-guest-virtiofs kernel-guest-arm64 kernel-guest-arm64-minimal kernel-unpack hostcheck sandboxes-local sandboxes-local-down sandboxes-local-status sandboxes-local-logs sandboxes-local-seed vet-cross
 
 all: build
 
@@ -72,6 +72,20 @@ build-darwin-amd64:
 build-darwin-arm64:
 	$(MAKE) build TARGET_GOOS=darwin TARGET_GOARCH=arm64
 
+## Produce a versioned zip with all eight Windows binaries laid out under
+## dist/windows-amd64/. The `|| true` on the cp guards against partial
+## build trees (e.g. `make build-windows-amd64` aborted before producing
+## one of the eight); the zip step still runs and the missing artifact is
+## obvious from the resulting archive contents. Used by the Windows leg
+## of the release workflow and reproducible locally via:
+##   make release-windows-amd64
+release-windows-amd64: build-windows-amd64
+	@mkdir -p dist/windows-amd64
+	@cp gocracker.exe gocracker-vmm.exe gocracker-whp.exe gocracker-jailer.exe \
+	    gocracker-hostcheck.exe gocracker-toolbox.exe toolbox-cli.exe debugvm.exe \
+	    dist/windows-amd64/ || true
+	@cd dist/windows-amd64 && zip -r ../../gocracker-windows-amd64.zip .
+
 ## Run go vet across every supported GOOS/GOARCH so the tree never goes red on
 ## a cross-compile silently. Each invocation is independent so a regression on
 ## one target doesn't mask others.
@@ -94,6 +108,10 @@ NONLINUX_VET_PKGS = \
   ./internal/seccomp/... \
   ./internal/firecrackerapi/... \
   ./internal/whp/... \
+  ./internal/sharedfs/... \
+  ./internal/winsandbox/... \
+  ./internal/sandbox/... \
+  ./internal/stacknet/... \
   ./pkg/vmm/... \
   ./cmd/gocracker/... \
   ./cmd/gocracker-vmm/... \
