@@ -12,7 +12,9 @@ import (
 // it drops into virtio.NewNetDeviceWithBackend wherever a TAP fd would have
 // gone. The MVP scope (this branch) handles ARP, DHCPv4 and ICMP echo to
 // the gateway, plus UDP outbound NAT incl. DNS forwarding. TCP outbound
-// NAT is stubbed (drops with logged metric).
+// NAT is conditionally compiled: the default build drops TCP frames and
+// bumps a metric, while -tags=slirp_gvisor drops in a real gVisor netstack
+// for full outbound + port-forward support.
 type Slirp struct {
 	// rxQueue carries fully-formed Ethernet frames (with the 12-byte
 	// virtio_net_hdr prefix) destined for the guest. It's drained by
@@ -34,6 +36,11 @@ type Slirp struct {
 	// by the Slirp instance so the TCP dispatcher can consult it without
 	// needing extra plumbing, and so Close() can tear down host listeners.
 	portfwd *PortFwdRegistry
+
+	// tcp is the per-instance TCP backend state. With the default build
+	// tag it's an empty struct (handleTCP is a stub); with slirp_gvisor
+	// it holds the gVisor stack + channel endpoint.
+	tcp *tcpStack
 
 	// udpFlows tracks active outbound UDP NAT entries so the idle janitor
 	// can prune dead sessions.
@@ -58,12 +65,14 @@ type Stats struct {
 // New creates a fresh Slirp engine. The returned value is safe to share
 // across goroutines.
 func New() *Slirp {
-	return &Slirp{
+	s := &Slirp{
 		rxQueue:  make(chan []byte, 256),
 		done:     make(chan struct{}),
 		portfwd:  NewPortFwdRegistry(),
 		udpFlows: newUDPFlowTable(),
 	}
+	s.tcpInit()
+	return s
 }
 
 // PortFwd exposes the port-forwarding registry so operators can register
@@ -101,6 +110,7 @@ func (s *Slirp) Close() error {
 	if s.portfwd != nil {
 		s.portfwd.closeAll()
 	}
+	s.tcpClose()
 	s.mu.Lock()
 	for _, fn := range s.onClose {
 		fn()
@@ -214,10 +224,10 @@ func (s *Slirp) handleIPv4(body []byte, eth ethHeader) {
 	case ipProtoICMP:
 		s.handleICMP(ip, eth)
 	case ipProtoTCP:
-		// TCP NAT is the next chunk of work. Until then, drop and
-		// count — guests will see RST-equivalent silence and either
-		// fall back to UDP or retry. See docs/design/slirp-tcp.md.
-		s.stats.TCPDropped.Add(1)
+		// Pass the IPv4 packet (header + TCP payload) to handleTCP.
+		// Default build: counts & drops. slirp_gvisor build: injects
+		// into the gVisor stack for full TCP NAT.
+		s.handleTCP(body)
 	default:
 		s.stats.UnknownDrop.Add(1)
 	}
