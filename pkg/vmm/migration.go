@@ -341,9 +341,9 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 }
 
 func captureSnapshotState(m *VM) (*Snapshot, error) {
-	vcpuStates := make([]VCPUState, 0, len(m.vcpus))
-	for _, vcpu := range m.vcpus {
-		state, err := m.archBackend.captureVCPU(vcpu)
+	vcpuStates := make([]VCPUState, 0, len(m.hvVCPUs))
+	for _, hvcpu := range m.hvVCPUs {
+		state, err := m.archBackend.captureVCPU(hvcpu)
 		if err != nil {
 			return nil, err
 		}

@@ -453,14 +453,14 @@ func New(cfg Config) (*VM, error) {
 	}
 
 	if m.archBackend.setupVCPUsInParallel() {
-		vcpuErrs := make([]error, len(m.vcpus))
+		vcpuErrs := make([]error, len(m.hvVCPUs))
 		var vcpuWG sync.WaitGroup
-		for i, vcpu := range m.vcpus {
+		for i, hvcpu := range m.hvVCPUs {
 			vcpuWG.Add(1)
-			go func(i int, vcpu *kvm.VCPU) {
+			go func(i int, hvcpu HVVCPU) {
 				defer vcpuWG.Done()
-				vcpuErrs[i] = m.archBackend.setupVCPU(m, vcpu, i, kernelInfo)
-			}(i, vcpu)
+				vcpuErrs[i] = m.archBackend.setupVCPU(m, hvcpu, i, kernelInfo)
+			}(i, hvcpu)
 		}
 		vcpuWG.Wait()
 		for _, err := range vcpuErrs {
@@ -469,13 +469,13 @@ func New(cfg Config) (*VM, error) {
 			}
 		}
 	} else {
-		for i, vcpu := range m.vcpus {
-			if err := m.archBackend.setupVCPU(m, vcpu, i, kernelInfo); err != nil {
+		for i, hvcpu := range m.hvVCPUs {
+			if err := m.archBackend.setupVCPU(m, hvcpu, i, kernelInfo); err != nil {
 				return nil, err
 			}
 		}
 	}
-	m.events.Emit(EventCPUConfigured, fmt.Sprintf("%d vCPU(s) configured", len(m.vcpus)))
+	m.events.Emit(EventCPUConfigured, fmt.Sprintf("%d vCPU(s) configured", len(m.hvVCPUs)))
 
 	gclog.VMM.Info("vm created", "id", cfg.ID, "mem_mb", cfg.MemMB, "vcpus", cfg.VCPUs)
 	return m, nil
@@ -1396,7 +1396,7 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	if err := m.archBackend.setupIRQs(m); err != nil {
 		return nil, fmt.Errorf("restore irqs: %w", err)
 	}
-	if err := m.archBackend.restoreVMState(kvmVM, snap.Arch); err != nil {
+	if err := m.archBackend.restoreVMState(m.hvVM, snap.Arch); err != nil {
 		return nil, fmt.Errorf("restore vm arch state: %w", err)
 	}
 
@@ -1429,7 +1429,7 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 	// defaults and partially succeed — leaving secondaries with an ICC
 	// interface whose SRE bit disagrees with the guest's view. Firecracker
 	// orders restore as: vcpu_fd.restore_state → vm.restore_state(gic).
-	for i, vcpu := range m.vcpus {
+	for i, hvcpu := range m.hvVCPUs {
 		// restoreVCPU already swallows the expected kvmclock-ctrl EINVAL
 		// inline (arch_x86.go:96) and returns nil in that case. Doing a
 		// second isIgnorableKVMClockCtrlError check here is WRONG: it was
@@ -1440,7 +1440,7 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		// callers as "exec agent broker is closed" / "connection timed
 		// out". Let every non-nil error propagate so real failures are
 		// loud instead of silent.
-		if err := m.archBackend.restoreVCPU(sys, kvmVM, vcpu, vcpuStates[i]); err != nil {
+		if err := m.archBackend.restoreVCPU(m.hv, m.hvVM, hvcpu, vcpuStates[i]); err != nil {
 			return nil, fmt.Errorf("restore vcpu %d: %w", i, err)
 		}
 	}
@@ -2078,7 +2078,7 @@ func (m *VM) runLoop(vcpu *kvm.VCPU, hvvcpu HVVCPU) {
 				m.handleMMIO(vcpu)
 
 			case ExitReasonSystemEvent:
-				if handled, stop, err := m.archBackend.handleExit(m, vcpu); err != nil {
+				if handled, stop, err := m.archBackend.handleExit(m, hvvcpu); err != nil {
 					gclog.VMM.Error("arch exit handling failed", "id", m.cfg.ID, "vcpu", vcpu.ID, "error", err)
 					m.events.Emit(EventError, fmt.Sprintf("arch-specific exit handling on vcpu %d: %v", vcpu.ID, err))
 					m.Stop()

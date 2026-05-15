@@ -39,8 +39,21 @@ func (x86MachineBackend) setupVCPUsInParallel() bool {
 	return true
 }
 
-func (x86MachineBackend) setupVCPU(vm *VM, vcpu *kvm.VCPU, index int, kernelInfo *loader.KernelInfo) error {
-	if err := kvm.SetupCPUID(vm.kvmSys, vcpu); err != nil {
+func (x86MachineBackend) setupVCPU(vm *VM, hvcpu HVVCPU, index int, kernelInfo *loader.KernelInfo) error {
+	kvcpu, ok := hvcpu.(*kvmVCPU)
+	if !ok {
+		return fmt.Errorf("arch_x86 setupVCPU: expected *kvmVCPU, got %T", hvcpu)
+	}
+	vcpu := kvcpu.vcpu
+	kvmVM, err := kvmVMFromHV(vm.hvVM)
+	if err != nil {
+		return fmt.Errorf("arch_x86 setupVCPU: %w", err)
+	}
+	kvmSys, err := kvmSysFromHV(vm.hv)
+	if err != nil {
+		return fmt.Errorf("arch_x86 setupVCPU: %w", err)
+	}
+	if err := kvm.SetupCPUID(kvmSys, vcpu); err != nil {
 		return fmt.Errorf("cpuid setup vcpu %d: %w", index, err)
 	}
 	if err := kvm.SetupMSRs(vcpu); err != nil {
@@ -49,7 +62,7 @@ func (x86MachineBackend) setupVCPU(vm *VM, vcpu *kvm.VCPU, index int, kernelInfo
 	if err := kvm.SetupFPU(vcpu); err != nil {
 		return fmt.Errorf("fpu setup vcpu %d: %w", index, err)
 	}
-	if err := kvm.SetupLongMode(vcpu, vm.kvmVM.Memory(), kernelInfo.EntryPoint, PageTableBase, BootParamsAddr); err != nil {
+	if err := kvm.SetupLongMode(vcpu, kvmVM.Memory(), kernelInfo.EntryPoint, PageTableBase, BootParamsAddr); err != nil {
 		return fmt.Errorf("cpu setup vcpu %d: %w", index, err)
 	}
 	if err := kvm.SetupLAPIC(vcpu); err != nil {
@@ -58,11 +71,24 @@ func (x86MachineBackend) setupVCPU(vm *VM, vcpu *kvm.VCPU, index int, kernelInfo
 	return nil
 }
 
-func (x86MachineBackend) captureVCPU(vcpu *kvm.VCPU) (VCPUState, error) {
-	return captureVCPUState(vcpu)
+func (x86MachineBackend) captureVCPU(hvcpu HVVCPU) (VCPUState, error) {
+	kvcpu, ok := hvcpu.(*kvmVCPU)
+	if !ok {
+		return VCPUState{}, fmt.Errorf("arch_x86 captureVCPU: expected *kvmVCPU, got %T", hvcpu)
+	}
+	return captureVCPUState(kvcpu.vcpu)
 }
 
-func (x86MachineBackend) restoreVCPU(sys *kvm.System, _ *kvm.VM, vcpu *kvm.VCPU, state VCPUState) error {
+func (x86MachineBackend) restoreVCPU(hv Hypervisor, _ HVVM, hvcpu HVVCPU, state VCPUState) error {
+	kvcpu, ok := hvcpu.(*kvmVCPU)
+	if !ok {
+		return fmt.Errorf("arch_x86 restoreVCPU: expected *kvmVCPU, got %T", hvcpu)
+	}
+	vcpu := kvcpu.vcpu
+	sys, err := kvmSysFromHV(hv)
+	if err != nil {
+		return fmt.Errorf("arch_x86 restoreVCPU: %w", err)
+	}
 	x86State := state.normalizedX86()
 	// Mirror Firecracker's VcpuState::restore order (src/vstate/vcpu/src/x86_64.rs):
 	//   CPUID → MSRs → XSAVE → XCRs → DEBUGREGS → LAPIC → MP_STATE → REGS
@@ -161,7 +187,11 @@ func (x86MachineBackend) captureVMState(vm *VM) (*SnapshotArchState, error) {
 	return captureVMArchState(vm)
 }
 
-func (x86MachineBackend) restoreVMState(kvmVM *kvm.VM, arch *SnapshotArchState) error {
+func (x86MachineBackend) restoreVMState(hvVM HVVM, arch *SnapshotArchState) error {
+	kvmVM, err := kvmVMFromHV(hvVM)
+	if err != nil {
+		return fmt.Errorf("arch_x86 restoreVMState: %w", err)
+	}
 	return restoreVMArchState(kvmVM, arch)
 }
 
@@ -172,7 +202,7 @@ func (x86MachineBackend) restoreVMStatePostIRQ(_ *VM, _ *SnapshotArchState) erro
 	return nil
 }
 
-func (x86MachineBackend) handleExit(_ *VM, _ *kvm.VCPU) (handled bool, stop bool, err error) {
+func (x86MachineBackend) handleExit(_ *VM, _ HVVCPU) (handled bool, stop bool, err error) {
 	return false, false, nil
 }
 

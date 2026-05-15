@@ -20,6 +20,36 @@ type kvmHypervisor struct {
 	sys *kvm.System
 }
 
+// kvmVMFromHV unwraps an HVVM into the underlying *kvm.VM. The arch_*
+// adapters use this when they need KVM-specific extensions (memory, GIC,
+// PIT2, IRQChip, GSI routing, virtio-fs memfd...) that the portable HVVM
+// interface deliberately does NOT expose. Type-assertion only — never
+// imported from outside pkg/vmm.
+func kvmVMFromHV(hv HVVM) (*kvm.VM, error) {
+	if hv == nil {
+		return nil, fmt.Errorf("kvmVMFromHV: hvVM is nil")
+	}
+	kvm, ok := hv.(*hvvmKVM)
+	if !ok {
+		return nil, fmt.Errorf("kvmVMFromHV: expected *hvvmKVM, got %T", hv)
+	}
+	return kvm.vm, nil
+}
+
+// kvmSysFromHV unwraps a Hypervisor into the underlying *kvm.System. Used by
+// arch_x86 setupCPUID/restoreVCPU which call KVM-system-level helpers that
+// have no portable equivalent.
+func kvmSysFromHV(hv Hypervisor) (*kvm.System, error) {
+	if hv == nil {
+		return nil, fmt.Errorf("kvmSysFromHV: hv is nil")
+	}
+	kvm, ok := hv.(*kvmHypervisor)
+	if !ok {
+		return nil, fmt.Errorf("kvmSysFromHV: expected *kvmHypervisor, got %T", hv)
+	}
+	return kvm.sys, nil
+}
+
 // NewKVMHypervisor opens /dev/kvm and returns a Hypervisor backed by KVM.
 // Linux-only; non-Linux builds fall through to NewUnsupportedHypervisor
 // (see hypervisor_unsupported.go).

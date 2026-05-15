@@ -5,7 +5,6 @@ package vmm
 import (
 	"fmt"
 
-	"github.com/gocracker/gocracker/internal/kvm"
 	"github.com/gocracker/gocracker/internal/loader"
 )
 
@@ -15,17 +14,17 @@ type machineArchBackend interface {
 	loadKernel(*VM) (*loader.KernelInfo, error)
 	postCreateVCPUs(*VM) error
 	setupVCPUsInParallel() bool
-	setupVCPU(*VM, *kvm.VCPU, int, *loader.KernelInfo) error
-	captureVCPU(*kvm.VCPU) (VCPUState, error)
-	restoreVCPU(*kvm.System, *kvm.VM, *kvm.VCPU, VCPUState) error
+	setupVCPU(*VM, HVVCPU, int, *loader.KernelInfo) error
+	captureVCPU(HVVCPU) (VCPUState, error)
+	restoreVCPU(Hypervisor, HVVM, HVVCPU, VCPUState) error
 	captureVMState(*VM) (*SnapshotArchState, error)
-	restoreVMState(*kvm.VM, *SnapshotArchState) error
+	restoreVMState(HVVM, *SnapshotArchState) error
 	// restoreVMStatePostIRQ runs AFTER postCreateVCPUs, so the interrupt
 	// controller (x86 IRQCHIP already up, arm64 VGIC just created) exists.
 	// Needed on ARM64 because the VGIC cannot be restored before it is
 	// created; no-op on x86.
 	restoreVMStatePostIRQ(*VM, *SnapshotArchState) error
-	handleExit(*VM, *kvm.VCPU) (handled bool, stop bool, err error)
+	handleExit(*VM, HVVCPU) (handled bool, stop bool, err error)
 	deviceList(*VM) []DeviceInfo
 	consoleOutput(*VM) []byte
 }
