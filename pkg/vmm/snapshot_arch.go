@@ -2,7 +2,12 @@
 
 package vmm
 
-import "github.com/gocracker/gocracker/internal/kvm"
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/gocracker/gocracker/internal/kvm"
+)
 
 // X86VCPUState stores the amd64-specific vCPU state needed for
 // snapshot/restore and migration.
@@ -194,5 +199,197 @@ func (s *SnapshotArchState) normalizedX86() *X86MachineState {
 		Clock:    s.Clock,
 		PIT2:     s.PIT2,
 		IRQChips: append([]kvm.IRQChip(nil), s.IRQChips...),
+	}
+}
+
+// SnapshotArchStateV2 is an alias documenting that the existing
+// SnapshotArchState type can be embedded inside a SnapshotV2.Meta
+// blob (JSON-encoded) when the migration tool wants to keep the
+// legacy in-kernel-device state alongside the portable envelope.
+// Same-hypervisor restores read it back via this alias.
+type SnapshotArchStateV2 = SnapshotArchState
+
+// kvmX86VCPUExtendedState is the per-vCPU blob format the KVM backend
+// stores in PortableVCPUState.ExtendedState. It carries everything the
+// portable Registers / SegmentRegisters fields don't already cover —
+// MP state, LAPIC, MSRs, XSAVE/XCRs, VCPU events, debug regs, and the
+// TSC frequency.
+//
+// Forward compatibility: a destination running an older binary that
+// doesn't understand a new field will simply leave it zero on
+// unmarshal; backwards compatibility goes the other way (a new binary
+// reading an older blob sees zero for fields the old encoder didn't
+// emit). Both are acceptable because the restore path already handles
+// nil LAPIC / empty MSRs as "skip".
+type kvmX86VCPUExtendedState struct {
+	MPState     kvm.MPState     `json:"mp_state"`
+	LAPIC       *kvm.LAPICState `json:"lapic,omitempty"`
+	MSRs        []kvm.MSREntry  `json:"msrs,omitempty"`
+	TSCDeadline uint64          `json:"tsc_deadline,omitempty"`
+	FPU         *kvm.FPUState   `json:"fpu,omitempty"`
+	XSAVE       *kvm.XSaveState `json:"xsave,omitempty"`
+	XCRs        *kvm.XCRsState  `json:"xcrs,omitempty"`
+	VCPUEvents  *kvm.VCPUEvents `json:"vcpu_events,omitempty"`
+	DebugRegs   *kvm.DebugRegs  `json:"debug_regs,omitempty"`
+	TSCKHz      uint32          `json:"tsc_khz,omitempty"`
+}
+
+// kvmARM64VCPUExtendedState is the per-vCPU blob format the KVM/arm64
+// backend stores in PortableVCPUState.ExtendedState. arm64 doesn't
+// fit the x86 portable Registers/Sregs shape, so on arm64 the
+// portable fields stay zero and the entire register state lives
+// here.
+type kvmARM64VCPUExtendedState struct {
+	CoreRegs     map[uint64]uint64   `json:"core_regs,omitempty"`
+	FPSIMDRegs   map[uint64][16]byte `json:"fpsimd_regs,omitempty"`
+	FPStatusRegs map[uint64]uint32   `json:"fp_status_regs,omitempty"`
+	SysRegs      map[uint64]uint64   `json:"sys_regs,omitempty"`
+	OtherRegs    map[uint64]uint64   `json:"other_regs,omitempty"`
+	MPState      uint32              `json:"mp_state"`
+}
+
+// EncodeKVMX86ExtendedState turns the KVM-shaped per-vCPU state into a
+// SnapshotV2 ExtendedState blob. Lives next to its decoder so the
+// pair is reviewed together.
+func EncodeKVMX86ExtendedState(x X86VCPUState) ([]byte, error) {
+	blob := kvmX86VCPUExtendedState{
+		MPState:     x.MPState,
+		LAPIC:       x.LAPIC,
+		MSRs:        x.MSRs,
+		TSCDeadline: x.TSCDeadline,
+		FPU:         x.FPU,
+		XSAVE:       x.XSAVE,
+		XCRs:        x.XCRs,
+		VCPUEvents:  x.VCPUEvents,
+		DebugRegs:   x.DebugRegs,
+		TSCKHz:      x.TSCKHz,
+	}
+	return json.Marshal(&blob)
+}
+
+// DecodeKVMX86ExtendedState parses a KVM-source ExtendedState blob.
+// Empty input is allowed (returns zero state) so a partial v2
+// envelope without extended state doesn't fail the restore.
+func DecodeKVMX86ExtendedState(data []byte) (X86VCPUState, error) {
+	if len(data) == 0 {
+		return X86VCPUState{}, nil
+	}
+	var blob kvmX86VCPUExtendedState
+	if err := json.Unmarshal(data, &blob); err != nil {
+		return X86VCPUState{}, fmt.Errorf("DecodeKVMX86ExtendedState: %w", err)
+	}
+	return X86VCPUState{
+		MPState:     blob.MPState,
+		LAPIC:       blob.LAPIC,
+		MSRs:        blob.MSRs,
+		TSCDeadline: blob.TSCDeadline,
+		FPU:         blob.FPU,
+		XSAVE:       blob.XSAVE,
+		XCRs:        blob.XCRs,
+		VCPUEvents:  blob.VCPUEvents,
+		DebugRegs:   blob.DebugRegs,
+		TSCKHz:      blob.TSCKHz,
+	}, nil
+}
+
+// EncodeKVMARM64ExtendedState turns the KVM-shaped arm64 per-vCPU
+// state into a SnapshotV2 ExtendedState blob.
+func EncodeKVMARM64ExtendedState(a ARM64VCPUState) ([]byte, error) {
+	blob := kvmARM64VCPUExtendedState{
+		CoreRegs:     a.CoreRegs,
+		FPSIMDRegs:   a.FPSIMDRegs,
+		FPStatusRegs: a.FPStatusRegs,
+		SysRegs:      a.SysRegs,
+		OtherRegs:    a.OtherRegs,
+		MPState:      a.MPState,
+	}
+	return json.Marshal(&blob)
+}
+
+// DecodeKVMARM64ExtendedState parses a KVM-source arm64
+// ExtendedState blob.
+func DecodeKVMARM64ExtendedState(data []byte) (ARM64VCPUState, error) {
+	if len(data) == 0 {
+		return ARM64VCPUState{}, nil
+	}
+	var blob kvmARM64VCPUExtendedState
+	if err := json.Unmarshal(data, &blob); err != nil {
+		return ARM64VCPUState{}, fmt.Errorf("DecodeKVMARM64ExtendedState: %w", err)
+	}
+	return ARM64VCPUState{
+		CoreRegs:     blob.CoreRegs,
+		FPSIMDRegs:   blob.FPSIMDRegs,
+		FPStatusRegs: blob.FPStatusRegs,
+		SysRegs:      blob.SysRegs,
+		OtherRegs:    blob.OtherRegs,
+		MPState:      blob.MPState,
+	}, nil
+}
+
+// vcpuStateToPortable turns a Linux/KVM VCPUState into a
+// PortableVCPUState. The hypervisor's native shapes get folded into
+// the portable Registers/Sregs + ExtendedState pair.
+//
+// On amd64: Regs/Sregs come straight from the KVM uapi types (binary
+// layout is intentionally identical to portable Registers). The
+// ExtendedState carries the LAPIC + MSRs + XSAVE blob.
+//
+// On arm64: Registers and Sregs stay zero; ExtendedState carries the
+// full per-vCPU register map.
+func vcpuStateToPortable(vs VCPUState) (PortableVCPUState, error) {
+	out := PortableVCPUState{Index: uint32(vs.ID)}
+	switch {
+	case vs.X86 != nil:
+		x := vs.normalizedX86()
+		out.GPRs = Registers(x.Regs)
+		out.Sregs = sregsFromKVM(x.Sregs)
+		blob, err := EncodeKVMX86ExtendedState(x)
+		if err != nil {
+			return PortableVCPUState{}, err
+		}
+		out.ExtendedState = blob
+	case vs.ARM64 != nil:
+		blob, err := EncodeKVMARM64ExtendedState(*vs.ARM64)
+		if err != nil {
+			return PortableVCPUState{}, err
+		}
+		out.ExtendedState = blob
+	default:
+		// Legacy flat snapshot (pre-v3 shape): synthesize an X86 view.
+		x := vs.normalizedX86()
+		out.GPRs = Registers(x.Regs)
+		out.Sregs = sregsFromKVM(x.Sregs)
+		blob, err := EncodeKVMX86ExtendedState(x)
+		if err != nil {
+			return PortableVCPUState{}, err
+		}
+		out.ExtendedState = blob
+	}
+	return out, nil
+}
+
+// portableToVCPUState turns a PortableVCPUState back into the
+// KVM-shaped VCPUState the existing restore path consumes. arch
+// selects which decoder runs ("amd64" / "arm64"); empty arch defaults
+// to amd64 for backward compatibility with the historical x86-only
+// snapshots.
+func portableToVCPUState(p PortableVCPUState, arch string) (VCPUState, error) {
+	switch arch {
+	case SnapshotArchARM64:
+		a, err := DecodeKVMARM64ExtendedState(p.ExtendedState)
+		if err != nil {
+			return VCPUState{}, err
+		}
+		return VCPUState{ID: int(p.Index), ARM64: &a}, nil
+	case SnapshotArchAMD64, "":
+		x, err := DecodeKVMX86ExtendedState(p.ExtendedState)
+		if err != nil {
+			return VCPUState{}, err
+		}
+		x.Regs = kvm.Regs(p.GPRs)
+		x.Sregs = sregsToKVM(p.Sregs)
+		return newX86VCPUState(int(p.Index), x), nil
+	default:
+		return VCPUState{}, fmt.Errorf("portableToVCPUState: unknown arch %q", arch)
 	}
 }

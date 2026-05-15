@@ -57,15 +57,94 @@ func CreateMigrationBundle(vm *VM, dir string) (*Snapshot, error) {
 }
 
 // RestoreMigrationBundle restores a VM from a migration bundle directory.
+// Accepts either a legacy v1 snapshot.json or a portable v2 envelope; the
+// format is detected by probeSnapshotVersion on the snapshot.json header.
 func RestoreMigrationBundle(dir string, opts RestoreOptions) (*VM, error) {
 	if err := ApplyMigrationPatches(dir); err != nil {
 		return nil, err
 	}
-	snap, err := readSnapshot(dir)
+	snap, err := readSnapshotAny(dir)
 	if err != nil {
 		return nil, err
 	}
 	return restoreFromSnapshot(dir, snap, opts)
+}
+
+// readSnapshotAny reads <dir>/snapshot.json and dispatches on the
+// envelope format. v1 (legacy KVM-shaped) is returned via the existing
+// readSnapshot path so the bit-for-bit deserialisation is preserved.
+// v2 (portable envelope) is decoded and translated into the v1 shape
+// the rest of the restore pipeline expects; cross-hypervisor restore
+// is out of scope, so a v2 envelope with Hypervisor != "kvm" is
+// rejected here rather than silently producing wrong state.
+func readSnapshotAny(dir string) (Snapshot, error) {
+	metaFile := filepath.Join(dir, "snapshot.json")
+	data, err := os.ReadFile(metaFile)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("read snapshot: %w", err)
+	}
+	format, err := ProbeSnapshotBytes(data)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("probe snapshot version: %w", err)
+	}
+	switch format {
+	case SnapshotFormatV2:
+		return decodeSnapshotV2(data)
+	default:
+		// Legacy path: unmarshal directly into the existing Snapshot
+		// shape. Identical to the original readSnapshot body so v1
+		// round-trips are bit-identical.
+		var snap Snapshot
+		if err := json.Unmarshal(data, &snap); err != nil {
+			return Snapshot{}, err
+		}
+		return snap, nil
+	}
+}
+
+// decodeSnapshotV2 parses a portable envelope and reconstitutes a
+// Snapshot the existing Linux restore path can consume. The KVM
+// adapter owns the ExtendedState decode; non-KVM envelopes are
+// rejected because the same-hypervisor invariant doesn't hold.
+func decodeSnapshotV2(data []byte) (Snapshot, error) {
+	v2, err := UnmarshalSnapshotV2(data)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if v2.Hypervisor != SnapshotHypervisorKVM {
+		return Snapshot{}, fmt.Errorf("snapshot v2: hypervisor %q not supported on this build (kvm-only)", v2.Hypervisor)
+	}
+	vcpus := make([]VCPUState, 0, len(v2.VCPUs))
+	for _, p := range v2.VCPUs {
+		vs, err := portableToVCPUState(p, v2.Arch)
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("snapshot v2 vcpu %d: %w", p.Index, err)
+		}
+		vcpus = append(vcpus, vs)
+	}
+	snap := Snapshot{
+		Version: 3,
+		ID:      v2.ID,
+		VCPUs:   vcpus,
+		MemFile: migrationMemFile,
+	}
+	if len(vcpus) > 0 && vcpus[0].X86 != nil {
+		legacy := vcpus[0].normalizedX86()
+		snap.Regs = legacy.Regs
+		snap.Sregs = legacy.Sregs
+		snap.MPState = legacy.MPState
+	}
+	// SnapshotArchState may be carried in v2.Meta["arch_state"] as a
+	// JSON blob; this keeps the in-kernel-device state available for
+	// same-hypervisor restores without inflating the envelope schema.
+	if raw, ok := v2.Meta["arch_state"]; ok && raw != "" {
+		var arch SnapshotArchState
+		if err := json.Unmarshal([]byte(raw), &arch); err != nil {
+			return Snapshot{}, fmt.Errorf("snapshot v2 arch_state: %w", err)
+		}
+		snap.Arch = &arch
+	}
+	return snap, nil
 }
 
 // PrepareMigrationBundle creates the pre-copy base bundle while the VM is still
