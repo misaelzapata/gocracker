@@ -49,7 +49,7 @@ func TestWriteTables_RSDTReachableFromRSDP(t *testing.T) {
 	}
 
 	rsdtLen := binary.LittleEndian.Uint32(mem[rsdtAddr+4 : rsdtAddr+8])
-	wantRSDTLen := uint32(36 + 4) // SDT header + one u32 pointer
+	wantRSDTLen := uint32(36 + 4 + 4) // SDT header + MADT pointer + HPET pointer
 	if rsdtLen != wantRSDTLen {
 		t.Fatalf("RSDT length = %d, want %d", rsdtLen, wantRSDTLen)
 	}
@@ -146,5 +146,35 @@ func TestWriteTables_RejectsTooSmall(t *testing.T) {
 	mem := make([]byte, 0xE0000) // ends right before the RSDP slot
 	if err := WriteTables(mem); err == nil {
 		t.Fatal("WriteTables on short buffer: got nil error, want non-nil")
+	}
+}
+
+// TestWriteTables_HPETReachable verifies the HPET table is reachable
+// from the RSDT (second pointer), has the right signature, address,
+// and a zero checksum.
+func TestWriteTables_HPETReachable(t *testing.T) {
+	mem := make([]byte, 1<<20)
+	if err := WriteTables(mem); err != nil {
+		t.Fatalf("WriteTables: %v", err)
+	}
+	rsdtAddr := binary.LittleEndian.Uint32(mem[0xE0000+16 : 0xE0000+20])
+	// Second pointer in RSDT is HPET (offset 40, after the MADT at 36).
+	hpetAddr := binary.LittleEndian.Uint32(mem[rsdtAddr+40 : rsdtAddr+44])
+	if hpetAddr == 0 {
+		t.Fatal("HPET pointer in RSDT is zero")
+	}
+	if got := string(mem[hpetAddr : hpetAddr+4]); got != "HPET" {
+		t.Fatalf("HPET signature = %q, want \"HPET\"", got)
+	}
+	hpetLen := binary.LittleEndian.Uint32(mem[hpetAddr+4 : hpetAddr+8])
+	if hpetLen != 56 {
+		t.Fatalf("HPET length = %d, want 56", hpetLen)
+	}
+	if got := sumMod256(mem[hpetAddr : hpetAddr+hpetLen]); got != 0 {
+		t.Fatalf("HPET checksum sum = %d, want 0", got)
+	}
+	hpetBase := binary.LittleEndian.Uint64(mem[hpetAddr+44 : hpetAddr+52])
+	if hpetBase != 0xFED00000 {
+		t.Fatalf("HPET base = %#x, want 0xFED00000", hpetBase)
 	}
 }

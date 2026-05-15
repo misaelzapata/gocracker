@@ -93,6 +93,7 @@ type WHPBootSession struct {
 	emulator *whp.Emulator
 	blkDev   *VirtioBlk // virtio-blk-mmio (rootfs) — nil if no rootfs configured
 	rngDev   *VirtioRng // virtio-rng-mmio (entropy)
+	hpet     *HPET      // 10 MHz HPET at 0xFED00000 (skips PIT TSC calibration)
 
 	// IRQ lines wired through the 8259 PIC. Each must match the value
 	// in the `virtio_mmio.device=…:N` cmdline parameter.
@@ -318,8 +319,10 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 	session.pci = newPCIConfigDummy()
 	session.pit.SetIRQ0Callback(func() { session.raiseIRQ(0) })
 	session.pic.OnStateChange = session.drainPendingIRQs
-	// REGION:HPET-WIRE — Agent A2 replaces this with the HPET MMIO
-	// registration + IRQ wiring (high-resolution timer at 0xFED00000).
+	// HPET at 0xFED00000. Linux's hpet_enable + hpet_clocksource_register
+	// consumes it via the HPET ACPI table; once registered the kernel
+	// uses HPET as the boot clocksource, skipping PIT TSC calibration.
+	session.hpet = NewHPET(func(irq uint8) { session.raiseIRQ(irq) })
 
 	return session, nil
 }
@@ -494,6 +497,9 @@ func (s *WHPBootSession) mmioAddrHandled(addr uint64) bool {
 	if s.rngDev != nil && s.rngDev.HandlesAddr(addr) {
 		return true
 	}
+	if s.hpet != nil && s.hpet.HandlesAddr(addr) {
+		return true
+	}
 	return false
 }
 
@@ -517,6 +523,9 @@ func (s *WHPBootSession) dispatchMMIOExit(rawCtx *whp.ExitContext) error {
 			} else if s.rngDev != nil && s.rngDev.HandlesAddr(addr) {
 				v = s.rngDev.ReadMMIO(addr, uint32(length))
 				handled = true
+			} else if s.hpet != nil && s.hpet.HandlesAddr(addr) {
+				v = s.hpet.ReadMMIO(addr, uint32(length))
+				handled = true
 			}
 			if !handled {
 				return nil
@@ -536,6 +545,8 @@ func (s *WHPBootSession) dispatchMMIOExit(rawCtx *whp.ExitContext) error {
 				s.blkDev.WriteMMIO(addr, uint32(length), v)
 			} else if s.rngDev != nil && s.rngDev.HandlesAddr(addr) {
 				s.rngDev.WriteMMIO(addr, uint32(length), v)
+			} else if s.hpet != nil && s.hpet.HandlesAddr(addr) {
+				s.hpet.WriteMMIO(addr, uint32(length), v)
 			}
 		},
 	}

@@ -15,9 +15,11 @@ const (
 	wrRSDPAddr uint32 = 0x000E0000
 	wrRSDTAddr uint32 = 0x000E0100
 	wrMADTAddr uint32 = 0x000E0200
+	wrHPETAddr uint32 = 0x000E0300
 
 	rsdpLenACPI1 = 20
 	sdtHeaderLen = 36
+	hpetTableLen = 56
 
 	madtEntryLAPIC       = 0
 	madtEntryIOAPIC      = 1
@@ -30,6 +32,8 @@ const (
 	wrLocalAPICAddr uint32 = 0xFEE00000
 	// I/O APIC default address.
 	wrIOAPICAddr uint32 = 0xFEC00000
+	// HPET default base. Matches pkg/vmm.hpetMMIOBase.
+	wrHPETBase uint64 = 0xFED00000
 )
 
 var (
@@ -57,9 +61,9 @@ var (
 func WriteTables(mem []byte) error {
 	madtLen := sdtHeaderLen + 8 /* LAPIC addr + flags */ +
 		8 /* LAPIC entry */
-	rsdtLen := sdtHeaderLen + 4 /* one u32 pointer to MADT */
+	rsdtLen := sdtHeaderLen + 8 /* two u32 pointers: MADT + HPET */
 
-	required := int(wrMADTAddr) + madtLen
+	required := int(wrHPETAddr) + hpetTableLen
 	if len(mem) < required {
 		return fmt.Errorf("acpi: guest memory %d bytes too small for ACPI tables (need %d)", len(mem), required)
 	}
@@ -75,9 +79,13 @@ func WriteTables(mem []byte) error {
 	for i := 0; i < madtLen; i++ {
 		mem[int(wrMADTAddr)+i] = 0
 	}
+	for i := 0; i < hpetTableLen; i++ {
+		mem[int(wrHPETAddr)+i] = 0
+	}
 
 	writeMADT(mem[wrMADTAddr : int(wrMADTAddr)+madtLen])
-	writeRSDT(mem[wrRSDTAddr:int(wrRSDTAddr)+rsdtLen], wrMADTAddr)
+	writeHPET(mem[wrHPETAddr : int(wrHPETAddr)+hpetTableLen])
+	writeRSDT(mem[wrRSDTAddr:int(wrRSDTAddr)+rsdtLen], wrMADTAddr, wrHPETAddr)
 	writeRSDP(mem[wrRSDPAddr : int(wrRSDPAddr)+rsdpLenACPI1])
 	return nil
 }
@@ -116,9 +124,32 @@ func writeRSDP(buf []byte) {
 	buf[8] = onesComplementChecksum(buf[:rsdpLenACPI1])
 }
 
-func writeRSDT(buf []byte, madtAddr uint32) {
+func writeRSDT(buf []byte, madtAddr, hpetAddr uint32) {
 	writeSDTHeader(buf, "RSDT", uint32(len(buf)), 1)
 	binary.LittleEndian.PutUint32(buf[36:40], madtAddr)
+	binary.LittleEndian.PutUint32(buf[40:44], hpetAddr)
+	buf[9] = onesComplementChecksum(buf)
+}
+
+// writeHPET emits the 56-byte ACPI HPET description table (per ACPI 4.0
+// spec) so Linux discovers the high-resolution timer at 0xFED00000.
+// Without it, Linux falls back to PIT-based TSC calibration which
+// doesn't converge against our software-only PIT counter readbacks.
+func writeHPET(buf []byte) {
+	writeSDTHeader(buf, "HPET", uint32(len(buf)), 1)
+	// Event Timer Block ID — encodes vendor (Intel = 0x8086), revision,
+	// number of timers, and 64-bit support. Mirrors pkg/vmm.hpetCapabilities
+	// low 32 bits.
+	const blockID uint32 = 0x8086A201
+	binary.LittleEndian.PutUint32(buf[36:40], blockID)
+	buf[40] = 0  // Address Space ID: 0 = system memory
+	buf[41] = 64 // Register Bit Width
+	buf[42] = 0  // Register Bit Offset
+	buf[43] = 0  // Reserved
+	binary.LittleEndian.PutUint64(buf[44:52], wrHPETBase)
+	buf[52] = 0  // HPET Number
+	binary.LittleEndian.PutUint16(buf[53:55], 0) // Main Counter Minimum
+	buf[55] = 0  // Page Protection / OEM Attribute
 	buf[9] = onesComplementChecksum(buf)
 }
 

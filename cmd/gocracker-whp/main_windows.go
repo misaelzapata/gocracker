@@ -41,8 +41,8 @@ import (
 
 func main() {
 	memMB := flag.Int("mem", 128, "guest RAM in MiB")
-	cmdline := flag.String("cmdline", "console=ttyS0 earlyprintk=ttyS0 reboot=k panic=1 nomodule tsc_early_khz=2400000 tsc=reliable lpj=10000000 no_timer_check",
-		"kernel command line. tsc_early_khz=N tells the kernel the TSC frequency in kHz up front — skips the PIT-based calibration loop that fails against our software PIT. Adjust to your host CPU's actual TSC rate if precise time matters in the guest.")
+	cmdline := flag.String("cmdline", "console=ttyS0 earlyprintk=ttyS0 reboot=k panic=1",
+		"kernel command line. HPET emulation now provides a high-resolution timer, so the previous tsc_early_khz/tsc=reliable/lpj/no_timer_check workarounds are no longer needed.")
 	initrdPath := flag.String("initrd", "", "optional initramfs / initrd path (CPIO archive)")
 	rootfsPath := flag.String("rootfs", "", "optional ext4 rootfs to attach as /dev/vda via virtio-blk-mmio")
 	rootfsReadOnly := flag.Bool("rootfs-ro", false, "open the rootfs read-only (sets VIRTIO_BLK_F_RO)")
