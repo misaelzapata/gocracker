@@ -3,6 +3,7 @@
 package vmm
 
 import (
+	"encoding/binary"
 	"fmt"
 	"sync"
 
@@ -86,6 +87,20 @@ func (h *whpHypervisor) CreateVM(cfg HVVMConfig) (HVVM, error) {
 
 func (h *whpHypervisor) Close() error { return nil }
 
+// hypervisorIsWHP is the Windows-build detector that migration.go
+// (Linux build) defines as a constant-false stub. The dispatcher in
+// marshalSnapshotForSource calls through this to decide whether a
+// snapshot bundle should be written as v1 (KVM) or v2 (portable / WHP).
+//
+// migration.go currently lives under //go:build linux so this body is
+// never reached from the live Linux migration code path — it exists
+// for the Windows-side migration follow-up and for cross-platform unit
+// tests that build the WHP source vCPU flow.
+func hypervisorIsWHP(hv Hypervisor) bool {
+	_, ok := hv.(*whpHypervisor)
+	return ok
+}
+
 // whpMapping tracks a mapped guest physical range so we can unmap it on
 // Close. The host-side memory it points at is owned by guestMem (if
 // allocated via AllocateGuestRAM) — releasing those is HV-VM-Close's job.
@@ -146,11 +161,30 @@ func (v *whpVM) UnmapMemory(gpa uint64, size uint64) error {
 }
 
 func (v *whpVM) QueryDirtyBitmap(gpa uint64, size uint64, bitmap []byte) error {
-	// WHvQueryGpaRangeDirtyBitmap fills a UINT64 array. Phase 1.2 part 2
-	// will wire this through; for now it's the placeholder the contract
-	// requires. Returning a not-implemented error rather than silently
-	// returning empty so callers know not to depend on it yet.
-	return fmt.Errorf("whpVM.QueryDirtyBitmap: not implemented yet (Phase 1.2 part 2)")
+	// WHvQueryGpaRangeDirtyBitmap returns a packed UINT64 array (1 bit per
+	// 4 KiB guest page, little-endian word order). The HVVM contract takes
+	// a []byte caller buffer, so we copy the uint64s out as little-endian
+	// bytes — that matches what the migration patch builder expects when
+	// it walks the bitmap via mergeDirtyBitmaps / buildDirtyFilePatch.
+	pages := size / 4096
+	words := (pages + 63) / 64
+	need := int(words * 8)
+	if len(bitmap) < need {
+		return fmt.Errorf("whpVM.QueryDirtyBitmap: bitmap buffer too small: need %d bytes, got %d", need, len(bitmap))
+	}
+	src, err := whp.QueryGpaRangeDirtyBitmap(v.handle, gpa, size)
+	if err != nil {
+		return fmt.Errorf("WHvQueryGpaRangeDirtyBitmap(gpa=%#x, size=%d): %w", gpa, size, err)
+	}
+	for i, w := range src {
+		binary.LittleEndian.PutUint64(bitmap[i*8:], w)
+	}
+	// Zero any trailing bytes the caller passed beyond the bitmap's real
+	// payload so a stale buffer doesn't leak old dirty bits.
+	for i := need; i < len(bitmap); i++ {
+		bitmap[i] = 0
+	}
+	return nil
 }
 
 func (v *whpVM) CreateVCPU(idx int) (HVVCPU, error) {

@@ -230,7 +230,7 @@ func FinalizeMigrationBundle(vm *VM, dir string) (*Snapshot, *MigrationPatchSet,
 		return nil, nil, err
 	}
 
-	data, err := json.MarshalIndent(snap, "", "  ")
+	data, err := marshalSnapshotForSource(snap, vm)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -239,6 +239,94 @@ func FinalizeMigrationBundle(vm *VM, dir string) (*Snapshot, *MigrationPatchSet,
 	}
 
 	return snap, patches, nil
+}
+
+// marshalSnapshotForSource picks between v1 (legacy KVM-shaped) and v2
+// (portable envelope) on-disk emission based on the source hypervisor.
+//
+// Linux KVM source keeps emitting v1 so KVM↔KVM bundles produced by older
+// gocracker builds stay byte-identical and the established round-trip
+// fixtures don't need re-baking. WHP source emits v2 because the WHP
+// adapter (Windows-only) has no KVM uapi structs to populate the legacy
+// fields with — its capture path produces a SnapshotV2 envelope directly.
+//
+// On the Linux build this file lives under, isWHPSource is always false
+// (WHP only exists on Windows), so this is effectively a v1 emission with
+// the dispatch wired through for the cross-platform follow-up that owns
+// the Windows-side capture path.
+func marshalSnapshotForSource(snap *Snapshot, vm *VM) ([]byte, error) {
+	if isWHPSource(vm) {
+		return writeSnapshotV2Bytes(snap, SnapshotHypervisorWHP)
+	}
+	return json.MarshalIndent(snap, "", "  ")
+}
+
+// isWHPSource reports whether the VM's hypervisor backend is WHP. On
+// Linux the answer is always false — the WHP adapter is gated behind
+// //go:build windows in hypervisor_windows.go, so the type assertion in
+// the Windows build catches it. Centralising the check here means the
+// Windows-side migration follow-up only has to override one function.
+func isWHPSource(vm *VM) bool {
+	if vm == nil || vm.hv == nil {
+		return false
+	}
+	return hypervisorIsWHP(vm.hv)
+}
+
+// hypervisorIsWHP is the Linux build's view of the WHP detector: WHP is
+// Windows-only, so the answer is always false here. The Windows build
+// of pkg/vmm provides a concrete implementation in hypervisor_windows.go
+// that type-asserts *whpHypervisor.
+func hypervisorIsWHP(_ Hypervisor) bool { return false }
+
+// writeSnapshotV2Bytes builds a portable SnapshotV2 envelope from a v1
+// Snapshot in memory. The result is JSON ready to hand to WriteSnapshotJSON.
+//
+// The envelope carries vcpu state through vcpuStateToPortable (which
+// owns the KVM-specific ExtendedState encoding on Linux). Arch state
+// rides in Meta["arch_state"] as a JSON blob so the legacy
+// SnapshotArchState type doesn't need a v2-specific equivalent — same
+// strategy decodeSnapshotV2 uses on the read side.
+//
+// hypervisor MUST be one of SnapshotHypervisorKVM / SnapshotHypervisorWHP;
+// MarshalSnapshotV2 rejects an empty value.
+func writeSnapshotV2Bytes(snap *Snapshot, hypervisor string) ([]byte, error) {
+	if snap == nil {
+		return nil, fmt.Errorf("writeSnapshotV2Bytes: nil snapshot")
+	}
+	env := &SnapshotV2{
+		Hypervisor: hypervisor,
+		Arch:       SnapshotArchAMD64,
+		ID:         snap.ID,
+	}
+	if snap.Config.Arch == "arm64" {
+		env.Arch = SnapshotArchARM64
+	}
+	for _, vs := range snap.VCPUs {
+		p, err := vcpuStateToPortable(vs)
+		if err != nil {
+			return nil, fmt.Errorf("writeSnapshotV2Bytes: vcpu %d: %w", vs.ID, err)
+		}
+		env.VCPUs = append(env.VCPUs, p)
+	}
+	if snap.Arch != nil {
+		archBlob, err := json.Marshal(snap.Arch)
+		if err != nil {
+			return nil, fmt.Errorf("writeSnapshotV2Bytes: arch_state marshal: %w", err)
+		}
+		if env.Meta == nil {
+			env.Meta = make(map[string]string, 1)
+		}
+		env.Meta["arch_state"] = string(archBlob)
+	}
+	if snap.MemFile != "" {
+		env.Memory = []MemRegionSnapshot{{
+			GPA:      0,
+			Size:     0,
+			DataFile: snap.MemFile,
+		}}
+	}
+	return MarshalSnapshotV2(env)
 }
 
 // ResetMigrationTracking disables dirty tracking after a failed migration so
