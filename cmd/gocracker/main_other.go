@@ -1,17 +1,13 @@
-//go:build !linux
+//go:build !linux && !windows
 
-// gocracker on non-Linux is a stub binary until the WHP-backed run loop
-// inside pkg/vmm.VM is wired up (Phase 1.2 step 7-8: machineArchBackend
-// takes HVVCPU/HVVM, then we drop the legacy *kvm.System fields and
-// un-gate cmd/gocracker on Windows). Today the main CLI imports
-// pkg/vmm.VM, which still embeds kvm types — both Linux-only.
+// gocracker on non-Linux/non-Windows is a stub binary. On Linux the full
+// CLI is in main.go (KVM-backed VMM, jailer, seccomp, hostnet, OCI build,
+// REST API server, snapshot/restore, live migration). On Windows the WHP-
+// backed `run` subcommand lives in main_windows.go.
 //
-// On Windows the working alternative TODAY is gocracker-whp.exe, which
-// bypasses the CLI-style API entirely and drives a single Linux kernel
-// directly through the WHP backend:
-//
-//	gocracker-whp.exe -initrd initramfs.cpio.gz vmlinux
-//	gocracker-whp.exe -rootfs rootfs.ext4 vmlinux
+// Other GOOS values (darwin, freebsd, etc.) have no backend yet; the
+// binary exits with a clear message instead of producing confusing
+// runtime failures.
 package main
 
 import (
@@ -21,21 +17,8 @@ import (
 )
 
 func main() {
-	fmt.Fprintln(os.Stderr, "gocracker: the CLI surface is still Linux-only on "+runtime.GOOS+"/"+runtime.GOARCH+".")
-	fmt.Fprintln(os.Stderr, "")
-	if runtime.GOOS == "windows" {
-		fmt.Fprintln(os.Stderr, "On Windows you can already boot a Linux kernel via the WHP backend:")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "  gocracker-whp.exe -initrd initramfs.cpio.gz vmlinux")
-		fmt.Fprintln(os.Stderr, "  gocracker-whp.exe -rootfs rootfs.ext4 vmlinux")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "(requires Windows Hypervisor Platform — enable with")
-		fmt.Fprintln(os.Stderr, "Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All)")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "The full gocracker.exe is pending Phase 1.2 of the port — see the plan.")
-	} else {
-		fmt.Fprintln(os.Stderr, "Native "+runtime.GOOS+" support is not yet planned.")
-		fmt.Fprintln(os.Stderr, "Run gocracker inside a Linux VM (KVM is the supported hypervisor).")
-	}
+	fmt.Fprintln(os.Stderr, "gocracker: native "+runtime.GOOS+"/"+runtime.GOARCH+" support is not yet planned.")
+	fmt.Fprintln(os.Stderr, "Run gocracker inside a Linux VM (KVM is the supported hypervisor),")
+	fmt.Fprintln(os.Stderr, "or on Windows where WHP-backed boot is available via gocracker.exe run.")
 	os.Exit(2)
 }
