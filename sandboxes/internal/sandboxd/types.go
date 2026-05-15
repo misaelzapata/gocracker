@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package sandboxd is the gocracker sandbox control plane — a thin
 // HTTP service on top of pkg/container + pkg/vmm + the toolbox
 // agent client. It owns the sandbox lifecycle (create / get / list

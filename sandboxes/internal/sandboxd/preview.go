@@ -1,3 +1,5 @@
+//go:build linux
+
 // Preview integration for sandboxd (Fase 7 slice 3). Wires the
 // sandboxes/internal/preview Token + Proxy into the HTTP control
 // plane:

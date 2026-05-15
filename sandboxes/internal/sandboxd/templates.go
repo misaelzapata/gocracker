@@ -1,3 +1,5 @@
+//go:build linux
+
 // Templates integration for sandboxd (Fase 6 slice 3). Wires the
 // sandboxes/internal/templates package to sandboxd's HTTP control
 // plane:

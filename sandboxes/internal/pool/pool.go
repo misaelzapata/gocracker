@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package pool manages a warm pool of pre-booted sandbox VMs so that
 // Lease-based creates avoid the 200-500 ms cold-boot tax.
 //

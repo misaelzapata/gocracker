@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package templates manages reusable, content-addressed VM snapshot
 // templates. A Template captures the inputs needed to cold-boot a
 // gocracker VM (image, kernel, mem, vCPUs, env...) into a stable

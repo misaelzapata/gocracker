@@ -1,3 +1,5 @@
+//go:build linux
+
 // Pool integration for sandboxd (Fase 5 slice 7). Wires a per-template
 // warm pool to the HTTP control plane so callers can:
 //
