@@ -17,6 +17,10 @@ type Backend struct {
 	socketDir string
 	socket    string
 	stderr    bytes.Buffer
+	// inproc is non-nil when this backend runs the embedded FUSE server
+	// (no external virtiofsd process). The host-side conn is owned by the
+	// server; the guest-side endpoint is exposed via Conn().
+	inproc *inProcServer
 }
 
 // Attach returns a Backend that wraps an already-listening virtiofsd unix
@@ -114,8 +118,30 @@ func (b *Backend) SocketPath() string {
 	return b.socket
 }
 
+// StartWithConfig is the structured entry point. If cfg.InProcess is set,
+// the embedded FUSE server is used (cross-platform, no external binary).
+// Otherwise the existing virtiofsd-spawning Start/StartAt logic runs.
+func StartWithConfig(cfg Config) (*Backend, error) {
+	if cfg.InProcess {
+		return StartInProcess(cfg)
+	}
+	if cfg.SocketPath != "" {
+		return StartAt(cfg.SharedDir, cfg.Tag, cfg.SocketPath)
+	}
+	return Start(cfg.SharedDir, cfg.Tag)
+}
+
 func (b *Backend) Close() error {
 	if b == nil {
+		return nil
+	}
+	if b.inproc != nil {
+		b.inproc.closed.Store(true)
+		_ = b.inproc.conn.Close()
+		_ = b.inproc.peer.Close()
+		// Wait for serve goroutine to exit so closing is synchronous.
+		<-b.inproc.done
+		b.inproc = nil
 		return nil
 	}
 	var err error
