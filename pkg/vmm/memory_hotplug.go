@@ -56,9 +56,9 @@ func (m *VM) setupMemoryHotplug() error {
 	for i := uint64(0); i < slotCount; i++ {
 		slotID := hotplugRegionSlotBase + uint32(i)
 		guestAddr := hotplugRegionBaseAddr + i*slotBytes
-		if _, err := m.kvmVM.AddMemoryRegion(slotID, guestAddr, slotBytes, 0); err != nil {
+		if _, err := m.kvm().AddMemoryRegion(slotID, guestAddr, slotBytes, 0); err != nil {
 			for _, mapped := range state.slots {
-				_ = m.kvmVM.RemoveMemoryRegion(mapped.slot)
+				_ = m.kvm().RemoveMemoryRegion(mapped.slot)
 			}
 			return err
 		}

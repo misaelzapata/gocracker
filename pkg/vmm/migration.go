@@ -78,10 +78,10 @@ func PrepareMigrationBundle(vm *VM, dir string) error {
 	if err := vm.prepareSnapshot(); err != nil {
 		return err
 	}
-	if err := vm.kvmVM.EnableDirtyLogging(); err != nil {
+	if err := vm.kvm().EnableDirtyLogging(); err != nil {
 		return fmt.Errorf("enable dirty logging: %w", err)
 	}
-	if err := vm.kvmVM.ResetDirtyLog(0); err != nil {
+	if err := vm.kvm().ResetDirtyLog(0); err != nil {
 		return fmt.Errorf("reset dirty log: %w", err)
 	}
 	if vm.memDirty != nil {
@@ -91,7 +91,7 @@ func PrepareMigrationBundle(vm *VM, dir string) error {
 		vm.blkDev.ResetDirty()
 	}
 
-	if err := writeMemoryFile(filepath.Join(dir, migrationMemFile), vm.kvmVM.Memory()); err != nil {
+	if err := writeMemoryFile(filepath.Join(dir, migrationMemFile), vm.kvm().Memory()); err != nil {
 		return fmt.Errorf("write base memory: %w", err)
 	}
 	if _, err := bundleAsset(dir, vm.cfg.KernelPath, migrationKernelPath); err != nil {
@@ -171,8 +171,8 @@ func ResetMigrationTracking(vm *VM) error {
 	if vm.blkDev != nil {
 		vm.blkDev.ResetDirty()
 	}
-	if vm.kvmVM.DirtyLoggingEnabled() {
-		if err := vm.kvmVM.DisableDirtyLogging(); err != nil {
+	if vm.kvm().DirtyLoggingEnabled() {
+		if err := vm.kvm().DisableDirtyLogging(); err != nil {
 			return err
 		}
 	}
@@ -416,12 +416,13 @@ func writeMigrationPatches(vm *VM, dir string) (*MigrationPatchSet, error) {
 	var patches []DirtyFilePatch
 	var dataOffset uint64
 
-	memBitmap, err := vm.kvmVM.GetDirtyLog(0)
+	memBitmap, err := vm.kvm().GetDirtyLog(0)
 	if err != nil {
 		return nil, err
 	}
 	memBitmap = mergeDirtyBitmaps(memBitmap, vm.memDirty.SnapshotAndReset())
-	memPatch, err := buildDirtyFilePatch(patchFile, bytes.NewReader(vm.kvmVM.Memory()), uint64(len(vm.kvmVM.Memory())), migrationMemFile, vm.memDirty.PageSize(), memBitmap, &dataOffset)
+	mem := vm.kvm().Memory()
+	memPatch, err := buildDirtyFilePatch(patchFile, bytes.NewReader(mem), uint64(len(mem)), migrationMemFile, vm.memDirty.PageSize(), memBitmap, &dataOffset)
 	if err != nil {
 		return nil, err
 	}

@@ -255,25 +255,17 @@ type VM struct {
 	stopCh chan struct{}
 	doneCh chan struct{}
 
-	kvmSys *kvm.System
-	kvmVM  *kvm.VM
-	vcpus  []*kvm.VCPU
-	runWG  sync.WaitGroup
+	runWG sync.WaitGroup
 
-	// hv / hvVM mirror kvmSys / kvmVM behind the Hypervisor abstraction.
-	// Phase 1.2 step 1: present alongside the kvm handles (not breaking).
-	// Subsequent steps migrate call sites from the concrete kvm pointers
-	// to these interface handles. Once every call goes through the
-	// abstraction, the kvm fields disappear and `pkg/vmm` builds for any
-	// hypervisor backend (WHP on Windows, HVF on macOS in a follow-up).
-	//
-	// Lifetime: the legacy cleanup() owns kvmSys/kvmVM. The HV wrappers
-	// share their handles; their Close() methods are NOT called from
-	// cleanup() to avoid double-free. When the migration completes, the
-	// HV fields will own the handles and the kvm fields will be deleted.
+	// hv / hvVM / hvVCPUs are the portable hypervisor handles. KVM is the
+	// only backend wired here today; in-package callers reach KVM-specific
+	// extensions (Memory(), IRQLine, GetClock, GetPIT2, GuestPhysBase,
+	// CreateGIC, MemoryFD, ...) via the m.kvm() / m.kvmSystem() /
+	// m.kvmVCPU(i) accessors defined in hypervisor_kvm.go. cleanup() now
+	// closes the HV handles (hvVM, hv), not the underlying kvm.* fields.
 	hv      Hypervisor
 	hvVM    HVVM
-	hvVCPUs []HVVCPU // parallel to vcpus until the migration finishes
+	hvVCPUs []HVVCPU
 
 	archBackend machineArchBackend
 
@@ -393,19 +385,15 @@ func New(cfg Config) (*VM, error) {
 		state:       StateCreated,
 		stopCh:      make(chan struct{}),
 		doneCh:      make(chan struct{}),
-		kvmSys:      sys,
-		kvmVM:       kvmVM,
 		archBackend: backend,
 		events:      NewEventLog(),
 		pausedVCPUs: make(map[int]struct{}),
 		vcpuTIDs:    make(map[int]int),
 		memDirty:    virtio.NewDirtyTracker(uint64(len(kvmVM.Memory()))),
 	}
-	// Phase 1.2 step 1: also expose the hypervisor handles via the
-	// abstraction. The wrappers share kvmSys / kvmVM — they do NOT own
-	// them; legacy cleanup() still calls kvmSys.Close() / kvmVM.Close()
-	// directly. Migration in subsequent steps moves call sites onto
-	// m.hv / m.hvVM and eventually flips ownership.
+	// HV handles own the underlying kvm.* lifetimes — cleanup() closes
+	// them via the abstraction. In-package callsites reach KVM-specific
+	// methods through m.kvm() / m.kvmSystem() / m.kvmVCPU(i).
 	m.hv = &kvmHypervisor{sys: sys}
 	m.hvVM = &hvvmKVM{sys: sys, vm: kvmVM}
 	m.pauseCond = sync.NewCond(&m.mu)
@@ -436,11 +424,6 @@ func New(cfg Config) (*VM, error) {
 		if err != nil {
 			return nil, fmt.Errorf("create vcpu %d: %w", i, err)
 		}
-		m.vcpus = append(m.vcpus, vcpu)
-		// Phase 1.2 step 2: also build the HVVCPU adapter, sharing the
-		// underlying *kvm.VCPU handle. Once the migration moves the run
-		// loop / register access through m.hvVCPUs, the m.vcpus slice
-		// (and the kvm.VCPU type leak) goes away.
 		m.hvVCPUs = append(m.hvVCPUs, &kvmVCPU{vm: m.hvVM.(*hvvmKVM), vcpu: vcpu, id: i})
 	}
 	if err := m.archBackend.postCreateVCPUs(m); err != nil {
@@ -489,21 +472,21 @@ func (m *VM) Start() error {
 		return fmt.Errorf("cannot start VM in state %s", m.state)
 	}
 	startFresh := m.state == StateCreated
-	m.events.Emit(EventStarting, fmt.Sprintf("starting %d vCPU(s)", len(m.vcpus)))
+	m.events.Emit(EventStarting, fmt.Sprintf("starting %d vCPU(s)", len(m.hvVCPUs)))
 	m.state = StateRunning
 	m.startTime = time.Now()
-	if startFresh && len(m.vcpus) > 0 {
-		m.runWG.Add(len(m.vcpus))
-		for i, vcpu := range m.vcpus {
-			go m.runLoop(vcpu, m.hvVCPUs[i])
+	if startFresh && len(m.hvVCPUs) > 0 {
+		m.runWG.Add(len(m.hvVCPUs))
+		for _, hvcpu := range m.hvVCPUs {
+			go m.runLoop(hvcpu)
 		}
 		go m.awaitStop()
 		if m.cfg.Balloon != nil && m.cfg.Balloon.Auto == BalloonAutoConservative {
 			go m.balloonAutoLoop()
 		}
 	}
-	m.events.Emit(EventRunning, fmt.Sprintf("%d vCPU(s) started", len(m.vcpus)))
-	gclog.VMM.Info("vm started", "id", m.cfg.ID, "vcpus", len(m.vcpus))
+	m.events.Emit(EventRunning, fmt.Sprintf("%d vCPU(s) started", len(m.hvVCPUs)))
+	gclog.VMM.Info("vm started", "id", m.cfg.ID, "vcpus", len(m.hvVCPUs))
 	return nil
 }
 
@@ -587,7 +570,7 @@ func (m *VM) Pause() error {
 	m.state = StatePaused
 	clear(m.pausedVCPUs)
 	cond := m.ensurePauseCondLocked()
-	vcpuCount := len(m.vcpus)
+	vcpuCount := len(m.hvVCPUs)
 	// Phase 1.2 step 4: cancel via the abstraction.
 	for _, hv := range m.hvVCPUs {
 		_ = hv.Cancel()
@@ -638,8 +621,10 @@ func (m *VM) Pause() error {
 		m.state = StateRunning
 	}
 	clear(m.pausedVCPUs)
-	for _, vcpu := range m.vcpus {
-		vcpu.RunData.ImmediateExit = 0
+	for i := range m.hvVCPUs {
+		if kv := m.kvmVCPU(i); kv != nil && kv.RunData != nil {
+			kv.RunData.ImmediateExit = 0
+		}
 	}
 	cond.Broadcast()
 	m.mu.Unlock()
@@ -658,11 +643,13 @@ func (m *VM) Resume() error {
 	}
 	m.state = StateRunning
 	clear(m.pausedVCPUs)
-	for _, vcpu := range m.vcpus {
-		vcpu.RunData.ImmediateExit = 0
+	for i := range m.hvVCPUs {
+		if kv := m.kvmVCPU(i); kv != nil && kv.RunData != nil {
+			kv.RunData.ImmediateExit = 0
+		}
 	}
 	m.ensurePauseCondLocked().Broadcast()
-	m.events.Emit(EventResumed, fmt.Sprintf("%d vCPU(s) resumed", len(m.vcpus)))
+	m.events.Emit(EventResumed, fmt.Sprintf("%d vCPU(s) resumed", len(m.hvVCPUs)))
 	return nil
 }
 
@@ -964,7 +951,7 @@ type SnapshotOptions struct {
 func (m *VM) TakeSnapshot(dir string) (*Snapshot, error) {
 	return m.TakeSnapshotWithOptions(dir, SnapshotOptions{
 		Resume:         true,
-		SkipDiskBundle: m.kvmVM.DirtyLoggingEnabled(),
+		SkipDiskBundle: m.kvm().DirtyLoggingEnabled(),
 	})
 }
 
@@ -1015,9 +1002,9 @@ func (m *VM) TakeSnapshotWithOptions(dir string, opts SnapshotOptions) (*Snapsho
 	}
 
 	memFile := filepath.Join(dir, "mem.bin")
-	if m.kvmVM.DirtyLoggingEnabled() {
+	if m.kvm().DirtyLoggingEnabled() {
 		tDirty := time.Now()
-		bitmap, err := m.kvmVM.GetDirtyLog(0)
+		bitmap, err := m.kvm().GetDirtyLog(0)
 		if err != nil {
 			gclog.VMM.Warn("dirty log unavailable, falling back to full write", "error", err)
 			goto fullWrite
@@ -1025,11 +1012,11 @@ func (m *VM) TakeSnapshotWithOptions(dir string, opts SnapshotOptions) (*Snapsho
 		// The host-side kernel/initrd loader writes directly to the memory
 		// mapping — those writes don't trigger KVM dirty tracking, so we must
 		// also include any non-zero "clean" pages. ~15ms for 100 MB.
-		augmentDirtyBitmap(m.kvmVM.Memory(), bitmap)
+		augmentDirtyBitmap(m.kvm().Memory(), bitmap)
 		dirtyCount := countDirtyBits(bitmap)
 		gclog.VMM.Info("saving dirty pages", "dirty_mb", dirtyCount*4/1024, "total_mb", m.cfg.MemMB, "path", memFile, "getDirtyLog_ms", time.Since(tDirty).Milliseconds())
 		tWrite := time.Now()
-		if err := saveDirtyPages(memFile, m.kvmVM.Memory(), bitmap); err != nil {
+		if err := saveDirtyPages(memFile, m.kvm().Memory(), bitmap); err != nil {
 			return nil, fmt.Errorf("write dirty mem: %w", err)
 		}
 		gclog.VMM.Info("dirty pages written", "ms", time.Since(tWrite).Milliseconds())
@@ -1051,7 +1038,7 @@ func (m *VM) TakeSnapshotWithOptions(dir string, opts SnapshotOptions) (*Snapsho
 	}
 fullWrite:
 	gclog.VMM.Info("saving RAM", "mem_mb", m.cfg.MemMB, "path", memFile)
-	if err := saveMemAsync(memFile, m.kvmVM.Memory()); err != nil {
+	if err := saveMemAsync(memFile, m.kvm().Memory()); err != nil {
 		return nil, fmt.Errorf("write mem: %w", err)
 	}
 	snap, err := captureSnapshotState(m)
@@ -1359,15 +1346,15 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		state:       StateCreated,
 		stopCh:      make(chan struct{}),
 		doneCh:      make(chan struct{}),
-		kvmSys:      sys,
-		kvmVM:       kvmVM,
 		archBackend: backend,
 		events:      NewEventLog(),
 		pausedVCPUs: make(map[int]struct{}),
 		vcpuTIDs:    make(map[int]int),
 		memDirty:    virtio.NewDirtyTracker(uint64(len(kvmVM.Memory()))),
 	}
-	// Phase 1.2 step 1: HV abstraction handles, shared with kvmSys/kvmVM.
+	// HV handles own the kvm.System / kvm.VM lifetimes; cleanup() closes
+	// them. In-package callsites reach KVM-specific helpers via m.kvm() /
+	// m.kvmSystem() / m.kvmVCPU(i).
 	m.hv = &kvmHypervisor{sys: sys}
 	m.hvVM = &hvvmKVM{sys: sys, vm: kvmVM}
 	m.pauseCond = sync.NewCond(&m.mu)
@@ -1407,8 +1394,6 @@ func restoreFromSnapshot(dir string, snap Snapshot, opts RestoreOptions) (*VM, e
 		if err != nil {
 			return nil, fmt.Errorf("create vcpu %d: %w", i, err)
 		}
-		m.vcpus = append(m.vcpus, vcpu)
-		// Phase 1.2 step 2: parallel HVVCPU wrapper.
 		m.hvVCPUs = append(m.hvVCPUs, &kvmVCPU{vm: m.hvVM.(*hvvmKVM), vcpu: vcpu, id: i})
 	}
 	// Mirror the cold-boot sequence: archBackend.postCreateVCPUs runs after
@@ -1583,20 +1568,24 @@ func captureVCPUState(vcpu *kvm.VCPU) (VCPUState, error) {
 }
 
 func captureVMArchState(vm *VM) (*SnapshotArchState, error) {
-	clock, err := vm.kvmVM.GetClock()
+	kvmVM := vm.kvm()
+	if kvmVM == nil {
+		return nil, fmt.Errorf("captureVMArchState: kvm VM unavailable")
+	}
+	clock, err := kvmVM.GetClock()
 	if err != nil {
 		return nil, err
 	}
 	clock.Flags &^= kvm.ClockTSCStable
 
-	pit2, err := vm.kvmVM.GetPIT2()
+	pit2, err := kvmVM.GetPIT2()
 	if err != nil {
 		return nil, err
 	}
 
 	irqChips := make([]kvm.IRQChip, 0, 3)
 	for _, chipID := range []uint32{kvm.IRQChipPicMaster, kvm.IRQChipPicSlave, kvm.IRQChipIOAPIC} {
-		chip, err := vm.kvmVM.GetIRQChip(chipID)
+		chip, err := kvmVM.GetIRQChip(chipID)
 		if err != nil {
 			return nil, err
 		}
@@ -1654,7 +1643,7 @@ func (m *VM) acpiMMIODevices() []acpi.MMIODevice {
 // ---- Private: kernel + device setup ----
 
 func (m *VM) loadKernel() (*loader.KernelInfo, error) {
-	mem := m.kvmVM.Memory()
+	mem := m.kvm().Memory()
 	info, err := loader.LoadKernel(mem, m.cfg.KernelPath, BootParamsAddr)
 	if err != nil {
 		return nil, err
@@ -1765,7 +1754,7 @@ func (m *VM) makeIRQFn(irq uint32) func(bool) {
 		if assert {
 			level = 1
 		}
-		m.kvmVM.IRQLine(irq, level)
+		m.kvm().IRQLine(irq, level)
 	}
 }
 
@@ -1774,8 +1763,8 @@ func (m *VM) makePulseIRQFn(irq uint32) func(bool) {
 		if !assert {
 			return
 		}
-		m.kvmVM.IRQLine(irq, 1)
-		m.kvmVM.IRQLine(irq, 0)
+		m.kvm().IRQLine(irq, 1)
+		m.kvm().IRQLine(irq, 0)
 	}
 }
 
@@ -1811,7 +1800,7 @@ func (m *VM) setupIRQs() error {
 	for _, t := range m.transports {
 		routes = append(routes, uint32(t.IRQLine()))
 	}
-	return m.kvmVM.SetGSIRouting(uniqueIRQs(routes))
+	return m.kvm().SetGSIRouting(uniqueIRQs(routes))
 }
 
 func uniqueIRQs(irqs []uint32) []uint32 {
@@ -1828,7 +1817,7 @@ func uniqueIRQs(irqs []uint32) []uint32 {
 }
 
 func (m *VM) setupDevices() error {
-	mem := m.kvmVM.Memory()
+	mem := m.kvm().Memory()
 	slot := 0
 
 	// UART (serial console) — not virtio, handled via IO exits
@@ -1966,7 +1955,7 @@ func (m *VM) setupDevices() error {
 		base := uint64(VirtioBase) + uint64(slot)*VirtioStride
 		irq := uint8(VirtioIRQBase + slot)
 		irqFn := m.makeIRQLine(uint32(irq))
-		fsDev, err := virtio.NewFSDevice(mem, m.kvmVM.MemoryFD(), base, irq, fsCfg.Source, fsCfg.Tag, fsCfg.SocketPath, m.memDirty, irqFn)
+		fsDev, err := virtio.NewFSDevice(mem, m.kvm().MemoryFD(), base, irq, fsCfg.Source, fsCfg.Tag, fsCfg.SocketPath, m.memDirty, irqFn)
 		if err != nil {
 			return fmt.Errorf("virtio-fs %s: %w", fsCfg.Tag, err)
 		}
@@ -1992,16 +1981,16 @@ func defaultGuestMAC(id, tapName string) net.HardwareAddr {
 
 // ---- vCPU run loop ----
 
-// runLoop drives one vCPU's execution. Phase 1.2 step 3: control flow
-// goes through the Hypervisor abstraction (hvvcpu.Run() returning the
-// portable ExitContext), while device emulation (handleIO/handleMMIO,
-// arch-specific exit handlers, kvm.RunData fields like
-// RequestInterruptWindow) still consumes the legacy *kvm.VCPU. The
-// migration of those device-emulation paths is step 4+.
-func (m *VM) runLoop(vcpu *kvm.VCPU, hvvcpu HVVCPU) {
+// runLoop drives one vCPU's execution. Control flow goes through the
+// Hypervisor abstraction (hvvcpu.Run() returns a portable ExitContext);
+// KVM-specific device-emulation helpers (handleIO/handleMMIO) and the
+// kvm.RunData scratch (RequestInterruptWindow) are reached by unwrapping
+// the HVVCPU on demand via kvmVCPUFromHV.
+func (m *VM) runLoop(hvvcpu HVVCPU) {
 	runtime.LockOSThread()
+	vcpuID := hvvcpu.ID()
 	if err := seccomp.InstallThreadProfile(seccomp.ProfileVCPU); err != nil {
-		gclog.VMM.Error("install vcpu seccomp profile failed", "id", m.cfg.ID, "vcpu", vcpu.ID, "error", err)
+		gclog.VMM.Error("install vcpu seccomp profile failed", "id", m.cfg.ID, "vcpu", vcpuID, "error", err)
 		m.events.Emit(EventError, fmt.Sprintf("install vcpu seccomp profile: %v", err))
 		// Seccomp was NOT installed, so the thread is clean — unlock it
 		// to avoid leaking a locked OS thread.
@@ -2010,15 +1999,15 @@ func (m *VM) runLoop(vcpu *kvm.VCPU, hvvcpu HVVCPU) {
 		m.runWG.Done()
 		return
 	}
-	m.registerVCPUThread(vcpu.ID, unix.Gettid())
+	m.registerVCPUThread(vcpuID, unix.Gettid())
 	defer m.runWG.Done()
 	defer func() {
-		m.unregisterVCPUThread(vcpu.ID)
+		m.unregisterVCPUThread(vcpuID)
 		// DO NOT unlock after successful seccomp install — the thread
 		// is tainted with a strict filter and must not be reused.
 	}()
 	for {
-		if m.waitIfPaused(vcpu.ID) {
+		if m.waitIfPaused(vcpuID) {
 			return
 		}
 
@@ -2040,8 +2029,8 @@ func (m *VM) runLoop(vcpu *kvm.VCPU, hvvcpu HVVCPU) {
 			if errors.Is(err, unix.EINTR) || errors.Is(err, unix.EAGAIN) {
 				interrupted = true
 			} else {
-				gclog.VMM.Error("vcpu run error", "id", m.cfg.ID, "vcpu", vcpu.ID, "error", err)
-				m.events.Emit(EventError, fmt.Sprintf("vcpu %d run: %v", vcpu.ID, err))
+				gclog.VMM.Error("vcpu run error", "id", m.cfg.ID, "vcpu", vcpuID, "error", err)
+				m.events.Emit(EventError, fmt.Sprintf("vcpu %d run: %v", vcpuID, err))
 				m.Stop()
 				return
 			}
@@ -2060,8 +2049,8 @@ func (m *VM) runLoop(vcpu *kvm.VCPU, hvvcpu HVVCPU) {
 				// on its first KVM_RUN. Keep the VM alive while exec
 				// is wired so the idle HLT wakes on the next device
 				// IRQ (vsock dial from the host, timer tick, etc).
-				if len(m.vcpus) == 1 && (m.cfg.Exec == nil || !m.cfg.Exec.Enabled) {
-					gclog.VMM.Info("guest HLT", "id", m.cfg.ID, "vcpu", vcpu.ID)
+				if len(m.hvVCPUs) == 1 && (m.cfg.Exec == nil || !m.cfg.Exec.Enabled) {
+					gclog.VMM.Info("guest HLT", "id", m.cfg.ID, "vcpu", vcpuID)
 					m.events.Emit(EventHalted, "guest HLT")
 					m.Stop()
 					return
@@ -2072,15 +2061,15 @@ func (m *VM) runLoop(vcpu *kvm.VCPU, hvvcpu HVVCPU) {
 				// needed — the kernel's kvm_vcpu_block handles it.
 
 			case ExitReasonIOPort:
-				m.handleIO(vcpu)
+				m.handleIO(hvvcpu)
 
 			case ExitReasonMMIO:
-				m.handleMMIO(vcpu)
+				m.handleMMIO(hvvcpu)
 
 			case ExitReasonSystemEvent:
 				if handled, stop, err := m.archBackend.handleExit(m, hvvcpu); err != nil {
-					gclog.VMM.Error("arch exit handling failed", "id", m.cfg.ID, "vcpu", vcpu.ID, "error", err)
-					m.events.Emit(EventError, fmt.Sprintf("arch-specific exit handling on vcpu %d: %v", vcpu.ID, err))
+					gclog.VMM.Error("arch exit handling failed", "id", m.cfg.ID, "vcpu", vcpuID, "error", err)
+					m.events.Emit(EventError, fmt.Sprintf("arch-specific exit handling on vcpu %d: %v", vcpuID, err))
 					m.Stop()
 					return
 				} else if handled {
@@ -2090,13 +2079,13 @@ func (m *VM) runLoop(vcpu *kvm.VCPU, hvvcpu HVVCPU) {
 					}
 					continue
 				}
-				gclog.VMM.Warn("unhandled system event", "id", m.cfg.ID, "vcpu", vcpu.ID)
-				m.events.Emit(EventError, fmt.Sprintf("unhandled system event on vcpu %d", vcpu.ID))
+				gclog.VMM.Warn("unhandled system event", "id", m.cfg.ID, "vcpu", vcpuID)
+				m.events.Emit(EventError, fmt.Sprintf("unhandled system event on vcpu %d", vcpuID))
 				m.Stop()
 				return
 
 			case ExitReasonShutdown:
-				gclog.VMM.Info("guest shutdown", "id", m.cfg.ID, "vcpu", vcpu.ID)
+				gclog.VMM.Info("guest shutdown", "id", m.cfg.ID, "vcpu", vcpuID)
 				m.events.Emit(EventShutdown, "guest shutdown")
 				m.Stop()
 				return
@@ -2105,17 +2094,19 @@ func (m *VM) runLoop(vcpu *kvm.VCPU, hvvcpu HVVCPU) {
 				// KVM-specific control: clear the request-interrupt-window
 				// flag so the kernel doesn't immediately re-exit. WHP
 				// doesn't need this (different injection model).
-				vcpu.RunData.RequestInterruptWindow = 0
+				if kv, err := kvmVCPUFromHV(hvvcpu); err == nil && kv.RunData != nil {
+					kv.RunData.RequestInterruptWindow = 0
+				}
 
 			case ExitReasonInternal:
-				gclog.VMM.Error("hypervisor internal error", "id", m.cfg.ID, "vcpu", vcpu.ID, "msg", exitCtx.FailureMsg)
-				m.events.Emit(EventError, fmt.Sprintf("hypervisor internal error on vcpu %d: %s", vcpu.ID, exitCtx.FailureMsg))
+				gclog.VMM.Error("hypervisor internal error", "id", m.cfg.ID, "vcpu", vcpuID, "msg", exitCtx.FailureMsg)
+				m.events.Emit(EventError, fmt.Sprintf("hypervisor internal error on vcpu %d: %s", vcpuID, exitCtx.FailureMsg))
 				m.Stop()
 				return
 
 			case ExitReasonFailEntry:
-				gclog.VMM.Error("hypervisor fail entry", "id", m.cfg.ID, "vcpu", vcpu.ID, "msg", exitCtx.FailureMsg)
-				m.events.Emit(EventError, fmt.Sprintf("hypervisor fail entry on vcpu %d (bad guest state): %s", vcpu.ID, exitCtx.FailureMsg))
+				gclog.VMM.Error("hypervisor fail entry", "id", m.cfg.ID, "vcpu", vcpuID, "msg", exitCtx.FailureMsg)
+				m.events.Emit(EventError, fmt.Sprintf("hypervisor fail entry on vcpu %d (bad guest state): %s", vcpuID, exitCtx.FailureMsg))
 				m.Stop()
 				return
 
@@ -2124,14 +2115,14 @@ func (m *VM) runLoop(vcpu *kvm.VCPU, hvvcpu HVVCPU) {
 				return
 
 			case ExitReasonUnknown:
-				gclog.VMM.Warn("hypervisor exit unknown", "id", m.cfg.ID, "vcpu", vcpu.ID)
-				m.events.Emit(EventError, fmt.Sprintf("hypervisor exit unknown on vcpu %d", vcpu.ID))
+				gclog.VMM.Warn("hypervisor exit unknown", "id", m.cfg.ID, "vcpu", vcpuID)
+				m.events.Emit(EventError, fmt.Sprintf("hypervisor exit unknown on vcpu %d", vcpuID))
 				m.Stop()
 				return
 
 			default:
-				gclog.VMM.Warn("unhandled exit reason", "id", m.cfg.ID, "vcpu", vcpu.ID, "reason", exitCtx.Reason)
-				m.events.Emit(EventError, fmt.Sprintf("unhandled exit reason on vcpu %d: %d", vcpu.ID, exitCtx.Reason))
+				gclog.VMM.Warn("unhandled exit reason", "id", m.cfg.ID, "vcpu", vcpuID, "reason", exitCtx.Reason)
+				m.events.Emit(EventError, fmt.Sprintf("unhandled exit reason on vcpu %d: %d", vcpuID, exitCtx.Reason))
 				m.Stop()
 				return
 			}
@@ -2203,21 +2194,21 @@ func (m *VM) cleanup() {
 				gclog.VMM.Warn("net device cleanup failed", "id", m.cfg.ID, "error", err)
 			}
 		}
-		for _, vcpu := range m.vcpus {
-			if vcpu != nil {
-				if err := vcpu.Close(); err != nil {
+		for _, hvcpu := range m.hvVCPUs {
+			if hvcpu != nil {
+				if err := hvcpu.Close(); err != nil {
 					gclog.VMM.Warn("vcpu cleanup failed", "id", m.cfg.ID, "error", err)
 				}
 			}
 		}
-		if m.kvmVM != nil {
-			if err := m.kvmVM.Close(); err != nil {
-				gclog.VMM.Warn("kvm vm cleanup failed", "id", m.cfg.ID, "error", err)
+		if m.hvVM != nil {
+			if err := m.hvVM.Close(); err != nil {
+				gclog.VMM.Warn("hv vm cleanup failed", "id", m.cfg.ID, "error", err)
 			}
 		}
-		if m.kvmSys != nil {
-			if err := m.kvmSys.Close(); err != nil {
-				gclog.VMM.Warn("kvm system cleanup failed", "id", m.cfg.ID, "error", err)
+		if m.hv != nil {
+			if err := m.hv.Close(); err != nil {
+				gclog.VMM.Warn("hv system cleanup failed", "id", m.cfg.ID, "error", err)
 			}
 		}
 	})
@@ -2336,8 +2327,14 @@ func (m *VM) dispatchIOPort(port uint16, direction uint8, dataIn byte) (dataOut 
 // handleIO is the KVM-coupled wrapper around dispatchIOPort. Reads the
 // port-I/O exit context out of kvm.RunData and writes the device's
 // response back into the same shared buffer so KVM_RUN picks it up on
-// the next entry.
-func (m *VM) handleIO(vcpu *kvm.VCPU) {
+// the next entry. Operates on the underlying *kvm.VCPU unwrapped from
+// the HVVCPU.
+func (m *VM) handleIO(hvcpu HVVCPU) {
+	vcpu, err := kvmVCPUFromHV(hvcpu)
+	if err != nil {
+		gclog.VMM.Warn("handleIO: non-kvm vCPU", "error", err)
+		return
+	}
 	io := vcpu.GetIOData()
 	dataPtr := vcpu.RunDataByte(io.DataOffset)
 	var dataIn byte
@@ -2431,8 +2428,14 @@ func (m *VM) dispatchMMIO(gpa uint64, isWrite bool, dataIn []byte, dataOut []byt
 
 // handleMMIO is the KVM-coupled wrapper around dispatchMMIO. Reads the
 // MMIO exit context out of kvm.RunData and writes device responses back
-// into the same shared buffer.
-func (m *VM) handleMMIO(vcpu *kvm.VCPU) {
+// into the same shared buffer. Operates on the underlying *kvm.VCPU
+// unwrapped from the HVVCPU.
+func (m *VM) handleMMIO(hvcpu HVVCPU) {
+	vcpu, err := kvmVCPUFromHV(hvcpu)
+	if err != nil {
+		gclog.VMM.Warn("handleMMIO: non-kvm vCPU", "error", err)
+		return
+	}
 	mmio := vcpu.GetMMIOData()
 	isWrite := mmio.IsWrite == 1
 	if isWrite {

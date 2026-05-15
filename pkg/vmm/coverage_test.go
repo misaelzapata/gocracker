@@ -592,7 +592,7 @@ func TestVM_Pause_TimeoutNoVCPUs(t *testing.T) {
 		state:       StateRunning,
 		events:      NewEventLog(),
 		pausedVCPUs: make(map[int]struct{}),
-		vcpus:       nil, // no vcpus
+		hvVCPUs:     nil, // no vcpus
 	}
 	// Pause with 0 vcpus should succeed immediately (0 == 0)
 	err := vm.Pause()

@@ -50,6 +50,63 @@ func kvmSysFromHV(hv Hypervisor) (*kvm.System, error) {
 	return kvm.sys, nil
 }
 
+// kvmVCPUFromHV unwraps an HVVCPU into the underlying *kvm.VCPU. KVM-only
+// code paths (run-loop kvm.RunData accesses, snapshot capture/restore that
+// goes through KVM-specific ioctls) call this and propagate a clear error
+// if the HVVCPU is actually a WHP-backed vCPU (which is a programming
+// error today — every hypervisor on a given VM is uniform).
+func kvmVCPUFromHV(hv HVVCPU) (*kvm.VCPU, error) {
+	if hv == nil {
+		return nil, fmt.Errorf("kvmVCPUFromHV: hvcpu is nil")
+	}
+	k, ok := hv.(*kvmVCPU)
+	if !ok {
+		return nil, fmt.Errorf("kvmVCPUFromHV: expected *kvmVCPU, got %T", hv)
+	}
+	return k.vcpu, nil
+}
+
+// kvm is the in-package accessor that returns the underlying *kvm.VM. Every
+// KVM-specific helper inside pkg/vmm uses this so direct field access to
+// kvm internals does not need to be sprinkled through the file. Returns nil
+// if the VM's hypervisor backend isn't KVM (programmer error today — only
+// kvm backend is wired on Linux).
+func (m *VM) kvm() *kvm.VM {
+	if m == nil || m.hvVM == nil {
+		return nil
+	}
+	if k, ok := m.hvVM.(*hvvmKVM); ok {
+		return k.vm
+	}
+	return nil
+}
+
+// kvmSystem returns the underlying *kvm.System for callsites that need the
+// system handle (CPUID setup, vCPU ioctls scoped to /dev/kvm rather than the
+// VM fd).
+func (m *VM) kvmSystem() *kvm.System {
+	if m == nil || m.hv == nil {
+		return nil
+	}
+	if k, ok := m.hv.(*kvmHypervisor); ok {
+		return k.sys
+	}
+	return nil
+}
+
+// kvmVCPU returns the underlying *kvm.VCPU for the i-th hypervisor vCPU. Used
+// by KVM-specific runLoop control (RunData.ImmediateExit, RequestInterruptWindow)
+// and by the snapshot capture path. Returns nil on type mismatch.
+func (m *VM) kvmVCPU(i int) *kvm.VCPU {
+	if m == nil || i < 0 || i >= len(m.hvVCPUs) {
+		return nil
+	}
+	if k, ok := m.hvVCPUs[i].(*kvmVCPU); ok {
+		return k.vcpu
+	}
+	return nil
+}
+
 // NewKVMHypervisor opens /dev/kvm and returns a Hypervisor backed by KVM.
 // Linux-only; non-Linux builds fall through to NewUnsupportedHypervisor
 // (see hypervisor_unsupported.go).

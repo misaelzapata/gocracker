@@ -121,7 +121,7 @@ func (vm *VM) ensureARM64GICLayout() (arm64layout.GICLayout, error) {
 	}
 	// 128 IRQs matches Firecracker: 32 private (SGI+PPI) + 96 SPIs.
 	const nrIRQs = 128
-	layout, err := vm.kvmVM.ProbeGICLayout(vm.cfg.VCPUs, nrIRQs)
+	layout, err := vm.kvm().ProbeGICLayout(vm.cfg.VCPUs, nrIRQs)
 	if err != nil {
 		return arm64layout.GICLayout{}, err
 	}
@@ -134,7 +134,7 @@ func (vm *VM) ensureARM64GICLayout() (arm64layout.GICLayout, error) {
 // ---------------------------------------------------------------------------
 
 func (arm64MachineBackend) setupDevices(vm *VM) error {
-	mem := vm.kvmVM.Memory()
+	mem := vm.kvm().Memory()
 	slot := 0
 
 	// Serial console — gocracker currently exposes an ns16550a-compatible UART
@@ -249,7 +249,7 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 		base := uint64(arm64VirtioBase) + uint64(slot)*arm64VirtioStride
 		irq := uint8(arm64VirtioIRQBase + slot)
 		irqFn := vm.makeIRQLine(uint32(irq))
-		fsDev, err := virtio.NewFSDevice(mem, vm.kvmVM.MemoryFD(), base, irq, fsCfg.Source, fsCfg.Tag, fsCfg.SocketPath, vm.memDirty, irqFn)
+		fsDev, err := virtio.NewFSDevice(mem, vm.kvm().MemoryFD(), base, irq, fsCfg.Source, fsCfg.Tag, fsCfg.SocketPath, vm.memDirty, irqFn)
 		if err != nil {
 			return fmt.Errorf("virtio-fs %s: %w", fsCfg.Tag, err)
 		}
@@ -260,7 +260,7 @@ func (arm64MachineBackend) setupDevices(vm *VM) error {
 
 	// ARM64 RAM starts at a non-zero GPA; tell virtio queues so they can
 	// translate guest physical addresses to mem[] offsets.
-	base := vm.kvmVM.GuestPhysBase()
+	base := vm.kvm().GuestPhysBase()
 	for _, t := range vm.transports {
 		t.SetGuestPhysBase(base)
 	}
@@ -286,7 +286,7 @@ func (arm64MachineBackend) postCreateVCPUs(vm *VM) error {
 	if err != nil {
 		return fmt.Errorf("select arm64 gic layout: %w", err)
 	}
-	gic, err := vm.kvmVM.CreateGIC(gicLayout, nrIRQs)
+	gic, err := vm.kvm().CreateGIC(gicLayout, nrIRQs)
 	if err != nil {
 		return fmt.Errorf("create GIC: %w", err)
 	}
@@ -298,7 +298,7 @@ func (arm64MachineBackend) postCreateVCPUs(vm *VM) error {
 	for i := range vm.transports {
 		gsis = append(gsis, uint32(arm64VirtioIRQBase+i))
 	}
-	if err := vm.kvmVM.SetGSIRoutingGIC(gsis); err != nil {
+	if err := vm.kvm().SetGSIRoutingGIC(gsis); err != nil {
 		return fmt.Errorf("arm64 GSI routing: %w", err)
 	}
 
@@ -320,7 +320,7 @@ func (arm64MachineBackend) setupVCPUsInParallel() bool {
 // ---------------------------------------------------------------------------
 
 func (arm64MachineBackend) loadKernel(vm *VM) (*loader.KernelInfo, error) {
-	mem := vm.kvmVM.Memory()
+	mem := vm.kvm().Memory()
 	memBytes := uint64(len(mem))
 	memBase := uint64(fdt.DefaultARM64MemoryBase)
 	memTop := memBase + memBytes
@@ -794,7 +794,7 @@ func (arm64MachineBackend) captureVMState(vm *VM) (*SnapshotArchState, error) {
 		// fresh GIC.
 		return &SnapshotArchState{ARM64: &ARM64MachineState{}}, nil
 	}
-	vgic, err := captureVGICState(gic, len(vm.vcpus), arm64GICNrIRQs)
+	vgic, err := captureVGICState(gic, len(vm.hvVCPUs), arm64GICNrIRQs)
 	if err != nil {
 		return nil, fmt.Errorf("capture vgic state: %w", err)
 	}
@@ -820,7 +820,7 @@ func (arm64MachineBackend) restoreVMStatePostIRQ(vm *VM, arch *SnapshotArchState
 	if !ok || gic == nil {
 		return fmt.Errorf("arm64 restore: VGIC snapshot present but no GIC device")
 	}
-	if err := restoreVGICState(gic, arch.ARM64.VGIC, len(vm.vcpus)); err != nil {
+	if err := restoreVGICState(gic, arch.ARM64.VGIC, len(vm.hvVCPUs)); err != nil {
 		return fmt.Errorf("restore vgic state: %w", err)
 	}
 	return nil
