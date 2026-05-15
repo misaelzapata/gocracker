@@ -228,12 +228,16 @@ func TestEvict_MissingRootNoError(t *testing.T) {
 func TestDefaultRoot_XDGPrecedence(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", "/tmp/fake-xdg")
 	t.Setenv("HOME", "/tmp/fake-home")
-	if got := DefaultRoot(); got != "/tmp/fake-xdg/gocracker/snapshots" {
-		t.Fatalf("XDG_CACHE_HOME not honoured: %s", got)
+	// filepath.Join uses OS-native separators, so compare against the
+	// joined expectation rather than a hard-coded POSIX string.
+	wantXDG := filepath.Join("/tmp/fake-xdg", "gocracker", "snapshots")
+	if got := DefaultRoot(); got != wantXDG {
+		t.Fatalf("XDG_CACHE_HOME not honoured: %s (want %s)", got, wantXDG)
 	}
 	t.Setenv("XDG_CACHE_HOME", "")
-	if got := DefaultRoot(); got != "/tmp/fake-home/.cache/gocracker/snapshots" {
-		t.Fatalf("HOME fallback wrong: %s", got)
+	wantHome := filepath.Join("/tmp/fake-home", ".cache", "gocracker", "snapshots")
+	if got := DefaultRoot(); got != wantHome {
+		t.Fatalf("HOME fallback wrong: %s (want %s)", got, wantHome)
 	}
 }
 
