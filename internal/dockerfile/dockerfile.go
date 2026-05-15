@@ -981,6 +981,15 @@ func (b *builder) handleRUN(instr Instruction) error {
 	// (requires root or user namespaces on Linux)
 	runArgs := b.buildRunCommand(args)
 
+	// On Windows, neither chroot nor user namespaces exist; the OS-specific
+	// runPrivileged stub in rootless_windows.go decides whether to warn-and-
+	// skip or fail hard. Route through it so RUN --mount specs and the
+	// strict-mode env var land in a single place rather than being filtered
+	// out by the rootless-side guard below.
+	if runtime.GOOS == "windows" {
+		return b.runPrivileged(runArgs, envArgs, instr.RunMounts)
+	}
+
 	// Check if we can use chroot (requires root) or unshare
 	if os.Getuid() == 0 {
 		cleanupFns := []func(){}
