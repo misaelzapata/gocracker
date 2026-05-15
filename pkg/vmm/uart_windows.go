@@ -279,17 +279,18 @@ func (u *UART16550) PushRX(b byte) {
 		return
 	}
 
-	wasEmpty := !u.rxReady
 	u.rbr = b
 	u.rxReady = true
 	u.lsr |= uartLSRDR
 
-	// RDI is edge-triggered on FIFO-empty -> non-empty when bit 0 of
-	// IER is enabled. We only raise once per arrival edge to avoid
-	// IRQ storms on back-to-back PushRX calls while the guest hasn't
-	// drained RBR yet.
+	// RDI is level-triggered: every byte that arrives while IER.RDI is
+	// set latches an IRQ4 raise. The earlier edge-triggered logic
+	// (raise only on empty→non-empty) dropped IRQs whenever two host
+	// bytes arrived before the guest read RBR, which is the steady
+	// state when the host sends a multi-byte command faster than the
+	// kernel's 8250 read path drains the FIFO.
 	raise := false
-	if wasEmpty && u.ier&uartIERRdi != 0 {
+	if u.ier&uartIERRdi != 0 {
 		u.rdiPending = true
 		raise = true
 	}

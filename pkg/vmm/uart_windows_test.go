@@ -81,11 +81,14 @@ func TestUARTRxIRQ(t *testing.T) {
 		t.Fatalf("LSR after PushRX = %#x; expected DR bit set", lsr)
 	}
 
-	// A second PushRX with RBR still pending shouldn't raise again —
-	// the IRQ is edge-triggered on empty→non-empty.
+	// A second PushRX with RBR still pending raises again — RDI is
+	// level-triggered while IER.RDI is set, so every host byte that
+	// arrives latches another IRQ4. Edge-triggering dropped IRQs when
+	// host typed multi-byte commands faster than the guest drained
+	// RBR.
 	f.u.PushRX('B')
-	if got := f.irqHits - preHits; got != 1 {
-		t.Fatalf("second PushRX with RBR pending raised IRQ %d times; want still 1", got)
+	if got := f.irqHits - preHits; got != 2 {
+		t.Fatalf("second PushRX with RBR pending raised IRQ %d times; want 2 (level-triggered)", got)
 	}
 
 	if v := f.u.ReadPort(0x3F8); v != 'B' {

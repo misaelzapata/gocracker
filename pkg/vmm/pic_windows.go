@@ -33,6 +33,12 @@ type pic8259 struct {
 	mu     sync.Mutex
 	master picController
 	slave  picController
+
+	// OnStateChange is invoked outside the lock after every ICW
+	// completion or OCW1 (mask) write. Callers (typically the WHP boot
+	// session) use it to re-fire IRQs that were queued while the PIC
+	// wasn't accepting them. nil is fine.
+	OnStateChange func()
 }
 
 type picController struct {
@@ -69,7 +75,6 @@ func (p *pic8259) readPort(port uint16) byte {
 // writePort handles a guest write to a PIC port.
 func (p *pic8259) writePort(port uint16, value byte) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	switch port {
 	case 0x20:
 		p.writeCommand(&p.master, value)
@@ -79,6 +84,14 @@ func (p *pic8259) writePort(port uint16, value byte) {
 		p.writeCommand(&p.slave, value)
 	case 0xA1:
 		p.writeData(&p.slave, value)
+	}
+	cb := p.OnStateChange
+	p.mu.Unlock()
+	// State potentially changed (ICW completion or new mask). Notify
+	// outside the lock so callers can re-call back into pic methods
+	// (irqUnmasked etc.) without deadlocking.
+	if cb != nil {
+		cb()
 	}
 }
 

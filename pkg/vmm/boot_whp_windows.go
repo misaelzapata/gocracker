@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
+	"github.com/gocracker/gocracker/internal/acpi"
 	"github.com/gocracker/gocracker/internal/loader"
 	"github.com/gocracker/gocracker/internal/whp"
 )
@@ -96,6 +98,14 @@ type WHPBootSession struct {
 	// in the `virtio_mmio.device=…:N` cmdline parameter.
 	blkIRQ uint8
 	rngIRQ uint8
+
+	// pendingIRQs latches IRQ requests that arrived before the kernel
+	// finished the PIC ICW sequence or before the destination line was
+	// unmasked. The PIC's onMaskChange callback drains this bitmask
+	// whenever the kernel writes a new mask, so no early IRQ is lost
+	// (timer ticks, UART input on first connect, etc.).
+	pendingIRQMu sync.Mutex
+	pendingIRQs  uint16
 }
 
 // BootLinuxOnWHP prepares a Linux kernel boot via WHP — allocates the
@@ -220,9 +230,13 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 	// Long-mode page tables + GDT/IDT in guest RAM.
 	BuildBootPageTables(ram, PageTableBase)
 	WriteBootGDT(ram)
-	// REGION:ACPI-WIRE — Batch 2 integrator replaces with acpi.WriteTables(ram).
-	// (ACPI tables expose the LAPIC/IOAPIC topology and PIT/COM interrupt
-	// overrides so the kernel doesn't fall back to ad-hoc defaults.)
+	// ACPI tables (RSDP at 0xE0000 → RSDT → MADT) so the kernel
+	// discovers the LAPIC topology and IRQ overrides instead of falling
+	// back to compiled-in defaults.
+	if err := acpi.WriteTables(ram); err != nil {
+		cleanupVM()
+		return nil, fmt.Errorf("acpi.WriteTables: %w", err)
+	}
 
 	// Map RAM into the partition with full RWX.
 	if err := vm.MapMemory(0, ram, MemRWX); err != nil {
@@ -303,6 +317,7 @@ func BootLinuxOnWHP(ctx context.Context, cfg WHPBootConfig) (*WHPBootSession, er
 	)
 	session.pci = newPCIConfigDummy()
 	session.pit.SetIRQ0Callback(func() { session.raiseIRQ(0) })
+	session.pic.OnStateChange = session.drainPendingIRQs
 	// REGION:HPET-WIRE — Agent A2 replaces this with the HPET MMIO
 	// registration + IRQ wiring (high-resolution timer at 0xFED00000).
 
@@ -323,14 +338,45 @@ func (s *WHPBootSession) PushUARTInput(b byte) {
 	}
 }
 
-// raiseIRQ delivers a virtio device IRQ to the guest via the 8259
-// PIC. No-op until the kernel has finished the ICW sequence and
-// unmasked the line.
+// raiseIRQ delivers a device IRQ to the guest via the 8259 PIC. When
+// the PIC isn't yet initialised or the line is currently masked, the
+// IRQ is latched in pendingIRQs and re-fired by drainPendingIRQs once
+// the kernel completes the ICW sequence or unmasks the line.
 func (s *WHPBootSession) raiseIRQ(irq uint8) {
-	if !s.pic.initialized() || !s.pic.irqUnmasked(irq) {
+	if irq < 16 && (!s.pic.initialized() || !s.pic.irqUnmasked(irq)) {
+		s.pendingIRQMu.Lock()
+		s.pendingIRQs |= 1 << irq
+		s.pendingIRQMu.Unlock()
 		return
 	}
 	_ = whp.RequestFixedInterrupt(s.hndl, s.pic.vectorForIRQ(irq))
+}
+
+// drainPendingIRQs is invoked by the PIC whenever it sees a state
+// change (ICW completion or OCW1 mask update) — any latched IRQ whose
+// line is now deliverable fires immediately.
+func (s *WHPBootSession) drainPendingIRQs() {
+	if !s.pic.initialized() {
+		return
+	}
+	s.pendingIRQMu.Lock()
+	pending := s.pendingIRQs
+	s.pendingIRQMu.Unlock()
+	if pending == 0 {
+		return
+	}
+	for irq := uint8(0); irq < 16; irq++ {
+		if pending&(1<<irq) == 0 {
+			continue
+		}
+		if !s.pic.irqUnmasked(irq) {
+			continue
+		}
+		s.pendingIRQMu.Lock()
+		s.pendingIRQs &^= 1 << irq
+		s.pendingIRQMu.Unlock()
+		_ = whp.RequestFixedInterrupt(s.hndl, s.pic.vectorForIRQ(irq))
+	}
 }
 
 // Run drives the vCPU until the guest halts, the context is cancelled,
