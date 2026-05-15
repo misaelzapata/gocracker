@@ -35,8 +35,17 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
+            tags: ""
           - goos: linux
             goarch: arm64
+            tags: ""
+          # Windows builds need TAGS=slirp_gvisor because there's no
+          # /dev/net/tun on Windows — the userspace gVisor netstack is
+          # the only viable network backend. Packaged as a zip (vs the
+          # Linux tarballs) to match the Windows ecosystem norm.
+          - goos: windows
+            goarch: amd64
+            tags: "slirp_gvisor"
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -70,36 +79,60 @@ jobs:
         env:
           TARGET_GOOS: ${{ matrix.goos }}
           TARGET_GOARCH: ${{ matrix.goarch }}
+          TAGS: ${{ matrix.tags }}
           VERSION: ${{ steps.version.outputs.version }}
           COMMIT: ${{ steps.version.outputs.commit }}
           DATE: ${{ steps.version.outputs.date }}
         run: make build
       - name: Verify version stamp
-        # Skip on cross-arch matrix legs — the produced binary doesn't
-        # run on the amd64 ubuntu-latest runner. The tag/commit/date
-        # are still in the binary because they were injected via
-        # ldflags during `make build` above; downstream consumers can
-        # confirm with `gocracker version` after install.
-        if: matrix.goarch == 'amd64'
+        # Skip on cross-arch matrix legs and on the Windows cross-build
+        # — the produced binaries don't run on the amd64 ubuntu-latest
+        # runner. The tag/commit/date are still in the binary because
+        # they were injected via ldflags during `make build` above;
+        # downstream consumers can confirm with `gocracker version`
+        # after install.
+        if: matrix.goarch == 'amd64' && matrix.goos == 'linux'
         run: |
           ./gocracker version
           ./gocracker version | grep -q "${{ steps.version.outputs.version }}"
-      - name: Package tarball
-        id: pkg
+      - name: Package tarball (linux)
+        id: pkg_tar
+        if: matrix.goos == 'linux'
         run: |
           STAGE="gocracker-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}"
           mkdir -p "$STAGE"
           cp gocracker gocracker-vmm gocracker-jailer LICENSE README.md "$STAGE/"
           tar czf "$STAGE.tar.gz" "$STAGE"
           sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
-          echo "tarball=$STAGE.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "asset=$STAGE.tar.gz" >> "$GITHUB_OUTPUT"
           echo "sha256=$STAGE.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+      - name: Package zip (windows)
+        id: pkg_zip
+        if: matrix.goos == 'windows'
+        # Eight .exe binaries plus LICENSE/README, zipped. The `make
+        # build` step above produced all of gocracker*.exe + toolbox-cli
+        # + debugvm — list them explicitly so the package isn't silently
+        # incomplete if a future build target gets added without
+        # updating the release wiring.
+        run: |
+          STAGE="gocracker-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "$STAGE"
+          cp gocracker.exe gocracker-vmm.exe gocracker-whp.exe \
+             gocracker-jailer.exe gocracker-hostcheck.exe \
+             gocracker-toolbox.exe toolbox-cli.exe debugvm.exe \
+             LICENSE README.md "$STAGE/"
+          zip -r "$STAGE.zip" "$STAGE"
+          sha256sum "$STAGE.zip" > "$STAGE.zip.sha256"
+          echo "asset=$STAGE.zip" >> "$GITHUB_OUTPUT"
+          echo "sha256=$STAGE.zip.sha256" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: gocracker-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
-            ${{ steps.pkg.outputs.tarball }}
-            ${{ steps.pkg.outputs.sha256 }}
+            ${{ steps.pkg_tar.outputs.asset }}
+            ${{ steps.pkg_tar.outputs.sha256 }}
+            ${{ steps.pkg_zip.outputs.asset }}
+            ${{ steps.pkg_zip.outputs.sha256 }}
 
   release:
     needs: build
