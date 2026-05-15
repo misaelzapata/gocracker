@@ -5,6 +5,56 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+### Added — Windows / WHP port (2026-05-15)
+- **HPET emulation** (`pkg/vmm/hpet_windows.go`) — 10 MHz 64-bit
+  counter at 0xFED00000 with 3 timers and a monotonic counter read
+  path that always strictly increases between successive reads
+  (works around Linux's "counter not counting" check when the udelay
+  TSC is unstable during early boot). ACPI HPET table added to
+  `internal/acpi/tables_x86.go` so the kernel discovers it via the
+  RSDT. Default cmdline now reads `console=ttyS0 earlyprintk=ttyS0
+  reboot=k panic=1` — the `tsc_early_khz / tsc=reliable / lpj /
+  no_timer_check` workarounds are gone. Linux dmesg confirms:
+  `clocksource: hpet: ...` and `tsc: using HPET reference calibration`.
+- **Slirp TCP via gVisor netstack** (`internal/slirp/tcp_gvisor.go`,
+  build tag `slirp_gvisor`) — gVisor stack with one NIC backed by a
+  channel.Endpoint; `Slirp.handleTCP` injects guest frames, drains
+  outbound, dials real host sockets for guest-initiated connections.
+  `tcp_stub.go` (default tag) keeps the drop-with-metric behaviour
+  so Linux builds without `slirp_gvisor` stay lean. Windows builds
+  enable the tag by default.
+- **Host→guest port-forwarding registry**
+  (`internal/slirp/portfwd.go`) — `PortFwdRegistry.Add/Lookup/Listen`
+  with a goroutine-per-rule accept loop and `ctx`-driven shutdown.
+  Foundation for `--publish HOST_IP:PORT:GUEST_PORT/{tcp,udp}`.
+- **UDP NAT idle-flow janitor** (`internal/slirp/udp_nat.go`) —
+  per-flow `lastActivity` atomic; 5 s sweep evicts flows idle ≥ 30 s.
+
+### Changed — Windows / WHP port (2026-05-15)
+- **`machineArchBackend` interface** (`pkg/vmm/arch.go`) now takes
+  `HVVCPU`/`Hypervisor`/`HVVM` instead of `*kvm.VCPU`/`*kvm.System`/
+  `*kvm.VM`. The x86/arm64 adapters type-assert to the concrete
+  `*kvmVCPU`/`*kvmVM` to access KVM-specific extensions
+  (MSR/FPU/XSAVE/LAPIC/GIC/PSCI) — `HVVCPU` stays narrow.
+- **`VM` struct** drops `kvmSys`/`kvmVM`/`vcpus` fields; uses
+  `hv`/`hvVM`/`hvVCPUs` exclusively. Constructor + cleanup +
+  `runLoop`/`handleIO`/`handleMMIO` all updated to take `HVVCPU`.
+  `pkg/vmm` now cross-compiles cleanly on Windows.
+- **Interactive shell** —
+  - UART RDI is now level-triggered: every `PushRX` while `IER.RDI`
+    is set latches `rdiPending` and raises IRQ4 (was edge-triggered
+    on empty→non-empty; dropped IRQs when host typed multi-byte
+    commands faster than the guest drained RBR).
+  - `WHPBootSession.raiseIRQ` queues IRQs that arrive before the PIC
+    is initialised or while a line is masked; the new
+    `pic8259.OnStateChange` hook drains the queue on every ICW
+    completion / OCW1 mask update.
+  - `cmd/gocracker-guest-shell/main.go` opens `/dev/kmsg` once and
+    reuses the fd for every klog call (avoids reopening per call
+    which the kernel printk subsystem sometimes drops).
+  - Small `time.Sleep(50 ms)` after console wiring so the 8250
+    driver finishes its UART probe before we hit the port.
+
 ### Added — Windows / WHP port (2026-05-13)
 - 16550A UART (`pkg/vmm/uart_windows.go`) — full COM1 with DLAB-gated
   divisor latches, IER, MCR loopback, RX FIFO, IRQ4 on RBR/THRE transitions.
